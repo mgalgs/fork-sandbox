@@ -53,9 +53,11 @@
 #
 # The seen-list and the three refresh markers live in the sandbox's ephemeral
 # /tmp, never in the inbox: the inbox is mounted read-only, and a per-run
-# tmpfs is exactly the lifetime a "have I shown this yet" record wants. A
-# fresh sandbox means a fresh tmpfs, so all three refresh markers reset on
-# their own between legs — nothing here has to know a continuation started.
+# scratch root -- disk-backed, but wiped and recreated fresh for every
+# sandbox invocation -- is exactly the lifetime a "have I shown this yet"
+# record wants. A fresh sandbox means a fresh /tmp, so all three refresh
+# markers reset on their own between legs — nothing here has to know a
+# continuation started.
 #
 # This runs INSIDE the sandbox with the session's own privileges, so it is not
 # a security boundary and grants nothing the session did not already have.
@@ -110,8 +112,9 @@ if [[ -f "$refresh_config" ]]; then
     done < "$refresh_config"
 fi
 
-# Four per-leg markers, all in the ephemeral tmpfs (see the header comment
-# above): one for "this leg has been nudged, do not measure again", one for
+# Four per-leg markers, all in the sandbox's ephemeral scratch /tmp (see the
+# header comment above): one for "this leg has been nudged, do not measure
+# again", one for
 # "this leg has already been reminded once, at Stop, that no hand-off showed
 # up", one for "this leg has already been sent back once, at Stop, because
 # its hand-off predated its last commit", and one holding this leg's own

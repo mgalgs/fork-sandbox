@@ -40,6 +40,12 @@ check() {
     local label="$1" expected="$2" actual="$3"
     if [[ "$expected" == "$actual" ]]; then ok "$label"; else no "$label" "expected '$expected', got '$actual'"; fi
 }
+contains() {
+    if [[ "$3" == *"$2"* ]]; then ok "$1"; else no "$1" "missing '$2' in: $3"; fi
+}
+lacks() {
+    if [[ "$3" != *"$2"* ]]; then ok "$1"; else no "$1" "unexpected '$2' in: $3"; fi
+}
 newdir() { mktemp -d; }
 
 # The shape under test, built once and handed to whichever backend is running.
@@ -141,6 +147,98 @@ else
     else
         no "hosts alias preserves localhost"
     fi
+
+    # Disk-backed scratch: /tmp and $HOME replaced tmpfs with a per-invocation
+    # bind. Static check first -- neither --tmpfs /tmp nor --tmpfs "$HOME"
+    # (the literal spelling this file used before) may remain in the script,
+    # since a stray one would silently put RAM back under one of them.
+    # shellcheck disable=SC2016  # the pattern, not this script's own $HOME
+    if grep -qE -- '--tmpfs /tmp$|--tmpfs "\$HOME"$' "$repo_dir/scripts/sandbox-backend-bwrap"; then
+        no "no --tmpfs /tmp or --tmpfs \$HOME remains"
+    else
+        ok "no --tmpfs /tmp or --tmpfs \$HOME remains"
+    fi
+
+    # A bind mount reports the SOURCE directory's own mode, so asking the
+    # sandboxed process to stat $HOME and /tmp is a way to see the scratch
+    # root's mode (0700, from mktemp) without ever seeing its host path.
+    # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+    out="$(run_bwrap --workdir "$w" -- /bin/bash -c 'stat -c %a "$HOME"; stat -c %a /tmp')"
+    check "scratch \$HOME is mode 0700" "$(printf '700\n700')" "$out"
+
+    # Two invocations must not share a root: a marker left in the first run's
+    # $HOME must be gone in a second, independent one.
+    # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+    out="$(run_bwrap --workdir "$w" -- /bin/bash -c 'echo mark > "$HOME/marker"; cat "$HOME/marker"')"
+    check "first invocation writes its marker" "mark" "$out"
+    # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+    out="$(run_bwrap --workdir "$w" -- /bin/bash -c '[[ -e "$HOME/marker" ]] && echo present || echo absent')"
+    check "a second invocation gets a fresh root, not the first one's" "absent" "$out"
+
+    # --run-dir: the scratch root lands under the caller-supplied directory
+    # rather than the fallback location, and is gone once the sandbox exits
+    # -- including when the command itself fails, since cleanup is a trap,
+    # not a success-path step.
+    rd="$(newdir)"; tmpdirs+=("$rd")
+    # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+    run_bwrap --workdir "$w" --run-dir "$rd" -- /bin/bash -c 'echo hi > "$HOME/x"' >/dev/null
+    check "--run-dir leaves nothing behind after a normal exit" "" "$(ls -A "$rd")"
+    run_bwrap --workdir "$w" --run-dir "$rd" -- /bin/bash -c 'exit 7' >/dev/null
+    rc=$?
+    check "the failing command's exit code still comes back" "7" "$rc"
+    check "--run-dir leaves nothing behind after a failing command" "" "$(ls -A "$rd")"
+
+    # --run-dir refuses the same system paths --workdir does, rather than
+    # silently creating a scratch root there.
+    if run_out="$("$repo_dir/scripts/sandbox-backend-bwrap" --workdir "$w" --net sealed --run-dir /etc -- true 2>&1)"; then
+        no "--run-dir refuses a system path" "exit 0: $run_out"
+    else
+        case "$run_out" in *refusing*) ok "--run-dir refuses a system path" ;;
+            *) no "--run-dir refuses a system path" "$run_out" ;; esac
+    fi
+
+    # A build tool's own cache (Go's module cache under $HOME is the standard
+    # example) is routinely written read-only. On the old tmpfs that never
+    # mattered -- unmounting discarded it regardless -- but a plain rm -rf on
+    # disk stops at the first read-only directory and leaves the rest behind.
+    rd="$(newdir)"; tmpdirs+=("$rd")
+    # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+    run_bwrap --workdir "$w" --run-dir "$rd" -- /bin/bash -c \
+        'mkdir -p "$HOME/go/pkg/mod/x"; echo f > "$HOME/go/pkg/mod/x/f"; chmod -R a-w "$HOME/go/pkg/mod"' >/dev/null
+    check "--run-dir leaves nothing behind after a read-only subtree" "" "$(ls -A "$rd")"
+
+    # What the kernel says, not the argv: /tmp and $HOME are not tmpfs inside.
+    # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+    out="$(run_bwrap --workdir "$w" -- /bin/bash -c \
+        'while read -r _ mp fs _; do [[ "$mp" == /tmp || "$mp" == "$HOME" ]] && echo "$mp $fs"; done < /proc/mounts' \
+        | sed "s|^$HOME |HOME |")"
+    case "$out" in
+        *tmpfs*) no "/tmp and \$HOME are not tmpfs inside the sandbox" "$out" ;;
+        *"/tmp "*) ok "/tmp and \$HOME are not tmpfs inside the sandbox" ;;
+        *) no "/tmp and \$HOME are not tmpfs inside the sandbox" "no /tmp mount seen: $out" ;;
+    esac
+
+    # /dev/shm is capped where bwrap supports --size, and a bwrap that
+    # predates --size still launches, keeping --dev's own /dev/shm.
+    shm_opts() { grep ' /dev/shm ' /proc/mounts; }
+    if bwrap --help 2>&1 | grep -q -- '--size'; then
+        # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+        out="$(run_bwrap --workdir "$w" -- /bin/bash -c "$(declare -f shm_opts); shm_opts")"
+        contains "/dev/shm is capped at 1GiB" "size=1048576k" "$out"
+    fi
+    oldbwrap="$(newdir)"; tmpdirs+=("$oldbwrap")
+    real_bwrap="$(command -v bwrap)"
+    cat > "$oldbwrap/bwrap" <<STUB
+#!/usr/bin/env bash
+if [[ "\${1-}" == --help ]]; then "$real_bwrap" --help 2>&1 | grep -v -- '--size'; exit 0; fi
+for a in "\$@"; do [[ "\$a" == --size ]] && { echo "bwrap: Unknown option --size" >&2; exit 1; }; done
+exec "$real_bwrap" "\$@"
+STUB
+    chmod +x "$oldbwrap/bwrap"
+    # shellcheck disable=SC2016  # a program for the sandbox's bash, not this one
+    out="$(PATH="$oldbwrap:$PATH" run_bwrap --workdir "$w" -- /bin/bash -c "$(declare -f shm_opts); shm_opts; echo launched")"
+    contains "a bwrap without --size still launches" "launched" "$out"
+    lacks "a bwrap without --size gets no /dev/shm cap" "size=1048576k" "$out"
 fi
 
 printf '\n== container backend ==\n'

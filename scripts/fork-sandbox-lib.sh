@@ -783,9 +783,9 @@ fs_make_clone() {
 
 # Provision a node project into the clone, so the suites a handoff asks
 # for can actually run. Committed state has no node_modules, and the
-# sandbox's $HOME is a fresh tmpfs, so nvm's node is invisible there —
-# without this a node repo gets /usr/bin/node at whatever version the host
-# package manager last installed, and no npm at all.
+# sandbox's $HOME is a fresh, disk-backed scratch directory, so nvm's node
+# is invisible there — without this a node repo gets /usr/bin/node at
+# whatever version the host package manager last installed, and no npm at all.
 #   - .nvmrc names the version; FS_NODE_FLAGS asks claude-sandboxed to
 #     bind that exact install read-only and put its bin first on PATH.
 #     Only a plain dotted version is accepted: an alias such as lts/iron
@@ -1054,11 +1054,11 @@ fs_provision_ro() {
 
 # A provisioned virtualenv only runs if its interpreter is reachable inside
 # the sandbox. A venv on the system python needs nothing (/usr is mounted),
-# but uv and pyenv install interpreters under $HOME, which is a tmpfs inside:
-# .venv/bin/python dangles, and every compiled extension in the venv is dead
-# weight behind it. pyvenv.cfg names the interpreter's bin directory in
-# `home =`; bind the interpreter prefix read-only at its own path when it
-# lives in a recognized store.
+# but uv and pyenv install interpreters under $HOME, which is ephemeral
+# scratch inside: .venv/bin/python dangles, and every compiled extension in
+# the venv is dead weight behind it. pyvenv.cfg names the interpreter's bin
+# directory in `home =`; bind the interpreter prefix read-only at its own
+# path when it lives in a recognized store.
 #
 # The store allowlist is deliberate. This is the one bind derived from
 # UNTRACKED content (the venv is the user's working tree, not the repo's), so
@@ -1105,11 +1105,11 @@ fs_venv_interpreter_bind() {
 }
 
 # A provisioned venv is only useful if its tools can be FOUND, not just run.
-# Nothing activates a venv inside the sandbox — $HOME is a tmpfs, so there is
-# no shell profile and no VIRTUAL_ENV — which leaves bare `python` as the
-# system interpreter and bare `black` as nothing at all. An agent then either
-# rediscovers the venv and hand-prefixes .venv/bin/ onto every command, or
-# concludes the tool is unavailable and skips the check.
+# Nothing activates a venv inside the sandbox — $HOME is ephemeral scratch,
+# so there is no shell profile and no VIRTUAL_ENV — which leaves bare
+# `python` as the system interpreter and bare `black` as nothing at all. An
+# agent then either rediscovers the venv and hand-prefixes .venv/bin/ onto
+# every command, or concludes the tool is unavailable and skips the check.
 #
 # So put the venv's bin first on PATH, which is what activation does and all
 # it needs to do here. The effect is that a sandbox looks like the activated
@@ -1143,10 +1143,11 @@ fs_venv_bin_on_path() {
 # and at worst flips a writable one read-only. The one thing that is still
 # missing is what lives OUTSIDE the tree — a uv or pyenv virtualenv's
 # interpreter, since .venv/bin/python is a symlink into an interpreter store
-# under $HOME and $HOME is a tmpfs in the sandbox. So read the same provision-ro
-# list, but for each entry that is a venv do only the two things a present-but-
-# inert venv still needs: bind its interpreter, and put its bin on PATH, since
-# no more here than in a clone does anything activate it. A non-venv entry adds
+# under $HOME and $HOME is ephemeral scratch in the sandbox. So read the same
+# provision-ro list, but for each entry that is a venv do only the two
+# things a present-but-inert venv still needs: bind its interpreter, and put
+# its bin on PATH, since no more here than in a clone does anything activate
+# it. A non-venv entry adds
 # nothing. fs_venv_interpreter_bind keeps the store allowlist that makes this
 # safe from an untracked source. Fills FS_PROVISION_RO_FLAGS; a repo without
 # the file leaves it empty.
@@ -1611,12 +1612,18 @@ fs_resolve_backend() {
 # That reads as `host`, the status quo, so such a backend keeps behaving
 # exactly as it does today rather than silently changing.
 #
-# Takes FS_BACKEND_BIN, or any backend path. Fills FS_BACKEND_TOOLCHAIN and
-# FS_BACKEND_HOSTS_ALIAS.
+# Takes FS_BACKEND_BIN, or any backend path. Fills FS_BACKEND_TOOLCHAIN,
+# FS_BACKEND_HOSTS_ALIAS and FS_BACKEND_RUN_DIR.
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_BACKEND_TOOLCHAIN=host
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_BACKEND_HOSTS_ALIAS=0
+# Whether the backend understands --run-dir. A backend written before the
+# option existed rejects unknown flags outright (see docs/sandbox-backend.md),
+# so a caller must ask first, the same as hosts_alias, rather than pass it
+# unconditionally and break a backend that predates it.
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_BACKEND_RUN_DIR=0
 # Whether chromium's own inner sandbox (nested user namespaces) works under
 # this backend, so a caller never has to pass --no-sandbox to find out. See
 # docs/sandbox-backend.md's capabilities table.
@@ -1627,6 +1634,7 @@ fs_backend_capabilities() {
     local bin="$1" out line key value chromium_own_sandbox_seen=0
     FS_BACKEND_TOOLCHAIN=host
     FS_BACKEND_HOSTS_ALIAS=0
+    FS_BACKEND_RUN_DIR=0
     FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
     # Parse only a clean exit. A backend that refuses the option may still
     # print its usage, and a usage line can hold an '=' -- reading that as a
@@ -1653,6 +1661,10 @@ fs_backend_capabilities() {
         hosts_alias)
             # shellcheck disable=SC2034  # read by scripts sourcing this library
             [[ "$value" == 1 ]] && FS_BACKEND_HOSTS_ALIAS=1
+            ;;
+        run_dir)
+            # shellcheck disable=SC2034  # read by scripts sourcing this library
+            [[ "$value" == 1 ]] && FS_BACKEND_RUN_DIR=1
             ;;
         chromium_own_sandbox)
             case "$value" in
@@ -1903,6 +1915,75 @@ _fs_dir_mtime_age_secs() {
     local dir="$1" mtime
     mtime="$("$FS_STAT" -c %Y "$dir" 2>/dev/null)" || { printf '999999'; return 0; }
     printf '%s' $(( $(date +%s) - mtime ))
+}
+
+# Best-effort removal of orphaned sandbox scratch roots -- the disk-backed
+# replacement for tmpfs /tmp and $HOME (see sandbox-backend-bwrap and
+# sandbox-backend-container) -- left behind by a backend that was SIGKILLed
+# before its own EXIT trap could run. Each backend removes its own scratch
+# root on a normal exit, an error, or a caught signal; only a kill that skips
+# the trap entirely leaks one, and unlike the small per-run state dir this
+# leaks alongside (a few files, accepted as-is -- see each backend's header),
+# a scratch root can hold gigabytes (a Postgres or Chromium profile, a
+# webpack cache), so it needs an active reclaim rather than a shrug.
+#
+# Called by both backends, before creating this invocation's own root, so a
+# busy host cannot accumulate them indefinitely. Liveness comes first from
+# ROOT.lock, an flock each backend holds (as SCRATCH_LOCK_FD) for exactly as
+# long as it runs -- the kernel drops that lock however the process ends,
+# including SIGKILL, so flock -n on it tells us in one syscall whether the
+# owner is gone, the same pattern teardown_workspace_locked
+# (fork-sandbox-fleet.sh) uses for a workspace. That is the liveness check
+# age alone cannot give: a root only ever holds `tmp/` and `home/`, created
+# once at launch and never touched again no matter how busy the sandbox
+# inside them is, so the directory's own mtime is the launch time forever
+# after -- an interactive claude-sandboxed/agent-sandboxed session (the
+# default; --exec is what opts out) left open past FS_SCRATCH_STALE_SEC
+# looked exactly like a leak under an age-only check and got removed out
+# from under it, mid-session.
+#
+# A root with no lock file -- created before this lock existed, or one
+# fs_sweep couldn't open -- falls back to the age check, so a genuine leak
+# from an older build still gets reclaimed. The threshold is generous (6
+# hours by default); FS_SCRATCH_STALE_SEC overrides it for tests.
+#
+# Two glob shapes cover both places a root can be: directly under forks/
+# (the fallback, when no --run-dir was given) and one level down (nested
+# under a caller's own per-invocation directory). Errors are swallowed --
+# a sweep must never fail the run it runs ahead of.
+fs_sweep_stale_scratch_roots() {
+    local stale_sec="${FS_SCRATCH_STALE_SEC:-21600}" root age lockfile fd
+    for root in "$FS_SCRATCH_ROOT"/forks/sandbox-scratch.* \
+                "$FS_SCRATCH_ROOT"/forks/*/sandbox-scratch.*; do
+        [[ -d "$root" ]] || continue
+        lockfile="$root.lock"
+        if [[ -e "$lockfile" ]]; then
+            # See teardown_workspace_locked (fork-sandbox-fleet.sh) for why
+            # the open is braced: a bare `exec {fd}<>file 2>/dev/null` with
+            # no command redirects the whole shell's stderr from here on,
+            # not just this open.
+            { exec {fd}<>"$lockfile"; } 2>/dev/null || continue
+            if flock -n "$fd"; then
+                flock -u "$fd"
+                exec {fd}>&-
+                # See each backend's cleanup for why: a build tool's own
+                # cache (Go's module cache is the standard example) is
+                # routinely written read-only, which stops rm -rf partway
+                # through.
+                chmod -R u+w -- "$root" 2>/dev/null || true
+                rm -rf -- "$root" "$lockfile" 2>/dev/null || true
+            else
+                exec {fd}>&-
+            fi
+            continue
+        fi
+        age="$(_fs_dir_mtime_age_secs "$root")"
+        [[ "$age" =~ ^[0-9]+$ ]] || continue
+        (( age >= stale_sec )) || continue
+        chmod -R u+w -- "$root" 2>/dev/null || true
+        rm -rf -- "$root" 2>/dev/null || true
+    done
+    return 0
 }
 
 # Takes one mkdir-style lock directory, breaking it first if it is already

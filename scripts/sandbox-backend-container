@@ -5,7 +5,7 @@
 #          --image NAME [--bind-ro PATH]... [--bind-rw PATH]...
 #          [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]...
 #          [--bridge SOCKET=PORT]... [--hosts-alias NAME]... [--setenv K=V]... [--prepend-path DIR]...
-#          [--hostname NAME] -- COMMAND [ARG...]
+#          [--hostname NAME] [--run-dir DIR] -- COMMAND [ARG...]
 #
 # --image selects the Linux image; FORK_SANDBOX_CONTAINER_IMAGE is its
 # default. The runtime is docker unless FORK_SANDBOX_CONTAINER_CLI overrides
@@ -29,6 +29,12 @@
 # preserves the name in a Host-routed endpoint URL while the sealed bridge
 # receives the connection at 127.0.0.1.
 #
+# --run-dir DIR names a directory the CALLER already manages for the life of
+# this run -- claude-sandboxed's and agent-sandboxed's own per-invocation
+# state dir, say. When given, this invocation's scratch root (see "What the
+# sandbox gets" below) is created under it; when absent, it falls back to a
+# fresh directory under the fork machinery's own scratch root. Optional.
+#
 # The image supplies the sandbox toolchain, unlike bwrap, which mounts host
 # /usr. It must contain bash; pinned mode also needs iproute2's ip, and bridges
 # need socat. A host toolchain bind works on Linux only if ABI-compatible and
@@ -37,8 +43,10 @@
 # images whose entrypoint depends on their own users are unsupported. This
 # backend overrides the entrypoint.
 #
-# What the sandbox gets: a disposable writable image overlay, empty tmpfs /tmp
-# and $HOME, only named host mounts, host uid/gid, dropped capabilities,
+# What the sandbox gets: a disposable writable image overlay, a disk-backed
+# scratch directory bind-mounted at /tmp and another at $HOME (see --run-dir
+# above -- both empty and fresh for this invocation, removed when it exits),
+# only named host mounts, host uid/gid, dropped capabilities,
 # no-new-privileges, Docker's default seccomp, init, a minimal explicit
 # environment, and stdin unchanged. The overlay is not a host-persistent write.
 #
@@ -58,12 +66,22 @@
 #     only by fixed private ranges, and global tunnel prefixes only if present
 #     at startup. Docker DNS may resolve VPN-only names via the daemon even
 #     though their addresses are unreachable: names leak, reachability does not.
-#   - Resource limits: none. Docker supports --memory, --cpus and --pids-limit,
-#     but this backend does not set them.
-#   - SIGKILL leaves the stopped labeled container, labeled network, and state
-#     dir; the kernel releases the lock. Find strays with `docker ps -a
-#     --filter label=fork-sandbox-run` and `docker network ls --filter
-#     label=fork-sandbox-run`.
+#   - Resource limits: none on CPU or memory. Docker supports --memory, --cpus
+#     and --pids-limit, but this backend does not set them. /dev/shm is
+#     capped at Docker's own default (64MiB, via --shm-size's default); this
+#     backend does not raise it. Disk is unbounded: the scratch root behind
+#     /tmp and $HOME is not size-capped, so a runaway sandbox can fill the
+#     disk it lives on.
+#   - SIGKILL leaves the stopped labeled container, labeled network, state
+#     dir and this run's scratch root; the kernel releases the lock. Find
+#     stray containers/networks with `docker ps -a --filter
+#     label=fork-sandbox-run` and `docker network ls --filter
+#     label=fork-sandbox-run`; a stray scratch root is reclaimed by
+#     fs_sweep_stale_scratch_roots on a later invocation. Liveness comes from
+#     the root's own flock, not age -- a root still held by a running sandbox
+#     is never touched regardless of how long it has been open -- and only a
+#     root with no lock file falls back to an age check (see that function's
+#     comment in fork-sandbox-lib.sh).
 #   - --bridge is verified only on Linux and probably fails through Docker
 #     Desktop/Colima filesystem sharing. Treat it as Linux-only until verified.
 #   - macOS needs `flock` on PATH (stock macOS ships neither it nor GNU
@@ -99,6 +117,11 @@ if [[ "${1-}" == --capabilities ]]; then
     # (see docs/visual-browser.md), so this is not yet measured against a
     # real one -- it records the seccomp constraint that would apply.
     echo "chromium_own_sandbox=0"
+    # This backend understands --run-dir. A backend that predates it exits
+    # nonzero here (the same fallback every capability gets) and a caller
+    # that declared run_dir=1 for it would then hand it an option it
+    # rejects; see docs/sandbox-backend.md's capabilities table.
+    echo "run_dir=1"
     exit 0
 fi
 
@@ -110,7 +133,7 @@ fs_require_gnu_tools || exit 1
 
 CLI="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 IMAGE="${FORK_SANDBOX_CONTAINER_IMAGE:-}"
-WORK_DIR_ARG=""; NET_MODE=""; HOSTNAME_ARG=""
+WORK_DIR_ARG=""; NET_MODE=""; HOSTNAME_ARG=""; RUN_DIR_ARG=""
 BIND_RO=(); BIND_RW=(); BIND_RO_AT_SRC=(); BIND_RO_AT_DEST=()
 BIND_RW_AT_SRC=(); BIND_RW_AT_DEST=(); BRIDGE_SOCKETS=(); BRIDGE_PORTS=()
 HOSTS_ALIASES=()
@@ -121,6 +144,7 @@ while (( $# )); do
         --net) NET_MODE="${2:?--net requires pinned, sealed or unpinned}"; shift 2 ;;
         --image) IMAGE="${2:?--image requires a name}"; shift 2 ;;
         --hostname) HOSTNAME_ARG="${2:?--hostname requires a name}"; shift 2 ;;
+        --run-dir) RUN_DIR_ARG="${2:?--run-dir requires a directory}"; shift 2 ;;
         --bind-ro) BIND_RO+=("${2:?--bind-ro requires a path}"); shift 2 ;;
         --bind-rw) BIND_RW+=("${2:?--bind-rw requires a path}"); shift 2 ;;
         --bind-ro-at) BIND_RO_AT_SRC+=("${2:?--bind-ro-at requires a source path}"); BIND_RO_AT_DEST+=("${3:?--bind-ro-at requires a destination path}"); shift 3 ;;
@@ -204,6 +228,17 @@ mkdir -p /var/tmp/claude-scratch/forks "$WORK_DIR_ARG"
 WORK_DIR="$("$FS_REALPATH" "$WORK_DIR_ARG")"
 is_refused_work_dir "$WORK_DIR" && { echo "Error: refusing '$WORK_DIR' as the work dir. It is bind-mounted writable." >&2; exit 1; }
 check_mount_path --workdir "$WORK_DIR" || exit 1
+
+# --run-dir: the caller's own per-invocation directory, already created by
+# it. Not bind-mounted -- this script only ever mktemps a fresh subdirectory
+# under it -- but refused on the same list as the work dir anyway, on the
+# theory that a system path here is a caller mistake worth catching.
+RUN_DIR=""
+if [[ -n "$RUN_DIR_ARG" ]]; then
+    [[ -d "$RUN_DIR_ARG" ]] || { echo "Error: --run-dir '$RUN_DIR_ARG' is not a directory. The caller must create it before naming it here." >&2; exit 1; }
+    RUN_DIR="$("$FS_REALPATH" "$RUN_DIR_ARG")"
+    is_refused_work_dir "$RUN_DIR" && { echo "Error: refusing '$RUN_DIR' as --run-dir. A fresh scratch-root directory is created under it." >&2; exit 1; }
+fi
 
 MOUNTS=(--mount "type=bind,src=$WORK_DIR,dst=$WORK_DIR")
 # On macOS /var and /tmp live under /private, and callers pass the realpath,
@@ -301,9 +336,63 @@ LOCK_FILE="/var/tmp/claude-scratch/forks/.sandbox-backend-lock-$(printf '%s' "$W
 exec 9>"$LOCK_FILE"; flock -n 9 || { echo "Error: another sandbox is already using $WORK_DIR" >&2; exit 1; }
 RUN_ID="$(date +%s)-$$-$RANDOM"; STATE_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/sandbox-backend-container.XXXXXX)"
 CONTAINER=""; NETWORK=""
+
+# This invocation's scratch root, replacing Docker's own tmpfs /tmp and $HOME
+# with a disk-backed directory of the same lifetime: created fresh here,
+# removed below. mktemp's directories are mode 0700 regardless of umask.
+# Swept for staleness first -- see fs_sweep_stale_scratch_roots's own comment
+# in fork-sandbox-lib.sh for why a kill can otherwise leak one per run.
+fs_sweep_stale_scratch_roots
+SCRATCH_BASE="${RUN_DIR:-$FS_SCRATCH_ROOT/forks}"
+mkdir -p "$SCRATCH_BASE"
+SCRATCH_ROOT="$(mktemp -d "$SCRATCH_BASE/sandbox-scratch.XXXXXX")"
+
 # shellcheck disable=SC2329  # invoked by the EXIT trap
-cleanup() { set +e; [[ -z "$CONTAINER" ]] || "$CLI" rm -f "$CONTAINER" >/dev/null 2>&1; [[ -z "$NETWORK" ]] || "$CLI" network rm "$NETWORK" >/dev/null 2>&1; rm -rf "$STATE_DIR"; }
+cleanup() {
+    set +e
+    [[ -z "$CONTAINER" ]] || "$CLI" rm -f "$CONTAINER" >/dev/null 2>&1
+    [[ -z "$NETWORK" ]] || "$CLI" network rm "$NETWORK" >/dev/null 2>&1
+    # The size just before it goes, so a run that filled the disk leaves a
+    # trace in the log.
+    scratch_kb="$(du -sk "$SCRATCH_ROOT" 2>/dev/null | cut -f1)"
+    echo "sandbox-backend-container: scratch root final size: ${scratch_kb:-?}K" >&2
+    # A build tool's own cache (Go's module cache under $HOME is the
+    # standard example) is routinely written read-only. Unmounting a tmpfs
+    # discarded that regardless; rm -rf on disk stops at the first
+    # read-only directory and leaves the rest behind, so ownership write
+    # permission is restored first.
+    chmod -R u+w -- "$SCRATCH_ROOT" 2>/dev/null || true
+    rm -rf "$SCRATCH_ROOT"
+    flock -u "${SCRATCH_LOCK_FD:-}" 2>/dev/null || true
+    { exec {SCRATCH_LOCK_FD}>&-; } 2>/dev/null || true
+    rm -f "$SCRATCH_ROOT.lock" "$SCRATCH_ROOT.lock.tmp"
+    rm -rf "$STATE_DIR"
+}
+# Armed as soon as SCRATCH_ROOT exists, before the flock below: if that
+# flock loses its race against fs_sweep_stale_scratch_roots (below) and
+# fails under errexit, the trap must already be live so STATE_DIR and
+# SCRATCH_ROOT don't leak.
 trap cleanup EXIT
+
+# Held for exactly as long as this process runs, so fs_sweep_stale_scratch_roots
+# can tell a live scratch root from an orphaned one without guessing from
+# age: the kernel drops this lock however the process ends, including
+# SIGKILL, the same guarantee LOCK_FILE above relies on. Locked under a name
+# fs_sweep_stale_scratch_roots's glob never matches, then renamed into place
+# only once held: flock's lock follows the open file description across a
+# rename, and rename(2) is atomic, so "$SCRATCH_ROOT.lock" never becomes
+# visible to a concurrent sweep before it is locked. Without this, the lock
+# file would have to be created at its final name first and locked after, and
+# a sweep landing in that gap would see an unlocked lock file and reclaim this
+# brand-new root out from under it -- which used to fail this launch outright
+# (mkdir below against a missing parent) even though nothing was actually
+# orphaned.
+exec {SCRATCH_LOCK_FD}>"$SCRATCH_ROOT.lock.tmp"
+flock -n "$SCRATCH_LOCK_FD"
+mv -f "$SCRATCH_ROOT.lock.tmp" "$SCRATCH_ROOT.lock"
+mkdir -m 0700 "$SCRATCH_ROOT/tmp" "$SCRATCH_ROOT/home"
+
+check_mount_path --run-dir "$SCRATCH_ROOT" || exit 1
 
 uid_n="$(id -u)"; gid_n="$(id -g)"
 if (( uid_n != 0 )); then
@@ -343,13 +432,35 @@ if [[ "$NET_MODE" == sealed ]]; then NET_ARGS=(--network none); else NETWORK="fo
 ENV_ARGS=()
 for kv in "${COMMAND_ENV[@]}"; do ENV_ARGS+=(--env "$kv"); done
 TTY=(); [[ -t 0 && -t 1 ]] && TTY=(-t)
-# Docker's --tmpfs default options include noexec, which bwrap's equivalent
-# scratch does not apply — a silent divergence from the reference backend
-# that breaks a helper script written to /tmp and run, or a `pip install
-# --user`/`npm i -g` into a $HOME prefix, with a bare "Permission denied"
-# that points nowhere near the mount. Pass the rest of Docker's default set
-# explicitly, restoring only exec, for parity with bwrap.
-CREATE_ARGS=(create --label "fork-sandbox-run=$RUN_ID" --init --user "$uid_n:$gid_n" --cap-drop=ALL --security-opt no-new-privileges --tmpfs "/tmp:rw,nosuid,nodev,exec" --tmpfs "$HOME:rw,nosuid,nodev,exec" -i "${TTY[@]}" "${NET_ARGS[@]}" "${MOUNTS[@]}" "${ENV_ARGS[@]}" --workdir "$WORK_DIR" --entrypoint /bin/bash)
+# /tmp and $HOME are bind mounts of this invocation's own scratch root (see
+# SCRATCH_ROOT above), not Docker's own --tmpfs: unlike a tmpfs, a bind mount
+# carries no noexec/nosuid/nodev of its own, so a helper script written to
+# /tmp and run, or a `pip install --user`/`npm i -g` into a $HOME prefix,
+# keeps working with no restoring flag needed -- parity with bwrap's
+# equivalent scratch, which never restricted exec either.
+SCRATCH_MOUNTS=(--mount "type=bind,src=$SCRATCH_ROOT/tmp,dst=/tmp" --mount "type=bind,src=$SCRATCH_ROOT/home,dst=$HOME")
+# The runtime creates a missing mountpoint itself, as root. One under /tmp or
+# $HOME would land in the scratch root on the host disk, where this
+# unprivileged script -- and the stale-root sweep -- could never remove it.
+# So create each such mountpoint first, as the caller: a directory for a
+# directory source, an empty file for anything else.
+for m in "${MOUNTS[@]}"; do
+    [[ "$m" == type=bind,* ]] || continue
+    m_src="${m#*,src=}"; m_src="${m_src%%,*}"
+    m_dst="${m#*,dst=}"; m_dst="${m_dst%%,*}"
+    case "$m_dst" in
+        "$HOME"/*) m_host="$SCRATCH_ROOT/home/${m_dst#"$HOME"/}" ;;
+        /tmp/*) m_host="$SCRATCH_ROOT/tmp/${m_dst#/tmp/}" ;;
+        *) continue ;;
+    esac
+    if [[ -d "$m_src" ]]; then
+        mkdir -p -- "$m_host"
+    else
+        mkdir -p -- "$(dirname -- "$m_host")"
+        [[ -e "$m_host" ]] || : > "$m_host"
+    fi
+done
+CREATE_ARGS=(create --label "fork-sandbox-run=$RUN_ID" --init --user "$uid_n:$gid_n" --cap-drop=ALL --security-opt no-new-privileges "${SCRATCH_MOUNTS[@]}" -i "${TTY[@]}" "${NET_ARGS[@]}" "${MOUNTS[@]}" "${ENV_ARGS[@]}" --workdir "$WORK_DIR" --entrypoint /bin/bash)
 for hostname in "${HOSTS_ALIASES_UNIQUE[@]}"; do CREATE_ARGS+=(--add-host "$hostname:127.0.0.1"); done
 [[ -z "$HOSTNAME_ARG" ]] || CREATE_ARGS+=(--hostname "$HOSTNAME_ARG")
 CONTAINER="$("$CLI" "${CREATE_ARGS[@]}" "$IMAGE" /fork-sandbox-bootstrap "$@")" || { echo "Error: container create failed; command did not start." >&2; exit 1; }

@@ -306,6 +306,197 @@ contains_err="$(cat "$dwn/fail.err")"
 case "$contains_err" in *"pin helper failed"*) ok "a failing pin helper is reported on stderr" ;;
     *) no "a failing pin helper is reported on stderr" "$contains_err" ;; esac
 
+# shellcheck disable=SC2016  # a section header, not an expansion
+printf '\n== scratch root (disk-backed /tmp and $HOME) ==\n'
+# Static check first, independent of any runtime: neither literal --tmpfs
+# spelling this file used before may remain, since a stray one would
+# silently put RAM back under /tmp or $HOME.
+# shellcheck disable=SC2016  # the pattern, not this script's own $HOME
+if grep -qE -- '--tmpfs "/tmp|--tmpfs "\$HOME' "$backend"; then
+    no "no --tmpfs /tmp or --tmpfs \$HOME remains"
+else
+    ok "no --tmpfs /tmp or --tmpfs \$HOME remains"
+fi
+
+# A fake CLI that records the `create` argv and, for every bind mount it is
+# given, the SOURCE directory's own mode -- so the scratch root's mode
+# (0700, from mktemp) is visible without a real daemon to stat inside a
+# container. Everything else fakes just enough to let the backend finish.
+cat > "$dwn/bin/scratchcli" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  create)
+    printf '%s\n' "\$@" > "$dwn/scratch-create-argv.txt"
+    : > "$dwn/scratch-modes.txt"
+    for a in "\$@"; do
+        case "\$a" in
+            type=bind,src=*,dst=/tmp|type=bind,src=*,dst=$HOME)
+                src="\${a#type=bind,src=}"; src="\${src%%,*}"
+                stat -c '%a' "\$src" >> "$dwn/scratch-modes.txt" 2>/dev/null
+                ;;
+        esac
+    done
+    echo fake-container; exit 0 ;;
+  start) exit 0 ;;
+  wait) echo 0; exit 0 ;;
+  rm) exit 0 ;;
+  inspect) echo 2026-01-01T00:00:00Z; exit 0 ;;
+  network)
+    case "\$2" in create) echo fake-net; exit 0 ;; rm) exit 0 ;; esac ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/scratchcli"
+scratch_rd="$(newdir)"; tmpdirs+=("$scratch_rd")
+scratch_w="$(newdir)"; tmpdirs+=("$scratch_w")
+rm -f "$dwn/scratch-create-argv.txt" "$dwn/scratch-modes.txt"
+PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/scratchcli" \
+    "$backend" --workdir "$scratch_w" --run-dir "$scratch_rd" --net sealed --image fake -- true >/dev/null 2>&1
+
+create_argv="$(cat "$dwn/scratch-create-argv.txt" 2>/dev/null || true)"
+if [[ "$create_argv" == *"--mount"*"dst=/tmp"* && "$create_argv" == *"--mount"*"dst=$HOME"* ]]; then
+    ok "create argv binds a scratch mount at /tmp and \$HOME"
+else
+    no "create argv binds a scratch mount at /tmp and \$HOME" "$create_argv"
+fi
+if [[ "$create_argv" == *"--tmpfs"* ]]; then
+    no "create argv carries no --tmpfs" "$create_argv"
+else
+    ok "create argv carries no --tmpfs"
+fi
+modes="$(cat "$dwn/scratch-modes.txt" 2>/dev/null || true)"
+check "scratch mount sources are mode 0700" "$(printf '700\n700')" "$modes"
+check "--run-dir leaves nothing behind after the run" "" "$(ls -A "$scratch_rd")"
+
+# A bind whose destination lies under /tmp or $HOME needs a mountpoint inside
+# the scratch root. The runtime would make it as root, leaving the caller a
+# directory it cannot remove, so the backend must create it first. This fake
+# CLI reports, at create time, what already exists in the scratch sources.
+cat > "$dwn/bin/mpcli" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  create)
+    : > "$dwn/mp.txt"
+    for a in "\$@"; do
+        case "\$a" in
+            type=bind,src=*,dst=/tmp) t="\${a#type=bind,src=}"; t="\${t%%,*}" ;;
+            type=bind,src=*,dst=$HOME) h="\${a#type=bind,src=}"; h="\${h%%,*}" ;;
+        esac
+    done
+    { [[ -d "\$t/fs-mp/dir" && -O "\$t/fs-mp/dir" ]] && echo tmp-dir
+      [[ -f "\$t/fs-mp/file" && -O "\$t/fs-mp/file" ]] && echo tmp-file
+      [[ -d "\$h/.fs-mp/dir" && -O "\$h/.fs-mp/dir" ]] && echo home-dir; } >> "$dwn/mp.txt"
+    echo fake-container; exit 0 ;;
+  start) exit 0 ;;
+  wait) echo 0; exit 0 ;;
+  rm) exit 0 ;;
+  inspect) echo 2026-01-01T00:00:00Z; exit 0 ;;
+  network)
+    case "\$2" in create) echo fake-net; exit 0 ;; rm) exit 0 ;; esac ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/mpcli"
+mp_src="$(newdir)"; tmpdirs+=("$mp_src")
+printf 'x\n' > "$mp_src/f"
+mp_w="$(newdir)"; tmpdirs+=("$mp_w")
+rm -f "$dwn/mp.txt"
+PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/mpcli" \
+    "$backend" --workdir "$mp_w" --net sealed --image fake \
+    --bind-ro-at "$mp_src" /tmp/fs-mp/dir \
+    --bind-ro-at "$mp_src/f" /tmp/fs-mp/file \
+    --bind-ro-at "$mp_src" "$HOME/.fs-mp/dir" \
+    -- true >/dev/null 2>&1
+check "mountpoints under /tmp and \$HOME are pre-created, caller-owned" \
+    "$(printf 'tmp-dir\ntmp-file\nhome-dir')" "$(cat "$dwn/mp.txt" 2>/dev/null || true)"
+
+# Two invocations must not share a root: each --run-dir gets its own
+# scratch mount source, the same property the bwrap suite checks by
+# planting a marker in $HOME across two real runs.
+extract_scratch_src() {
+    printf '%s\n' "$1" | grep -F ",dst=$HOME" | head -1 | sed -E 's/^type=bind,src=([^,]+),.*/\1/'
+}
+run1_rd="$(newdir)"; tmpdirs+=("$run1_rd")
+run1_w="$(newdir)"; tmpdirs+=("$run1_w")
+rm -f "$dwn/scratch-create-argv.txt"
+PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/scratchcli" \
+    "$backend" --workdir "$run1_w" --run-dir "$run1_rd" --net sealed --image fake -- true >/dev/null 2>&1
+src1="$(extract_scratch_src "$(cat "$dwn/scratch-create-argv.txt" 2>/dev/null || true)")"
+run2_rd="$(newdir)"; tmpdirs+=("$run2_rd")
+run2_w="$(newdir)"; tmpdirs+=("$run2_w")
+rm -f "$dwn/scratch-create-argv.txt"
+PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/scratchcli" \
+    "$backend" --workdir "$run2_w" --run-dir "$run2_rd" --net sealed --image fake -- true >/dev/null 2>&1
+src2="$(extract_scratch_src "$(cat "$dwn/scratch-create-argv.txt" 2>/dev/null || true)")"
+if [[ -n "$src1" && -n "$src2" && "$src1" != "$src2" ]]; then
+    ok "two invocations get different scratch roots"
+else
+    no "two invocations get different scratch roots" "src1=$src1 src2=$src2"
+fi
+
+# Cleanup is a trap, not a success-path step, so it must run when the
+# sandboxed command itself fails too -- the same case the bwrap suite
+# checks with `exit 7`. This fake CLI's `wait` reports that exit code.
+cat > "$dwn/bin/scratchcli-fail" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  create) echo fake-container; exit 0 ;;
+  start) exit 0 ;;
+  wait) echo 7; exit 0 ;;
+  rm) exit 0 ;;
+  inspect) echo 2026-01-01T00:00:00Z; exit 0 ;;
+  network)
+    case "\$2" in create) echo fake-net; exit 0 ;; rm) exit 0 ;; esac ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/scratchcli-fail"
+fail_rd="$(newdir)"; tmpdirs+=("$fail_rd")
+fail_w="$(newdir)"; tmpdirs+=("$fail_w")
+PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/scratchcli-fail" \
+    "$backend" --workdir "$fail_w" --run-dir "$fail_rd" --net sealed --image fake -- true >/dev/null 2>&1
+rc=$?
+check "the failing command's exit code still comes back" "7" "$rc"
+check "--run-dir leaves nothing behind after a failing command" "" "$(ls -A "$fail_rd")"
+
+# A build tool's own cache (Go's module cache under $HOME is the standard
+# example) is routinely written read-only. On the old tmpfs that never
+# mattered -- unmounting discarded it regardless -- but a plain rm -rf on
+# disk stops at the first read-only directory and leaves the rest behind.
+# This fake CLI's `create` writes one into the $HOME scratch mount's source
+# before the backend's own cleanup runs, the same point a real container
+# would have written to it.
+cat > "$dwn/bin/scratchcli-ro" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  create)
+    for a in "\$@"; do
+        case "\$a" in
+            type=bind,src=*,dst=$HOME)
+                src="\${a#type=bind,src=}"; src="\${src%%,*}"
+                mkdir -p "\$src/go/pkg/mod/x"
+                echo f > "\$src/go/pkg/mod/x/f"
+                chmod -R a-w "\$src/go/pkg/mod"
+                ;;
+        esac
+    done
+    echo fake-container; exit 0 ;;
+  start) exit 0 ;;
+  wait) echo 0; exit 0 ;;
+  rm) exit 0 ;;
+  inspect) echo 2026-01-01T00:00:00Z; exit 0 ;;
+  network)
+    case "\$2" in create) echo fake-net; exit 0 ;; rm) exit 0 ;; esac ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/scratchcli-ro"
+ro_rd="$(newdir)"; tmpdirs+=("$ro_rd")
+ro_w="$(newdir)"; tmpdirs+=("$ro_w")
+PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/scratchcli-ro" \
+    "$backend" --workdir "$ro_w" --run-dir "$ro_rd" --net sealed --image fake -- true >/dev/null 2>&1
+check "--run-dir leaves nothing behind after a read-only subtree" "" "$(ls -A "$ro_rd")"
+
 printf '\n== runtime integration ==\n'
 runtime="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 if ! command -v "$runtime" >/dev/null 2>&1 || ! "$runtime" info >/dev/null 2>&1; then

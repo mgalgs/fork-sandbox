@@ -116,10 +116,12 @@ for backend in bwrap container; do
         bwrap)
             contains "bwrap declares toolchain=host" "toolchain=host" "$out"
             contains "bwrap declares hosts_alias=1" "hosts_alias=1" "$out"
+            contains "bwrap declares run_dir=1" "run_dir=1" "$out"
             ;;
         container)
             contains "container declares toolchain=image" "toolchain=image" "$out"
             contains "container declares hosts_alias=1" "hosts_alias=1" "$out"
+            contains "container declares run_dir=1" "run_dir=1" "$out"
             ;;
     esac
 done
@@ -151,6 +153,33 @@ out="$(PATH="$scratch:$PATH" FORK_SANDBOX_BACKEND=capture \
     --bind-rw-at "$rw_src" "$rw_dest" "$rw_work" /bin/true)"
 contains "--bind-rw-at reaches the selected backend" \
     $'--bind-rw-at\n'"$rw_src"$'\n'"$rw_dest" "$out"
+
+# --run-dir gating: the flag must reach the backend only when
+# it advertises run_dir=1 -- a backend written before the option existed
+# rejects any unknown flag outright, the same hazard --hosts-alias solved
+# before it. capture_backend above declares only toolchain=host, so its
+# already-captured argv doubles as the negative case.
+lacks "claude-sandboxed omits --run-dir against a backend without run_dir=1" \
+    "--run-dir" "$out"
+
+run_dir_capture_backend="$scratch/sandbox-backend-rundircapture"
+cat > "$run_dir_capture_backend" <<'BACKEND'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --capabilities ]]; then
+    printf 'toolchain=host\nrun_dir=1\n'
+    exit 0
+fi
+printf '%s\n' "$@"
+BACKEND
+chmod 755 "$run_dir_capture_backend"
+rd_work="$scratch/rundir-work"; mkdir -p "$rd_work"
+rd_out="$(PATH="$scratch:$PATH" FORK_SANDBOX_BACKEND=rundircapture \
+    "$repo_dir/scripts/claude-sandboxed" --exec --seal-egress "$rd_work" /bin/true)"
+if [[ "$rd_out" == *$'--run-dir\n/var/tmp/claude-scratch/forks/claude-sandboxed-state.'* ]]; then
+    ok "claude-sandboxed passes --run-dir, pointed at its own STATE_DIR, to a backend that advertises run_dir=1"
+else
+    no "claude-sandboxed passes --run-dir, pointed at its own STATE_DIR, to a backend that advertises run_dir=1" "$rd_out"
+fi
 
 echo ""
 echo "== fs_backend_capabilities =="

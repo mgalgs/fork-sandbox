@@ -109,9 +109,10 @@
 #
 # pi's sessions are kept in <work-dir>/.git/pi-sessions when the work dir is a
 # repository, and in <work-dir>/pi-sessions when it is not. pi's own default —
-# ~/.pi/agent/sessions — is a tmpfs here and would die with the run, and the
-# work dir's root would show up untracked in the owner's `git status` and need
-# an ignore rule in every repo this is pointed at. git tracks nothing under
+# ~/.pi/agent/sessions — is the sandbox's ephemeral scratch $HOME here and
+# would die with the run, and the work dir's root would show up untracked in
+# the owner's `git status` and need an ignore rule in every repo this is
+# pointed at. git tracks nothing under
 # .git, so a repository gets them there. The path is printed when the run ends,
 # because nothing else would lead anyone to it.
 #
@@ -795,6 +796,15 @@ cleanup() {
             wait "$pid" 2>/dev/null
         done
     fi
+    # When the backend advertises run_dir=1, STATE_DIR is also its --run-dir
+    # (see sandbox_cmd below), so it normally holds the backend's own
+    # scratch root by the time this runs -- gone already on a normal backend
+    # exit, but left behind by a SIGKILLed one. A build tool's own cache
+    # under it (Go's module cache is the standard example) is routinely
+    # written read-only, which stops
+    # rm -rf partway through, so ownership write permission is restored
+    # first.
+    chmod -R u+w -- "$STATE_DIR" 2>/dev/null || true
     rm -rf "$STATE_DIR"
 }
 trap cleanup EXIT
@@ -865,13 +875,13 @@ fi
 mv "$STATE_DIR/pi-agent/settings.json.new" "$STATE_DIR/pi-agent/settings.json"
 
 # pi keeps its sessions in ~/.pi/agent/sessions by default, and $HOME in the
-# sandbox is a tmpfs that dies with the run, so they have to go somewhere that
-# persists. The work dir is the only such path — but its root is the wrong place
-# in a repository: it shows up as untracked in every `git status` the owner
-# reads, it would need an ignore rule in every repo this is ever pointed at, and
-# an agent running `git add -A` could commit it. .git is writable and git tracks
-# nothing inside it, so a repository gets them there instead. fork-sandbox.sh
-# does the same, for the same reasons.
+# sandbox is ephemeral scratch that dies with the run, so they have to go
+# somewhere that persists. The work dir is the only such path — but its root
+# is the wrong place in a repository: it shows up as untracked in every `git
+# status` the owner reads, it would need an ignore rule in every repo this is
+# ever pointed at, and an agent running `git add -A` could commit it. .git is
+# writable and git tracks nothing inside it, so a repository gets them there
+# instead. fork-sandbox.sh does the same, for the same reasons.
 #
 # A linked worktree or a submodule has .git as a FILE, naming a directory
 # outside the work dir that the sandbox cannot write. Those fall back to the
@@ -881,8 +891,8 @@ mv "$STATE_DIR/pi-agent/settings.json.new" "$STATE_DIR/pi-agent/settings.json"
 # --session-dir is dual-purpose. Given as THIS script's own flag (before the
 # work dir, parsed above into SESSION_DIR_ARG), it names a durable HOST
 # directory: bind it read-write at a fixed path under the sandbox's own
-# (tmpfs) $HOME, and tell pi to use it there — $HOME dies with the sandbox,
-# so pi's own default would lose the transcript, exactly like the
+# (ephemeral scratch) $HOME, and tell pi to use it there — $HOME dies with
+# the sandbox, so pi's own default would lose the transcript, exactly like the
 # WORK_DIR-relative default below exists to avoid the same loss. Forwarded to
 # the AGENT instead (after the work dir, so it lands in "$@") it is pi's own
 # flag, used directly, exactly as before this option existed — both
@@ -1137,6 +1147,15 @@ sandbox_cmd=(
     --workdir "$WORK_DIR"
     --hostname agent-sandbox
 )
+if [[ "$FS_BACKEND_RUN_DIR" == 1 ]]; then
+    # This script's own STATE_DIR is already a fresh, disk-backed,
+    # per-invocation directory removed on exit -- exactly what the
+    # backend's scratch root (replacing tmpfs /tmp and $HOME) wants, so it
+    # is handed down rather than left to the backend's own fallback. Only
+    # done when the backend advertises run_dir=1 (see fs_backend_capabilities
+    # above): a backend that predates --run-dir would reject it outright.
+    sandbox_cmd+=(--run-dir "$STATE_DIR")
+fi
 if (( EP_NEEDS_HOSTS_ALIAS )); then
     sandbox_cmd+=(--hosts-alias "$EP_HOST")
 fi

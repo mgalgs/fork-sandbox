@@ -158,6 +158,17 @@ argv_has_flag_value() {
         END { exit(found ? 0 : 1) }
     ' "$1"
 }
+# Like argv_has_flag_value, but the value is unpredictable (a fresh mktemp
+# path per run), so this returns it for a glob check instead of comparing it
+# against a literal. Same before-the-separator guard, for the same reason.
+argv_flag_value() {
+    awk -v flag="$2" '
+        $0 == "--" { after = 1 }
+        !after && prev == flag { print; found = 1 }
+        { prev = $0 }
+        END { exit(found ? 0 : 1) }
+    ' "$1"
+}
 # The assertion helper gets its own falsification tests. An assertion nobody
 # has watched fail is not known to be an assertion -- which is the whole defect
 # this helper exists to fix, so it would be absurd to take the helper itself on
@@ -295,6 +306,29 @@ if [[ "$setenv_out" == *'not KEY=VALUE'* ]]; then
     ok "--setenv refuses a value that is not KEY=VALUE"
 else
     no "--setenv refuses a value that is not KEY=VALUE" "$setenv_out"
+fi
+
+
+# --run-dir gating: a backend written before the option existed
+# rejects any unknown flag outright, the same hazard --hosts-alias solved
+# above, so agent-sandboxed passes --run-dir only to a backend that
+# advertises run_dir=1 -- and points it at this script's own STATE_DIR
+# (mktemp -d /var/tmp/claude-scratch/forks/agent-sandboxed.XXXXXX) rather
+# than leaving the backend to its own fallback location.
+run_endpoint_case "run_dir capability granted" 'http://192.0.2.10:8080/v1' $'toolchain=host\nrun_dir=1'
+run_dir_value="$(argv_flag_value "$work/run_dir capability granted.args.text" --run-dir)"
+if [[ -n "$run_dir_value" && "$run_dir_value" == /var/tmp/claude-scratch/forks/agent-sandboxed.* ]]; then
+    ok "run_dir=1 backend receives --run-dir pointed at STATE_DIR"
+else
+    no "run_dir=1 backend receives --run-dir pointed at STATE_DIR" "$run_dir_value"
+fi
+
+run_endpoint_case "run_dir capability absent" 'http://192.0.2.10:8080/v1' 'toolchain=host'
+if ! grep -qx -- '--run-dir' "$work/run_dir capability absent.args.text"; then
+    ok "backend without run_dir capability never receives --run-dir"
+else
+    no "backend without run_dir capability never receives --run-dir" \
+        "$(cat "$work/run_dir capability absent.args.text")"
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

@@ -562,6 +562,14 @@ cleanup() {
         find "$STATE_DIR/claude/projects" -name '*.jsonl' \
             -exec cp {} "$WORK_DIR/claude-session/" \; 2>/dev/null
     fi
+    # When the backend advertises run_dir=1, STATE_DIR is also its --run-dir
+    # (see BACKEND_ARGS below), so it normally holds the backend's own
+    # scratch root by the time this runs -- gone already on a normal backend
+    # exit, but left behind by a SIGKILLed one. A build tool's own cache
+    # under it (Go's module cache is the standard example) is routinely
+    # written read-only, which stops rm -rf partway through, so ownership
+    # write permission is restored first.
+    chmod -R u+w -- "$STATE_DIR" 2>/dev/null || true
     rm -rf "$STATE_DIR"
 }
 trap cleanup EXIT
@@ -764,8 +772,9 @@ fi
 # Fills FS_GITCONFIG_FLAGS.
 fs_gitconfig_bind "$STATE_DIR"
 
-# $HOME is a fresh tmpfs, so claude finds no config. Pre-accept onboarding
-# and trust for the work dir to keep non-interactive runs from stalling.
+# $HOME is a fresh, disk-backed scratch directory, so claude finds no
+# config. Pre-accept onboarding and trust for the work dir to keep
+# non-interactive runs from stalling.
 if (( ! EXEC_MODE )); then
     jq -n --arg dir "$WORK_DIR" '{
         hasCompletedOnboarding: true,
@@ -847,6 +856,15 @@ BACKEND_ARGS=(
     "${FS_CACHE_FLAGS[@]}"
     "${CLAUDE_FLAGS[@]}"
 )
+if [[ "$FS_BACKEND_RUN_DIR" == 1 ]]; then
+    # This script's own STATE_DIR is already a fresh, disk-backed,
+    # per-invocation directory removed on exit -- exactly what the
+    # backend's scratch root (replacing tmpfs /tmp and $HOME) wants, so it
+    # is handed down rather than left to the backend's own fallback. Only
+    # done when the backend advertises run_dir=1 (see fs_backend_capabilities
+    # above): a backend that predates --run-dir would reject it outright.
+    BACKEND_ARGS+=(--run-dir "$STATE_DIR")
+fi
 for d in "${BIND_RO[@]}"; do
     BACKEND_ARGS+=(--bind-ro "$d")
 done

@@ -5,7 +5,7 @@
 #          [--bind-ro PATH]... [--bind-rw PATH]...
 #          [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]...
 #          [--bridge SOCKET=PORT]... [--hosts-alias NAME]... [--setenv K=V]... [--prepend-path DIR]...
-#          [--hostname NAME] -- COMMAND [ARG...]
+#          [--hostname NAME] [--run-dir DIR] -- COMMAND [ARG...]
 #
 # This is the isolation substrate and nothing else. It knows about mounts,
 # namespaces, egress and bridges; it knows nothing about agents, credentials
@@ -93,6 +93,14 @@
 # --hostname sets the sandbox hostname, so a shell prompt inside can show
 # where it is.
 #
+# --run-dir DIR names a directory the CALLER already manages for the life of
+# this run -- claude-sandboxed's and agent-sandboxed's own per-invocation
+# state dir, say. When given, this invocation's scratch root (see "What the
+# sandbox gets" below) is created under it, so it lives alongside whatever
+# else that run already keeps there; when absent, it falls back to a fresh
+# directory under the fork machinery's own scratch root. Optional -- a direct
+# invocation (a test, a manual run) needs no run dir at all.
+#
 # -- ends option parsing. Everything after it is the command, passed
 # verbatim, and its exit code is this script's.
 #
@@ -115,13 +123,25 @@
 # name is unreachable, including ones added to the host later.
 #
 # What the sandbox gets:
-#   - Filesystem: /usr, /etc, /opt and /sys read-only, so the host
-#     toolchain works. The root, $HOME and /tmp are ephemeral tmpfs,
-#     writable but invisible to the host and gone when the sandbox
-#     exits. No host content beyond the paths named here is present.
-#     /run and /var do exist, but only as empty scaffolding holding the
-#     resolv.conf replacement and the work dir path. The tmpfs mounts
-#     are not size-capped, so a runaway sandbox can use host memory.
+#   - Filesystem: the root (/) itself is bwrap's own newroot, an ordinary
+#     uncapped tmpfs bwrap creates before any of the binds below land on
+#     it -- this script never remounts or caps it, so it is still host RAM,
+#     the same way the whole tree used to be before $HOME and /tmp moved to
+#     disk. /usr, /etc, /opt and /sys read-only, so the host toolchain
+#     works. $HOME and /tmp are a fresh, empty, disk-backed scratch root --
+#     a mode-0700 directory created fresh for this invocation (see
+#     --run-dir above), writable but invisible to the host beyond that one
+#     directory, and removed when the sandbox exits. No host content
+#     beyond the paths named here is present. /run and /var do exist, but
+#     only as empty scaffolding holding the resolv.conf replacement and the
+#     work dir path -- scaffolding that itself lives on the root tmpfs
+#     above. The scratch root is not size-capped, so a runaway sandbox can
+#     fill the disk it lives on; /dev/shm is capped at 1GiB (on a bwrap
+#     new enough for --size; older ones keep it uncapped), since it is
+#     the one part of the synthetic /dev this script mounts that would
+#     otherwise still be an uncapped tmpfs (Docker's own 64MiB default is
+#     too small for Chromium, the workload this cap exists for -- see the
+#     --size flag below for why).
 #   - Writable: the work dir and each --bind-rw. Those are the only paths
 #     that persist. --bind-ro adds readable paths, never writable ones, so
 #     it cannot change what the sandbox is able to leave behind.
@@ -176,14 +196,26 @@
 #     the namespace — so it would take nftables inside the network namespace,
 #     and whether the sandbox could tear those rules down again from its own
 #     child user namespace is untested; if it can, the control is decorative.
-#   - Resource limits: NONE. CPU, memory and disk are unbounded, and the
-#     tmpfs mounts are not size-capped, so a runaway sandbox can exhaust host
-#     memory.
+#   - Resource limits: NONE. CPU and memory are unbounded. The scratch root
+#     backing /tmp and $HOME is disk, not memory, so it no longer competes
+#     with the host's RAM the way a tmpfs did, but it is not size-capped
+#     either, so a runaway sandbox can fill the disk it lives on. The root
+#     (/) is a different story: it is still bwrap's own uncapped tmpfs (see
+#     "Filesystem" above), so anything written outside $HOME, /tmp, the
+#     work dir and the binds still lands in host RAM, uncapped.
 #   - What a SIGKILL leaves behind: the per-run state dir under
 #     /var/tmp/claude-scratch/forks, holding the synthesized resolv.conf and,
-#     with --bridge, the generated bootstrap script. Neither holds a secret.
-#     Teardown runs from an EXIT trap, and a trap that is skipped does not
-#     run. The per-work-dir lock is released by the kernel either way.
+#     with --bridge, the generated bootstrap script -- neither holds a
+#     secret -- and this run's scratch root, which can hold much more (a
+#     Postgres or Chromium profile, a webpack cache). Teardown runs from an
+#     EXIT trap, and a trap that is skipped does not run, so a kill leaks the
+#     scratch root the same way; fs_sweep_stale_scratch_roots (called before
+#     a fresh root is created, in this file and in sandbox-backend-container)
+#     reclaims it. Liveness comes from the root's own flock, not age: a root
+#     still held by a running sandbox is never touched regardless of how long
+#     it has been open, and only a root with no lock file (predating the
+#     lock, or one the sweep could not open) falls back to an age check. The
+#     per-work-dir lock is released by the kernel either way.
 
 set -euo pipefail
 
@@ -213,6 +245,11 @@ if [[ "${1-}" == --capabilities ]]; then
     # --no-sandbox needed. Measured 2026-09-18 on Arch; see
     # docs/visual-browser.md.
     echo "chromium_own_sandbox=1"
+    # This backend understands --run-dir. A backend that predates it exits
+    # nonzero here (the same fallback every capability gets) and a caller
+    # that declared run_dir=1 for it would then hand it an option it
+    # rejects; see docs/sandbox-backend.md's capabilities table.
+    echo "run_dir=1"
     exit 0
 fi
 
@@ -226,6 +263,7 @@ DNS_FORWARD_ADDR="169.254.0.53"
 WORK_DIR_ARG=""
 NET_MODE=""
 HOSTNAME_ARG=""
+RUN_DIR_ARG=""
 BIND_RO=()
 BIND_RW=()
 BIND_RO_AT_SRC=(); BIND_RO_AT_DEST=()
@@ -246,6 +284,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --hostname)
             HOSTNAME_ARG="${2:?--hostname requires a name}"
+            shift 2
+            ;;
+        --run-dir)
+            RUN_DIR_ARG="${2:?--run-dir requires a directory}"
             shift 2
             ;;
         --bind-ro)
@@ -592,6 +634,27 @@ if is_refused_work_dir "$WORK_DIR"; then
     exit 1
 fi
 
+# --run-dir: the caller's own per-invocation directory, already created by
+# it. Not bind-mounted, so it carries none of the work dir's own risk -- this
+# script only ever mktemps a fresh subdirectory under it -- but it is
+# refused on the same list anyway, on the theory that a system path here is
+# a caller mistake worth catching rather than a scratch root worth creating.
+RUN_DIR=""
+if [[ -n "$RUN_DIR_ARG" ]]; then
+    if [[ ! -d "$RUN_DIR_ARG" ]]; then
+        echo "Error: --run-dir '$RUN_DIR_ARG' is not a directory. The caller" >&2
+        echo "must create it before naming it here." >&2
+        exit 1
+    fi
+    RUN_DIR="$(realpath "$RUN_DIR_ARG")"
+    if is_refused_work_dir "$RUN_DIR"; then
+        echo "Error: refusing '$RUN_DIR' as --run-dir. A fresh scratch-root" >&2
+        echo "directory is created under it, so a system path here would" >&2
+        echo "place one there too." >&2
+        exit 1
+    fi
+fi
+
 # Resolve the read-only binds before the mount list is built, so a bad
 # path fails here rather than inside bwrap. There is no refusal list:
 # these grant no write, so none of them can damage the host. Mount the
@@ -710,13 +773,63 @@ fi
 # Per-run state on the host: the synthesized resolv.conf, and the bridge
 # bootstrap when there is one. Neither is a secret. Removed on exit.
 STATE_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/sandbox-backend-bwrap.XXXXXX)"
+
+# This invocation's scratch root, replacing tmpfs /tmp and $HOME with a
+# disk-backed directory that has the same lifetime: created fresh here,
+# removed below. mktemp's directories are mode 0700 regardless of umask,
+# which is the "created mode 0700" this run's own tmp/ and home/ inherit.
+# Swept for staleness first, so a host that has been running sandboxes for a
+# while cannot accumulate one per kill -- see fs_sweep_stale_scratch_roots's
+# own comment for the liveness check it uses, which SCRATCH_LOCK below feeds.
+fs_sweep_stale_scratch_roots
+SCRATCH_BASE="${RUN_DIR:-$FS_SCRATCH_ROOT/forks}"
+mkdir -p "$SCRATCH_BASE"
+SCRATCH_ROOT="$(mktemp -d "$SCRATCH_BASE/sandbox-scratch.XXXXXX")"
+
 # shellcheck disable=SC2329  # invoked by the EXIT trap below
 cleanup() {
     # Drop errexit first: this handler must always reach the rm.
     set +e
+    # The size just before it goes, so a run that filled the disk leaves a
+    # trace in the log rather than a silent directory that is already gone
+    # by the time anyone looks.
+    scratch_kb="$(du -sk "$SCRATCH_ROOT" 2>/dev/null | cut -f1)"
+    echo "sandbox-backend-bwrap: scratch root final size: ${scratch_kb:-?}K" >&2
+    # A build tool's own cache (Go's module cache under $HOME is the
+    # standard example) is routinely written read-only. Unmounting a tmpfs
+    # discarded that regardless; rm -rf on disk stops at the first
+    # read-only directory and leaves the rest behind, so ownership write
+    # permission is restored first.
+    chmod -R u+w -- "$SCRATCH_ROOT" 2>/dev/null || true
+    rm -rf "$SCRATCH_ROOT"
+    flock -u "${SCRATCH_LOCK_FD:-}" 2>/dev/null || true
+    { exec {SCRATCH_LOCK_FD}>&-; } 2>/dev/null || true
+    rm -f "$SCRATCH_ROOT.lock" "$SCRATCH_ROOT.lock.tmp"
     rm -rf "$STATE_DIR"
 }
+# Armed as soon as SCRATCH_ROOT exists, before the flock below: if that
+# flock loses its race against fs_sweep_stale_scratch_roots (below) and
+# fails under errexit, the trap must already be live so STATE_DIR and
+# SCRATCH_ROOT don't leak.
 trap cleanup EXIT
+
+# Held for exactly as long as this process runs, so fs_sweep_stale_scratch_roots
+# can tell a live scratch root from an orphaned one without guessing from
+# age: the kernel drops this lock however the process ends, including
+# SIGKILL, the same guarantee LOCK_FILE above relies on. Locked under a name
+# fs_sweep_stale_scratch_roots's glob never matches, then renamed into place
+# only once held: flock's lock follows the open file description across a
+# rename, and rename(2) is atomic, so "$SCRATCH_ROOT.lock" never becomes
+# visible to a concurrent sweep before it is locked. Without this, the lock
+# file would have to be created at its final name first and locked after, and
+# a sweep landing in that gap would see an unlocked lock file and reclaim this
+# brand-new root out from under it -- which used to fail this launch outright
+# (mkdir below against a missing parent) even though nothing was actually
+# orphaned.
+exec {SCRATCH_LOCK_FD}>"$SCRATCH_ROOT.lock.tmp"
+flock -n "$SCRATCH_LOCK_FD"
+mv -f "$SCRATCH_ROOT.lock.tmp" "$SCRATCH_ROOT.lock"
+mkdir -m 0700 "$SCRATCH_ROOT/tmp" "$SCRATCH_ROOT/home"
 
 # The host resolver is unreachable from the namespace: /etc/resolv.conf
 # names 127.0.0.53, and resolved's varlink socket lives in /run, which is
@@ -846,8 +959,16 @@ case "$NET_MODE" in
         ;;
 esac
 
-# Mount order matters: bwrap applies these in sequence, so every tmpfs
-# comes before the binds that must show through it.
+# --size arrived in bubblewrap 0.5 and older releases (still shipped by some
+# LTS distros) reject it, failing every launch; there --dev's own uncapped
+# /dev/shm is kept rather than refusing to run.
+SHM_ARGS=()
+if bwrap --help 2>&1 | grep -q -- '--size'; then
+    SHM_ARGS=(--size 1073741824 --tmpfs /dev/shm)
+fi
+
+# Mount order matters: bwrap applies these in sequence, so every scratch
+# bind comes before the binds that must show through it.
 BWRAP_ARGS=(
     # The host toolchain, read-only. Arch merges /bin, /sbin and /lib
     # into /usr, so recreate those symlinks.
@@ -869,17 +990,33 @@ BWRAP_ARGS=(
     --ro-bind-try /sys /sys
 
     --dev /dev
+    # --dev's own /dev/shm is an uncapped tmpfs nested in the equally
+    # uncapped tmpfs --dev itself creates -- the one part of "ephemeral,
+    # disk-backed" that would otherwise still be RAM. Chromium is the
+    # reason it exists at all (shared memory for its GPU/render process),
+    # so it cannot simply be dropped; capped instead, so a runaway consumer
+    # still hits a wall well short of the host's memory. Docker's own
+    # 64MiB default was tried first for parity between the two backends,
+    # but 64MiB is the well-known cause of Chromium tab crashes ("Aw,
+    # Snap") -- Puppeteer's own troubleshooting docs tell containers to
+    # raise --shm-size or pass --disable-dev-shm-usage -- which would have
+    # broken the screenshot runs this path exists for. 1GiB is generous
+    # enough for Chromium's renderer processes while still bounding it well
+    # short of "uncapped". Empty on a bwrap without --size (SHM_ARGS above).
+    "${SHM_ARGS[@]}"
     --proc /proc
 
-    # Ephemeral, writable, invisible to the host
-    --tmpfs /tmp
-    --tmpfs "$HOME"
+    # This invocation's disk-backed scratch root, replacing tmpfs /tmp and
+    # $HOME: writable, invisible to the host beyond the one directory it
+    # lives in, and removed when the sandbox exits (see SCRATCH_ROOT above).
+    --bind "$SCRATCH_ROOT/tmp" /tmp
+    --bind "$SCRATCH_ROOT/home" "$HOME"
 
-    # The bridge sockets' directories, read-only. After the tmpfs mounts so
+    # The bridge sockets' directories, read-only. After the scratch binds so
     # they show through, and empty when there is no bridge.
     "${BRIDGE_MOUNTS[@]}"
 
-    # Writable: the work dir. Last, so no tmpfs shadows it.
+    # Writable: the work dir. Last, so no other bind shadows it.
     --bind "$WORK_DIR" "$WORK_DIR"
 
     # pasta already put us in a private net namespace and mapped us to
@@ -926,8 +1063,8 @@ for kv in "${SETENV[@]}"; do
 done
 
 # The caller's binds, all four kinds, gathered before any is emitted. They go
-# after the tmpfs mounts they must show through and after the work dir, so one
-# may also re-protect a path inside it.
+# after the scratch binds they must show through and after the work dir, so
+# one may also re-protect a path inside it.
 #
 # Category order sets the tiebreak below, and it is the order the flags
 # document: read-only first, then the writable paths a run needs outside the

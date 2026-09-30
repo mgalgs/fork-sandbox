@@ -849,7 +849,8 @@
 # It keeps the review kit. pi implements the Agent Skills standard, so the
 # commit-then-review and code-review-portable skill directories and the script
 # toolbox are bound in; pi is handed each skill with --skill, because its $HOME
-# here is a fresh tmpfs with no settings file to discover them from. A handoff
+# here is a fresh, disk-backed scratch directory with no settings file to
+# discover them from. A handoff
 # should ask for a skill by name rather than with a slash command.
 #
 # The agent kit is the same mechanism for skills of your own. Name them in
@@ -4638,8 +4639,9 @@ codex)
         # An npm codex is a node script symlinked out of bin/ into
         # lib/node_modules, so the bin dir taken as written and the script
         # taken as resolved name two different trees; bind the one directory
-        # that covers both. The sandbox's $HOME is a fresh tmpfs, so an
-        # install under ~/.nvm is invisible there without this. A distro
+        # that covers both. The sandbox's $HOME is a fresh, disk-backed
+        # scratch directory, so an install under ~/.nvm is invisible there
+        # without this. A distro
         # package is a native binary under /usr, which is mounted already and
         # needs none of it.
         codex_real="$(readlink -f "$codex_bin")"
@@ -5514,8 +5516,8 @@ else
 
     # pi's session dir is a fixed path under this workspace's .git (see
     # out_pi_session_dir in fs_build_sandbox_cmd, below) so that it survives
-    # the sandbox's tmpfs $HOME -- but a fixed path is also the SAME path
-    # every wake of this seat writes to. Left alone, wake 2 would write
+    # the sandbox's ephemeral scratch $HOME -- but a fixed path is also the
+    # SAME path every wake of this seat writes to. Left alone, wake 2 would write
     # beside wake 1's session files rather than replace them, and the cost
     # walk and last-stopReason check near the end of the runner sum and read
     # every file under a leg's directory: a fresh clone starts with none, so
@@ -6738,8 +6740,8 @@ fs_build_sandbox_cmd() {
     if (( b_harness_exec )); then
         case "$b_harness" in
         pi)
-            # pi keeps its session under $HOME, and $HOME here is a tmpfs
-            # that dies with the sandbox — so the transcript, and the
+            # pi keeps its session under $HOME, and $HOME here is ephemeral
+            # scratch that dies with the sandbox — so the transcript, and the
             # tokens recorded in it, would go with it. Put it inside the
             # clone's .git instead. That is writable, and git tracks
             # nothing under .git, so a session that runs `git add -A`
@@ -6787,7 +6789,8 @@ fs_build_sandbox_cmd() {
             ;;
         codex)
             # codex wants its credential as a FILE, and the sandbox's $HOME
-            # is a fresh tmpfs with nothing in it. The token rides in as an
+            # is a fresh, disk-backed scratch directory with nothing in it.
+            # The token rides in as an
             # environment variable, which claude-sandboxed keeps out of
             # every command line, and this shim writes it where codex
             # looks. Writing it inside rather than binding it also leaves
@@ -6817,8 +6820,8 @@ fs_build_sandbox_cmd() {
         out+=("$clone_dir" "${harness_cmd[@]}")
     elif [[ "$b_harness" == "pi-local" ]]; then
         # pi's own flags, in the position claude's go. The session dir is
-        # the same trick as the pi harness above: $HOME is a tmpfs that
-        # dies with the sandbox, and .git is writable but tracked by
+        # the same trick as the pi harness above: $HOME is ephemeral scratch
+        # that dies with the sandbox, and .git is writable but tracked by
         # nothing, so a session running `git add -A` cannot commit the
         # transcript by accident. The runner copies it out at the end.
         #
