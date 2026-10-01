@@ -110,11 +110,15 @@ Four of these reach less far than an agent definition suggests, and the
 parser refuses the cases the engine cannot honor rather than trimming
 them silently: `claude-args`/`pi-args`/`codex-args` reach only the first code step's
 legs (there is no per-seat argument plumbing for any other leg yet), the
-refresh keys reach only the first code step's *first pass*, `repeat`
-is refused on an agent that never codes, and `endpoint` is refused on
-an agent that does not sit the first code step in pipeline order (the
-run has one proxy base URL for the whole run) and without `--k8s` (it
-names a cluster proxy path and means nothing there).
+refresh keys may only be SET on the first code step's agent — there is no
+per-seat refresh plumbing, only the one run-level `--refresh-at`/
+`--refresh-max` pair — but once set there they become that pair and so
+govern every code and fix leg of the run exactly as the flags would (see
+"A run that refreshes itself" in `README.md`), not only the first code
+step's first pass. `repeat` is refused on an agent that never codes, and
+`endpoint` is refused on an agent that does not sit the first code step in
+pipeline order (the run has one proxy base URL for the whole run) and
+without `--k8s` (it names a cluster proxy path and means nothing there).
 
 ### `pipeline`
 
@@ -204,11 +208,15 @@ that deviates from the plan without saying why, and a plan assumption that
 contradicts the brief, as findings; a code or fix leg is told instead to
 say why when it deviates, so the reviewer is not left guessing.
 
-`--refresh-at`'s continuation chain does not yet reach the code leg that
-follows a plan step: the chain only runs for a pipeline's step 1, and a
-plan step always sits there. A plan pipeline's refresh reports `none`, and
-the launch warns when `--refresh-at` is on (the claude default included)
-over a pipeline whose step 1 is not a code step.
+`--refresh-at`'s continuation chain reaches the code leg that follows a
+plan step exactly as it reaches a step-1 code leg — it follows every code
+and fix leg of the run, wherever it sits (see "A run that refreshes
+itself" in `README.md`). A plan-first run's step-1 `refresh` field in
+`summary.json` reports `none` regardless (there is no implement leg at
+step 1 for it to describe); the plan-following code step's own chain, like
+every other non-step-1 leg's, lands in `summary.json`'s `leg_refreshes`
+array instead. A `plan` leg itself never refreshes — it is a short
+read-and-verdict leg, same as review and maintain.
 
 A `plan` step is refused on a read-only pipeline, with `--review-only`,
 and with `--k8s` — like any other pipeline shape that is not legacy-
@@ -280,8 +288,16 @@ Each pass is an ordinary leg with its own events file
 (`events-code-2.jsonl`, or `events-fix-1-p2.jsonl` for a fix round's
 second pass) and its own accounting. When it applies to fix legs, the
 loop's no-progress check compares the branch across the whole N-pass
-round. Passes after the first do not context-refresh — the refresh chain
-belongs to the first pass of the code step alone.
+round. Every pass context-refreshes on its own, exactly like any other
+code or fix leg — a pass that crosses the threshold hands off and
+continues under a fresh session the same way, with its own chain of
+`handoff-<leg>-c<N>.md`/`continuation-prompt-<leg>-c<N>.md`/
+`events-<leg>-continuation-<N>.jsonl` records named after that pass's own
+leg tag (e.g. `code-2`, `fix-1-p2`). A refused hand-off is filed as
+`handoff-<leg>-c<N>-refused-empty.md` or `…-refused-too-large.md`. A
+hand-off an earlier chain left in the outbox (the step-1 chain leaves its
+capped one there) is moved to `handoff-unclaimed-<K>.md` before a later
+leg is armed, so that leg never mistakes it for its own.
 
 ## Inline pipelines: `--pipeline`
 
@@ -593,6 +609,16 @@ with `--preset` also writes `pipeline.json` (see "Provenance" above for
 `preset.json`/`preset.yaml`, which are separate files) — its `steps` array
 is the source of truth this section's canonical key is built from.
 
+A code or fix leg's OWN refresh chain (every one of them, now — see "A
+run that refreshes itself" in `README.md`) is named after that leg's own
+tag, never the run's flat numbering, which stays reserved for the step-1
+implement leg's own chain: `handoff-<leg>-c<C>.md`,
+`continuation-prompt-<leg>-c<C>.md` and `events-<leg>-continuation-<C>.jsonl`
+for continuation `<C>` of leg `<leg>` — `code-2` or `fix-1-p2` in a
+legacy-shaped run, `s2-code-1` or `s3-fix-2` in a composed one, always
+carrying a kind word that a flat `handoff-1.md`/`events-continuation-1.jsonl`
+never does, so the two naming schemes can never collide.
+
 A code pass after the first also writes `code-prompt-<K>-<P>.md` (step
 `<K>`, pass `<P>`): the handoff plus the addenda earlier legs archived, and
 the plan when this run has one. It is written only when an addendum was
@@ -648,8 +674,8 @@ steps get the same one-entry-per-step treatment even though it never writes
 ```json
 {"schema": 1, "label": "sbx-foo", "spec": "composed", "state": "running",
  "updated": 1234567890,
- "steps": [{"action": "code", "state": "done", "i": 1, "cap": 1, "ended": null},
-           {"action": "review", "state": "running", "i": 1, "cap": 2, "ended": null}]}
+ "steps": [{"action": "code", "state": "done", "i": 1, "cap": 1, "ended": null, "continuation": 0},
+           {"action": "review", "state": "running", "i": 1, "cap": 2, "ended": null, "continuation": 2}]}
 ```
 
 `label` is the branch with a leading `sandbox/`-style prefix (one path
@@ -660,7 +686,19 @@ begun (or, for a code step with `repeat: N`, passes run so far), and
 `ended` takes the walker's own vocabulary verbatim (`approved`, `findings`,
 `cap`, `no-progress`, `harness-error`, `skipped`, `stop-requested`, a
 `plan` step's own `done`, `blocked` and `committed`, …), same spelling as
-`review-loop.json`/`step-<K>-loop.json`'s own `ended` key. The
+`review-loop.json`/`step-<K>-loop.json`'s own `ended` key.
+
+`continuation` counts the `--refresh-at` continuations taken so far by
+this step's *currently running leg*: for a code step, its code leg's own
+chain; for a review or maintain step, its fix leg's chain (a review or
+maintain leg never refreshes, per the operator decisions above). It
+resets to 0 when that leg starts a fresh chain — a code step's next
+`repeat` pass, or a review/maintain step's next iteration's fix leg — so a
+value here always describes the leg presently in flight, never a prior
+pass's or prior iteration's chain. It stays 0 for the whole run when
+`--refresh-at` is off, the seat isn't `claude`, or the step is plan,
+review or maintain (no leg of its own ever refreshes). This is additive:
+`i`'s own meaning (iterations/passes) is unchanged. The
 run's own `state` is `failed` when the final exit code is non-zero *or* any
 step ended `failed` — a review-loop harness error does not by itself
 change the run's exit code (see "Composed runs" above), so this is the one
@@ -760,8 +798,15 @@ the syntax does not have, no engine — present or planned — has either:
   fixing.
 - **No action beyond `code`/`review`/`maintain`/`plan`**, and no branches
   or graphs — a pipeline is always a single linear chain, of any length.
-- **No per-seat args or refresh** beyond the first code step — a plumbing
-  gap named by its own refusal, not a design position.
+- **No per-seat args, or per-seat `refresh-at`/`refresh-max`.** Both reach
+  only the first code step's agent — `claude-args`/`pi-args`/`codex-args`
+  because there is no per-seat argument plumbing for any other leg yet; an
+  agent's own `refresh-at`/`refresh-max` key because there is no per-seat
+  *refresh* plumbing either, only the one run-level `--refresh-at`/
+  `--refresh-max` pair a preset's key becomes once accepted — so it governs
+  every code and fix leg of the run, not just the seat it was written on
+  (see "A run that refreshes itself" in `README.md`). Both are plumbing
+  gaps named by their own refusal, not a design position.
 - **No `input:` key.** The engine fixes the data flow — the code step
   reads the handoff, fix legs read the verdict, review prompts are
   generated — so a key that names a prompt source would promise a choice

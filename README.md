@@ -404,6 +404,19 @@ ran, each one's exit, cost and usage, and how the chain ended — and
 `total_cost_usd` folds every continuation in beside the review loop's own
 legs, the same way it already does for `--review-loop`.
 
+This applies to every code and fix leg, not only the run's first one: a
+pipeline's code step at any position, each pass of a repeated code step,
+and the fix leg of a review or maintain loop each get their own chain,
+sized against that leg's own model, capped by `--refresh-max`
+independently. Those other chains land in `summary.json`'s `leg_refreshes`
+array instead of `continuations` — one entry per leg that was eligible to
+refresh, naming its leg, kind, how its own chain ended and its own
+continuations — so `refresh`/`continuations` keep meaning exactly the
+run's first (step-1 implement) leg, as they always have. A fix leg's own
+continuation carries what that leg was asked to fix (the findings it was
+given), not just the run's original brief. Plan, review and maintain legs
+never refresh — they are short read-and-verdict legs.
+
 A claude leg (implement, continuation, review, fix or maintainer alike)
 that fails on an auth or transient provider error — a revoked OAuth token,
 an overloaded model — is retried, fresh, up to twice before the run gives
