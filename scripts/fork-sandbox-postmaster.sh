@@ -73,7 +73,7 @@
 #                condition, not a per-agent one; see pm_flag_keyword)
 #   defer        thread, agent, reason=wake-when -- the seat's wake gate
 #                (rule 5) answered "not now": no spawn, no budget slot
-#   wake-gate-error thread, agent, reason=exit <N>|timeout|missing|context --
+#   wake-gate-error thread, agent, reason=exit-<N>|timeout|missing|context --
 #                a wake gate could not answer, so the seat was woken anyway
 #   refuse       agent, thread, reason=hops|budget|budget-reserved|no-grant --
 #                an agent's
@@ -2873,7 +2873,7 @@ pm_wake_gate() {
             pm_event "defer thread=${tid:0:8} agent=$agent reason=wake-when"
             return 1 ;;
         124|137) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=timeout" ;;
-        *) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=exit $rc" ;;
+        *) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=exit-$rc" ;;
     esac
     return 0
 }

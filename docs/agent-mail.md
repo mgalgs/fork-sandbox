@@ -922,9 +922,9 @@ replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
 `defer` (thread, agent, reason=wake-when — a seat's wake gate said not
-now; see rule 5), `wake-gate-error` (thread, agent, reason=exit
-<N>|timeout|missing|context — a gate could not answer and the seat was
-woken anyway),
+now; see rule 5), `wake-gate-error` (thread, agent,
+reason=exit-<N>|timeout|missing|context — a gate could not answer and
+the seat was woken anyway),
 `refuse` (agent, thread, reason=hops|budget|budget-reserved — at
 route-pass time this names only the message's `To:` candidates, since a
 refused message skips Cc resolution outright, but the same gate is
@@ -1230,7 +1230,7 @@ thread routes it.
      wake renders the whole thread anyway. **Anything else fails open**:
      any other exit code, a timeout, a missing or non-executable hook,
      or a failure to build the gate's context wakes the seat and emits
-     `wake-gate-error` with `reason=exit <N>`, `timeout`, `missing` or
+     `wake-gate-error` with `reason=exit-<N>`, `timeout`, `missing` or
      `context`. A broken gate never silently starves a seat.
    - **How it runs.** Synchronously, so routing waits for the answer:
      under `timeout` for `$FORK_SANDBOX_WAKE_GATE_TIMEOUT` seconds

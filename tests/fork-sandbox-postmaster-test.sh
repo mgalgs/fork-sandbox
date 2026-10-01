@@ -7142,7 +7142,7 @@ tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
 check "wake gate: exit 3 fails open (spawns)" 1 "$(wg_spawns hana)"
 contains "wake gate: exit 3 emits wake-gate-error" "$(cat "$work/once.out")" \
-    "pm wake-gate-error thread=$short agent=hana reason=exit 3"
+    "pm wake-gate-error thread=$short agent=hana reason=exit-3"
 not_contains "wake gate: exit 3 is not a defer" "$(cat "$work/once.out")" "pm defer"
 
 wg_new_store
