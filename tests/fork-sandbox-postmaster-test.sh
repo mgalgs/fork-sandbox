@@ -7070,6 +7070,258 @@ check "seeding: and still no on-target" 0 "$(hk_count on-target)"
 hk_uninstall
 
 # ============================================================
+printf '\n== wake gate: wake-when.<suffix> guards a seat spawn ==\n'
+# ============================================================
+
+# Seats are added to the fleet for this group only (a bare persona file is
+# an agent too, so those are removed again at the end).
+wg_saved_fleet="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+for wg_seat in hana hugo hera; do
+    printf 'Gate fixture seat.\n' > "$FORK_SANDBOX_PERSONAS_DIR/$wg_seat.md"
+done
+sed -i 's/^agents:$/agents:\n  hana:\n    wake-when: gate\n  hugo:\n    wake-when: absent\n  hera:\n    wake-when: noexec/' \
+    "$FORK_SANDBOX_FLEET_FILE"
+new_root WG_HOOKS
+new_root WG_OUT
+# shellcheck disable=SC2031  # the subshell is hk_call's, not this scope
+export WG_OUT FORK_SANDBOX_HOOKS_DIR="$WG_HOOKS"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WG_HOOKS/wake-when.noexec"
+
+# wg_gate <body>: installs wake-when.gate; every run is logged to $WG_OUT/calls.
+wg_gate() {
+    # shellcheck disable=SC2016  # expands in the gate, not here
+    printf '#!/usr/bin/env bash\necho "$FS_HOOK_AGENT" >> "$WG_OUT/calls"\n%s\n' "$1" > "$WG_HOOKS/wake-when.gate"
+    chmod +x "$WG_HOOKS/wake-when.gate"
+}
+wg_calls() { [[ -f "$WG_OUT/calls" ]] && wc -l < "$WG_OUT/calls" || echo 0; }
+wg_spawns() { grep -c -- "^sbx-mail-${short}-$1-" "$STUB_ARGV_LOG" || true; }
+wg_new_store() {
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    WG_STATE="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    : > "$WG_OUT/calls"
+    : > "$STUB_ARGV_LOG"
+}
+wg_finish_run() {
+    local rd
+    rd="$(sed -n 's/^RUN_DIR=//p' "$(env_file_for_agent "$1")")"
+    mkdir -p -- "$rd/outbox"
+    printf '0\n' > "$rd/exit-code"
+    printf '{}\n' > "$rd/summary.json"
+    printf '\nAcknowledged, thanks.\n' > "$rd/outbox/mail-1.md"
+}
+
+wg_new_store
+wg_gate 'exit 0'
+mid="$(send_msg '@alice' '@hana' 'gate wakes' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: exit 0 wakes the seat" 1 "$(wg_spawns hana)"
+check "wake gate: exit 0 spends a budget slot" 1 "$(spawn_count_of "$tid")"
+check "wake gate: the gate ran once" 1 "$(wg_calls)"
+
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@hana' 'gate defers' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: exit 1 defers (no spawn)" 0 "$(wg_spawns hana)"
+check "wake gate: exit 1 spends no budget slot" 0 "$(spawn_count_of "$tid")"
+contains "wake gate: exit 1 emits the defer event" "$(cat "$work/once.out")" \
+    "pm defer thread=$short agent=hana reason=wake-when"
+check "wake gate: a deferred message is routed, not retried every pass" 1 \
+    "$( [[ -e "$WG_STATE/routed/$mid" ]] && echo 1 || echo 0 )"
+check "wake gate: the gate's output is logged under hooks/logs" 1 \
+    "$(find "$WG_STATE/hooks/logs" -name '*-wake-when-*' | wc -l)"
+
+wg_new_store
+wg_gate 'exit 3'
+mid="$(send_msg '@alice' '@hana' 'gate errors' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: exit 3 fails open (spawns)" 1 "$(wg_spawns hana)"
+contains "wake gate: exit 3 emits wake-gate-error" "$(cat "$work/once.out")" \
+    "pm wake-gate-error thread=$short agent=hana reason=exit 3"
+not_contains "wake gate: exit 3 is not a defer" "$(cat "$work/once.out")" "pm defer"
+
+wg_new_store
+wg_gate 'sleep 30'
+mid="$(send_msg '@alice' '@hana' 'gate hangs' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_t0="$(date +%s)"
+FORK_SANDBOX_WAKE_GATE_TIMEOUT=1 once
+wg_took=$(( $(date +%s) - wg_t0 ))
+check "wake gate: a timeout fails open (spawns)" 1 "$(wg_spawns hana)"
+contains "wake gate: a timeout emits wake-gate-error" "$(cat "$work/once.out")" \
+    "pm wake-gate-error thread=$short agent=hana reason=timeout"
+check "wake gate: a hung gate does not wedge the postmaster" yes "$( (( wg_took < 15 )) && echo yes)"
+check "wake gate: the context dir is gone after a timeout" 0 \
+    "$(find "$WG_STATE" -maxdepth 1 -name 'wake-gate.*' | wc -l)"
+
+wg_new_store
+mid="$(send_msg '@alice' '@hugo' 'gate missing' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: a missing hook fails open (spawns)" 1 "$(wg_spawns hugo)"
+contains "wake gate: a missing hook emits wake-gate-error" "$(cat "$work/once.out")" \
+    "pm wake-gate-error thread=$short agent=hugo reason=missing"
+wg_new_store
+mid="$(send_msg '@alice' '@hera' 'gate not executable' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: a non-executable hook fails open (spawns)" 1 "$(wg_spawns hera)"
+contains "wake gate: a non-executable hook reports missing" "$(cat "$work/once.out")" \
+    "pm wake-gate-error thread=$short agent=hera reason=missing"
+
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@operator' '@hana' 'operator mail' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: operator mail bypasses the gate (spawns)" 1 "$(wg_spawns hana)"
+check "wake gate: operator mail never ran the gate" 0 "$(wg_calls)"
+
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@carol' 'ungated seat' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: a seat without wake-when spawns as before" 1 "$(wg_spawns carol)"
+check "wake gate: a seat without wake-when never runs a gate" 0 "$(wg_calls)"
+
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@hana' 'retry bypass' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: the retry's first wake was deferred" 0 "$(wg_spawns hana)"
+mkdir -p -- "$WG_STATE/retries/$tid"
+printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$mid" > "$WG_STATE/retries/$tid/hana"
+once
+check "wake gate: a retry of a failed wake is not gated" 1 "$(wg_spawns hana)"
+check "wake gate: the retry never ran the gate" 1 "$(wg_calls)"
+
+wg_new_store
+wg_gate 'exit 0'
+mid="$(send_msg '@alice' '@hana' 'live seat' 'first' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: live-run setup spawned" 1 "$(wg_spawns hana)"
+wg_gate 'exit 1'
+: > "$WG_OUT/calls"
+mid2="$(reply_msg '@alice' "$mid" 'second' --to '@hana')"
+: > "$STUB_ARGV_LOG"
+once
+check "wake gate: a seat with a live run gets no second spawn" 0 "$(wg_spawns hana)"
+check "wake gate: delivery to a live run never runs the gate" 0 "$(wg_calls)"
+contains "wake gate: the message is pended on the live run" \
+    "$(cat "$(env_file_for_agent hana)")" "PENDING_MSGS=$mid2"
+wg_finish_run hana
+: > "$STUB_ARGV_LOG"
+once
+check "wake gate: the pending follow-up wake is gated" 1 "$(wg_calls)"
+check "wake gate: a deferred follow-up does not spawn" 0 "$(wg_spawns hana)"
+contains "wake gate: a deferred follow-up emits defer" "$(cat "$work/once.out")" \
+    "pm defer thread=$short agent=hana reason=wake-when"
+: > "$STUB_ARGV_LOG"
+once
+check "wake gate: the dropped pending message is not woken later" 0 "$(wg_spawns hana)"
+
+wg_new_store
+wg_gate 'exit 0'
+mid="$(send_msg '@alice' '@hana' 'live seat allowed' 'first' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+mid2="$(reply_msg '@alice' "$mid" 'second' --to '@hana')"
+once
+wg_finish_run hana
+: > "$STUB_ARGV_LOG"
+: > "$WG_OUT/calls"
+once
+check "wake gate: an allowed follow-up wake runs the gate" 1 "$(wg_calls)"
+check "wake gate: an allowed follow-up wake spawns" 1 "$(wg_spawns hana)"
+
+wg_new_store
+# shellcheck disable=SC2016  # expands in the gate, not here
+wg_gate 'env | grep "^FS_" | sort > "$WG_OUT/env"
+cp "$FS_HOOK_EXPORT_FILE" "$WG_OUT/export.json"
+cp "$FS_HOOK_STATUS_FILE" "$WG_OUT/status.json"
+cp "$FS_HOOK_MESSAGE_FILE" "$WG_OUT/message.msg"
+dirname "$FS_HOOK_EXPORT_FILE" > "$WG_OUT/ctxdir"
+exit 1'
+mid="$(send_msg '@alice' '@hana' 'gate context' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+wg_env() { sed -n "s/^$1=//p" "$WG_OUT/env"; }
+check "wake gate env: FS_HOOK_EVENT" "wake-when" "$(wg_env FS_HOOK_EVENT)"
+check "wake gate env: FS_HOOK_THREAD" "$tid" "$(wg_env FS_HOOK_THREAD)"
+check "wake gate env: FS_HOOK_AGENT" "hana" "$(wg_env FS_HOOK_AGENT)"
+check "wake gate env: FS_HOOK_MESSAGE" "$mid" "$(wg_env FS_HOOK_MESSAGE)"
+check "wake gate env: FS_HOOK_MAIL_ROOT" "$FORK_SANDBOX_MAIL_ROOT" "$(wg_env FS_HOOK_MAIL_ROOT)"
+check "wake gate env: FS_HOOK_REPO" "$PROJECT_DIR" "$(wg_env FS_HOOK_REPO)"
+case "$(wg_env FS_HOOK_MESSAGE_FILE)" in
+    /*) ok "wake gate env: FS_HOOK_MESSAGE_FILE is absolute" ;;
+    *) no "wake gate env: FS_HOOK_MESSAGE_FILE is absolute" "got '$(wg_env FS_HOOK_MESSAGE_FILE)'" ;;
+esac
+check "wake gate: FS_HOOK_MESSAGE_FILE was a readable copy of the trigger" "$mid" \
+    "$(sed -n 's/^Message-ID: //p' "$WG_OUT/message.msg")"
+check "wake gate: the export file is what mail export --json prints" same \
+    "$("$MAIL" export "$tid" --json > "$work/export.cmp" 2>/dev/null; cmp -s "$work/export.cmp" "$WG_OUT/export.json" && echo same || echo differ)"
+check "wake gate: the export file is not empty" yes "$( [[ -s "$WG_OUT/export.json" ]] && echo yes)"
+check "wake gate: the status file is what status --thread --json prints" same \
+    "$("$postmaster" status --thread "$tid" --json > "$work/status.cmp" 2>/dev/null; cmp -s "$work/status.cmp" "$WG_OUT/status.json" && echo same || echo differ)"
+check "wake gate: the status file is not empty" yes "$( [[ -s "$WG_OUT/status.json" ]] && echo yes)"
+check "wake gate: the context dir is gone after the gate" 0 \
+    "$(find "$WG_STATE" -maxdepth 1 -name 'wake-gate.*' | wc -l)"
+check "wake gate: the context dir was under the state dir" "$WG_STATE" "$(dirname "$(cat "$WG_OUT/ctxdir")")"
+
+# The gate must not inherit the store lock fd: a child it leaves behind
+# would hold the lock past the postmaster's own death. (flock -u on exit
+# releases it for every sharer, so the fd table is what has to be checked.)
+wg_new_store
+# shellcheck disable=SC2016  # expands in the gate, not here
+wg_gate 'for fd in /proc/$$/fd/*; do readlink "$fd"; done > "$WG_OUT/fds"
+exit 0'
+mid="$(send_msg '@alice' '@hana' 'gate fd table' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: the gate ran for the fd check" 1 "$(wg_calls)"
+check "wake gate: the gate's fd table was captured" yes "$( [[ -s "$WG_OUT/fds" ]] && echo yes)"
+check "wake gate: the gate inherits no fd on the store lock" 0 \
+    "$(grep -c -- "$WG_STATE/lock" "$WG_OUT/fds" || true)"
+
+# Forced failure to build the context: fail open, gate never run.
+wg_new_store
+wg_gate 'exit 1'
+new_root WG_CTX_DIR
+cp "$postmaster" "$WG_CTX_DIR/postmaster"
+sed -i "s|^REPO_FLEET_KIT=.*|REPO_FLEET_KIT=\"$repo_dir/share/fleet-kit.md\"|" "$WG_CTX_DIR/postmaster"
+for wg_f in fork-sandbox-mail.sh fork-sandbox-fleet.sh fork-sandbox-fleet-parse.py fork-sandbox-lib.sh; do
+    ln -s "$repo_dir/scripts/$wg_f" "$WG_CTX_DIR/$wg_f"
+done
+cat > "$WG_CTX_DIR/fork-sandbox-mail-render.py" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == --json ]] && exit 1; done
+exec python3 "$repo_dir/scripts/fork-sandbox-mail-render.py" "\$@"
+EOF
+chmod +x "$WG_CTX_DIR/fork-sandbox-mail-render.py"
+mid="$(send_msg '@alice' '@hana' 'gate context fails' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+postmaster="$WG_CTX_DIR/postmaster"
+once
+postmaster="$repo_dir/scripts/fork-sandbox-postmaster.sh"
+check "wake gate: a context failure fails open (spawns)" 1 "$(wg_spawns hana)"
+contains "wake gate: a context failure emits wake-gate-error" "$(cat "$work/once.out")" \
+    "pm wake-gate-error thread=$short agent=hana reason=context"
+check "wake gate: a context failure never runs the gate" 0 "$(wg_calls)"
+check "wake gate: a context failure leaves no temp dir" 0 \
+    "$(find "$WG_STATE" -maxdepth 1 -name 'wake-gate.*' | wc -l)"
+
+unset FORK_SANDBOX_HOOKS_DIR WG_OUT
+printf '%s\n' "$wg_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"
+rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/hana.md" "$FORK_SANDBOX_PERSONAS_DIR/hugo.md" "$FORK_SANDBOX_PERSONAS_DIR/hera.md"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 

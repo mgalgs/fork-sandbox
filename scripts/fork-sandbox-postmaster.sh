@@ -2677,11 +2677,73 @@ pm_held_write() {
     mv -- "$tmp" "$STATE/held/$tid/$agent"
 }
 
+# True when message file $1 is operator mail: the same test rule 1 applies
+# (a sender that is not a fleet agent; under --cluster, only one on the
+# operator list).
+pm_message_is_operator() {
+    local from
+    from="$(pm_header "$1" From)"
+    if "$FLEET" resolve "${from#@}" >/dev/null 2>&1; then
+        return 1
+    fi
+    (( ! PM_CLUSTER )) || pm_is_operator "$from"
+}
+
+# The per-seat wake gate: runs $HOOKS_DIR/wake-when.<suffix> for a seat
+# about to be spawned and returns 0 to wake it, 1 to defer. Synchronous, so
+# routing waits (under the store lock: the gate must only read the store),
+# and fail-open: only exit 1 defers; any other status, a timeout, a missing
+# or non-executable hook or a failure to build its context wakes the seat.
+# The gate gets the thread as files (export and status, the same bytes the
+# `mail export --json` and `status --thread --json` verbs print) in a temp
+# dir removed on every path. It never inherits the store lock fd.
+pm_wake_gate() {
+    local agent="$1" tid="$2" mid="$3" suffix="$4"
+    local gate="$HOOKS_DIR/wake-when.$suffix" msg_file ctx log rc=0
+    msg_file="$(pm_find_by_id "$mid" || true)"
+    if [[ -n "$msg_file" ]] && pm_message_is_operator "$msg_file"; then
+        return 0
+    fi
+    if [[ ! -f "$gate" || ! -x "$gate" ]]; then
+        pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=missing"
+        return 0
+    fi
+    [[ -z "$msg_file" || "$msg_file" == /* ]] || msg_file="$PWD/$msg_file"
+    ctx="$(mktemp -d "$STATE/wake-gate.XXXXXX" 2>/dev/null)" || ctx=""
+    if [[ -z "$msg_file" || -z "$ctx" ]] \
+        || ! "$MAIL_RENDER" --json "$MAIL_ROOT" --thread "$tid" > "$ctx/export.json" 2>/dev/null \
+        || ! cmd_status_json "$tid" > "$ctx/status.json" 2>/dev/null; then
+        [[ -z "$ctx" ]] || rm -rf -- "$ctx"
+        pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=context"
+        return 0
+    fi
+    pm_hook_env "wake-when" "$tid" "FS_HOOK_AGENT=$agent" "FS_HOOK_MESSAGE=$mid" \
+        "FS_HOOK_MESSAGE_FILE=$msg_file" "FS_HOOK_EXPORT_FILE=$ctx/export.json" \
+        "FS_HOOK_STATUS_FILE=$ctx/status.json"
+    mkdir -p -- "$STATE/hooks/logs"
+    log="$STATE/hooks/logs/$(date +%s)-wake-when-${tid:0:8}-$agent-$RANDOM.log"
+    (
+        [[ -z "${pm_lock_fd:-}" ]] || exec {pm_lock_fd}>&-
+        exec env "${PM_HOOK_ENV[@]}" "$FS_TIMEOUT" --kill-after 10 \
+            "${FORK_SANDBOX_WAKE_GATE_TIMEOUT:-30}" "$gate" < /dev/null > "$log" 2>&1
+    ) || rc=$?
+    rm -rf -- "$ctx"
+    case "$rc" in
+        0) return 0 ;;
+        1)
+            pm_event "defer thread=${tid:0:8} agent=$agent reason=wake-when"
+            return 1 ;;
+        124|137) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=timeout" ;;
+        *) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=exit $rc" ;;
+    esac
+    return 0
+}
+
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4" is_retry="${5:-}"
     local harness model thinking network persona_path description wake_on_cc \
           refresh_at triage preset handler command backend endpoint grant \
-          review_target
+          review_target wake_when
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
@@ -2709,9 +2771,16 @@ pm_spawn_wake() {
            read -r persona_path; read -r description; read -r wake_on_cc; \
            read -r refresh_at; read -r triage; read -r preset; read -r handler; \
            read -r command; read -r backend; read -r endpoint; read -r grant; \
-           read -r review_target; \
+           read -r review_target; read -r wake_when; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
+        return 0
+    fi
+    # The one choke point for the wake gate: every spawn path passes here.
+    # A retry and a held seat's release were already admitted, so neither
+    # is asked again (PM_WAKE_ADMITTED is set by pm_held_pass).
+    if [[ -n "$wake_when" && -z "$is_retry" && -z "${PM_WAKE_ADMITTED:-}" ]] \
+        && ! pm_wake_gate "$agent" "$tid" "$mid" "$wake_when"; then
         return 0
     fi
     if [[ -n "$handler" ]]; then
@@ -4456,6 +4525,7 @@ pm_held_pass() {
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
             [[ "$retry_flag" == 1 ]] && is_retry=1
             rm -f -- "$f"
+            local PM_WAKE_ADMITTED=1
             pm_event "held-release thread=${tid:0:8} agent=$agent trigger=${trigger:0:8}"
             pm_followup_wake "$project" "$agent" "$tid" "$trigger" "$is_retry"
         done
