@@ -1149,6 +1149,25 @@ Secret entry *would be created*, naming only the endpoint. One key per
 endpoint, shared by every run using it — there is no per-run or
 per-operator credential here.
 
+Embeddings are off by default. `K8S_PROXY_ENDPOINT_EMBEDDINGS=<name>[,...]`
+opts registered endpoints in to two more exact-match locations each,
+`/e/<name>/v1/embeddings` (forwarded to the registered base URL's
+`/embeddings`) and the TEI-native `/e/<name>/embed`. The gateway serves
+`/embed` at its root, not under `/v1`, so its upstream is the registered
+base URL with one trailing `/v1` removed; an opted-in endpoint whose base
+URL does not end in `/v1` is a parse-time error, since there is no separate
+root URL key. Both locations behave like the endpoint's existing two —
+same TLS and `Host` handling, and the same `Authorization` injection when
+the endpoint is keyed — but are rate-limited in their own zone
+(`fork_sandbox_embed`, 50 r/s per pod, burst 100) so batched embeds from
+app code and the agent's own chat traffic (5 r/s, burst 10) cannot throttle
+each other. An unknown name, a duplicate, an empty element or trailing
+comma, and use on a legacy `K8S_PROXY_UPSTREAM` install are all parse-time
+errors. With the key unset the rendered proxy config is byte-identical to
+before, so existing installs do not roll the proxy; the agent egress
+policy, the proxy's `NetworkPolicy`, and the per-run claude proxy are
+unchanged either way.
+
 `http://` is accepted here (and on `K8S_PROXY_UPSTREAM`) when the host is a
 literal private IPv4 address (RFC1918, loopback, or link-local), or when it
 is a Kubernetes Service DNS name — a host ending in
@@ -1219,6 +1238,12 @@ legacy `K8S_PROXY_UPSTREAM` install a set `K8S_DEFAULT_ENDPOINT` is an
 error with the same shape as the `--endpoint` refusal there, since that
 render has no named endpoints. On a legacy install `PROXY_BASE_URL`
 stays the `/api/v1` literal.
+
+App code running inside the pod (as opposed to the agent) reaches an
+opted-in endpoint's embeddings routes through that same `PROXY_BASE_URL`,
+present in the pod environment under both harnesses: `$PROXY_BASE_URL/embeddings`
+for the OpenAI-style route and `${PROXY_BASE_URL%/v1}/embed` for the
+TEI-native one.
 
 **`--model` is optional on an endpoints install; the pod discovers the
 model facts itself.** `fork-sandbox-k8s-entrypoint.sh` queries
