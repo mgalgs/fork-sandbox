@@ -7399,6 +7399,145 @@ check "wake-deferred: a retry spawns the seat" 1 "$(wg_spawns hana)"
 check "wake-deferred: and clears its record" 0 \
     "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
 
+# ---- the budget reserve: the last spawns of a thread's budget ----
+# Budget 10 with 3 reserved: the band is 7 <= spawns so far < 10. carol and
+# hana may spawn inside it; alice, bob and dana may not.
+sed -i '1i budget-reserve:\n  spawns: 3\n  agents: [carol, hana]' "$FORK_SANDBOX_FLEET_FILE"
+export FORK_SANDBOX_THREAD_BUDGET=10
+wg_seed() { mkdir -p -- "$WG_STATE/spawns"; seq 1 "$1" > "$WG_STATE/spawns/$tid"; }
+wg_finish_quiet() {
+    local rd
+    rd="$(sed -n 's/^RUN_DIR=//p' "$(env_file_for_agent "$1")")"
+    mkdir -p -- "$rd/outbox"
+    printf '0\n' > "$rd/exit-code"
+    printf '{}\n' > "$rd/summary.json"
+}
+wg_record() { cat "$WG_STATE/budget-reserved/$tid" 2>/dev/null || true; }
+
+wg_new_store
+mid="$(send_msg '@dana' '@bob,@carol' 'in the band' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 7
+once
+check "reserve: in the band, the reserved seat spawns" 1 "$(wg_spawns carol)"
+check "reserve: in the band, the other seat is refused" 0 "$(wg_spawns bob)"
+contains "reserve: the refusal event names the reason" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=bob reason=budget-reserved"
+check "reserve: only the reserved seat spent a slot" 8 "$(spawn_count_of "$tid")"
+check "reserve: the refusal is recorded" "bob $mid" "$(wg_record)"
+check "reserve: the refusal does not flag the thread" "" "$(wg_flag_file)"
+not_contains "reserve: no flag event at refusal" "$(cat "$work/once.out")" "pm flag"
+wg_finish_quiet carol
+once
+check "reserve: a quiescent thread with a standing refusal is flagged" \
+    "thread budget 10: @bob refused at $mid (last 3 spawns reserved for @carol, @hana) and nothing woke it" \
+    "$(wg_flag_file)"
+contains "reserve: the flag event carries the fixed keyword" "$(cat "$work/once.out")" \
+    "pm flag thread=$short reason=budget-reserved"
+check "reserve: flagged exactly once" 1 "$(wg_flags)"
+once
+check "reserve: not flagged again on the next pass" 1 "$(wg_flags)"
+
+# A refused seat that then spawns (here via the operator's rule-1 reset) is
+# never flagged.
+wg_new_store
+mid="$(send_msg '@dana' '@bob,@carol' 'refused then woken' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 7
+once
+check "reserve: the refusal is recorded before the reset" "bob $mid" "$(wg_record)"
+mid2="$(reply_msg '@operator' "$mid" 'carry on' --to '@bob')"
+once
+check "reserve: the refused seat spawns after the reset" 1 "$(wg_spawns bob)"
+check "reserve: and its record is cleared" "" "$(wg_record)"
+wg_finish_quiet carol
+wg_finish_quiet bob
+once
+once
+check "reserve: a thread whose refused seat later spawned is not flagged" 0 "$(wg_flags)"
+check "reserve: and carries no flag" "" "$(wg_flag_file)"
+
+# Below the band nothing changes: both candidates spawn.
+wg_new_store
+mid="$(send_msg '@dana' '@bob,@carol' 'below the band' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 6
+once
+check "reserve: below the band the non-reserved seat spawns" 1 "$(wg_spawns bob)"
+check "reserve: below the band the reserved seat spawns" 1 "$(wg_spawns carol)"
+not_contains "reserve: below the band nothing is refused" "$(cat "$work/once.out")" "pm refuse"
+
+# At the budget the exhausted gate is unchanged, reserved seats included.
+wg_new_store
+mid="$(send_msg '@dana' '@bob,@carol' 'exhausted' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 10
+once
+check "reserve: at the budget the reserved seat is refused too" 0 "$(wg_spawns carol)"
+check "reserve: at the budget the other seat is refused" 0 "$(wg_spawns bob)"
+contains "reserve: at the budget the refusal reason is budget" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=carol reason=budget"
+not_contains "reserve: at the budget nothing is budget-reserved" "$(cat "$work/once.out")" "budget-reserved"
+check "reserve: at the budget the flag is immediate and unchanged" "thread budget 10 exhausted" "$(wg_flag_file)"
+contains "reserve: at the budget the keyword is budget-exhausted" "$(cat "$work/once.out")" \
+    "pm flag thread=$short reason=budget-exhausted"
+
+# A follow-up wake honors the band.
+wg_new_store
+mid="$(send_msg '@dana' '@bob' 'follow-up in the band' 'first' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+mid2="$(reply_msg '@dana' "$mid" 'second' --to '@bob')"
+once
+check "reserve: the follow-up message is pended below the band" yes \
+    "$(grep -q "PENDING_MSGS=$mid2" "$(env_file_for_agent bob)" && echo yes)"
+wg_seed 7
+wg_finish_quiet bob
+: > "$STUB_ARGV_LOG"
+once
+check "reserve: a follow-up wake of a non-reserved seat is refused in the band" 0 "$(wg_spawns bob)"
+contains "reserve: and says so" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=bob reason=budget-reserved"
+check "reserve: and records it" "bob $mid2" "$(wg_record)"
+wg_new_store
+mid="$(send_msg '@dana' '@carol' 'follow-up reserved' 'first' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+mid2="$(reply_msg '@dana' "$mid" 'second' --to '@carol')"
+once
+wg_seed 7
+wg_finish_quiet carol
+: > "$STUB_ARGV_LOG"
+once
+check "reserve: a follow-up wake of a reserved seat spawns in the band" 1 "$(wg_spawns carol)"
+
+# Both records on one thread: one flag, reasons joined, keyword from the
+# two booleans.
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@dana' '@bob,@hana' 'both records' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 7
+once
+check "reserve: both records standing give one combined flag" \
+    "wake deferred: @hana at $mid and nothing woke it; thread budget 10: @bob refused at $mid (last 3 spawns reserved for @carol, @hana) and nothing woke it" \
+    "$(wg_flag_file)"
+contains "reserve: the combined keyword lists both" "$(cat "$work/once.out")" \
+    "pm flag thread=$short reason=wake-deferred,budget-reserved"
+check "reserve: combined, flagged once" 1 "$(wg_flags)"
+
+# Startup: a reserve that is not smaller than the budget refuses to start.
+wg_new_store
+wg_rc="$(FORK_SANDBOX_THREAD_BUDGET=3 once_rc)"
+check "reserve: spawns >= budget refuses startup with exit 2" 2 "$wg_rc"
+contains "reserve: the refusal names the reserve" "$(cat "$work/once.err")" "budget-reserve spawns (3)"
+contains "reserve: the refusal names the budget" "$(cat "$work/once.err")" "thread budget (3)"
+wg_rc="$(FORK_SANDBOX_THREAD_BUDGET=2 once_rc)"
+check "reserve: spawns > budget refuses startup too" 2 "$wg_rc"
+wg_rc="$(FORK_SANDBOX_THREAD_BUDGET=4 once_rc)"
+check "reserve: spawns < budget starts" 0 "$wg_rc"
+unset FORK_SANDBOX_THREAD_BUDGET
+
 unset FORK_SANDBOX_HOOKS_DIR WG_OUT
 printf '%s\n' "$wg_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"
 rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/hana.md" "$FORK_SANDBOX_PERSONAS_DIR/hugo.md" "$FORK_SANDBOX_PERSONAS_DIR/hera.md"

@@ -941,8 +941,11 @@ NEEDS_OPERATOR_JOURNAL="$STATE/needs-operator-journal"
 # path. A thread that goes quiescent with a record still standing is
 # flagged once per message count (DEFERRAL_MARKS) -- see pm_deferral_pass.
 WAKE_DEFERRED="$STATE/wake-deferred"
+# The same shape for a seat the budget reserve refused (see pm_in_reserve_band);
+# it flags at quiescence too, never at the moment of refusal.
+BUDGET_RESERVED="$STATE/budget-reserved"
 DEFERRAL_MARKS="$STATE/deferral-marks"
-PM_SEAT_RECORD_DIRS=("$WAKE_DEFERRED")
+PM_SEAT_RECORD_DIRS=("$WAKE_DEFERRED" "$BUDGET_RESERVED")
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
 # same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
@@ -1678,6 +1681,7 @@ pm_flag_keyword() {
         "hops exhausted at"*) printf 'hops-exhausted' ;;
         "thread budget"*"exhausted") printf 'budget-exhausted' ;;
         "wake deferred: @"*" and nothing woke it") printf 'wake-deferred' ;;
+        "thread budget "*": @"*" refused at "*" and nothing woke it") printf 'budget-reserved' ;;
         "malformed reply file"*) printf 'malformed-reply' ;;
         "pending message"*"vanished"*) printf 'pending-vanished' ;;
         "run dir for"*"vanished"*) printf 'run-vanished' ;;
@@ -2716,12 +2720,51 @@ pm_seat_records_clear() {
     done
 }
 
-# `@a at <mid>, @b at <mid>` for one record file.
+# The fleet's budget-reserve block, into PM_RESERVE_SPAWNS and
+# PM_RESERVE_AGENTS (space-separated); both empty when there is none.
+PM_RESERVE_SPAWNS="" PM_RESERVE_AGENTS=""
+pm_reserve_load() {
+    PM_RESERVE_SPAWNS="" PM_RESERVE_AGENTS=""
+    { read -r PM_RESERVE_SPAWNS; read -r PM_RESERVE_AGENTS; } \
+        < <("$FLEET" resolve-budget-reserve 2>/dev/null) || true
+    PM_RESERVE_AGENTS="${PM_RESERVE_AGENTS//,/ }"
+}
+
+# True when $1 spawns so far puts the thread in the reserve band: below the
+# budget but within the last PM_RESERVE_SPAWNS of it. Needs pm_reserve_load.
+pm_in_reserve_band() {
+    [[ -n "$PM_RESERVE_SPAWNS" ]] && (( $1 >= ${FORK_SANDBOX_THREAD_BUDGET:-96} - PM_RESERVE_SPAWNS ))
+}
+
+pm_reserved_seat() {
+    [[ " $PM_RESERVE_AGENTS " == *" $1 "* ]]
+}
+
+# Refuses seat $2 on thread $1 for message $3 in the reserve band: an event
+# and a durable record, no flag (the reserve doing its job is not a failure).
+pm_refuse_reserved() {
+    pm_event "refuse thread=${1:0:8} agent=$2 reason=budget-reserved"
+    pm_seat_record_set "$BUDGET_RESERVED" "$1" "$2" "$3"
+}
+
+# Startup gate: a reserve as large as the budget would refuse every other
+# seat from the first message.
+pm_require_budget_reserve() {
+    local budget="${FORK_SANDBOX_THREAD_BUDGET:-96}"
+    pm_reserve_load
+    [[ -n "$PM_RESERVE_SPAWNS" && "$budget" =~ ^[0-9]+$ ]] || return 0
+    if (( PM_RESERVE_SPAWNS >= budget )); then
+        echo "Error: postmaster: the fleet's budget-reserve spawns ($PM_RESERVE_SPAWNS) must be less than the thread budget ($budget); every non-reserved seat would be refused from the first message." >&2
+        return 1
+    fi
+}
+
+# `@a <verb> <mid>, @b <verb> <mid>` for record file $1.
 pm_seat_record_text() {
     local agent mid out=""
     while read -r agent mid; do
         [[ -n "$agent" ]] || continue
-        out+="${out:+, }@$agent at $mid"
+        out+="${out:+, }@$agent ${2:-at} $mid"
     done < "$1"
     printf '%s' "$out"
 }
@@ -3442,7 +3485,7 @@ pm_process_message() {
         to_reason="unresolvable To: $unresolved_joined at $mid"
     fi
 
-    local gate_reason=""
+    local gate_reason="" in_reserve_band=0
     if [[ "$x_hops" == "0" ]]; then
         gate_reason="hops exhausted at $mid"
     else
@@ -3450,6 +3493,12 @@ pm_process_message() {
         count="$(pm_spawn_count "$tid")"
         if (( count >= budget )); then
             gate_reason="thread budget $budget exhausted"
+        else
+            # Once per message, like the budget check itself: a message
+            # that finds the thread in the band judges every candidate
+            # against it, however many spawns it adds along the way.
+            pm_reserve_load
+            ! pm_in_reserve_band "$count" || in_reserve_band=1
         fi
     fi
 
@@ -3595,6 +3644,10 @@ pm_process_message() {
     local agent
     for agent in "${candidates[@]}"; do
         [[ -n "$agent" ]] || continue
+        if (( in_reserve_band )) && ! pm_reserved_seat "$agent"; then
+            pm_refuse_reserved "$tid" "$agent" "$mid"
+            continue
+        fi
         pm_wake_or_pend "$project" "$agent" "$tid" "$mid"
     done
 }
@@ -3928,6 +3981,11 @@ pm_followup_wake() {
     if (( count >= budget )); then
         pm_event "refuse thread=${tid:0:8} agent=$agent reason=budget"
         pm_flag "$tid" "thread budget $budget exhausted"
+        return 1
+    fi
+    pm_reserve_load
+    if pm_in_reserve_band "$count" && ! pm_reserved_seat "$agent"; then
+        pm_refuse_reserved "$tid" "$agent" "$mid"
         return 1
     fi
     pm_spawn_wake "$project" "$agent" "$tid" "$mid" "$is_retry"
@@ -4637,22 +4695,50 @@ pm_thread_is_quiescent() {
 }
 
 # Flags a quiescent thread whose seat records still stand: a wake the gate
-# deferred and nothing has woken since is otherwise invisible. Once per
-# message count, like the on-quiescent marks; a new message un-quiesces the
-# thread and can flag it again. Walks every thread with a record, not only
-# the ones with a review target.
+# deferred, or one the budget reserve refused, that nothing has woken since
+# is otherwise invisible. Once per message count, like the on-quiescent
+# marks; a new message un-quiesces the thread and can flag it again. Walks
+# every thread with a record, not only the ones with a review target. With
+# both records standing the flag is one, reasons joined by "; ", and its
+# keyword is built from the two booleans, never by matching the text.
 pm_deferral_pass() {
-    local f tid count
-    for f in "$WAKE_DEFERRED"/*; do
+    local f tid count reason keyword
+    local -A seen=()
+    for f in "$WAKE_DEFERRED"/* "$BUDGET_RESERVED"/*; do
         [[ -s "$f" ]] || continue
         tid="${f##*/}"
+        [[ -z "${seen[$tid]:-}" ]] || continue
+        seen[$tid]=1
         count="$(pm_thread_message_count "$tid")"
         (( count > 0 )) || continue
         [[ "$(cat -- "$DEFERRAL_MARKS/$tid" 2>/dev/null)" == "$count" ]] && continue
         pm_thread_is_quiescent "$tid" || continue
         pm_hook_mark "$DEFERRAL_MARKS" "$tid" "$count"
-        pm_flag "$tid" "wake deferred: $(pm_seat_record_text "$f") and nothing woke it" wake-deferred
+        reason="" keyword=""
+        if [[ -s "$WAKE_DEFERRED/$tid" ]]; then
+            reason="wake deferred: $(pm_seat_record_text "$WAKE_DEFERRED/$tid") and nothing woke it"
+            keyword="wake-deferred"
+        fi
+        if [[ -s "$BUDGET_RESERVED/$tid" ]]; then
+            reason+="${reason:+; }$(pm_reserved_reason "$tid")"
+            keyword+="${keyword:+,}budget-reserved"
+        fi
+        pm_flag "$tid" "$reason" "$keyword"
     done
+}
+
+# The budget-reserved flag reason for thread $1, built from the record and
+# the fleet's current reserve (a reserve removed since is simply not named).
+pm_reserved_reason() {
+    local tid="$1" reason
+    pm_reserve_load
+    reason="thread budget ${FORK_SANDBOX_THREAD_BUDGET:-96}: $(pm_seat_record_text "$BUDGET_RESERVED/$tid" "refused at")"
+    if [[ -n "$PM_RESERVE_SPAWNS" ]]; then
+        local names="" a
+        for a in $PM_RESERVE_AGENTS; do names+="${names:+, }@$a"; done
+        reason+=" (last $PM_RESERVE_SPAWNS spawns reserved for $names)"
+    fi
+    printf '%s and nothing woke it' "$reason"
 }
 
 # The extra env words on-quiescent carries, into PM_HOOK_QUIESCENT.
@@ -4806,6 +4892,7 @@ cmd_deliver() {
     pm_require_routing_source || return 1
     pm_require_fleet_check || return 1
     pm_require_operators || return 2
+    pm_require_budget_reserve || return 2
     pm_require_retry_backoff || return 1
     pm_require_k8s_timeout || return 1
 
