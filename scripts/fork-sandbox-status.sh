@@ -1022,13 +1022,18 @@ print_tail_of_log() {
 # session's own account, exactly as --monitor's does.
 # $1 is the event-file count. events.jsonl holds only the code leg, so on a
 # multi-leg run its result event is not the run's outcome and must say so.
+# A BLOCKED plan has no code leg, so its text is the account instead.
 flush_result_if_terminal_only() {
-    if (( terminal_only )) && have_events; then
-        if (( ${1:-1} > 1 )); then
-            printf "(the code leg's own account; later legs' verdicts follow)\n"
-        fi
-        "$formatter" --result "$RUN_FILE_PATH"
+    local out
+    (( terminal_only )) || return 0
+    print_plan_report && return 0
+    have_events || return 0
+    out="$("$formatter" --result "$RUN_FILE_PATH")"
+    [[ -n "$out" ]] || return 0
+    if (( ${1:-1} > 1 )); then
+        printf "(the code leg's own account; later legs' verdicts follow)\n"
     fi
+    printf '%s\n' "$out"
 }
 
 # Counted outside the command substitution that buffers the terminal block:

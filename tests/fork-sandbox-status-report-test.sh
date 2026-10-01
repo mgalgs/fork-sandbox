@@ -947,6 +947,13 @@ out="$($status "$rd_new")"
     || { echo "plain status omitted the plan report: $out"; exit 1; }
 [[ "$out" == *"the brief asks for something this repository cannot do"* ]] \
     || { echo "plain status did not carry the plan's own text: $out"; exit 1; }
+: > "$rd_new/events.jsonl"
+printf '%s\n' "$dead_pid" > "$rd_new/pid"
+out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$(head -1 <<<"$out")" == "== report: plan leg (BLOCKED) ==" ]] \
+    || { echo "--monitor-terminal did not lead with the BLOCKED plan: $out"; exit 1; }
+[[ "$out" != *"own account"* ]] \
+    || { echo "--monitor-terminal printed an empty code-leg header: $out"; exit 1; }
 
 # 30a. A plan leg that simply finished ("done") is not BLOCKED, so no plan
 # report should appear -- the run's result is whatever the code leg after
