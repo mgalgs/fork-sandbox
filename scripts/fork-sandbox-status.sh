@@ -412,12 +412,17 @@ resolve_run_file() {
         # events- through, which is the property this allowlist exists to
         # deny. A repeat pass of a leg appends -p<P> to the leg number, and
         # the refresh loop's continuation legs and the code leg's repeat
-        # passes have their own kinds.
+        # passes have their own kinds. A code or fix leg that itself
+        # refreshes (every code and fix leg now can, not just the run's
+        # step-1 implement leg) appends -continuation-<C> to ITS OWN leg
+        # name instead of getting the flat events-continuation-N.jsonl the
+        # step-1 chain still uses -- see fs_refresh_chain's own naming
+        # comment in fork-sandbox.sh.
         events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl|events-code-[0-9]*.jsonl|events-continuation-[0-9]*.jsonl)
-            [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+            [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
         events-s[0-9]*-*.jsonl)
-            [[ "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+            [[ "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
         review-verdict-[0-9]*.md)
             [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
@@ -662,7 +667,16 @@ have_events() {
     if resolve_run_file events.jsonl && [[ -s "$RUN_FILE_PATH" ]]; then
         return 0
     fi
-    local -a code_files=("$run_dir"/events-s[0-9]*-code-*.jsonl)
+    local -a all_code_files=("$run_dir"/events-s[0-9]*-code-*.jsonl) code_files=()
+    local f
+    for f in "${all_code_files[@]}"; do
+        # A code leg's own continuation is tee'd into its base leg's file
+        # already (fs_refresh_chain), so the base file holds the whole
+        # chain and the continuation file is only its last slice. Excluding
+        # it here keeps the base file, not its tail, picked below.
+        [[ "$f" == *-continuation-*.jsonl ]] && continue
+        code_files+=("$f")
+    done
     local last
     if [[ -e "${code_files[0]}" ]]; then
         # Sorted without the extension so "-p2" orders after its base leg.
@@ -700,8 +714,8 @@ all_event_files() {
     for path in "${candidates[@]}"; do
         [[ -e "$path" ]] || continue
         name="${path##*/}"
-        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ \
-            || "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ \
+            || "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
             || die "'$name' is not a valid event file name"
         resolve_run_file "$name" || die "'$name' is not a readable event file"
         EVENT_FILES+=("$RUN_FILE_PATH")
@@ -880,14 +894,16 @@ end_reason_value() {
         | jq -r '.end_reason // empty' 2>/dev/null
 }
 
-# The refresh loop's continuation legs tee into events.jsonl AND their own
-# file, so their events are already counted through events.jsonl. Skipping
-# the copy here keeps the total exact; counting both would double every
-# continuation leg.
+# The refresh loop's continuation legs tee into events.jsonl (or, for a
+# per-leg chain, into that leg's own events-<tag>.jsonl) AND their own
+# events-continuation-N.jsonl / events-<tag>-continuation-N.jsonl file, so
+# their events are already counted through the file they were teed into.
+# Skipping the copy here keeps the total exact; counting both would double
+# every continuation leg.
 event_files_counted() {
     local f
     for f in "${EVENT_FILES[@]}"; do
-        [[ "${f##*/}" == events-continuation-* ]] && continue
+        [[ "${f##*/}" == *-continuation-[0-9]*.jsonl ]] && continue
         printf '%s\n' "$f"
     done
 }

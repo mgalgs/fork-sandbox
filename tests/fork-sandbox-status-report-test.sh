@@ -530,6 +530,27 @@ if (( rc != 0 )); then echo "events-continuation-1.jsonl was not accepted (rc=$r
 [[ "$out" == *"events:   2"* ]] || { echo "continuation leg double-counted: $out"; exit 1; }
 [[ "$out" == *"commits:  1 (seen so far"* ]] || { echo "continuation leg commit miscounted: $out"; exit 1; }
 
+# 9c2. A per-leg refresh chain's continuation file (events-<tag>-continuation-
+# <N>.jsonl, not the flat step-1 events-continuation-<N>.jsonl 9c already
+# covers) is also a tee'd copy of its leg's own events-<tag>.jsonl, not new
+# events, and must be skipped the same way.
+new_run_dir
+cat > "$rd_new/events-s2-code-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m one"}}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"base work"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"continuation line"}]}}
+{"type":"result","subtype":"success","result":"continuation account"}
+EOF
+cat > "$rd_new/events-s2-code-1-continuation-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"continuation line"}]}}
+{"type":"result","subtype":"success","result":"continuation account"}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+rc=$?
+if (( rc != 0 )); then echo "events-s2-code-1-continuation-1.jsonl was not accepted (rc=$rc): $out"; exit 1; fi
+[[ "$out" == *"events:   4"* ]] || { echo "per-leg continuation double-counted: $out"; exit 1; }
+[[ "$out" == *"commits:  1 (seen so far"* ]] || { echo "per-leg continuation commit miscounted: $out"; exit 1; }
+
 # 9d. A name in the new shapes that still fails the pattern is refused.
 new_run_dir
 cat > "$rd_new/events.jsonl" <<'EOF'
@@ -993,4 +1014,33 @@ out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
 [[ "$out" == *$'own account; later legs\' verdicts follow)\n== result: success'*"second code pass"* ]] \
     || { echo "--monitor-terminal did not flush the last code leg's result: $out"; exit 1; }
 
-echo "66 passed, 0 failed"
+# 30c. A code leg's own --refresh-at continuation is tee'd into its base
+# leg's file already (fs_refresh_chain), so the base file
+# (events-s2-code-1.jsonl) holds the whole chain and the continuation file
+# (events-s2-code-1-continuation-1.jsonl) is only its last slice. Sorted by
+# name, the continuation file sorts after its base, so have_events must
+# skip it explicitly or it wins as "the session's own account" and a
+# reader sees only the tail, never the earlier lines (commits included) --
+# --monitor's offset tracking would also read from under itself the moment
+# the continuation file appeared, since it is far shorter than the base
+# file it replaces.
+new_run_dir
+: > "$rd_new/events.jsonl"
+cat > "$rd_new/events-s2-code-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m base-work"}}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"continuation line"}]}}
+{"type":"result","subtype":"success","result":"continuation account"}
+EOF
+cat > "$rd_new/events-s2-code-1-continuation-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"continuation line"}]}}
+{"type":"result","subtype":"success","result":"continuation account"}
+EOF
+out="$($status --events 10 "$rd_new")"
+[[ "$out" == *"base-work"* ]] \
+    || { echo "--events read the continuation's own file instead of its base leg's: $out"; exit 1; }
+printf '%s\n' "$dead_pid" > "$rd_new/pid"
+out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$out" == *"continuation account"* ]] \
+    || { echo "--monitor-terminal did not flush the code leg's own continuation result: $out"; exit 1; }
+
+echo "68 passed, 0 failed"
