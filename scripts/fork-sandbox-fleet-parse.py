@@ -58,6 +58,11 @@ job, not a sealed harness's), or that resolves any preset (the cluster
 path is single-leg only in this phase, no maintainer tier, no repeat, no
 composed pipeline).
 
+`wake-when` is fleet.yaml-only as well: a suffix (^[a-z0-9][a-z0-9._-]*$)
+naming the postmaster's per-seat wake gate, $HOOKS_DIR/wake-when.<suffix>
+(see docs/agent-mail.md). Unlike `grant` it is legal on a handler seat: the
+gate guards a spawn, whatever the seat is.
+
 `review-target` is fleet.yaml-only too, same reason as `backend`: a seat
 must not know it is the one moving a review thread's shared target.
 Value is the literal string `sets` or `follow` (see docs/agent-mail.md
@@ -99,7 +104,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (fifteen lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (seventeen lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -114,6 +119,8 @@ routine instead of two.
     agent\t<name>\tbackend\t<value>
     agent\t<name>\tendpoint\t<value>
     agent\t<name>\tgrant\t<value>
+    agent\t<name>\treview-target\t<value>
+    agent\t<name>\twake-when\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -168,10 +175,11 @@ BACKENDS = ("local", "k8s")
 # places is a bug, so if that regex ever changes, this one must change
 # with it.
 ENDPOINT_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+WAKE_WHEN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
           "handler", "command", "backend", "endpoint", "grant",
-          "review-target")
+          "review-target", "wake-when")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
@@ -478,6 +486,17 @@ def check_review_target(value, path, errors):
     return value
 
 
+def check_wake_when(value, path, errors):
+    """A hook-name suffix: the postmaster runs $HOOKS_DIR/wake-when.<value>
+    before spawning this seat. Shape only -- whether the hook exists is the
+    postmaster's call at spawn time, and a missing one fails open."""
+    if not WAKE_WHEN_RE.fullmatch(value):
+        errors.append(f"{path}: wake-when suffixes match "
+                       f"^[a-z0-9][a-z0-9._-]*$, not '{value}'")
+        return ""
+    return value
+
+
 def check_backend_fields_pair(backend, endpoint, grant, path, errors):
     """endpoint/grant only mean anything to the k8s spawn path; on any
     other backend they would silently do nothing, so refuse the
@@ -602,6 +621,10 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["review-target"] = check_review_target(v, path, errors)
+            elif prop == "wake-when":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["wake-when"] = check_wake_when(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],

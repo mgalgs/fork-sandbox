@@ -496,12 +496,13 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the sixteen-line contract into named globals for assertions.
+    # Reads the seventeen-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
       read -r r_refresh_at; read -r r_triage; read -r r_preset; \
       read -r r_handler; read -r r_command; read -r r_backend; \
       read -r r_endpoint; read -r r_grant; read -r r_review_target; \
+      read -r r_wake_when; \
     } < <("$fleet" resolve "$1")
 }
 
@@ -531,12 +532,13 @@ check "resolve: all-empty agent, backend empty" "" "$r_backend"
 check "resolve: all-empty agent, endpoint empty" "" "$r_endpoint"
 check "resolve: all-empty agent, grant empty" "" "$r_grant"
 check "resolve: all-empty agent, review-target empty" "" "$r_review_target"
+check "resolve: all-empty agent, wake-when empty" "" "$r_wake_when"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (review-target) is empty, as it is for tuner.
-check "resolve: output is exactly sixteen lines" "16" "$("$fleet" resolve tuner | wc -l)"
+# (wake-when) is empty, as it is for tuner.
+check "resolve: output is exactly seventeen lines" "17" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -1085,6 +1087,71 @@ agents:
 EOF
 
 printf '%s\n' "$saved_fleet_for_review_target" > "$FORK_SANDBOX_FLEET_FILE"
+
+printf '\n== wake-when ==\n'
+
+saved_fleet_for_wake_when="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    wake-when: panel-ready.v2
+  tuner: {}
+EOF
+check "wake-when: a valid suffix passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "wake-when: resolves verbatim as the 17th line" "panel-ready.v2" "$r_wake_when"
+resolve_lines tuner
+check "wake-when: empty on a seat that sets none" "" "$r_wake_when"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    review-target: follow
+    wake-when: gate
+EOF
+resolve_lines riffler
+check "wake-when: review-target keeps its own line beside it" "follow" "$r_review_target"
+check "wake-when: and wake-when keeps its own" "gate" "$r_wake_when"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: some-handler
+    wake-when: gate
+EOF
+# dump, not check: check also wants the handler's command on disk.
+check "wake-when: a handler seat may carry one" "gate" \
+    "$(python3 "$parse" dump "$FORK_SANDBOX_FLEET_FILE" fleet.yaml | awk -F'\t' '$3=="wake-when"{print $4}')"
+
+for badval in "Gate" "-gate" ".gate" "a/b" "a b" "gate!" "''"; do
+    printf 'agents:\n  riffler:\n    wake-when: %s\n' "$badval" > "$FORK_SANDBOX_FLEET_FILE"
+    if "$fleet" check >/dev/null 2>&1; then
+        no "wake-when: refuses [$badval]" "check passed"
+    else
+        ok "wake-when: refuses [$badval]"
+    fi
+done
+
+bad "wake-when: a non-scalar value is refused" "agents.riffler.wake-when" <<'EOF'
+agents:
+  riffler:
+    wake-when: [a, b]
+EOF
+
+saved_riffler_persona="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+printf '%s\n' "---" "wake-when: gate" "---" "persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+bad "wake-when: persona frontmatter refuses it as an unknown key" \
+    "frontmatter.wake-when: unknown key" <<'EOF'
+agents:
+  riffler: {}
+EOF
+printf '%s\n' "$saved_riffler_persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+
+printf '%s\n' "$saved_fleet_for_wake_when" > "$FORK_SANDBOX_FLEET_FILE"
 
 printf '\n== expand ==\n'
 

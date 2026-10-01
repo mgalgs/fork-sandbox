@@ -109,18 +109,19 @@
 #                  fork-sandbox-preset-parse.py, never a second parser.
 #                  Handler seats stay legal. Without --cluster, `check`
 #                  behaves exactly as it always has.
-#   resolve <name> Print exactly fifteen lines for one agent: harness,
+#   resolve <name> Print exactly seventeen lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
 #                  wake-on-cc, refresh-at, triage, preset, handler,
-#                  command, backend, endpoint, grant. A field with
-#                  nothing configured anywhere prints as an empty line --
-#                  output is always fifteen lines, never fewer. A handler
+#                  command, backend, endpoint, grant, review-target,
+#                  wake-when. A field with nothing configured anywhere
+#                  prints as an empty line -- output is always seventeen
+#                  lines, never fewer. A handler
 #                  seat's harness/model/thinking/network/triage/preset/
 #                  refresh-at lines are always empty (refused together at
 #                  `check` time); its handler/command lines are the only
 #                  ones populated besides persona-path/description/
-#                  wake-on-cc. The last three (backend/endpoint/grant) are
-#                  fleet.yaml-only (see fork-sandbox-fleet-parse.py's
+#                  wake-on-cc. The last five (backend/endpoint/grant/
+#                  review-target/wake-when) are fleet.yaml-only (see fork-sandbox-fleet-parse.py's
 #                  module docstring for their rules) and so carry no
 #                  persona-frontmatter fallback -- printed straight from
 #                  the fleet file, empty when unset.
@@ -378,7 +379,7 @@ check_cluster() {
         rc=1
     fi
     for name in "$@"; do
-        # Not $(...): that strips the trailing empty lines of the fifteen.
+        # Not $(...): that strips the trailing empty lines of the seventeen.
         mapfile -t seat < <(resolve_with_dump "$dump" "$name")
         harness="${seat[0]-}" preset="${seat[9]-}" handler="${seat[10]-}" backend="${seat[12]-}"
         [[ "$handler" == exec ]] && continue
@@ -437,7 +438,7 @@ fleet_read_agent() {
     fleet_wake_on_cc="" fleet_refresh_at="" fleet_triage=""
     fleet_preset="" fleet_handler="" fleet_command=""
     fleet_backend="" fleet_endpoint="" fleet_grant=""
-    fleet_review_target=""
+    fleet_review_target="" fleet_wake_when=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -460,6 +461,7 @@ fleet_read_agent() {
             endpoint) fleet_endpoint="$value" ;;
             grant) fleet_grant="$value" ;;
             review-target) fleet_review_target="$value" ;;
+            wake-when) fleet_wake_when="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -537,10 +539,12 @@ resolve_with_dump() {
     printf '%s\n' "$fleet_endpoint"
     printf '%s\n' "$fleet_grant"
     # review-target is likewise fleet.yaml-only -- no frontmatter
-    # fallback, see fork-sandbox-fleet-parse.py's docstring. This is the
-    # 16th and last resolve line; a new one must always be appended here,
-    # never inserted, or every positional reader below breaks.
+    # fallback, see fork-sandbox-fleet-parse.py's docstring.
     printf '%s\n' "$fleet_review_target"
+    # wake-when is fleet.yaml-only too. This is the 17th and last resolve
+    # line; a new one must always be appended here, never inserted, or
+    # every positional reader breaks.
+    printf '%s\n' "$fleet_wake_when"
 }
 
 cmd_resolve() {
