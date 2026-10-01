@@ -403,7 +403,7 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|pipeline.json) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|pipeline.json) ;;
         step-[0-9]*-loop.json)
             [[ "$name" =~ ^step-[0-9]+-loop\.json$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         # One file per leg, named by the runner. The leg kinds are
@@ -417,7 +417,7 @@ resolve_run_file() {
             [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
         events-s[0-9]*-*.jsonl)
-            [[ "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+            [[ "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
         review-verdict-[0-9]*.md)
             [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
@@ -538,6 +538,21 @@ print_report_marker() {
     label="$STEP_VERDICT_ACTION"
     [[ "$label" == maintain ]] && label=maintainer
     printf 'report: %s leg %s (%s)\n' "$label" "$STEP_VERDICT_ITER" "$status"
+}
+
+# A BLOCKED plan's text is the run's result: no code leg ran, so there is
+# no events.jsonl to report from. A plan step is always step 1.
+print_plan_report() {
+    local loopfile ended
+    resolve_run_file step-1-loop.json >/dev/null 2>&1 || return 1
+    loopfile="$RUN_FILE_PATH"
+    ended="$(jq -r '.ended // empty' -- "$loopfile" 2>/dev/null)"
+    [[ "$ended" == "blocked" ]] || return 1
+    resolve_run_file plan.md >/dev/null 2>&1 || return 1
+    [[ -s "$RUN_FILE_PATH" ]] || return 1
+    printf '== report: plan leg (BLOCKED) ==\n'
+    cat -- "$RUN_FILE_PATH" | tr -d '\000-\010\013-\037\177'
+    printf '\n'
 }
 
 print_review_report() {
@@ -668,7 +683,7 @@ all_event_files() {
         [[ -e "$path" ]] || continue
         name="${path##*/}"
         [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ \
-            || "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+            || "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
             || die "'$name' is not a valid event file name"
         resolve_run_file "$name" || die "'$name' is not a readable event file"
         EVENT_FILES+=("$RUN_FILE_PATH")
@@ -1009,49 +1024,52 @@ count_event_files() {
 
 case "$mode" in
     result)
-        report_printed=false
-        if print_maintainer_report; then
-            report_printed=true
-        fi
-        if print_review_report; then
-            report_printed=true
-        fi
-        if $report_printed; then
-            printf '== the session'"'"'s own account ==\n'
-        fi
-        out=""
-        if have_events 2>/dev/null; then
-            out="$("$formatter" --result "$RUN_FILE_PATH")"
-        fi
-        if [[ -n "$out" ]]; then
-            printf '%s\n' "$out"
-        else
-            state="$(run_state)"
-            case "$state" in
-                starting|running)
-                    printf 'No result yet. The session is still %s, %s in.\n' \
-                        "$state" "$(elapsed_human)"
-                    ;;
-                *)
-                    # A leg that died on a provider error (spend cap, revoked
-                    # token) wrote no result, and summary.json carries the
-                    # cause; say that instead of the generic account.
-                    herr=""
-                    if herr_json="$(run_file_read summary.json 2>/dev/null)"; then
-                        herr="$(printf '%s' "$herr_json" \
-                            | jq -r '.harness_error // empty' 2>/dev/null \
-                            | tr -d '\000-\037\177')"
-                    fi
-                    if [[ -n "$herr" ]]; then
-                        printf 'The session failed on a harness error: %s\n' "$herr"
-                    else
-                        printf 'The session wrote no result. It ended as "%s" after %s,\n' \
+        # A BLOCKED plan ran no code leg, so its text replaces the fallback.
+        if ! print_plan_report; then
+            report_printed=false
+            if print_maintainer_report; then
+                report_printed=true
+            fi
+            if print_review_report; then
+                report_printed=true
+            fi
+            if $report_printed; then
+                printf '== the session'"'"'s own account ==\n'
+            fi
+            out=""
+            if have_events 2>/dev/null; then
+                out="$("$formatter" --result "$RUN_FILE_PATH")"
+            fi
+            if [[ -n "$out" ]]; then
+                printf '%s\n' "$out"
+            else
+                state="$(run_state)"
+                case "$state" in
+                    starting|running)
+                        printf 'No result yet. The session is still %s, %s in.\n' \
                             "$state" "$(elapsed_human)"
-                        printf 'so it never finished its turn.\n'
-                    fi
-                    print_tail_of_log
-                    ;;
-            esac
+                        ;;
+                    *)
+                        # A leg that died on a provider error (spend cap, revoked
+                        # token) wrote no result, and summary.json carries the
+                        # cause; say that instead of the generic account.
+                        herr=""
+                        if herr_json="$(run_file_read summary.json 2>/dev/null)"; then
+                            herr="$(printf '%s' "$herr_json" \
+                                | jq -r '.harness_error // empty' 2>/dev/null \
+                                | tr -d '\000-\037\177')"
+                        fi
+                        if [[ -n "$herr" ]]; then
+                            printf 'The session failed on a harness error: %s\n' "$herr"
+                        else
+                            printf 'The session wrote no result. It ended as "%s" after %s,\n' \
+                                "$state" "$(elapsed_human)"
+                            printf 'so it never finished its turn.\n'
+                        fi
+                        print_tail_of_log
+                        ;;
+                esac
+            fi
         fi
         ;;
 
@@ -1109,19 +1127,21 @@ case "$mode" in
             if summary="$(run_file_read summary.txt 2>/dev/null)"; then
                 printf '\n%s\n' "$summary"
             fi
-            report_printed=false
-            if print_maintainer_report; then
-                report_printed=true
-            fi
-            if print_review_report; then
-                report_printed=true
-            fi
-            if $report_printed; then
-                printf '== the session'"'"'s own account ==\n'
-            fi
-            if have_events 2>/dev/null; then
-                printf '\n'
-                "$formatter" --result "$RUN_FILE_PATH"
+            if ! print_plan_report; then
+                report_printed=false
+                if print_maintainer_report; then
+                    report_printed=true
+                fi
+                if print_review_report; then
+                    report_printed=true
+                fi
+                if $report_printed; then
+                    printf '== the session'"'"'s own account ==\n'
+                fi
+                if have_events 2>/dev/null; then
+                    printf '\n'
+                    "$formatter" --result "$RUN_FILE_PATH"
+                fi
             fi
         fi
         if [[ "$state" == "failed" || "$state" == "abandoned" ]]; then

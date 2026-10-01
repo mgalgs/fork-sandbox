@@ -922,4 +922,43 @@ out="$(FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session "$sess
     || { echo "a directory outside the run-dir prefix leaked its progress.json: $out"; exit 1; }
 rm -rf -- "$secret_dir"
 
-echo "64 passed, 0 failed"
+# 30. A BLOCKED plan leg ends the run with no code leg and no events.jsonl,
+# so --result and plain status must fall back to the plan's own text (see
+# print_plan_report) rather than the generic "wrote no result" text a run
+# with no events otherwise gets. step-1-loop.json's "ended" is the signal
+# (the pipeline grammar keeps a plan step at step 1 whenever one exists).
+new_run_dir
+cat > "$rd_new/step-1-loop.json" <<'EOF'
+{"ended":"blocked"}
+EOF
+printf 'BLOCKED\nthe brief asks for something this repository cannot do\n' \
+    > "$rd_new/plan.md"
+printf '1\n' > "$rd_new/exit-code"
+printf 'exit: 1\ncommits: 0\nNothing landed.\n' > "$rd_new/summary.txt"
+out="$($status --result "$rd_new")"
+[[ "$out" == *"== report: plan leg (BLOCKED) =="* ]] \
+    || { echo "--result omitted the plan report: $out"; exit 1; }
+[[ "$out" == *"the brief asks for something this repository cannot do"* ]] \
+    || { echo "--result did not carry the plan's own text: $out"; exit 1; }
+[[ "$out" != *"wrote no result"* ]] \
+    || { echo "--result still printed the generic no-result fallback: $out"; exit 1; }
+out="$($status "$rd_new")"
+[[ "$out" == *"== report: plan leg (BLOCKED) =="* ]] \
+    || { echo "plain status omitted the plan report: $out"; exit 1; }
+[[ "$out" == *"the brief asks for something this repository cannot do"* ]] \
+    || { echo "plain status did not carry the plan's own text: $out"; exit 1; }
+
+# 30a. A plan leg that simply finished ("done") is not BLOCKED, so no plan
+# report should appear -- the run's result is whatever the code leg after
+# it wrote, which events.jsonl (absent here) would otherwise carry.
+new_run_dir
+cat > "$rd_new/step-1-loop.json" <<'EOF'
+{"ended":"done"}
+EOF
+printf 'the approach\n' > "$rd_new/plan.md"
+printf '0\n' > "$rd_new/exit-code"
+out="$($status --result "$rd_new")"
+[[ "$out" != *"report: plan leg"* ]] \
+    || { echo "a done plan leg wrongly produced a plan report: $out"; exit 1; }
+
+echo "65 passed, 0 failed"
