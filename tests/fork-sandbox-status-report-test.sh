@@ -961,4 +961,29 @@ out="$($status --result "$rd_new")"
 [[ "$out" != *"report: plan leg"* ]] \
     || { echo "a done plan leg wrongly produced a plan report: $out"; exit 1; }
 
-echo "65 passed, 0 failed"
+# 30b. A run whose step 1 is not code leaves events.jsonl empty; the session
+# account comes from the last per-step code leg's events, pass order included.
+new_run_dir
+: > "$rd_new/events.jsonl"
+printf '{"type":"result","subtype":"success","result":"plan account"}\n' \
+    > "$rd_new/events-s1-plan-1.jsonl"
+printf '{"type":"result","subtype":"success","result":"first code pass"}\n' \
+    > "$rd_new/events-s2-code-1.jsonl"
+printf '{"type":"result","subtype":"success","result":"second code pass"}\n' \
+    > "$rd_new/events-s2-code-2.jsonl"
+printf '0\n' > "$rd_new/exit-code"
+printf 'exit: 0\n' > "$rd_new/summary.txt"
+out="$($status --result "$rd_new")"
+[[ "$out" == *"second code pass"* ]] \
+    || { echo "--result did not read the last code leg's events: $out"; exit 1; }
+[[ "$out" != *"wrote no result"* && "$out" != *"plan account"* ]] \
+    || { echo "--result fell back to the wrong account: $out"; exit 1; }
+out="$($status "$rd_new")"
+[[ "$out" == *"second code pass"* ]] \
+    || { echo "plain status did not read the last code leg's events: $out"; exit 1; }
+printf '%s\n' "$dead_pid" > "$rd_new/pid"
+out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$out" == *$'own account; later legs\' verdicts follow)\n== result: success'*"second code pass"* ]] \
+    || { echo "--monitor-terminal did not flush the last code leg's result: $out"; exit 1; }
+
+echo "66 passed, 0 failed"

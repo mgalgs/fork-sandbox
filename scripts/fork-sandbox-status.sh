@@ -654,7 +654,25 @@ inbox_count() {
 
 # The event log, once. Every reader goes through this, so the symlink refusal
 # applies to all of them.
+#
+# A composed run whose step 1 is not code (a plan or review step first)
+# leaves events.jsonl empty; its code legs log to per-step files, and the
+# last of those carries the session's account.
 have_events() {
+    if resolve_run_file events.jsonl && [[ -s "$RUN_FILE_PATH" ]]; then
+        return 0
+    fi
+    local -a code_files=("$run_dir"/events-s[0-9]*-code-*.jsonl)
+    local last
+    if [[ -e "${code_files[0]}" ]]; then
+        # Sorted without the extension so "-p2" orders after its base leg.
+        last="$(printf '%s\n' "${code_files[@]##*/}" | sed 's/\.jsonl$//' \
+            | sort -V | tail -n1).jsonl"
+        if [[ "$last" =~ ^events-s[0-9]+-code-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+            && resolve_run_file "$last" && [[ -s "$RUN_FILE_PATH" ]]; then
+            return 0
+        fi
+    fi
     resolve_run_file events.jsonl
 }
 
