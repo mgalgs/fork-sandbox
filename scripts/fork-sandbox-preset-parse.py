@@ -433,8 +433,10 @@ def main():
                  f"plumbing for any other leg yet")
         if name != first_code_agent and (agent["refresh_at"] or agent["refresh_max"]):
             fail(f"agents.{name}: has refresh keys but does not sit the "
-                 f"first code seat; context refresh reaches only that "
-                 f"seat's first pass today")
+                 f"first code seat; there is no per-seat refresh plumbing "
+                 f"-- refresh-at/refresh-max becomes the run's own single "
+                 f"setting wherever it is set, and today only the first "
+                 f"code seat may set it")
         if agent["repeat"] != 1 and name not in coding:
             fail(f"agents.{name}: has 'repeat' but never codes -- repeat "
                  f"re-runs coding legs, and this agent sits neither the "

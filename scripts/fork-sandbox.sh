@@ -3732,18 +3732,10 @@ fi
 # this script reads.
 refresh_at="" refresh_max="" refresh_enabled=0
 refresh_context_window="" refresh_threshold_tokens="" refresh_ceiling_tokens=""
+# A composed run's $model stays empty (see composed_step1_model above), so
+# size the step-1 chain against step 1's own seat, not the 1M default.
 fs_refresh_resolve "$harness" "$refresh_at_arg" "$refresh_at_given" \
-    "$refresh_max_arg" "$model" || exit 1
-
-# The continuation chain runs only for step 1 (fs_impl_leg_ran_at_step1,
-# below), so a pipeline whose step 1 is not code never refreshes.
-if (( refresh_enabled )) && [[ "$preset_is_legacy_shaped" != true \
-    && "${preset_step_action[1]:-}" != code ]]; then
-    echo "Warning: this pipeline's step 1 is" \
-        "'${preset_step_action[1]:-}', not 'code', so --refresh-at's" >&2
-    echo "continuation chain will not engage -- it only ever runs for a" >&2
-    echo "pipeline's own step 1. The run's refresh field reports 'none'." >&2
-fi
+    "$refresh_max_arg" "${composed_step1_model:-$model}" || exit 1
 
 # The resolved model values are what --dry-run prints, so they have to clear
 # the shell-safety check before it prints them. The full sweep over every
@@ -7876,6 +7868,11 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"
     printf 'review_verdict_file=%q\n' "$review_verdict_file"
     printf 'refresh_enabled=%q\n' "$refresh_enabled"
+    # refresh_at (not just refresh_max/refresh_context_window, already
+    # below): fs_refresh_window_for_model needs the resolved fraction/token
+    # count itself to size each OTHER refresh-eligible leg's own chain
+    # against ITS model's window, not the run's.
+    printf 'refresh_at=%q\n' "$refresh_at"
     printf 'refresh_max=%q\n' "$refresh_max"
     printf 'refresh_context_window=%q\n' "$refresh_context_window"
     printf 'refresh_config=%q\n' "$refresh_config"
@@ -8272,11 +8269,12 @@ fi
 # "skipped". Writing this file must never fail the run, so every jq call
 # below is best-effort and every write falls back to removing its own
 # .part rather than leaving a half-written file behind.
-declare -a progress_state=() progress_i=() progress_ended=()
+declare -a progress_state=() progress_i=() progress_ended=() progress_continuation=()
 for (( _pg_k = 1; _pg_k <= run_step_count; _pg_k++ )); do
     progress_state[_pg_k]="pending"
     progress_i[_pg_k]=0
     progress_ended[_pg_k]=""
+    progress_continuation[_pg_k]=0
 done
 # Set the moment any step's state becomes "failed" -- a harness error in a
 # review/maintainer loop does not by itself change $rc (see the walker's own
@@ -8296,8 +8294,10 @@ progress_write() {
             --argjson i "${progress_i[_pg_j]:-0}" \
             --argjson cap "${run_step_cap[_pg_j]}" \
             --arg ended "$ended_val" \
+            --argjson continuation "${progress_continuation[_pg_j]:-0}" \
             '{action:$action, state:$state, i:$i, cap:$cap,
-              ended:(if $ended == "" then null else $ended end)}' \
+              ended:(if $ended == "" then null else $ended end),
+              continuation:$continuation}' \
             2>/dev/null)" || step_json=""
         [[ -n "$step_json" ]] && steps_ndjson+="$step_json"$'\n'
     done
@@ -9119,6 +9119,12 @@ loop_cost_unknown=0
 refresh_ended=""
 continuations_json='[]'
 refresh_leg_n=0
+# Every OTHER leg's own refresh chain -- a code step's pass 2+, a code step
+# that is not step 1, a fix or mntfix leg -- lands here instead of in
+# refresh_ended/continuations_json above, which stay the step-1 implement
+# leg's own fields exactly as they always have (decision 6: existing field
+# meanings do not change). See fs_refresh_chain, below run_leg.
+leg_refreshes_json='[]'
 # The events slice to check for a nudge marker once no hand-off is waiting:
 # starts as the implement leg's own events.jsonl (nothing else has been
 # appended to it yet at this point), and becomes each continuation's own
@@ -9198,6 +9204,7 @@ if [[ "$refresh_enabled" == "1" && "$fs_impl_leg_ran_at_step1" == 1 ]]; then
             refresh_leg_n="$refresh_next_n"
             leg_no=$(( refresh_leg_n + 1 ))
             record_name="handoff-$refresh_leg_n.md"
+            progress_continuation[1]="$refresh_leg_n"
 
             # Bug B's host-side backstop: the sandbox-side Stop check cannot
             # help a leg that died (quota, crash, timeout) right after
@@ -9426,7 +9433,11 @@ run_leg() {
     # and share a session the cost walk would double-bill, exactly the
     # collision the surrounding comment there already warns about for the
     # fixed tiers.
-    local leg_tag
+    # leg_tag is deliberately NOT local: fs_refresh_chain, called by the
+    # caller right after run_leg returns for a "code"/"fix"/"mntfix" leg,
+    # reads it back to name that leg's OWN refresh chain's artifacts, the
+    # same "public output" convention leg_rc/leg_cost/leg_usage already use.
+    leg_tag=""
     if [[ -n "$step_idx" ]]; then
         case "$kind" in
         fix | mntfix) leg_tag="${step_idx}-fix-$n" ;;
@@ -9441,7 +9452,10 @@ run_leg() {
         leg_tag="$kind-$n"
     fi
     legs_run=$(( ${legs_run:-0} + 1 ))
-    local leg_events="$run_dir/events-$leg_tag.jsonl"
+    # Also not local, for the same reason as leg_tag: fs_refresh_chain checks
+    # THIS leg's own events for a nudge marker before it decides there is no
+    # hand-off to chase.
+    leg_events="$run_dir/events-$leg_tag.jsonl"
     # A review-only run has no implement leg, so its first leg's events are
     # the run's own; a read-only maintain leg after it keeps its own file. A
     # composed read-only step (it has a step_idx) always keeps its own file.
@@ -9461,14 +9475,18 @@ run_leg() {
     # throughout, by the existing rule that --review-model never changed.
     local leg_pi_session_dir="$pi_session_dir"
     local leg_usage_source="$usage_source"
-    local leg_formatter="$formatter"
+    # leg_formatter is not local -- same "public output" reason as leg_tag
+    # above: fs_refresh_chain reuses THIS leg's own formatter for every
+    # continuation in its chain.
+    leg_formatter="$formatter"
     # The harness THIS leg actually runs on -- $review_preamble_harness for a
     # review leg (set above beside the review preamble: $review_harness when
     # --review-harness was given, $harness otherwise), $harness for a fix
     # leg, which never overrides it. fs_archive_inbox's Stop-contract
     # invariant only holds for whichever harness this is, not for the
-    # implement harness unconditionally.
-    local leg_harness="$harness"
+    # implement harness unconditionally. Not local, for the same reason:
+    # fs_refresh_chain gates a leg's whole chain on this being "claude".
+    leg_harness="$harness"
     if [[ -n "$step_idx" ]]; then
         # A composed step's own seat: resolved by the seat-resolution loop
         # into "s<K>_*"/"s<K>fix_*" and serialized into this same run.sh's
@@ -9555,6 +9573,15 @@ run_leg() {
             fi
         done
     fi
+    # The fully-resolved argv this leg actually runs, in a global (not
+    # local) array: fs_refresh_chain reuses it unchanged for every
+    # continuation in this leg's own chain -- a "code"/"fix"/"mntfix" leg
+    # never carries --session-state (see the comment below on what these
+    # legs do NOT inherit), so a continuation is just another fresh,
+    # never-resumed run of this same argv against a different prompt file,
+    # with no "cont_sandbox_cmd" distinction to make the way the top-level
+    # implement leg needs one.
+    leg_seat_cmd=("${cmd[@]}")
 
     # The branch head as of just before the leg, for the retry-exhaustion
     # check in this leg's accounting: for a code, fix or mntfix leg, "the leg
@@ -9759,6 +9786,259 @@ run_leg() {
     fi
 }
 
+# ------------------------------------------------------ per-leg refresh --
+# Every code and fix leg refreshes the same way the step-1 implement leg
+# above always has; plan, review and maintain legs never do. run_leg (above)
+# runs a leg's own first attempt; arming the nudge before that call, and
+# draining whatever hand-off chain follows it, is the caller's job -- see
+# fs_refresh_arm/fs_refresh_chain below and the three call sites further
+# down (a code step's own pass loop, and the legacy and composed fix loops)
+# that use them. The step-1 implement leg's own chain, above, is untouched
+# by any of this: refresh_ended/continuations_json keep meaning exactly what
+# they always have.
+
+# Arm the inbox hook's nudge for the NEXT leg this sandbox launches, sized to
+# THAT leg's own model -- "each leg's threshold is computed against that
+# leg's own model's context window." $1 the model. A no-op when refresh is
+# disabled for the run. Must run BEFORE that leg's own run_leg call: the
+# hook reads this file from the very first turn of that leg's sandbox, not
+# only its continuations -- a leg nudged on pass 1 is exactly how the step-1
+# implement leg's own chain, above, already works.
+fs_refresh_arm() {
+    local model="$1"
+    [[ "$refresh_enabled" == "1" && -n "$refresh_config" ]] || return 0
+    local refresh_context_window refresh_threshold_tokens refresh_ceiling_tokens
+    # A hand-off still waiting in the shared outbox (the step-1 chain leaves
+    # its capped one there) belongs to an earlier leg; this leg's chain would
+    # otherwise take it as its own first continuation.
+    if [[ -e "$outbox_dir/handoff.md" || -L "$outbox_dir/handoff.md" ]]; then
+        fs_refresh_unclaimed_n=$(( ${fs_refresh_unclaimed_n:-0} + 1 ))
+        mv -f -- "$outbox_dir/handoff.md" \
+            "$run_dir/handoff-unclaimed-$fs_refresh_unclaimed_n.md" 2>/dev/null
+    fi
+    fs_refresh_window_for_model "$refresh_at" "$model"
+    {
+        printf 'THRESHOLD_TOKENS=%s\n' "$refresh_threshold_tokens"
+        printf 'OUTBOX_DIR=%s\n' "$outbox_dir"
+        printf 'CLONE_DIR=%s\n' "$clone_dir"
+        printf 'CEILING_TOKENS=%s\n' "$refresh_ceiling_tokens"
+    } > "$refresh_config"
+    fs_reject_unsafe_chars "$refresh_config"
+}
+
+# Disarm the nudge: no leg between this call and the next fs_refresh_arm may
+# be told to hand off. Every plan, review and maintain leg runs with this
+# disarmed, and every eligible leg's own chain disarms again the moment its
+# chain ends (fs_refresh_chain's own last act, below), so the window where
+# it is armed is never wider than one leg's own run_leg call plus its chain.
+fs_refresh_disarm() {
+    [[ -n "$refresh_config" ]] && rm -f -- "$refresh_config" 2>/dev/null
+    return 0
+}
+
+# Drain whatever hand-off chain follows a "code"/"fix"/"mntfix" leg that
+# run_leg (above) just ran, the same stall/cap/stale/nudge logic the step-1
+# implement leg's own chain uses, scoped to THIS leg instead of the whole
+# run: every artifact name carries $1, the leg's own tag (run_leg's own
+# $leg_tag, read back from the caller -- never "code-1"/"fix-1" bare, which
+# stay reserved for the step-1 implement leg's flat numbering so the two
+# schemes can never collide), so two legs that both refresh never overwrite
+# each other's hand-offs, prompts or event files.
+#
+# $1 leg tag, $2 kind (for log lines and the leg_refreshes_json record), $3
+# the model (for this leg's own window), $4 the original brief, $5 (optional)
+# a findings file -- a fix leg's own verdict text, so ITS chain carries what
+# that leg was asked to fix, not just the brief (decision: "a fix leg's
+# continuation still carries ... the findings it was given").
+#
+# A no-op when refresh is disabled, or this leg's own harness (run_leg's
+# $leg_harness, read back the same way) is not claude -- "a leg seated on a
+# non-claude harness simply does not refresh." On return: $leg_rc, $leg_cost
+# and $leg_usage are overwritten to describe the chain's LAST leg, the same
+# "judged by its last coding leg" rule the implement leg's own chain
+# applies -- so every existing caller that reads run_leg's own output
+# variables right after calling it keeps working unchanged merely by
+# calling this in between; $loop_cost_sum gains each continuation's own
+# cost, same accumulator every other leg already adds to; $next_leg_no
+# advances by one per continuation, so fs_archive_inbox's addenda ordering
+# stays one flat, run-wide sequence across every leg kind.
+fs_refresh_chain() {
+    local chain_tag="$1" chain_kind="$2" chain_model="$3" chain_brief="$4" \
+        chain_findings="${5:-}"
+    [[ "$refresh_enabled" == "1" && "$leg_harness" == "claude" ]] || return 0
+    local refresh_context_window refresh_threshold_tokens refresh_ceiling_tokens
+    fs_refresh_window_for_model "$refresh_at" "$chain_model"
+    fs_refresh_window_mismatch "$leg_events" "$refresh_context_window" \
+        | tee -a "$sandbox_log"
+
+    local chain_n=0 chain_ended="" chain_last_events="$leg_events" \
+        chain_head_before="" chain_outbox_before="" chain_next_n="" \
+        chain_record_name="" chain_cont_prompt="" chain_cont_events="" \
+        chain_leg_no="" chain_stale=0 chain_stale_json=false \
+        chain_summary_arr='[]' chain_cost_known=1 chain_cost_sum="${leg_cost:-0}" \
+        cont_cost="" cont_usage="" summed="" merged=""
+    [[ -n "$leg_cost" ]] || chain_cost_known=0
+    while :; do
+        if [[ "${stop_requested:-0}" == 1 ]]; then
+            chain_ended="stop-requested"
+            break
+        fi
+        if [[ -f "$outbox_dir/handoff.md" ]]; then
+            if fs_refresh_is_stall "$(( chain_n + 1 ))" \
+                "$chain_head_before" "$(clone_branch_head)" \
+                "$chain_outbox_before" "$(fs_refresh_outbox_sig "$outbox_dir")"; then
+                chain_ended="stalled"
+                mv -f -- "$outbox_dir/handoff.md" \
+                    "$run_dir/handoff-stalled-$chain_tag-$(( chain_n + 1 )).md" 2>/dev/null
+                printf 'fork-sandbox: %s leg %s continuation %s stalled (hand-off waiting, branch head and outbox unchanged); ending its refresh chain\n' \
+                    "$chain_kind" "$chain_tag" "$(( chain_n + 1 ))" | tee -a "$sandbox_log"
+                break
+            fi
+            if (( chain_n >= refresh_max )); then
+                chain_ended="cap"
+                # Same reason as the step-1 chain's own cap branch above:
+                # a hand-off left waiting here would be mistaken for the
+                # NEXT leg's own first continuation once fs_refresh_arm
+                # rearms, and would read as stale to the inbox hook once
+                # that leg commits.
+                mv -f -- "$outbox_dir/handoff.md" \
+                    "$run_dir/handoff-capped-$chain_tag-$(( chain_n + 1 )).md" 2>/dev/null
+                break
+            fi
+            chain_next_n=$(( chain_n + 1 ))
+            if ! fs_refresh_take_handoff "$outbox_dir" "$run_dir" \
+                "$chain_tag-c$chain_next_n" "$sandbox_log" > /dev/null; then
+                chain_ended="no-handoff"
+                break
+            fi
+            chain_n="$chain_next_n"
+            chain_leg_no="$next_leg_no"
+            next_leg_no=$(( next_leg_no + 1 ))
+            chain_record_name="handoff-$chain_tag-c$chain_n.md"
+            progress_continuation[cur_step_no]="$chain_n"
+
+            chain_stale=0
+            if fs_refresh_handoff_stale "$clone_dir" "$run_dir/$chain_record_name"; then
+                chain_stale=1
+                printf "fork-sandbox: %s predates the clone's last commit; %s leg %s continuation %s is warned\n" \
+                    "$chain_record_name" "$chain_kind" "$chain_tag" "$chain_n" | tee -a "$sandbox_log"
+            fi
+            chain_stale_json=false; (( chain_stale )) && chain_stale_json=true
+
+            chain_cont_prompt="$run_dir/continuation-prompt-$chain_tag-c$chain_n.md"
+            fs_refresh_build_prompt "$chain_n" "$run_dir/$chain_record_name" \
+                "$chain_cont_prompt" "$chain_stale" "$continuation_prompt_header" \
+                "$chain_brief" "$run_dir" "$plan_file" "$chain_findings"
+
+            jq -c -n --arg leg "$chain_tag" --argjson c "$chain_n" --arg handoff "$chain_record_name" \
+                '{type: "system", subtype: "fork_sandbox_continuation", leg: $leg, continuation: $c, handoff: $handoff}' \
+                >> "$leg_events" 2>/dev/null
+            printf '\n== fork-sandbox: %s leg %s, continuation %s (from %s) ==\n' \
+                "$chain_kind" "$chain_tag" "$chain_n" "$chain_record_name"
+
+            chain_cont_events="$run_dir/events-$chain_tag-continuation-$chain_n.jsonl"
+            : > "$chain_cont_events"
+            chain_head_before="$(clone_branch_head)"
+            chain_outbox_before="$(fs_refresh_outbox_sig "$outbox_dir")"
+            _fs_chain_attempt() {
+                if [[ -n "$leg_formatter" ]]; then
+                    fs_run_lock_closed "${leg_seat_cmd[@]}" < "$chain_cont_prompt" \
+                        2> >(tee -a "$sandbox_log" >&2) \
+                        | tee -a "$leg_events" -a "$chain_cont_events" \
+                        | "$leg_formatter"
+                else
+                    fs_run_lock_closed "${leg_seat_cmd[@]}" < "$chain_cont_prompt" \
+                        2> >(tee -a "$sandbox_log" >&2) \
+                        | tee -a "$leg_events" -a "$chain_cont_events"
+                fi
+                _fs_leg_attempt_rc="${PIPESTATUS[0]:-1}"
+            }
+            fs_run_claude_leg_with_retry "$leg_harness" "$chain_cont_events" "$sandbox_log" \
+                "the $chain_kind leg $chain_tag's continuation $chain_n" _fs_chain_attempt "$leg_formatter"
+            leg_rc="$fs_retry_rc"
+            total_leg_retries=$(( total_leg_retries + fs_retry_count ))
+            fs_archive_inbox "$chain_leg_no" "$leg_harness" "$leg_rc"
+            progress_write running
+            chain_last_events="$chain_cont_events"
+            fs_refresh_window_mismatch "$chain_cont_events" "$refresh_context_window" \
+                | tee -a "$sandbox_log"
+
+            cont_cost="$("$leg_formatter" --cost "$chain_cont_events" 2>/dev/null)"
+            cont_usage="$("$leg_formatter" --usage "$chain_cont_events" 2>/dev/null)"
+            [[ -n "$cont_usage" ]] || cont_usage=null
+            if [[ "$fs_retry_cost_unknown" == 1 ]]; then
+                cont_cost=""
+            elif [[ -n "$fs_retry_extra_cost" ]]; then
+                if [[ "$cont_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                    cont_cost="$(jq -n --argjson a "$cont_cost" --argjson b "$fs_retry_extra_cost" \
+                        '$a + $b' 2>/dev/null)"
+                else
+                    cont_cost=""
+                fi
+            fi
+            if [[ "$cont_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                chain_cost_sum="$(jq -n --argjson a "$chain_cost_sum" --argjson b "$cont_cost" \
+                    '$a + $b' 2>/dev/null)"
+                [[ -n "$chain_cost_sum" ]] || { chain_cost_sum=0; chain_cost_known=0; }
+                summed="$(jq -n --argjson a "$loop_cost_sum" --argjson b "$cont_cost" \
+                    '$a + $b' 2>/dev/null)"
+                if [[ -n "$summed" ]]; then
+                    loop_cost_sum="$summed"
+                else
+                    loop_cost_unknown=1
+                fi
+            else
+                cont_cost=null
+                chain_cost_known=0
+                loop_cost_unknown=1
+            fi
+
+            merged="$(jq -c -n --argjson prev "$chain_summary_arr" --argjson c "$chain_n" \
+                --argjson exit "$leg_rc" --argjson cost "$cont_cost" --argjson usage "$cont_usage" \
+                --arg handoff "$chain_record_name" --argjson handoff_stale "$chain_stale_json" \
+                --argjson retries "$fs_retry_records" \
+                '$prev + [{continuation: $c, exit: $exit, cost_usd: $cost, usage: $usage, handoff: $handoff, handoff_stale: $handoff_stale, retries: $retries}]' \
+                2>/dev/null)"
+            [[ -n "$merged" ]] && chain_summary_arr="$merged"
+
+            if [[ "$leg_rc" != "0" ]]; then
+                if [[ -f "$outbox_dir/handoff.md" && ! -L "$outbox_dir/handoff.md" ]]; then
+                    mv -f -- "$outbox_dir/handoff.md" \
+                        "$run_dir/handoff-$chain_tag-after-error.md" 2>/dev/null
+                fi
+                chain_ended="leg-error"
+                break
+            fi
+            continue
+        fi
+        if fs_refresh_leg_was_nudged "$chain_last_events"; then
+            chain_ended="no-handoff"
+        else
+            chain_ended="empty-outbox"
+        fi
+        break
+    done
+    [[ -n "$chain_ended" ]] || chain_ended="none"
+    if (( chain_cost_known )); then
+        leg_cost="$chain_cost_sum"
+    else
+        leg_cost=""
+    fi
+    # A single leg's whole chain is one conversation per sub-leg, not one --
+    # usage is only meaningful when there is exactly one to report, same
+    # rule the fix loops below already apply to a multi-pass fix round.
+    (( chain_n > 0 )) && leg_usage=null
+    merged="$(jq -c -n --argjson prev "$leg_refreshes_json" --arg leg "$chain_tag" \
+        --arg kind "$chain_kind" --arg ended "$chain_ended" \
+        --argjson continuations "$chain_summary_arr" \
+        '$prev + [{leg: $leg, kind: $kind, ended: $ended, continuations: $continuations}]' \
+        2>/dev/null)"
+    [[ -n "$merged" ]] && leg_refreshes_json="$merged"
+    printf 'fork-sandbox: %s leg %s: refresh ended %s (%s continuation leg(s) ran)\n' \
+        "$chain_kind" "$chain_tag" "$chain_ended" "$chain_n"
+    fs_refresh_disarm
+}
+
 # Walk every run's steps -- composed and legacy-translated alike -- after
 # the first code leg. Both step flavors share this same run_leg
 # accounting primitive; cur_legacy (set per-step below) branches the
@@ -9850,6 +10130,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             # the same rule the review/maintain loop below applies to its
             # own cur_i.
             progress_i[cur_step_no]="$cur_pass"
+            progress_continuation[cur_step_no]=0
             progress_write running
             # Built fresh for every pass, like the fix prompt below, so an
             # addendum archived by an earlier pass reaches this one. With
@@ -9863,7 +10144,22 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                   printf '%s\n' "$cur_code_addenda"; } > "$cur_code_prompt.part"
                 mv -f "$cur_code_prompt.part" "$cur_code_prompt"
             fi
+            # A legacy code step has no per-step seat of its own -- every
+            # pass runs the implement model/harness, $model/$harness, the
+            # same as run_leg's own fallback for a "code" kind leg with no
+            # step_idx. A composed step's own seat, cur_model/cur_harness
+            # (resolved once per step above), applies to its code passes
+            # too -- the branch above that sets them does not gate on
+            # cur_kind.
+            cur_code_model="$cur_model"; cur_code_harness="$cur_harness"
+            [[ "$cur_legacy" == 1 ]] && { cur_code_model="$model"; cur_code_harness="$harness"; }
+            if [[ "$refresh_enabled" == "1" && "$cur_code_harness" == "claude" ]]; then
+                fs_refresh_arm "$cur_code_model"
+            else
+                fs_refresh_disarm
+            fi
             run_leg code "$cur_pass" "$cur_code_prompt" "$cur_step_idx"
+            fs_refresh_chain "$leg_tag" code "$cur_code_model" "$handoff_original" ""
             rc="$leg_rc"
             progress_write running
         done
@@ -9904,6 +10200,9 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         cur_plan_outbox_file="$outbox_dir/plan.md"
         rm -f -- "$cur_plan_outbox_file"
         cur_plan_head_before="$(clone_branch_head)"
+        # A plan leg never refreshes -- it is a short read-and-verdict leg,
+        # same as review and maintain, below.
+        fs_refresh_disarm
         run_leg plan 1 "$cur_prompt" "$cur_step_idx"
         rc="$leg_rc"
         cur_plan_head_after="$(clone_branch_head)"
@@ -10052,6 +10351,9 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         # the step's own state/ended are finalized once, after this whole
         # loop ends, below.
         progress_i[cur_step_no]="$cur_i"
+        # The review/maintain leg in flight never refreshes; the last fix
+        # leg's count must not linger through it.
+        progress_continuation[cur_step_no]=0
         progress_write running
         rm -f "$cur_verdict_file"
         if [[ "$cur_legacy" == 1 ]]; then
@@ -10222,6 +10524,10 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             cur_review_exit=null; cur_review_cost=null; cur_review_usage=null; cur_fix_exit=null; cur_fix_cost=null; cur_fix_usage=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
             cur_save_live
         fi
+        # A review/maintainer leg never refreshes -- it is a short
+        # read-and-verdict leg; the fix leg its FINDINGS verdict may spawn,
+        # below, is the one that does.
+        fs_refresh_disarm
         run_leg "$cur_kind" "$cur_i" "$cur_prompt_iter" "$cur_step_idx"
         # Tag with which leg retried: the review/maintainer leg and the fix
         # leg(s) below both fold their own retries into this one array, and
@@ -10297,6 +10603,29 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 [[ -n "${fxr_fix_prompt_header:-}" ]] && cur_fix_header="$fxr_fix_prompt_header"
                             fi
                             cur_fix_cost=null; cur_fix_known=1
+                            # A fix leg stays on the implement harness/model
+                            # throughout UNLESS a preset seated its own fix
+                            # agent (cur_fix_harness/cur_fix_model, resolved
+                            # above) -- the same fallback run_leg itself
+                            # applies when it picks this leg's own cmd/model.
+                            cur_fix_refresh_model="${cur_fix_model:-$model}"
+                            cur_fix_refresh_harness="${cur_fix_harness:-$harness}"
+                            # The findings this fix leg (every pass of it) was
+                            # asked to fix, stripped of the verdict's own
+                            # "## Report" section the same way the fix prompt
+                            # itself is -- a refresh chain on any pass carries
+                            # exactly what that pass's prompt carried, not the
+                            # whole verdict. The path is fixed up front, but
+                            # the file itself is only written once a pass
+                            # actually leaves a hand-off waiting for
+                            # fs_refresh_chain to read (below, right after
+                            # each pass's own run_leg) -- refresh defaults ON
+                            # for a claude seat, so "armed" alone is true on
+                            # almost every run; only a hand-off means the
+                            # chain will ever open this file, and a run that
+                            # never produces one must not leave it behind
+                            # (it isn't part of the legacy filename set).
+                            cur_fix_findings="$cur_fix_base-findings.md"
                             # A fix agent with repeat: N runs the fix as N
                             # passes -- distrust of a cheap model's premature
                             # "done": there is no early exit on a pass that
@@ -10325,8 +10654,36 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 # Leg-start/leg-end transitions for this fix pass --
                                 # a repeated or long-running fix leg must not leave
                                 # $updated stuck at the preceding review leg's write.
+                                progress_continuation[cur_step_no]=0
                                 progress_write running
+                                if [[ "$refresh_enabled" == "1" && "$cur_fix_refresh_harness" == "claude" ]]; then
+                                    fs_refresh_arm "$cur_fix_refresh_model"
+                                else
+                                    fs_refresh_disarm
+                                fi
                                 run_leg "$cur_fix_kind" "$cur_fix_leg" "$cur_fix_prompt"
+                                # Captured before fs_refresh_chain overwrites leg_cost with
+                                # the chain's total: fix_cost_usd keeps meaning this pass's
+                                # own leg, same as the implement leg's cost_usd field: a
+                                # continuation's cost lives only in leg_refreshes_json, never
+                                # folded in here too (decision 6: add fields, don't redefine).
+                                # Same reason for usage: fs_refresh_chain nulls leg_usage once
+                                # the chain has any continuation, so the base leg's own usage
+                                # has to be captured here or it is lost everywhere.
+                                cur_fix_pass_cost="$leg_cost"
+                                cur_fix_pass_usage="$leg_usage"
+                                # Write the findings file now, not before this pass ran: a
+                                # hand-off waiting in the outbox is exactly the condition
+                                # fs_refresh_chain's own loop checks first, so this is the
+                                # earliest point that is also never too late.
+                                if [[ "$refresh_enabled" == "1" && "$cur_fix_refresh_harness" == "claude" \
+                                    && -f "$outbox_dir/handoff.md" ]]; then
+                                    awk '/^## Report$/ { exit } { print }' "$cur_copy" \
+                                        > "$cur_fix_findings.part" \
+                                        && mv -f "$cur_fix_findings.part" "$cur_fix_findings"
+                                fi
+                                fs_refresh_chain "$leg_tag" "$cur_fix_kind" "$cur_fix_refresh_model" \
+                                    "$handoff_original" "$cur_fix_findings"
                                 # Tag this pass's own retries "fix" (never
                                 # $cur_fix_kind's internal mntfix spelling,
                                 # to match the shape documented at the
@@ -10341,13 +10698,13 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 [[ -n "$cur_retries" ]] || cur_retries='[]'
                                 cur_fix_exit="$leg_rc"
                                 progress_write running
-                                if [[ -n "$leg_cost" ]]; then
-                                    [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
+                                if [[ -n "$cur_fix_pass_cost" ]]; then
+                                    [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$cur_fix_pass_cost" '$a + $b')" || cur_fix_cost="$cur_fix_pass_cost"
                                 else cur_fix_known=0; fi
                                 [[ "$leg_rc" == 0 ]] || break
                             done
                             (( cur_fix_known )) || cur_fix_cost=null
-                            (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
+                            (( cur_fix_repeat == 1 )) && cur_fix_usage="${cur_fix_pass_usage:-null}"
                             cur_after="$(clone_branch_head)"
                             if [[ "$leg_rc" != 0 ]]; then
                                 cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
@@ -10386,6 +10743,13 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                     # fix/maintainer-fix block above.
                     cur_fix_base="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"
                     cur_fix_cost=null; cur_fix_known=1
+                    cur_fix_refresh_model="${cur_fix_model:-$model}"
+                    cur_fix_refresh_harness="${cur_fix_harness:-$harness}"
+                    # Same deferred findings-file write as the legacy fix
+                    # block above: the path is fixed here, the file itself
+                    # only written once a pass actually leaves a hand-off
+                    # waiting (below, right after each pass's own run_leg).
+                    cur_fix_findings="$cur_fix_base-findings.md"
                     for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
                         cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
                         cur_fix_prompt="$cur_fix_base.md"
@@ -10396,8 +10760,32 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                           fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt"
                         # Leg-start/leg-end transitions for this fix pass, same
                         # reason as the legacy fix block above.
+                        progress_continuation[cur_step_no]=0
                         progress_write running
-                        run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
+                        if [[ "$refresh_enabled" == "1" && "$cur_fix_refresh_harness" == "claude" ]]; then
+                            fs_refresh_arm "$cur_fix_refresh_model"
+                        else
+                            fs_refresh_disarm
+                        fi
+                        run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"
+                        # Same reason as the legacy fix block above: capture this pass's
+                        # own cost before fs_refresh_chain folds its continuations into
+                        # leg_cost, so fix_cost_usd does not double-count what
+                        # leg_refreshes_json already records per continuation. Same for
+                        # usage, which fs_refresh_chain nulls once the chain continues.
+                        cur_fix_pass_cost="$leg_cost"
+                        cur_fix_pass_usage="$leg_usage"
+                        # Same deferred write as the legacy fix block above: only once
+                        # this pass actually left a hand-off for fs_refresh_chain to read.
+                        if [[ "$refresh_enabled" == "1" && "$cur_fix_refresh_harness" == "claude" \
+                            && -f "$outbox_dir/handoff.md" ]]; then
+                            awk '/^## Report$/ { exit } { print }' "$cur_copy" \
+                                > "$cur_fix_findings.part" \
+                                && mv -f "$cur_fix_findings.part" "$cur_fix_findings"
+                        fi
+                        fs_refresh_chain "$leg_tag" fix "$cur_fix_refresh_model" \
+                            "$handoff_original" "$cur_fix_findings"
+                        cur_fix_exit="$leg_rc"
                         # Same tag as the legacy fix block above: "fix" plus,
                         # when there is more than one pass, which pass, so
                         # this leg's retries never collide with the
@@ -10408,13 +10796,13 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                             '$a + ($b | map(. + {leg: "fix"} + (if $multi == 1 then {pass: $pass} else {} end)))' 2>/dev/null)"
                         [[ -n "$cur_retries" ]] || cur_retries='[]'
                         progress_write running
-                        if [[ -n "$leg_cost" ]]; then
-                            [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
+                        if [[ -n "$cur_fix_pass_cost" ]]; then
+                            [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$cur_fix_pass_cost" '$a + $b')" || cur_fix_cost="$cur_fix_pass_cost"
                         else cur_fix_known=0; fi
                         [[ "$leg_rc" == 0 ]] || break
                     done
                     (( cur_fix_known )) || cur_fix_cost=null
-                    (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
+                    (( cur_fix_repeat == 1 )) && cur_fix_usage="${cur_fix_pass_usage:-null}"
                     cur_after="$(clone_branch_head)"
                     if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
                     elif [[ -z "$cur_after" ]]; then cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
@@ -11031,6 +11419,14 @@ loop_findings() {
         printf 'refresh:   %s continuation leg(s), ended %s\n' \
             "$refresh_leg_n" "$refresh_ended"
     fi
+    # One line per OTHER leg whose own chain ran at least one continuation,
+    # or was nudged and never wrote one -- the same "worth a line" rule as
+    # the step-1 implement leg's own refresh line above. A run with no code
+    # step past step 1 and no fix leg that ever refreshed reads exactly as
+    # it did before this feature existed.
+    jq -r '.[] | select((.continuations | length) > 0 or .ended == "no-handoff") |
+        "refresh:   \(.leg) (\(.kind)): \(.continuations | length) continuation leg(s), ended \(.ended)"' \
+        <<<"$leg_refreshes_json" 2>/dev/null || true
     # The total is printed only when it actually spent something beyond the
     # coding session's own cost, so a run with neither flag -- or with
     # neither ever doing anything -- reads exactly as it did before either
@@ -11210,6 +11606,7 @@ jq -n \
     --arg report_from "$report_from" \
     --argjson ro_steps "$ro_steps_json" \
     --argjson continuations "$continuations_json" \
+    --argjson leg_refreshes "$leg_refreshes_json" \
     --argjson outbox_bytes "$outbox_bytes" \
     --argjson outbox_max_bytes "$outbox_max_bytes" \
     --arg session_state "$session_state" \
@@ -11249,6 +11646,7 @@ jq -n \
         refresh: $refresh,
         report_from: $report_from,
         continuations: $continuations,
+        leg_refreshes: $leg_refreshes,
         outbox_bytes: $outbox_bytes,
         outbox_max_bytes: $outbox_max_bytes,
         usage: $usage,

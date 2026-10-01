@@ -1129,7 +1129,7 @@ pipeline:
 EOF
 
 bad "refresh keys on an agent off the first code seat are refused" \
-    "context refresh reaches only" <<'EOF'
+    "there is no per-seat refresh plumbing" <<'EOF'
 agents:
   coder:
     harness: claude
@@ -1623,18 +1623,24 @@ accepts "a review stage after a maintain stage compiles" \
 accepts "a plan stage before the code stage compiles" \
     --pipeline pfable-csonnet
 
-# --refresh-at's continuation chain only ever runs for a pipeline's own
-# step 1, and a plan step always sits there ahead of the code step it
-# plans for -- so it never engages on a plan-first pipeline. --dry-run
-# must say so instead of printing refresh_at=/refresh_threshold_tokens=
-# as if the chain will run (the claude default of 0.5 included).
+# A composed run's step-1 chain is sized against step 1's own seat model.
+out="$("$launcher" --dry-run --pipeline chaiku-rsonnet-chaiku --refresh-at 0.5 \
+    unused-project unused-handoff 2>/dev/null)"
+contains "a composed haiku step 1 refreshes against haiku's window" \
+    "$out" "refresh_context_window=200000"
+
+# --refresh-at's continuation chain now follows every code and fix leg,
+# wherever it sits -- including the code leg that follows a plan step -- so
+# a plan-first pipeline no longer gets a "will not engage" launch warning
+# (removed entirely; every eligible leg refreshes the same way regardless
+# of pipeline shape).
 "$launcher" --dry-run --pipeline pfable-csonnet --refresh-at 0.3 \
     unused-project unused-handoff >/dev/null 2>"$err"
-contains "a plan-first --pipeline with --refresh-at warns it will not engage" \
+lacks "a plan-first --pipeline with --refresh-at warns of nothing" \
     "$(cat "$err")" "will not engage"
 "$launcher" --dry-run --pipeline pfable-csonnet \
     unused-project unused-handoff >/dev/null 2>"$err"
-contains "the same warning fires on the claude refresh-at default too" \
+lacks "the claude refresh-at default warns of nothing either" \
     "$(cat "$err")" "will not engage"
 "$launcher" --dry-run --pipeline csonnet --refresh-at 0.3 \
     unused-project unused-handoff >/dev/null 2>"$err"

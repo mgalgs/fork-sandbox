@@ -448,6 +448,14 @@ launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
 # ~/src -- which it resolves against the scratch HOME above, so fixture
 # projects must live there too.
 mkdir -p "$launcher_home/src"
+# --review-loop (the fix-leg refresh scenario, below) refuses to start
+# unless the review kit's skill directories exist under $HOME/.claude/
+# skills -- real content is never read, only the path is quoted into the
+# review prompt, so an empty directory satisfies it. Same fixture
+# fork-sandbox-review-harness-test.sh and fork-sandbox-maintainer-test.sh
+# already set up.
+mkdir -p "$launcher_home/.claude/skills/commit-then-review" \
+    "$launcher_home/.claude/skills/code-review-portable"
 operator_archive_dir="$HOME/.claude/sandbox-handoffs"
 
 stub_bin="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-stub.XXXXXX)"
@@ -477,12 +485,29 @@ for a in "$@"; do
     prev="$a"
 done
 
-cat >/dev/null   # drain the prompt; its content is not needed by this stub
+# Captured, not drained: FAKE_VERDICT_*_LEGS (below) need the verdict path
+# the real prompt names, the same way fork-sandbox-preset-test.sh's own
+# stub reads it.
+prompt="$(cat)"
 
 n=0
 [[ -f "$FAKE_CLAUDE_COUNT_FILE" ]] && n="$(cat "$FAKE_CLAUDE_COUNT_FILE")"
 n=$(( n + 1 ))
 printf '%s' "$n" > "$FAKE_CLAUDE_COUNT_FILE"
+
+# The stub runs on the bare host, not inside bwrap, so it can read the
+# inbox's own .refresh-config directly -- fs_refresh_arm writes it before
+# EVERY armed leg and fs_refresh_disarm removes it right after, so a
+# snapshot taken here, mid-leg, is the only way a test gets to see what
+# THIS leg was actually armed with (property 3: each leg's own model's
+# window). Harmless when unarmed: the file is simply absent then.
+if [[ -n "$outbox" ]]; then
+    snapshot_run_dir="$(dirname "$outbox")"
+    if [[ -f "$snapshot_run_dir/inbox/.refresh-config" ]]; then
+        cp -f "$snapshot_run_dir/inbox/.refresh-config" \
+            "$snapshot_run_dir/refresh-config-snapshot-$n" 2>/dev/null
+    fi
+fi
 
 nudge_legs=",${FAKE_NUDGE_LEGS:-},"
 handoff_legs=",${FAKE_HANDOFF_LEGS:-},"
@@ -491,6 +516,17 @@ fail_legs=",${FAKE_FAIL_LEGS:-},"
 stale_legs=",${FAKE_STALE_LEGS:-},"
 addendum_legs=",${FAKE_ADDENDUM_LEGS:-},"
 nocommit_legs=",${FAKE_NOCOMMIT_LEGS:-},"
+# Composed-pipeline fixtures (the per-leg refresh tests, below): a plan
+# leg's own output (no commit -- a plan leg that commits fails the run);
+# a review/maintain leg's verdict, FINDINGS or APPROVED, written to
+# whichever path the prompt itself names (same grep
+# fork-sandbox-preset-test.sh's own stub uses); a plain commit with no
+# hand-off, for an implement/code leg this scenario does not want to
+# refresh.
+plan_legs=",${FAKE_PLAN_LEGS:-},"
+verdict_findings_legs=",${FAKE_VERDICT_FINDINGS_LEGS:-},"
+verdict_approved_legs=",${FAKE_VERDICT_APPROVED_LEGS:-},"
+commit_legs=",${FAKE_COMMIT_LEGS:-},"
 
 # The stub bypasses bwrap and its --bind-ro entirely, so it can write into
 # the inbox the same way a real fork-sandbox-say.sh would -- found the same
@@ -521,7 +557,41 @@ fi
 if [[ "${FAKE_NUDGE_LEGS:-}" == "all" || "$nudge_legs" == *",$n,"* ]]; then
     printf '{"type":"system","subtype":"hook_response","stderr":"fork-sandbox-refresh: nudged (usage >= 1 tokens)\\n"}\n'
 fi
-if [[ "${FAKE_SYMLINK_LEGS:-}" == "all" || "$symlink_legs" == *",$n,"* ]]; then
+if [[ -n "$outbox" ]] \
+    && { [[ "${FAKE_PLAN_LEGS:-}" == "all" ]] || [[ "$plan_legs" == *",$n,"* ]]; }; then
+    plan_run_dir="$(dirname "$outbox")"
+    mkdir -p "$plan_run_dir/outbox"
+    printf '# Plan\n\n## Mechanism\n\nStub plan body from call %s.\n' "$n" \
+        > "$plan_run_dir/outbox/plan.md"
+elif { [[ "${FAKE_VERDICT_FINDINGS_LEGS:-}" == "all" ]] || [[ "$verdict_findings_legs" == *",$n,"* ]]; } \
+    || { [[ "${FAKE_VERDICT_APPROVED_LEGS:-}" == "all" ]] || [[ "$verdict_approved_legs" == *",$n,"* ]]; }; then
+    verdict_clone_dir=""
+    for a in "$@"; do
+        [[ -d "$a/.git" ]] && verdict_clone_dir="$a"
+    done
+    verdict_name="$(printf '%s\n' "$prompt" \
+        | sed -nE 's#.*\.git/(s[0-9]+-verdict\.md|maintainer-verdict\.md|review-verdict\.md).*#\1#p' \
+        | head -1)"
+    [[ -n "$verdict_name" ]] || verdict_name=review-verdict.md
+    if [[ -n "$verdict_clone_dir" ]]; then
+        if [[ "${FAKE_VERDICT_FINDINGS_LEGS:-}" == "all" ]] || [[ "$verdict_findings_legs" == *",$n,"* ]]; then
+            printf 'FINDINGS\n\nfile.txt:1 the stub found a problem on call %s\n\n## Report\nIgnore this.\n' "$n" \
+                > "$verdict_clone_dir/.git/$verdict_name"
+        else
+            printf 'APPROVED\n\nChecked: everything on call %s.\n\n## Report\nFine.\n' "$n" \
+                > "$verdict_clone_dir/.git/$verdict_name"
+        fi
+    fi
+elif [[ "${FAKE_COMMIT_LEGS:-}" == "all" || "$commit_legs" == *",$n,"* ]]; then
+    commit_clone_dir=""
+    for a in "$@"; do
+        [[ -d "$a/.git" ]] && commit_clone_dir="$a"
+    done
+    if [[ -n "$commit_clone_dir" ]]; then
+        git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+            -C "$commit_clone_dir" commit --allow-empty -q -m "stub commit from leg $n"
+    fi
+elif [[ "${FAKE_SYMLINK_LEGS:-}" == "all" || "$symlink_legs" == *",$n,"* ]]; then
     [[ -n "$outbox" ]] && ln -sf "${FAKE_SYMLINK_TARGET:-/etc/hostname}" "$outbox/handoff.md"
 elif [[ "${FAKE_HANDOFF_LEGS:-}" == "all" || "$handoff_legs" == *",$n,"* ]]; then
     if [[ -n "$outbox" ]]; then
@@ -616,6 +686,15 @@ run_real() {
     # An explicit, unique name per call sidesteps that instead of relying
     # on wall-clock spacing.
     branch_name="fs-refresh-test-$(date +%s%N)-$RANDOM"
+    # A composed pipeline (--pipeline) or a composed preset (--preset) names
+    # its own per-step harness in each segment and refuses an explicit
+    # --harness entirely -- so this scans the extra args for either rather
+    # than hardcoding --harness claude unconditionally the way every other
+    # scenario here wants.
+    local -a harness_flag=(--harness claude) extra_arg
+    for extra_arg in "$@"; do
+        [[ "$extra_arg" == "--pipeline" || "$extra_arg" == "--preset" ]] && harness_flag=()
+    done
     out="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" \
         FAKE_CLAUDE_COUNT_FILE="$count_file" \
         FAKE_NUDGE_LEGS="$nudge_legs" \
@@ -629,7 +708,11 @@ run_real() {
         FAKE_NOCOMMIT_LEGS="${FAKE_NOCOMMIT_LEGS:-}" \
         FAKE_OUTBOX_LEGS="${FAKE_OUTBOX_LEGS:-}" \
         FAKE_CONTEXT_WINDOW="${FAKE_CONTEXT_WINDOW:-}" \
-        timeout 60 "$launcher" --foreground --harness claude --branch "$branch_name" "$@" \
+        FAKE_PLAN_LEGS="${FAKE_PLAN_LEGS:-}" \
+        FAKE_VERDICT_FINDINGS_LEGS="${FAKE_VERDICT_FINDINGS_LEGS:-}" \
+        FAKE_VERDICT_APPROVED_LEGS="${FAKE_VERDICT_APPROVED_LEGS:-}" \
+        FAKE_COMMIT_LEGS="${FAKE_COMMIT_LEGS:-}" \
+        timeout 60 "$launcher" --foreground "${harness_flag[@]}" --branch "$branch_name" "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
     rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
@@ -1178,6 +1261,499 @@ if HOME="$launcher_home" PATH="$stub_bin:$PATH" "$launcher" --harness pi --model
 else
     contains "--harness pi --refresh-at 0.5 is refused" \
         "only works with --harness claude" "$(cat "$stub_bin/err")"
+fi
+
+# =====================================================================
+printf '\n== every code leg refreshes, not just step 1: a plan-then-code pipeline ==\n'
+# =====================================================================
+# invocation 1: the plan leg (no refresh -- plan legs never refresh).
+# invocation 2: the code step's own pass 1, nudged, hands off.
+# invocation 3: that leg's own continuation, ends empty-outbox.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_PLAN_LEGS=1
+rd="$(run_real "$proj" "$count_file" 2 2 --pipeline pfable-csonnet --refresh-at 0.5)"
+FAKE_PLAN_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "three legs ran (plan + the code step's pass 1 + its own continuation)" \
+        "3" "$(cat "$count_file")"
+    cont_prompt="$rd/continuation-prompt-s2-code-1-c1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        ok "the code step's own continuation prompt exists, named by its leg tag"
+        contains "it carries the original brief" "do the task" "$(cat "$cont_prompt")"
+        contains "it carries the plan section" "## The plan" "$(cat "$cont_prompt")"
+        contains "it carries the plan's own body" \
+            "Stub plan body from call 1" "$(cat "$cont_prompt")"
+        contains "it still carries the hand-off" \
+            "## Hand-off from the previous leg" "$(cat "$cont_prompt")"
+        brief_at="$(grep -n '## The original brief' "$cont_prompt" | head -1 | cut -d: -f1)"
+        plan_at="$(grep -n '## The plan' "$cont_prompt" | head -1 | cut -d: -f1)"
+        handoff_at="$(grep -n '## Hand-off from the previous leg' "$cont_prompt" | head -1 | cut -d: -f1)"
+        if [[ -n "$brief_at" && -n "$plan_at" && -n "$handoff_at" \
+            && "$brief_at" -lt "$plan_at" && "$plan_at" -lt "$handoff_at" ]]; then
+            ok "the plan sits between the brief and the hand-off"
+        else
+            no "the plan sits between the brief and the hand-off" \
+                "brief at $brief_at, plan at $plan_at, hand-off at $handoff_at"
+        fi
+    else
+        no "the code step's own continuation prompt exists, named by its leg tag"
+        no "it carries the original brief"
+        no "it carries the plan section"
+        no "it carries the plan's own body"
+        no "it still carries the hand-off"
+        no "the plan sits between the brief and the hand-off"
+    fi
+    if [[ -f "$rd/summary.json" ]]; then
+        check "summary.json's step-1 refresh field stays none (no implement leg ran)" \
+            "none" "$(jq -r '.refresh' "$rd/summary.json")"
+        check "summary.json's leg_refreshes has exactly one entry" \
+            "1" "$(jq '.leg_refreshes | length' "$rd/summary.json")"
+        check "the entry names the code step's own leg tag" \
+            "s2-code-1" "$(jq -r '.leg_refreshes[0].leg' "$rd/summary.json")"
+        check "the entry's kind is code" \
+            "code" "$(jq -r '.leg_refreshes[0].kind' "$rd/summary.json")"
+        check "the entry ran exactly one continuation" \
+            "1" "$(jq '.leg_refreshes[0].continuations | length' "$rd/summary.json")"
+        check "the entry ended empty-outbox" \
+            "empty-outbox" "$(jq -r '.leg_refreshes[0].ended' "$rd/summary.json")"
+    else
+        no "summary.json's leg_refreshes has exactly one entry" "no summary.json"
+    fi
+    status_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd" 2>/dev/null)"
+    contains "fork-sandbox-status.sh reads the run without choking on the new continuation file" \
+        "mode:" "$status_out"
+fi
+
+# =====================================================================
+printf '\n== a per-leg chain records each continuation'"'"'s OWN handoff_stale, not the previous one'"'"'s ==\n'
+# =====================================================================
+# invocation 1: the plan leg. invocation 2: the code step's own pass 1,
+# nudged, hands off a STALE hand-off (FAKE_STALE_LEGS=2) -- so continuation
+# 1 reads a stale hand-off. invocation 3: continuation 1, nudged, hands off
+# a CLEAN hand-off -- so continuation 2 reads a clean one. invocation 4:
+# continuation 2, ends empty-outbox. If fs_refresh_chain records
+# handoff_stale from the previous iteration's value (the bug this
+# reproduces), continuations[0] reads false (leg 2's own staleness,
+# computed but not yet stored) and continuations[1] reads true (leg 2's
+# staleness, carried over instead of leg 3's).
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_PLAN_LEGS=1
+FAKE_STALE_LEGS=2
+rd="$(run_real "$proj" "$count_file" "2,3" "2,3" --pipeline pfable-csonnet --refresh-at 0.5)"
+FAKE_PLAN_LEGS=""
+FAKE_STALE_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "four legs ran (plan + the code step's pass 1 + two continuations)" \
+        "4" "$(cat "$count_file")"
+    if [[ -f "$rd/summary.json" ]]; then
+        check "the chain ran exactly two continuations" \
+            "2" "$(jq '.leg_refreshes[0].continuations | length' "$rd/summary.json")"
+        check "continuation 1 (reading leg 2's stale hand-off) is marked stale" \
+            "true" "$(jq -r '.leg_refreshes[0].continuations[0].handoff_stale' "$rd/summary.json")"
+        check "continuation 2 (reading leg 3's clean hand-off) is not marked stale" \
+            "false" "$(jq -r '.leg_refreshes[0].continuations[1].handoff_stale' "$rd/summary.json")"
+    else
+        no "the chain ran exactly two continuations" "no summary.json"
+        no "continuation 1 (reading leg 2's stale hand-off) is marked stale" "no summary.json"
+        no "continuation 2 (reading leg 3's clean hand-off) is not marked stale" "no summary.json"
+    fi
+    # progress.json's own additive field (decision 4: report every leg's
+    # continuations, without redefining what "i" means): the code step's
+    # entry carries the chain's final continuation count.
+    if [[ -f "$rd/progress.json" ]]; then
+        check "progress.json's code step reports two continuations ran" \
+            "2" "$(jq -r '.steps[1].continuation' "$rd/progress.json")"
+        check "progress.json's code step still reports i unchanged (pass 1, not redefined)" \
+            "1" "$(jq -r '.steps[1].i' "$rd/progress.json")"
+    else
+        no "progress.json's code step reports two continuations ran" "no progress.json"
+        no "progress.json's code step still reports i unchanged (pass 1, not redefined)" "no progress.json"
+    fi
+fi
+
+# =====================================================================
+printf '\n== progress.json does not carry a fix chain'"'"'s count into the next review leg ==\n'
+# =====================================================================
+# invocation 1: implement, commits. 2: review, FINDINGS. 3: fix, nudged,
+# hands off. 4: the fix leg's continuation. 5: review, approves.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_COMMIT_LEGS=1 FAKE_VERDICT_FINDINGS_LEGS=2
+rd="$(run_real "$proj" "$count_file" 3 3 --review-loop 2 --refresh-at 0.5)"
+FAKE_COMMIT_LEGS="" FAKE_VERDICT_FINDINGS_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "five legs ran (implement, review, fix, its continuation, review)" \
+        "5" "$(cat "$count_file")"
+    check "the review step's continuation count is back to 0 after the last review leg" \
+        "0" "$(jq -r '.steps[1].continuation' "$rd/progress.json" 2>/dev/null)"
+fi
+
+# =====================================================================
+printf '\n== fix legs refresh too, and their continuation carries the findings ==\n'
+# =====================================================================
+# invocation 1: the implement leg, a plain commit (this scenario is about
+# the FIX leg's own chain, so the implement leg itself must not refresh).
+# invocation 2: the review leg, FINDINGS, and delivers an operator
+# addendum -- so this chain can prove decision 7, that addenda keep
+# reaching every leg including a LATER leg's own continuation, not just
+# the step-1 implement leg's.
+# invocation 3: the fix leg, nudged, hands off.
+# invocation 4: the fix leg's own continuation, ends empty-outbox.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_COMMIT_LEGS=1 FAKE_VERDICT_FINDINGS_LEGS=2 FAKE_ADDENDUM_LEGS=2
+rd="$(run_real "$proj" "$count_file" 3 3 --review-loop 1 --refresh-at 0.5)"
+FAKE_COMMIT_LEGS="" FAKE_VERDICT_FINDINGS_LEGS="" FAKE_ADDENDUM_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "four legs ran (implement + review + fix + the fix leg's own continuation)" \
+        "4" "$(cat "$count_file")"
+    cont_prompt="$rd/continuation-prompt-fix-1-c1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        ok "the fix leg's own continuation prompt exists, named by its leg tag"
+        contains "it carries the original brief" "do the task" "$(cat "$cont_prompt")"
+        contains "it carries the findings section heading" \
+            "## The findings this leg was asked to fix" "$(cat "$cont_prompt")"
+        contains "it carries the finding text itself" \
+            "the stub found a problem on call 2" "$(cat "$cont_prompt")"
+        if grep -q 'Ignore this' "$cont_prompt"; then
+            no "the findings exclude the verdict's own Report section"
+        else
+            ok "the findings exclude the verdict's own Report section"
+        fi
+        contains "it carries the addendum delivered to the earlier review leg" \
+            "operator addendum for leg 2" "$(cat "$cont_prompt")"
+        contains "it still carries the hand-off" \
+            "## Hand-off from the previous leg" "$(cat "$cont_prompt")"
+        brief_at="$(grep -n '## The original brief' "$cont_prompt" | head -1 | cut -d: -f1)"
+        findings_at="$(grep -n '## The findings this leg was asked to fix' "$cont_prompt" | head -1 | cut -d: -f1)"
+        handoff_at="$(grep -n '## Hand-off from the previous leg' "$cont_prompt" | head -1 | cut -d: -f1)"
+        if [[ -n "$brief_at" && -n "$findings_at" && -n "$handoff_at" \
+            && "$brief_at" -lt "$findings_at" && "$findings_at" -lt "$handoff_at" ]]; then
+            ok "the findings section sits between the brief and the hand-off"
+        else
+            no "the findings section sits between the brief and the hand-off" \
+                "brief at $brief_at, findings at $findings_at, hand-off at $handoff_at"
+        fi
+    else
+        no "the fix leg's own continuation prompt exists, named by its leg tag"
+        no "it carries the original brief"
+        no "it carries the findings section heading"
+        no "it carries the finding text itself"
+        no "the findings exclude the verdict's own Report section"
+        no "it carries the addendum delivered to the earlier review leg"
+        no "it still carries the hand-off"
+        no "the findings section sits between the brief and the hand-off"
+    fi
+    if [[ -f "$rd/summary.json" ]]; then
+        # step 1 IS code here (a plain --review-loop run always has an
+        # implement leg) -- refresh runs for it exactly as it always has
+        # and ends empty-outbox (active, but never nudged), not "none"
+        # (which means refresh never ran for it at all -- see the
+        # plan-then-code scenario above, where step 1 truly has no
+        # implement leg).
+        check "summary.json's step-1 refresh field is empty-outbox (never nudged)" \
+            "empty-outbox" "$(jq -r '.refresh' "$rd/summary.json")"
+        check "summary.json has no step-1 continuations (only the fix leg's own chain ran)" \
+            "0" "$(jq '.continuations | length' "$rd/summary.json")"
+        check "summary.json's leg_refreshes has exactly one entry" \
+            "1" "$(jq '.leg_refreshes | length' "$rd/summary.json")"
+        check "the entry names the fix leg's own tag" \
+            "fix-1" "$(jq -r '.leg_refreshes[0].leg' "$rd/summary.json")"
+        check "the entry's kind is fix" \
+            "fix" "$(jq -r '.leg_refreshes[0].kind' "$rd/summary.json")"
+    else
+        no "summary.json's leg_refreshes has exactly one entry" "no summary.json"
+    fi
+    # review-loop.json's fix_cost_usd keeps meaning the fix leg's own pass
+    # alone (decision 6: existing field meanings do not change) -- the
+    # stub always prices a call at 0.01, so a chain-inclusive fix_cost_usd
+    # would read 0.02 here, double-counting the same continuation cost
+    # leg_refreshes[0].continuations[0].cost_usd already carries.
+    if [[ -f "$rd/review-loop.json" ]]; then
+        check "review-loop.json's fix_cost_usd is this pass's own leg, not the chain total" \
+            "0.01" "$(jq -r '.iterations[0].fix_cost_usd' "$rd/review-loop.json")"
+        # Same decision-6 rule applies to fix_usage: fs_refresh_chain nulls
+        # leg_usage once the chain has run any continuation (a single
+        # leg's chain is one conversation per sub-leg, so "the usage"
+        # stops being single-valued), but the base fix leg's OWN usage was
+        # known and must not be thrown away just because its chain
+        # continued -- it has to be captured before the chain call, the
+        # same way fix_cost_usd already is.
+        check "review-loop.json's fix_usage is the base fix leg's own usage, not null" \
+            "100" "$(jq -r '.iterations[0].fix_usage.input_tokens' "$rd/review-loop.json")"
+    else
+        no "review-loop.json's fix_cost_usd is this pass's own leg, not the chain total" \
+            "no review-loop.json"
+        no "review-loop.json's fix_usage is the base fix leg's own usage, not null" \
+            "no review-loop.json"
+    fi
+fi
+
+# =====================================================================
+printf '\n== a repeat code pass refreshes too, in a legacy-shaped (non-composed) run ==\n'
+# =====================================================================
+# --pipeline chaiku2 compiles to plain legacy flags (harness/model/
+# code_repeat=2), not a composed pipeline: two legacy artifact-naming
+# claims this scenario checks that the step-1 claims above cannot --
+# "code-2" (no step index at all) and the LEGACY event-file regex in
+# fork-sandbox-status.sh, not the composed s<K>- one.
+# invocation 1: pass 1 (the implement leg), a plain commit, no refresh.
+# invocation 2: pass 2, nudged, hands off.
+# invocation 3: pass 2's own continuation, ends empty-outbox.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_COMMIT_LEGS=1
+rd="$(run_real "$proj" "$count_file" 2 2 --pipeline chaiku2 --refresh-at 0.5)"
+FAKE_COMMIT_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "three legs ran (pass 1 + pass 2 + pass 2's own continuation)" \
+        "3" "$(cat "$count_file")"
+    cont_events="$rd/events-code-2-continuation-1.jsonl"
+    marker "pass 2's own continuation events file exists, flat-named (no step index)" \
+        "$cont_events" yes
+    cont_prompt="$rd/continuation-prompt-code-2-c1.md"
+    marker "pass 2's own continuation prompt exists, flat-named (no step index)" \
+        "$cont_prompt" yes
+    if [[ -f "$rd/summary.json" ]]; then
+        check "the entry names the repeat pass's own leg tag" \
+            "code-2" "$(jq -r '.leg_refreshes[0].leg' "$rd/summary.json")"
+        check "the entry's kind is code" \
+            "code" "$(jq -r '.leg_refreshes[0].kind' "$rd/summary.json")"
+        check "the entry ran exactly one continuation" \
+            "1" "$(jq '.leg_refreshes[0].continuations | length' "$rd/summary.json")"
+    else
+        no "the entry names the repeat pass's own leg tag" "no summary.json"
+    fi
+    status_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd" 2>/dev/null)"
+    contains "fork-sandbox-status.sh reads the legacy-shaped run without choking" \
+        "mode:" "$status_out"
+fi
+
+# =====================================================================
+printf '\n== a composed pipeline'"'"'s own fix leg refreshes too (not just its code leg) ==\n'
+# =====================================================================
+# pfable-csonnet-rsonnet: plan, code, review -- composed (a plan step
+# always makes a pipeline composed), unlike the plain --review-loop
+# scenario above, which is legacy-shaped. The composed fix loop (a
+# DIFFERENT call site in the walker from the legacy one just exercised)
+# rides the review step's own step_idx, so its leg tag is "s3-fix-1", not
+# "fix-1".
+# invocation 1: the plan leg.
+# invocation 2: the code step's own pass 1, a plain commit (this scenario
+# is about the FIX leg's own chain).
+# invocation 3: the review leg, FINDINGS.
+# invocation 4: the fix leg, nudged, hands off.
+# invocation 5: the fix leg's own continuation, ends empty-outbox.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_PLAN_LEGS=1 FAKE_COMMIT_LEGS=2 FAKE_VERDICT_FINDINGS_LEGS=3
+rd="$(run_real "$proj" "$count_file" 4 4 --pipeline pfable-csonnet-rsonnet --refresh-at 0.5)"
+FAKE_PLAN_LEGS="" FAKE_COMMIT_LEGS="" FAKE_VERDICT_FINDINGS_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "five legs ran (plan + code + review + fix + the fix leg's own continuation)" \
+        "5" "$(cat "$count_file")"
+    cont_prompt="$rd/continuation-prompt-s3-fix-1-c1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        ok "the composed fix leg's own continuation prompt exists, named by its leg tag"
+        contains "it carries the findings section heading" \
+            "## The findings this leg was asked to fix" "$(cat "$cont_prompt")"
+        contains "it carries the finding text itself" \
+            "the stub found a problem on call 3" "$(cat "$cont_prompt")"
+    else
+        no "the composed fix leg's own continuation prompt exists, named by its leg tag"
+        no "it carries the findings section heading"
+        no "it carries the finding text itself"
+    fi
+    if [[ -f "$rd/summary.json" ]]; then
+        # Two entries now: the code step's own (eligible, but never nudged
+        # -- FAKE_COMMIT_LEGS, not FAKE_NUDGE_LEGS, isolates this scenario
+        # to the fix leg's own chain) and the fix leg's own, found by kind
+        # rather than assumed at index 0.
+        check "two leg_refreshes entries (the code step's own, and the fix leg's)" \
+            "2" "$(jq '.leg_refreshes | length' "$rd/summary.json")"
+        check "the fix entry names the composed fix leg's own tag" \
+            "s3-fix-1" "$(jq -r '.leg_refreshes[] | select(.kind == "fix") | .leg' "$rd/summary.json")"
+        check "the fix entry ran exactly one continuation" \
+            "1" "$(jq -r '.leg_refreshes[] | select(.kind == "fix") | .continuations | length' "$rd/summary.json")"
+        check "the code entry ran zero continuations (never nudged)" \
+            "0" "$(jq -r '.leg_refreshes[] | select(.kind == "code") | .continuations | length' "$rd/summary.json")"
+    else
+        no "the fix entry names the composed fix leg's own tag" "no summary.json"
+    fi
+    status_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd" 2>/dev/null)"
+    contains "fork-sandbox-status.sh reads the composed fix-leg run without choking" \
+        "mode:" "$status_out"
+fi
+
+# =====================================================================
+printf '\n== each leg is armed against its OWN model'"'"'s window, and continuation costs are counted once ==\n'
+# =====================================================================
+# --pipeline's grammar has no fix_agent syntax, so every scenario above
+# that exercises a composed fix leg rides the code seat's own model --
+# never proving decision 3 ("each leg's threshold is computed against
+# that leg's own model's context window") against a leg whose model
+# actually differs from the run's. A preset can seat a fix_agent of its
+# own, so this one puts the code step on sonnet (a 1,000,000-token window)
+# and the review step's fix seat on haiku (the 200,000-token exception),
+# both armed by the same run-level --refresh-at 0.5.
+#
+# invocation 1: the plan leg (never armed).
+# invocation 2: the code leg (sonnet), nudged, hands off.
+# invocation 3: the code leg's own continuation, ends empty-outbox.
+# invocation 4: the review leg (never armed), FINDINGS.
+# invocation 5: the fix leg (haiku), nudged, hands off.
+# invocation 6: the fix leg's own continuation, ends empty-outbox.
+#
+# The stub prices every leg at 0.01 regardless of model, so six legs --
+# two of them (2 and 5) not at step 1 -- give an exact total_cost_usd of
+# 0.06, proving decision 5 (a continuation's cost is counted in the run's
+# total exactly once) without rounding or an inequality to hide a
+# double-count or a drop behind.
+preset_cfg_dir="$(mktemp -d)"; tmpdirs+=("$preset_cfg_dir")
+mkdir -p "$preset_cfg_dir/presets"
+cat > "$preset_cfg_dir/presets/fs-refresh-leg-model-test.yaml" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: fable
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+  haikufix:
+    harness: claude
+    model: haiku
+
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: haikufix
+EOF
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_PLAN_LEGS=1 FAKE_VERDICT_FINDINGS_LEGS=4
+export FORK_SANDBOX_CONFIG_DIR="$preset_cfg_dir"
+rd="$(run_real "$proj" "$count_file" "2,5" "2,5" --preset fs-refresh-leg-model-test --refresh-at 0.5)"
+unset FORK_SANDBOX_CONFIG_DIR
+FAKE_PLAN_LEGS="" FAKE_VERDICT_FINDINGS_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "six legs ran (plan + code pass 1 + its continuation + review + fix pass 1 + its continuation)" \
+        "6" "$(cat "$count_file")"
+    check "the code leg (sonnet) is armed at half of its 1,000,000-token window" \
+        "THRESHOLD_TOKENS=500000" \
+        "$(grep '^THRESHOLD_TOKENS=' "$rd/refresh-config-snapshot-2" 2>/dev/null)"
+    check "the code leg's continuation stays armed the same way" \
+        "THRESHOLD_TOKENS=500000" \
+        "$(grep '^THRESHOLD_TOKENS=' "$rd/refresh-config-snapshot-3" 2>/dev/null)"
+    check "the fix leg (haiku) is armed at half of ITS OWN, smaller window -- not the code leg's" \
+        "THRESHOLD_TOKENS=100000" \
+        "$(grep '^THRESHOLD_TOKENS=' "$rd/refresh-config-snapshot-5" 2>/dev/null)"
+    check "the fix leg's continuation stays armed the same way" \
+        "THRESHOLD_TOKENS=100000" \
+        "$(grep '^THRESHOLD_TOKENS=' "$rd/refresh-config-snapshot-6" 2>/dev/null)"
+    marker "the plan leg is never armed" "$rd/refresh-config-snapshot-1" no
+    marker "the review leg is never armed" "$rd/refresh-config-snapshot-4" no
+    if [[ -f "$rd/summary.json" ]]; then
+        check "total_cost_usd sums all six legs exactly once, not approximately" \
+            "0.060000" "$(jq -r '.total_cost_usd' "$rd/summary.json")"
+        check "the code leg's own chain is recorded under its leg tag" \
+            "1" "$(jq '[.leg_refreshes[] | select(.leg == "s2-code-1")] | length' "$rd/summary.json")"
+        check "the fix leg's own chain is recorded under its leg tag, a non-step-1 leg that refreshed" \
+            "1" "$(jq '[.leg_refreshes[] | select(.leg == "s3-fix-1")] | length' "$rd/summary.json")"
+    else
+        no "total_cost_usd sums all six legs exactly once, not approximately" "no summary.json"
+    fi
+fi
+
+# =====================================================================
+printf '\n== a chain that ends on the cap leaves nothing for the next leg to misread ==\n'
+# =====================================================================
+# Two review-loop iterations, --refresh-max 1: iteration 1's fix leg's own
+# chain is capped after exactly one continuation, which (before the fix)
+# left outbox/handoff.md behind for fs_refresh_arm to re-arm into iteration
+# 2's own fix leg -- whose fs_refresh_chain call would then find that
+# leftover hand-off waiting before it had even run itself, and launch a
+# bogus, paid continuation seeded with iteration 1's hand-off instead of
+# its own.
+# invocation 1: the implement leg, a plain commit.
+# invocation 2: review leg 1, FINDINGS.
+# invocation 3: fix leg 1 pass 1, nudged, hands off.
+# invocation 4: fix leg 1's own continuation, nudged, hands off again --
+# chain_n reaches 1 == --refresh-max, so the chain ends on the cap here.
+# invocation 5: review leg 2, FINDINGS.
+# invocation 6: fix leg 2 pass 1, a plain commit, never nudged -- its own
+# chain must find nothing waiting and end empty-outbox with zero
+# continuations. A leftover hand-off from iteration 1 would instead launch
+# an invocation 7 here.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_COMMIT_LEGS="1,6" FAKE_VERDICT_FINDINGS_LEGS="2,5"
+rd="$(run_real "$proj" "$count_file" "3,4" "3,4" --review-loop 2 --refresh-at 0.5 --refresh-max 1)"
+FAKE_COMMIT_LEGS="" FAKE_VERDICT_FINDINGS_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "six legs ran (no bogus continuation seeded from iteration 1's hand-off)" \
+        "6" "$(cat "$count_file")"
+    if [[ -f "$rd/summary.json" ]]; then
+        check "two leg_refreshes entries (one fix chain per iteration)" \
+            "2" "$(jq '.leg_refreshes | length' "$rd/summary.json")"
+        check "iteration 1's fix chain ran exactly one continuation" \
+            "1" "$(jq -r '.leg_refreshes[0].continuations | length' "$rd/summary.json")"
+        check "iteration 1's fix chain ended at the cap" \
+            "cap" "$(jq -r '.leg_refreshes[0].ended' "$rd/summary.json")"
+        check "iteration 2's fix chain ran zero continuations" \
+            "0" "$(jq -r '.leg_refreshes[1].continuations | length' "$rd/summary.json")"
+        check "iteration 2's fix chain ended empty-outbox, not seeded from leftovers" \
+            "empty-outbox" "$(jq -r '.leg_refreshes[1].ended' "$rd/summary.json")"
+    else
+        no "two leg_refreshes entries (one fix chain per iteration)" "no summary.json"
+    fi
+    if [[ -f "$rd/handoff-capped-fix-1-2.md" ]]; then
+        ok "the capped hand-off was moved aside into the run dir"
+    else
+        no "the capped hand-off was moved aside into the run dir" \
+            "no handoff-capped-fix-1-2.md"
+    fi
+    check "the capped hand-off was moved out of the outbox" \
+        "0" "$([[ -f "$rd/outbox/handoff.md" ]] && echo 1 || echo 0)"
+fi
+
+# =====================================================================
+printf '\n== the step-1 chain'"'"'s capped hand-off stays put unless a later leg is armed ==\n'
+# =====================================================================
+# No later leg: invocation 1 implement and 2 its continuation both hand
+# off; the cap ends the chain and the hand-off stays in the outbox.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+rd="$(run_real "$proj" "$count_file" "1,2" "1,2" --refresh-at 0.5 --refresh-max 1)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "step-1 alone: the chain ended at the cap" \
+        "cap" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+    check "step-1 alone: the capped hand-off is still in the outbox" \
+        "1" "$([[ -f "$rd/outbox/handoff.md" ]] && echo 1 || echo 0)"
+fi
+# A later fix leg: 3 review FINDINGS, 4 fix commits, never nudged. Its
+# chain must not take step 1's leftover as its own (no invocation 5).
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_COMMIT_LEGS=4 FAKE_VERDICT_FINDINGS_LEGS=3
+rd="$(run_real "$proj" "$count_file" "1,2" "1,2" --review-loop 1 --refresh-at 0.5 --refresh-max 1)"
+FAKE_COMMIT_LEGS="" FAKE_VERDICT_FINDINGS_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "with a fix leg: four legs ran, no continuation seeded from step 1" \
+        "4" "$(cat "$count_file")"
+    check "with a fix leg: its chain ended empty-outbox" \
+        "empty-outbox" "$(jq -r '.leg_refreshes[0].ended' "$rd/summary.json" 2>/dev/null)"
+    check "with a fix leg: step 1's hand-off was moved aside before it armed" \
+        "1" "$([[ -f "$rd/handoff-unclaimed-1.md" ]] && echo 1 || echo 0)"
 fi
 
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
