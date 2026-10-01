@@ -71,8 +71,15 @@
 #   harvest      agent, thread, replies=<count posted this pass>
 #   flag         thread, reason=<fixed keyword> (no agent -- a thread-level
 #                condition, not a per-agent one; see pm_flag_keyword)
-#   refuse       agent, thread, reason=hops|budget|no-grant -- an agent's
-#                wake was refused (X-Hops or thread-budget gate, or a
+#   defer        thread, agent, reason=wake-when -- the seat's wake gate
+#                (rule 5) answered "not now": no spawn, no budget slot
+#   wake-gate-error thread, agent, reason=exit <N>|timeout|missing|context --
+#                a wake gate could not answer, so the seat was woken anyway
+#   refuse       agent, thread, reason=hops|budget|budget-reserved|no-grant --
+#                an agent's
+#                wake was refused (X-Hops or thread-budget gate, a seat
+#                outside the budget reserve while the thread is in its
+#                band (rule 3), or a
 #                `backend: k8s` seat with `grant: required` and no grant
 #                file yet for this thread -- see "Cluster seats" below);
 #                the thread itself is also separately flag'd for hops and
@@ -196,6 +203,8 @@
 # A hook is detached (setsid, stdin /dev/null, output in a log file) and
 # never blocks routing or harvest; it runs under $FORK_SANDBOX_HOOK_TIMEOUT
 # seconds (default 300, then SIGKILL 10 s after SIGTERM). See pm_hook_fire.
+# wake-when.<suffix> lives in the same dir but is not one of these events:
+# it runs synchronously, per seat, before a spawn (rule 5).
 # FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline runs hooks in the foreground:
 # a test seam only.
 #
@@ -283,7 +292,19 @@
 #      reason "thread budget <n> exhausted". Checked once per message,
 #      not once per candidate: a message addressing several agents with
 #      one budget slot left still spawns all of them (v1 does not ration
-#      within a single message).
+#      within a single message) -- except in a reserve band. A fleet
+#      `budget-reserve:` block (spawns: N, agents: [...]) makes the last N
+#      spawns the listed seats' alone: with budget-N <= spawns-so-far <
+#      budget only those seats spawn, judged per candidate. Every other
+#      candidate gets `refuse ... reason=budget-reserved` and a line in
+#      $STATE/budget-reserved/<tid> (`<agent> <message-id>`, cleared when
+#      that seat spawns), and the thread is NOT flagged then; a thread that
+#      goes quiescent with a line standing is flagged once per message
+#      count (keyword budget-reserved, reason "thread budget <n>: @a
+#      refused at <mid> (last <N> spawns reserved for @x, @y) and nothing
+#      woke it"). At or past the budget the exhausted gate is unchanged.
+#      A reserve of N >= budget refuses startup (exit 2). pm_followup_wake
+#      applies the same band.
 #   4. One wake per (agent, message), regardless of which header named it:
 #      an agent named in To and/or Cc (directly or via a list, including
 #      both headers at once, or the same header twice via two lists)
@@ -311,8 +332,33 @@
 #      harness, or the wake died first -- rules 2-3 are re-checked and a
 #      follow-up wake is spawned for the newest pending message exactly as
 #      before live delivery existed.
+#   5. Wake gate: a seat with `wake-when: <suffix>` (fleet.yaml-only) has
+#      $FORK_SANDBOX_HOOKS_DIR/wake-when.<suffix> run before it is SPAWNED
+#      (pm_spawn_wake, the one choke point: a new message and a pending
+#      message's follow-up wake). Not gated: a retry or a held seat's
+#      release (already admitted), delivery into a live run (rule 4), and
+#      a message whose From is an operator (rule 1's test). Exit 0 wakes;
+#      exit 1 defers -- no spawn, no budget slot, `defer` event, the
+#      trigger dropped, the seat recorded in $STATE/wake-deferred/<tid>
+#      (`<agent> <message-id>`, cleared when it spawns by any path; a
+#      quiescent thread with a line standing is flagged once per message
+#      count, keyword wake-deferred, "wake deferred: @a at <mid> and
+#      nothing woke it"; with a budget-reserved record too, one flag,
+#      reasons joined by "; ", keyword wake-deferred,budget-reserved).
+#      Anything else fails open (wake + `wake-gate-error`): another exit
+#      status, a timeout ($FORK_SANDBOX_WAKE_GATE_TIMEOUT, default 30 s),
+#      a missing or non-executable hook, or a failure to build its
+#      context. It runs synchronously UNDER THE STORE LOCK, so it must
+#      only read the store, and never inherits the lock fd. Its
+#      environment is the hook one (FS_HOOK_EVENT=wake-when, THREAD,
+#      MAIL_ROOT, REPO, target vars) plus FS_HOOK_AGENT, FS_HOOK_MESSAGE,
+#      FS_HOOK_MESSAGE_FILE (the trigger's .msg, absolute),
+#      FS_HOOK_EXPORT_FILE (= `mail export <tid> --json`) and
+#      FS_HOOK_STATUS_FILE (= `status --thread <tid> --json`), the last two
+#      in a temp dir under $STATE removed when the gate returns. Output
+#      goes to $STATE/hooks/logs/.
 #
-#   A candidate that clears rules 0-4 is spawned per THE WAKE below -- unless
+#   A candidate that clears rules 0-5 is spawned per THE WAKE below -- unless
 #   its seat declares `handler: exec` (fleet resolve's handler/command
 #   fields), in which case it runs synchronously per THE WAKE's handler
 #   variant instead of a sandbox spawn: no live delivery either (rule 4's

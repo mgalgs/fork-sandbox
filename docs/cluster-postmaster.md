@@ -223,7 +223,9 @@ like handlers do. The installer reads the laptop dir `hooks/` (under the
 same config dir as `handlers/`), takes executable files only, and puts
 them in the ConfigMap `fork-sandbox-postmaster-hooks` as flat files
 (`on-<event>` and `on-<event>.<suffix>`; no subdirectories, which a
-ConfigMap cannot hold). It is mounted at
+ConfigMap cannot hold). A per-seat `wake-when.<suffix>` gate ships in the
+same dir, but unlike those hooks it runs synchronously, before a spawn of
+the seat that names it (agent-mail.md, routing rule 5). It is mounted at
 `/etc/fork-sandbox/hooks` in the postmaster container only, with
 `FORK_SANDBOX_HOOKS_DIR` set to that path. Like any config change, editing
 a hook needs `install --postmaster` run again.

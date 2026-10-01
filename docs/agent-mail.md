@@ -380,6 +380,8 @@ agents:
     wake-on-cc: false          # never wakes on a Cc, only on To:
   skeptic:
     triage: false              # Cc wake always spawns, skips the classifier
+  alice:
+    wake-when: ready            # a spawn of alice asks wake-when.ready first (rule 5)
   notifier:
     handler: exec              # a deterministic script seat, not an LLM
     command: notify-slack       # bare name, resolved under $FORK_SANDBOX_HANDLERS_DIR
@@ -466,18 +468,51 @@ agents:
 Presence of the key (even `triage: {}`) turns triage on fleet-wide;
 absence of the key entirely means no Cc wake is ever gated.
 
+A per-agent `wake-when: <suffix>` guards every spawn of that seat with a
+site-supplied executable, `wake-when.<suffix>` in the hooks dir (routing
+rule 5 below says when it runs and what its exit codes mean). It is
+fleet.yaml-only, like `grant`: a persona file naming it is refused as an
+unknown key. The suffix matches `^[a-z0-9][a-z0-9._-]*$`; whether the
+executable exists is the postmaster's question at spawn time, not
+`check`'s, and a missing one fails open. Any seat may carry it, a
+handler seat included.
+
+An optional top-level `budget-reserve:` block holds back the last spawns
+of a thread's budget for named seats (routing rule 3 below):
+
+```yaml
+budget-reserve:
+  spawns: 4
+  agents: [scribe]
+agents:
+  scribe: {}
+```
+
+`spawns` is a positive integer and `agents` a non-empty list of agents
+declared in the fleet file; a list name, a reserved name (`all`,
+`operator`) or an unknown key inside the block is refused by `check`.
+Absence of the block means no reserve. `deliver` refuses to start (exit
+2) when `spawns` is not smaller than the thread budget, since every
+other seat would be refused from a thread's first message.
+
 ### Verbs
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # sixteen lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # seventeen lines: harness, model, thinking,
                                       # network, persona-path, description,
                                       # wake-on-cc, refresh-at, triage,
                                       # preset, handler, command, backend,
-                                      # endpoint, grant, review-target
+                                      # endpoint, grant, review-target,
+                                      # wake-when
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
+fork-sandbox fleet resolve-budget-reserve
+                                      # two lines: spawns, and the comma-joined
+                                      # agents, for the top-level
+                                      # budget-reserve: block; both empty when
+                                      # there is none
 fork-sandbox fleet expand @crew,@ci   # a list becomes its members, deduped
 fork-sandbox fleet roster             # human-readable summary
 fork-sandbox fleet teardown <agent> [--thread <id>]
@@ -488,7 +523,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly sixteen lines;
+than stopping at the first. `resolve` always prints exactly seventeen lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
@@ -881,12 +916,16 @@ Every route/harvest pass, `deliver` prints one porcelain line per action
 worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
 live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
-resolved fleet registry name, never raw header text. The twelve events are
+resolved fleet registry name, never raw header text. The fourteen events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
 replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
-`refuse` (agent, thread, reason=hops|budget — at
+`defer` (thread, agent, reason=wake-when — a seat's wake gate said not
+now; see rule 5), `wake-gate-error` (thread, agent, reason=exit
+<N>|timeout|missing|context — a gate could not answer and the seat was
+woken anyway),
+`refuse` (agent, thread, reason=hops|budget|budget-reserved — at
 route-pass time this names only the message's `To:` candidates, since a
 refused message skips Cc resolution outright, but the same gate is
 re-checked at follow-up-wake time against whichever agent owns the live
@@ -929,7 +968,7 @@ rule 1's reset in the same pass that performed it.
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
-event of its own in the twelve above, so a thread being flagged and later
+event of its own in the fourteen above, so a thread being flagged and later
 auto-cleared (rule 1, operator mail) is invisible on this stream — only
 the flag is observable, not its clearing. This is a stable contract, not
 a log file — stderr is unchanged (errors only), and nothing
@@ -977,7 +1016,7 @@ A hook inherits the postmaster's own environment, plus:
 | `FS_HOOK_MESSAGES` | `on-harvest` | ids of the messages that run's harvest posted, space-separated, in posting order |
 | `FS_HOOK_RUN` | `on-harvest` | the run id |
 | `FS_HOOK_BRANCH` | `on-harvest` | the wake's branch; empty for a handler seat |
-| `FS_HOOK_AGENT` | `on-harvest` | the resolved fleet name |
+| `FS_HOOK_AGENT` | `on-harvest`, and the wake gate | the resolved fleet name |
 | `FS_TARGET_SHA_PRESENT` | `on-target` | `1` or `0`: whether the sha is present in the repo. The postmaster first tries to fetch `origin` for it, and fires either way |
 | `FS_HOOK_MESSAGE_COUNT` | `on-quiescent` | the thread's message count |
 | `FS_HOOK_FLAGGED` | `on-quiescent` | `1` or `0` |
@@ -1137,10 +1176,26 @@ thread routes it.
    needs-operator, reason `hops exhausted at <message-id>`.
 3. **Thread budget.** Spawns so far ≥ budget (default 96,
    `$FORK_SANDBOX_THREAD_BUDGET`) means no wake. Flag T, reason
-   `thread budget <n> exhausted`. This is checked once per message, not
-   once per candidate: a message addressing four agents with one slot
-   left still spawns all four. v1 does not ration within a single
-   message.
+   `thread budget <n> exhausted` (keyword `budget-exhausted`). This is
+   checked once per message, not once per candidate: a message addressing
+   four agents with one slot left still spawns all four. v1 does not
+   ration within a single message — except inside a reserve band:
+   a fleet `budget-reserve:` block (`spawns: N`, `agents: [...]`) makes
+   the last N spawns of the budget the reserved seats' alone. While the
+   count is in the band (`budget − N ≤ spawns so far < budget`) the check
+   is per candidate: a message addressing a reserved seat and two others
+   spawns only the reserved seat. Each refused candidate gets a `refuse
+   ... reason=budget-reserved` event and a line in
+   `budget-reserved/<thread-id>`, and the thread is **not** flagged: the
+   reserve doing its job is not a failure. Flagging waits for
+   quiescence — a thread that goes quiet with a line still standing is
+   flagged once per message count (keyword `budget-reserved`, reason
+   `thread budget <n>: @a refused at <message-id>[, ...] (last <N> spawns
+   reserved for @x, @y) and nothing woke it`). A seat's line goes when
+   that seat spawns on the thread, so a reset by operator mail (rule 1)
+   that wakes it leaves nothing to flag. At or past the budget the
+   exhausted check above applies unchanged, reserved seats included.
+   Follow-up wakes, retries included, honor the band the same way.
 4. **One wake per (agent, message).** An agent named twice — directly and
    via a list, in `To` and/or `Cc` — wakes once. The run's ledger, and
    the handoff itself, record whether `To` or `Cc` actually produced the
@@ -1158,6 +1213,55 @@ thread routes it.
    exactly like an undelivered pending message: rules 2-3 are
    re-checked and a follow-up wake is spawned for the newest pending
    message if they still pass.
+5. **Wake gate.** A seat with `wake-when: <suffix>` has
+   `$FORK_SANDBOX_HOOKS_DIR/wake-when.<suffix>` (the same flat dir as the
+   hooks below, so the cluster ships it in the same ConfigMap) asked
+   before it is *spawned*. It runs after rules 2–4, so a message they
+   refused never reaches it.
+   - **Where it applies.** One choke point guards every spawn of a gated
+     seat: a new message whose wake would spawn, and the follow-up wake
+     for a pending message at harvest. Not gated: a retry of a failed
+     wake, and a held seat's release (both were already admitted);
+     delivery into a seat's already-running wake (rule 4: pending, live
+     delivery); and a message whose `From` is an operator (rule 1's
+     test). Seats without `wake-when` behave exactly as before.
+   - **Exit codes.** 0 wakes the seat. 1 *defers* it: no spawn, no budget
+     slot, a `defer` event, and the trigger is dropped — the seat's next
+     wake renders the whole thread anyway. **Anything else fails open**:
+     any other exit code, a timeout, a missing or non-executable hook,
+     or a failure to build the gate's context wakes the seat and emits
+     `wake-gate-error` with `reason=exit <N>`, `timeout`, `missing` or
+     `context`. A broken gate never silently starves a seat.
+   - **How it runs.** Synchronously, so routing waits for the answer:
+     under `timeout` for `$FORK_SANDBOX_WAKE_GATE_TIMEOUT` seconds
+     (default 30; SIGKILL 10 s after SIGTERM), stdin `/dev/null`, stdout
+     and stderr in `hooks/logs/`. The postmaster holds the store lock
+     meanwhile, so **a gate must only read the store**. It does not
+     inherit the lock fd.
+   - **What it gets.** The environment every hook gets (`FS_HOOK_EVENT`
+     is `wake-when`, plus `FS_HOOK_THREAD`, `FS_HOOK_MAIL_ROOT`,
+     `FS_HOOK_REPO` and the review-target variables), plus
+     `FS_HOOK_AGENT` (the seat), `FS_HOOK_MESSAGE` (the trigger's
+     message id), `FS_HOOK_MESSAGE_FILE` (absolute path of that message
+     in the store, to read its headers without searching),
+     `FS_HOOK_EXPORT_FILE` (exactly what `mail export <thread-id> --json`
+     prints for the thread) and `FS_HOOK_STATUS_FILE` (exactly what
+     `postmaster status --thread <thread-id> --json` prints), the last two
+     in a temp dir under the state dir that is removed when the gate
+     returns, on every path. A gate is thereby pinned to the view the
+     postmaster decides on.
+   - **A deferral is remembered.** `wake-deferred/<thread-id>` holds one
+     `<agent> <message-id>` line per deferred seat (a later defer of the
+     same seat replaces its line); a seat's line is removed when it
+     actually spawns on the thread, by any path — new message, follow-up,
+     retry or operator. A thread that goes quiescent with a line still
+     standing is flagged once per message count, reason `wake deferred:
+     @a at <message-id>[, @b at <message-id>] and nothing woke it`,
+     keyword `wake-deferred`, so a deferred seat nothing ever wakes is
+     visible. Every thread with a record is checked, not only those with
+     a review target. If a thread has both a `wake-deferred` and a
+     `budget-reserved` record, it gets one flag with both reasons joined
+     by `; ` and the keyword `wake-deferred,budget-reserved`.
 
 Together with "a Cc-only wake replies only when something genuinely
 matters, not routinely", those rules are the stop rules. Hops bound the
@@ -1445,7 +1549,10 @@ own thread scans never see it:
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |
 | `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
 | `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, `file`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
-| `hooks/logs/<id>.log` | a reaped hook's stdout and stderr; the newest 100 are kept |
+| `hooks/logs/<id>.log` | a reaped hook's stdout and stderr, and a wake gate's (`<time>-wake-when-<thread>-<agent>-<n>.log`); the newest 100 are kept |
+| `wake-deferred/<thread-id>` | one `<agent> <message-id>` line per seat whose spawn its `wake-when` gate deferred; cleared per seat when it spawns — see rule 5 |
+| `budget-reserved/<thread-id>` | the same shape, for a seat the budget reserve refused — see rule 3 |
+| `deferral-marks/<thread-id>` | the message count at which the thread's seat records were last flagged, so a quiescent state flags once |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
 All state transitions are marker-file creation, never deletion of
