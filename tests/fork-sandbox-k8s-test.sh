@@ -3744,11 +3744,62 @@ refuses "a K8S_PROXY_ENDPOINT_KEYS entry with a malformed VAR_NAME is refused" \
 
 rm -f /tmp/fs-k8s-test-keyed-install.err /tmp/fs-k8s-test-keyed-real-install.err
 
-rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
-    /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
-    /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err \
-    /tmp/fs-k8s-test-svc-dns.out /tmp/fs-k8s-test-svc-dns.err \
-    /tmp/fs-k8s-test-custom-domain.out /tmp/fs-k8s-test-custom-domain.err
+printf '\n== K8S_PROXY_ENDPOINT_EMBEDDINGS -- opt-in embeddings routes ==\n'
+# embed_fixture <dir> <endpoints> <keys> <embeddings>: a k8s.env (plus a pi.env
+# carrying MY_API_KEY) under <dir>. Empty keys/embeddings leave the line out.
+embed_fixture() {
+    local dir="$1" endpoints="$2" keys="$3" embeddings="$4"
+    mkdir -p "$dir"
+    {
+        printf 'K8S_CONTEXT=test-context\nK8S_NAMESPACE=fork-sandbox-test\n'
+        printf 'K8S_IMAGE=registry.example/you/fork-sandbox:latest\n'
+        printf '%s\n' "$endpoints"
+        [[ -n "$keys" ]] && printf 'K8S_PROXY_ENDPOINT_KEYS=%s\n' "$keys"
+        [[ -n "$embeddings" ]] && printf 'K8S_PROXY_ENDPOINT_EMBEDDINGS=%s\n' "$embeddings"
+        printf 'K8S_DENIED_PROBE=10.0.0.1:443\n'
+    } > "$dir/k8s.env"
+    install -m 600 /dev/null "$dir/pi.env"
+    printf 'MY_API_KEY=sk-secondary-test-dummy\nOPENROUTER_API_KEY=sk-test-dummy\n' >> "$dir/pi.env"
+}
+embed_render() { FORK_SANDBOX_CONFIG_DIR="$1" "$k8s_sh" install --dry-run 2>&1; }
+embed_block() { # <render> <location-path-regex>
+    awk -v re="location = $2 \\\\{" '$0 ~ re, /^            \}/' <<< "$1"
+}
+embed_two='primary=http://10.0.0.5:8001/v1,secondary=http://10.0.0.6:8000/v1'
+embed_eps="K8S_PROXY_ENDPOINTS=$embed_two"
+
+# Refusals.
+embed_bad() { # <label> <needle> <endpoints> <keys> <embeddings>
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    embed_fixture "$d" "$3" "$4" "$5"
+    refuses "$1" "$2" env FORK_SANDBOX_CONFIG_DIR="$d" "$k8s_sh" install --dry-run
+}
+embed_bad "an unknown K8S_PROXY_ENDPOINT_EMBEDDINGS name is refused, naming it" \
+    "'bogus'" "$embed_eps" '' bogus
+embed_bad "an unknown K8S_PROXY_ENDPOINT_EMBEDDINGS name lists the registered names" \
+    "secondary" "$embed_eps" '' bogus
+embed_bad "K8S_PROXY_ENDPOINT_EMBEDDINGS on a legacy install is refused" \
+    "K8S_PROXY_ENDPOINT_EMBEDDINGS is not available" 'K8S_PROXY_UPSTREAM=https://openrouter.ai' '' primary
+embed_bad "an opted-in endpoint whose base URL does not end in /v1 is refused" \
+    "TEI root" 'K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/api' '' primary
+embed_bad "the no-/v1 refusal names the endpoint" \
+    "'primary'" 'K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001' '' primary
+embed_bad "a bare host named v1 is not a /v1 path segment" \
+    "TEI root" 'K8S_PROXY_ENDPOINTS=primary=https://v1' '' primary
+embed_bad "a duplicate K8S_PROXY_ENDPOINT_EMBEDDINGS name is refused" \
+    "more than once" "$embed_eps" '' primary,primary
+embed_bad "an empty K8S_PROXY_ENDPOINT_EMBEDDINGS element is refused" \
+    "empty" "$embed_eps" '' primary,,secondary
+embed_bad "a trailing comma in K8S_PROXY_ENDPOINT_EMBEDDINGS is refused" \
+    "empty" "$embed_eps" '' primary,
+# A non-opted-in endpoint without /v1 is untouched by the rule.
+embed_ok_dir="$(newdir)"; tmpdirs+=("$embed_ok_dir")
+embed_fixture "$embed_ok_dir" 'K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1,odd=http://10.0.0.6:8000/api' '' primary
+if embed_render "$embed_ok_dir" >/dev/null; then
+    ok "an endpoint that did not opt in may have a base URL without /v1"
+else
+    no "an endpoint that did not opt in may have a base URL without /v1"
+fi
 
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude ==\n'
 # The default (--harness pi, i.e. submit_out above) renders no claude-proxy

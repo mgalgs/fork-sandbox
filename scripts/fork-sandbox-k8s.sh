@@ -500,6 +500,17 @@
 #                         a Secret, mounted into the proxy only, and never
 #                         reaches the agent pod -- same handling as
 #                         K8S_PROXY_UPSTREAM's own key, one layer down.
+#   K8S_PROXY_ENDPOINT_EMBEDDINGS=
+#                         <name>[,<name>...] -- opts K8S_PROXY_ENDPOINTS
+#                         entries in to two more exact-match proxy routes,
+#                         /e/<name>/v1/embeddings and the TEI-native
+#                         /e/<name>/embed, for app code running in the pod.
+#                         Each <name> must be registered, and its base URL
+#                         must end in /v1 (the TEI route is served at the
+#                         gateway's root, so the /v1 is stripped for it).
+#                         Rate-limited in its own zone, apart from the
+#                         agent's chat traffic. Endpoints only, and off by
+#                         default: unset renders exactly as before.
 #   K8S_DEFAULT_ENDPOINT= the K8S_PROXY_ENDPOINTS entry a run is wired to
 #                         when neither submit nor run names one with
 #                         --endpoint. Optional, and only meaningful on an
@@ -841,6 +852,8 @@ K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
 # Keys a K8S_PROXY_ENDPOINTS entry -- holds the VAR_NAME only, never the
 # value; see parse_proxy_endpoint_keys and cmd_install's Secret handling.
 K8S_PROXY_ENDPOINT_KEYS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_KEYS || true)"
+# Opts endpoints in to the embeddings routes; see parse_proxy_endpoint_embeddings.
+K8S_PROXY_ENDPOINT_EMBEDDINGS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_EMBEDDINGS || true)"
 K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 # Default model for a run with no --model, on a K8S_PROXY_ENDPOINTS
 # install; see the model-requirement block in cmd_submit, which resolves
@@ -984,6 +997,7 @@ fi
 if [[ "${1-}" != check-grant ]]; then
     fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
         "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ENDPOINT_KEYS" \
+        "$K8S_PROXY_ENDPOINT_EMBEDDINGS" \
         "$K8S_PROXY_ALLOW" \
         "$K8S_PROXY_ALLOW_NS" "$K8S_CLUSTER_DOMAIN" \
         "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
@@ -2065,6 +2079,78 @@ is_keyed_endpoint() {
     local name="$1" k
     for k in "${KEYED_ENDPOINT_NAMES[@]}"; do
         [[ "$k" == "$name" ]] && return 0
+    done
+    return 1
+}
+
+# Parses K8S_PROXY_ENDPOINT_EMBEDDINGS ("<name>,<name>,...") into the
+# EMBED_ENDPOINT_NAMES array (module-global). Must run after
+# parse_proxy_endpoints: every name has to be registered there, and an
+# opted-in endpoint's base URL has to end in /v1, since the TEI-native
+# /embed route lives at the gateway root and its upstream is derived by
+# stripping that one segment. An empty spec is not an error.
+parse_proxy_endpoint_embeddings() {
+    local spec="$1" name i url rest seen=","
+    EMBED_ENDPOINT_NAMES=()
+    [[ -z "$spec" ]] && return 0
+
+    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+        echo "Error: K8S_PROXY_ENDPOINT_EMBEDDINGS is not available: this" >&2
+        echo "namespace was installed with K8S_PROXY_UPSTREAM; there are no" >&2
+        echo "named endpoints." >&2
+        return 1
+    fi
+    # read -ra drops a trailing empty field, so a trailing comma has to be
+    # caught on the raw string.
+    if [[ "$spec" == ,* || "$spec" == *, || "$spec" == *,,* ]]; then
+        echo "Error: K8S_PROXY_ENDPOINT_EMBEDDINGS '$spec' has an empty" >&2
+        echo "element. Names are comma-separated, with no leading, doubled" >&2
+        echo "or trailing comma." >&2
+        return 1
+    fi
+
+    local -a entries
+    IFS=',' read -ra entries <<< "$spec"
+    for name in "${entries[@]}"; do
+        url=""
+        for (( i = 0; i < ${#PROXY_ENDPOINT_NAMES[@]}; i++ )); do
+            if [[ "${PROXY_ENDPOINT_NAMES[$i]}" == "$name" ]]; then
+                url="${PROXY_ENDPOINT_URLS[$i]}"
+                break
+            fi
+        done
+        if [[ -z "$url" ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_EMBEDDINGS names endpoint '$name'," >&2
+            echo "which is not registered in K8S_PROXY_ENDPOINTS. The registered" >&2
+            echo "endpoints are:" >&2
+            printf '%s\n' "${PROXY_ENDPOINT_NAMES[@]}" | sed 's/^/  /' >&2
+            return 1
+        fi
+        if [[ "$seen" == *",$name,"* ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_EMBEDDINGS names endpoint '$name'" >&2
+            echo "more than once." >&2
+            return 1
+        fi
+        seen+="$name,"
+        # Judged on what follows the scheme, so a host that is itself
+        # called v1 (http://v1) is not mistaken for a /v1 path segment.
+        rest="${url#*://}"
+        if [[ "$rest" != */v1 ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_EMBEDDINGS opts in endpoint '$name'," >&2
+            echo "but its base URL '$url' does not end in /v1, so the TEI root" >&2
+            echo "for /e/$name/embed cannot be derived." >&2
+            return 1
+        fi
+        EMBED_ENDPOINT_NAMES+=("$name")
+    done
+    return 0
+}
+
+# True (0) if $1 is a K8S_PROXY_ENDPOINT_EMBEDDINGS-opted-in endpoint name.
+is_embeddings_endpoint() {
+    local name="$1" e
+    for e in "${EMBED_ENDPOINT_NAMES[@]}"; do
+        [[ "$e" == "$name" ]] && return 0
     done
     return 1
 }
@@ -3182,6 +3268,9 @@ cmd_install() {
             exit 1
         fi
     done
+
+    # Fills EMBED_ENDPOINT_NAMES, which render_proxy_locations reads.
+    parse_proxy_endpoint_embeddings "$K8S_PROXY_ENDPOINT_EMBEDDINGS" || exit 1
 
     # Fills the module-global PROXY_ALLOW_CIDRS / PROXY_ALLOW_PORTS arrays
     # render_proxy_egress_rules reads below. K8S_PROXY_ALLOW is independent
