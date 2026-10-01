@@ -6825,6 +6825,7 @@ printf '\n== hooks: the detached runner, its timeout, its records and its event 
 # Direct calls: the script defines everything and runs nothing when sourced.
 hk_call() {
     (
+        # shellcheck disable=SC2030  # deliberately subshell-local
         export FORK_SANDBOX_HOOKS_DIR="$HK_DIR"
         # shellcheck disable=SC1090
         source "$postmaster"
