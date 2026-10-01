@@ -7249,7 +7249,9 @@ cp "$FS_HOOK_STATUS_FILE" "$WG_OUT/status.json"
 cp "$FS_HOOK_MESSAGE_FILE" "$WG_OUT/message.msg"
 dirname "$FS_HOOK_EXPORT_FILE" > "$WG_OUT/ctxdir"
 exit 1'
-mid="$(send_msg '@alice' '@hana' 'gate context' 'body' 8)"
+# carol spawns first and stays live, so the thread is not quiescent and the
+# post-defer state (no flag) is the state the gate saw.
+mid="$(send_msg '@alice' '@carol,@hana' 'gate context' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
 wg_env() { sed -n "s/^$1=//p" "$WG_OUT/env"; }
@@ -7316,6 +7318,86 @@ contains "wake gate: a context failure emits wake-gate-error" "$(cat "$work/once
 check "wake gate: a context failure never runs the gate" 0 "$(wg_calls)"
 check "wake gate: a context failure leaves no temp dir" 0 \
     "$(find "$WG_STATE" -maxdepth 1 -name 'wake-gate.*' | wc -l)"
+
+# ---- the durable deferral record and its quiescent flag ----
+wg_flag_file() { cat "$WG_STATE/needs-operator/$tid" 2>/dev/null || true; }
+wg_flags() {
+    local n
+    n="$(grep -c "	flag	" "$WG_STATE/needs-operator-journal/$tid" 2>/dev/null || true)"
+    echo "${n:-0}"
+}
+
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@hana' 'deferral record' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake-deferred: a defer writes the seat's record" "hana $mid" \
+    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+check "wake-deferred: a quiescent thread with an outstanding defer is flagged" \
+    "wake deferred: @hana at $mid and nothing woke it" "$(wg_flag_file)"
+contains "wake-deferred: the flag event carries the fixed keyword" "$(cat "$work/once.out")" \
+    "pm flag thread=$short reason=wake-deferred"
+check "wake-deferred: flagged once" 1 "$(wg_flags)"
+once
+check "wake-deferred: not flagged again on the next pass" 1 "$(wg_flags)"
+not_contains "wake-deferred: no repeat flag event" "$(cat "$work/once.out")" "reason=wake-deferred"
+mid2="$(reply_msg '@alice' "$mid" 'again' --to '@hana')"
+once
+check "wake-deferred: a later defer replaces the seat's line" "hana $mid2" \
+    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+check "wake-deferred: a new message re-arms the flag" 2 "$(wg_flags)"
+contains "wake-deferred: the re-flag names the newer message" "$(wg_flag_file)" "@hana at $mid2"
+wg_gate 'exit 0'
+mid3="$(reply_msg '@alice' "$mid2" 'third' --to '@hana')"
+once
+check "wake-deferred: the seat then spawns" 1 "$(wg_spawns hana)"
+check "wake-deferred: a spawn of the seat clears its record" 0 \
+    "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
+
+# A thread that is still busy is not flagged, and a seat that spawns before
+# the thread goes quiet is not flagged at all.
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@hana,@carol' 'busy thread' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake-deferred: the busy thread's deferral is recorded" "hana $mid" \
+    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+check "wake-deferred: a thread with a live run is not flagged" "" "$(wg_flag_file)"
+wg_gate 'exit 0'
+mid2="$(reply_msg '@alice' "$mid" 'now' --to '@hana')"
+once
+check "wake-deferred: the deferred seat spawned on a later message" 1 "$(wg_spawns hana)"
+wg_finish_run carol
+wg_finish_run hana
+once
+once
+check "wake-deferred: a seat that spawned afterwards is never flagged" 0 "$(wg_flags)"
+
+# Operator mail and a retry spawn the seat too, and clear its line.
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@hana' 'cleared by operator' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+mid2="$(reply_msg '@operator' "$mid" 'wake up' --to '@hana')"
+once
+check "wake-deferred: operator mail spawns the gated seat" 1 "$(wg_spawns hana)"
+check "wake-deferred: and clears its record" 0 \
+    "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
+wg_new_store
+mid="$(send_msg '@alice' '@hana' 'cleared by retry' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake-deferred: the retry thread's deferral is recorded" "hana $mid" \
+    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+mkdir -p -- "$WG_STATE/retries/$tid"
+printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$mid" > "$WG_STATE/retries/$tid/hana"
+once
+check "wake-deferred: a retry spawns the seat" 1 "$(wg_spawns hana)"
+check "wake-deferred: and clears its record" 0 \
+    "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
 
 unset FORK_SANDBOX_HOOKS_DIR WG_OUT
 printf '%s\n' "$wg_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"

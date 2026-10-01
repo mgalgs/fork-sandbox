@@ -935,6 +935,14 @@ UNRESOLVED_TO="$STATE/unresolved-to"
 # instead of only ever showing whichever reason happened to write last.
 # Nothing routes on it.
 NEEDS_OPERATOR_JOURNAL="$STATE/needs-operator-journal"
+# Per-thread seat records, one `<agent> <message-id>` line per seat: a wake
+# the seat's wake-when gate deferred and that nothing has since replaced.
+# A seat's line goes when that seat actually spawns on the thread, by any
+# path. A thread that goes quiescent with a record still standing is
+# flagged once per message count (DEFERRAL_MARKS) -- see pm_deferral_pass.
+WAKE_DEFERRED="$STATE/wake-deferred"
+DEFERRAL_MARKS="$STATE/deferral-marks"
+PM_SEAT_RECORD_DIRS=("$WAKE_DEFERRED")
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
 # same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
@@ -1669,6 +1677,7 @@ pm_flag_keyword() {
         "spawn failed for"*) printf 'spawn-failed' ;;
         "hops exhausted at"*) printf 'hops-exhausted' ;;
         "thread budget"*"exhausted") printf 'budget-exhausted' ;;
+        "wake deferred: @"*" and nothing woke it") printf 'wake-deferred' ;;
         "malformed reply file"*) printf 'malformed-reply' ;;
         "pending message"*"vanished"*) printf 'pending-vanished' ;;
         "run dir for"*"vanished"*) printf 'run-vanished' ;;
@@ -2654,6 +2663,7 @@ pm_exec_wake() {
 
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
+    pm_seat_records_clear "$tid" "$agent"
     printf '%s\n' "$run_id" >> "$SEQ/$tid"
 
     pm_hook_on_harvest "$tid" "$run_id" "" "$agent" "${PM_HARVEST_POSTED[@]}"
@@ -2675,6 +2685,45 @@ pm_held_write() {
         printf 'RETRY=%s\n' "$retry"
     } > "$tmp"
     mv -- "$tmp" "$STATE/held/$tid/$agent"
+}
+
+# Replaces seat $3's line in per-thread record $1/$2 with `<agent> <mid>`
+# (full-file tmp+mv: a reader never sees a partial write).
+pm_seat_record_set() {
+    local dir="$1" tid="$2" agent="$3" mid="$4" tmp
+    mkdir -p -- "$dir"
+    tmp="$(mktemp "$dir/.tmp.XXXXXX")"
+    {
+        [[ ! -f "$dir/$tid" ]] || awk -v a="$agent" '$1 != a' "$dir/$tid"
+        printf '%s %s\n' "$agent" "$mid"
+    } > "$tmp"
+    mv -- "$tmp" "$dir/$tid"
+}
+
+# Drops seat $2's line from every per-thread seat record of thread $1; a
+# record left empty is removed. Called wherever a seat actually spawns.
+pm_seat_records_clear() {
+    local tid="$1" agent="$2" dir tmp
+    for dir in "${PM_SEAT_RECORD_DIRS[@]}"; do
+        [[ -s "$dir/$tid" ]] || continue
+        tmp="$(mktemp "$dir/.tmp.XXXXXX")"
+        awk -v a="$agent" '$1 != a' "$dir/$tid" > "$tmp"
+        if [[ -s "$tmp" ]]; then
+            mv -- "$tmp" "$dir/$tid"
+        else
+            rm -f -- "$tmp" "$dir/$tid"
+        fi
+    done
+}
+
+# `@a at <mid>, @b at <mid>` for one record file.
+pm_seat_record_text() {
+    local agent mid out=""
+    while read -r agent mid; do
+        [[ -n "$agent" ]] || continue
+        out+="${out:+, }@$agent at $mid"
+    done < "$1"
+    printf '%s' "$out"
 }
 
 # True when message file $1 is operator mail: the same test rule 1 applies
@@ -2731,6 +2780,7 @@ pm_wake_gate() {
     case "$rc" in
         0) return 0 ;;
         1)
+            pm_seat_record_set "$WAKE_DEFERRED" "$tid" "$agent" "$mid"
             pm_event "defer thread=${tid:0:8} agent=$agent reason=wake-when"
             return 1 ;;
         124|137) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=timeout" ;;
@@ -3091,6 +3141,7 @@ pm_spawn_wake() {
         } > "$RUNS/$run_id.env"
         mkdir -p -- "$SPAWNS" "$SEQ"
         printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
+        pm_seat_records_clear "$tid" "$agent"
         printf '%s\n' "$run_id" >> "$SEQ/$tid"
         pm_event "spawn thread=${tid:0:8} agent=$agent run=$(basename -- "$wake_dir") via=$via"
         return 0
@@ -3174,6 +3225,7 @@ pm_spawn_wake() {
     } > "$RUNS/$run_id.env"
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
+    pm_seat_records_clear "$tid" "$agent"
     printf '%s\n' "$run_id" >> "$SEQ/$tid"
     pm_event "spawn thread=${tid:0:8} agent=$agent run=$(basename -- "$run_dir") via=$via"
 }
@@ -4584,6 +4636,25 @@ pm_thread_is_quiescent() {
     return 0
 }
 
+# Flags a quiescent thread whose seat records still stand: a wake the gate
+# deferred and nothing has woken since is otherwise invisible. Once per
+# message count, like the on-quiescent marks; a new message un-quiesces the
+# thread and can flag it again. Walks every thread with a record, not only
+# the ones with a review target.
+pm_deferral_pass() {
+    local f tid count
+    for f in "$WAKE_DEFERRED"/*; do
+        [[ -s "$f" ]] || continue
+        tid="${f##*/}"
+        count="$(pm_thread_message_count "$tid")"
+        (( count > 0 )) || continue
+        [[ "$(cat -- "$DEFERRAL_MARKS/$tid" 2>/dev/null)" == "$count" ]] && continue
+        pm_thread_is_quiescent "$tid" || continue
+        pm_hook_mark "$DEFERRAL_MARKS" "$tid" "$count"
+        pm_flag "$tid" "wake deferred: $(pm_seat_record_text "$f") and nothing woke it" wake-deferred
+    done
+}
+
 # The extra env words on-quiescent carries, into PM_HOOK_QUIESCENT.
 pm_hook_quiescent_env() {
     local tid="$1" count="$2" flagged=0 reason=""
@@ -4753,6 +4824,7 @@ cmd_deliver() {
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
         pm_hook_pass "$project"
+        pm_deferral_pass
         return 0
     fi
 
@@ -4765,6 +4837,7 @@ cmd_deliver() {
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
         pm_hook_pass "$project"
+        pm_deferral_pass
         (( stop )) && break
         sleep "${FORK_SANDBOX_POSTMASTER_INTERVAL:-15}" || true
     done
