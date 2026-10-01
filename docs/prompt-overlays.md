@@ -91,7 +91,7 @@ said:
 `<harness>` is one of `claude`, `pi`, `codex`. `<network>` is one of
 `pinned`, `sealed` — the same axis `--network` takes, chosen independently
 of `<harness>`. `<leg>` is exactly one of `implement`, `review`, `fix`,
-`maintainer` — the prompt currently being rendered.
+`maintainer`, `plan` — the prompt currently being rendered.
 Any file that does not exist is skipped silently — a directory holding only
 `all.md` is a perfectly normal setup. The ones that do exist are
 concatenated, in that order, under one heading, into the rendered prompt.
@@ -129,18 +129,18 @@ for this model in this leg alone, general first within the leg-scoped pair
 too. A `maintainer/` directory is how you correct the maintainer leg's
 prompt specifically — the leg that runs only under `--maintainer-loop`.
 
-`implement`, `review`, `fix` and `maintainer` are reserved directory names at
-the root of a prompts directory — a model can never be called `review`.
-There is no actual collision to worry about: a model id is always sanitised
-into `model/<id>.md` (below), never written at the root, so a model literally
-named `review` still cannot shadow the leg directory. But a reader should not
-have to work that out to know a model id is safe to pick; treat the four leg
-names as off-limits at the root, full stop.
+`implement`, `review`, `fix`, `maintainer` and `plan` are reserved directory
+names at the root of a prompts directory — a model can never be called
+`review`. There is no actual collision to worry about: a model id is always
+sanitised into `model/<id>.md` (below), never written at the root, so a model
+literally named `review` still cannot shadow the leg directory. But a reader
+should not have to work that out to know a model id is safe to pick; treat
+the five leg names as off-limits at the root, full stop.
 
-`fleet-kit.md` is a fifth reserved name at the root, for a different
+`fleet-kit.md` is a sixth reserved name at the root, for a different
 mechanism: agent mail's postmaster (`fork-sandbox-postmaster.sh`), not
 `fork-sandbox.sh`, reads it, and only when it exists — there is no
-repo-shipped fallback lookup here the way there is for the four leg
+repo-shipped fallback lookup here the way there is for the five leg
 prompts, since the postmaster falls back to its own repo copy
 (`share/fleet-kit.md`) instead. An overlay here replaces that file
 wholesale, no merging; see [agent-mail.md](agent-mail.md#the-wake) for

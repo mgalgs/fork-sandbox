@@ -118,9 +118,9 @@ names a cluster proxy path and means nothing there).
 
 ### `pipeline`
 
-A list of steps, each `action: code`, `review` or `maintain`, in any
-order and any count — the only structural requirement is at least one
-step:
+A list of steps, each `action: code`, `review`, `maintain` or `plan`, in
+any order and any count — the only structural requirement is at least
+one step:
 
 ```yaml
   - action: code
@@ -156,6 +156,65 @@ request — the surrounding code, building on the review loop's final
 verdict, which the engine forwards into its prompt (`--maintainer-loop`
 machinery). A `maintain` step without a `review` step is valid, and is
 then the branch's only review.
+
+A `plan` step is a one-shot leg that lets a strong model plan before a
+cheaper one codes, so an orchestrator can write a short, intent-level
+handoff and leave the mechanics — files and functions to touch, the test
+list, the commit split — to this leg instead. It takes `agent` and an
+optional `repeat`, which must be 1 for now (there is no loop to cap).
+Every `plan` step must come before the pipeline's first `code` step — a
+pipeline with a `plan` step and no `code` step anywhere is refused, the
+same as one where a `plan` step sits after the first `code` step:
+
+```yaml
+agents:
+  planner:
+    harness: claude
+    model: fable
+  coder:
+    harness: claude
+    model: sonnet
+
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+```
+
+The plan leg writes its plan, as markdown, to `plan.md` in the run's
+outbox (reserved there the same way `handoff.md` is, for every leg —
+see "Artifact outbox" in the prompt every leg gets) and makes no
+commits; the engine snapshots the file into the run directory and fails
+the run if the branch head moved, so a plan that committed is caught
+exactly like one that never wrote a plan at all. The plan is grounded in
+the repository — files and functions to touch, with `file:line`
+pointers — and asks for one decision, every open question turned into an
+assumption, requirements stated as testable behavior with a test mapped
+to each, and a commit split that keeps the tree green throughout; see
+`fs_emit_plan_prompt_body` in `scripts/fork-sandbox-lib.sh` for the
+prompt itself. If the plan's first non-blank line starts with the word
+`BLOCKED` (heading or emphasis markup aside), the run ends there with no
+code leg, and the plan's own text is the run's result.
+
+The plan, once written, is embedded — right after the brief, which wins
+where the two disagree — in the prompt of every code, fix, review and
+maintain leg that runs after it. A reviewer is told to treat a code change
+that deviates from the plan without saying why, and a plan assumption that
+contradicts the brief, as findings; a code or fix leg is told instead to
+say why when it deviates, so the reviewer is not left guessing.
+
+`--refresh-at`'s continuation chain does not yet reach the code leg that
+follows a plan step: the chain only runs for a pipeline's step 1, and a
+plan step always sits there. A plan pipeline's refresh reports `none`, and
+the launch warns when `--refresh-at` is on (the claude default included)
+over a pipeline whose step 1 is not a code step.
+
+A `plan` step is refused on a read-only pipeline, with `--review-only`,
+and with `--k8s` — like any other pipeline shape that is not legacy-
+shaped (a `plan` step always makes a pipeline composed; see "Composed
+runs" below), `--k8s` refuses it outright rather than running it without
+the leg a cluster pod has no path to.
 
 The same agent may sit any number of seats; an agent that sits none
 draws a warning, not an error.
@@ -235,12 +294,14 @@ fork-sandbox.sh --pipeline csonnet2-rsol2-mopus2 ~/src/myrepo handoff.md
 
 The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
 
-- **stage** is `c` (code), `r` (review) or `m` (maintain), in any order
-  and any count, as a preset file's `pipeline` allows:
+- **stage** is `c` (code), `r` (review), `m` (maintain) or `p` (plan), in
+  any order and any count, as a preset file's `pipeline` allows:
   `csonnet-csol-ropus-rsol-mopus-mastra` is two code steps, two review
   steps and two maintain steps. Fix legs ride the first code step's agent.
-  The one exception is a spec with no `c` at all: it compiles to a
-  read-only pipeline, so every repeat in it must be 1.
+  A `p` segment carries the same rule its preset form does: it must come
+  before the spec's first `c` segment, and a spec with `p` and no `c` is
+  refused. The other exception is a spec with no `c` at all: it compiles
+  to a read-only pipeline, so every repeat in it must be 1.
 - **model** is a name from the table at the top of
   `scripts/fork-sandbox-pipeline-spec.py`, and runs on its native harness:
   `haiku`, `sonnet`, `opus`, `fable` on claude; `luna`, `terra`, `sol`,
@@ -257,13 +318,15 @@ The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
 - **harness**, optional, seats the model on a non-native harness
   (`csolpi2`); the table must carry the model's id for that harness.
 - **N**, optional and 1 by default, is the code agent's `repeat`, or a
-  review or maintain step's loop cap. `csonnet-rsol-mopus` is one of each.
+  review or maintain step's loop cap; on a `p` segment it must be 1.
+  `csonnet-rsol-mopus` is one of each.
 
 Each segment compiles to its own agent and its own pipeline step. A
 stage's first segment names its agent the plain way (`coder`, `reviewer`,
-`maintainer`); a second and later segment of the same stage numbers it
-from there (`reviewer2`, `reviewer3`, …) — deterministic on the spec's
-own segment order, not on the model or harness a segment names.
+`maintainer`, `planner`); a second and later segment of the same stage
+numbers it from there (`reviewer2`, `reviewer3`, …) — deterministic on
+the spec's own segment order, not on the model or harness a segment
+names.
 
 The spec compiles to the preset document a hand-written preset with the
 same shape would be, and from there runs the `--preset` path unchanged:
@@ -451,6 +514,33 @@ pipeline:
 implementer, a cross-family reviewer whose findings re-run the cheap
 seat, and a maintainer whose findings get a strong fixer.
 
+**planned** — a strong model works out the approach, a cheap one codes
+it, and a mid-tier model reviews against both the plan and the brief:
+
+```yaml
+agents:
+  planner:
+    harness: claude
+    model: fable
+  coder:
+    harness: claude
+    model: haiku
+  reviewer:
+    harness: claude
+    model: sonnet
+
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+```
+
+Equivalently, `--pipeline pfable-chaiku-rsonnet2`.
+
 ## Provenance: what the run record carries
 
 A preset is part of what produced a result, so a run launched with one
@@ -504,9 +594,24 @@ with `--preset` also writes `pipeline.json` (see "Provenance" above for
 is the source of truth this section's canonical key is built from.
 
 A code pass after the first also writes `code-prompt-<K>-<P>.md` (step
-`<K>`, pass `<P>`): the handoff plus the addenda earlier legs archived. It
-is written only when an addendum was archived; otherwise the pass's prompt
-is the handoff itself.
+`<K>`, pass `<P>`): the handoff plus the addenda earlier legs archived, and
+the plan when this run has one. It is written only when an addendum was
+archived or this run has a plan step; otherwise the pass's prompt is the
+handoff itself. A plan-prefixed pipeline's first code pass writes this
+file too, from its own first pass: that code step is never the run's own
+top-level implement leg (a plan step always runs ahead of it), so it has
+no "first pass, outside this accounting" case to be the exception to.
+
+A `plan` step (always composed — a pipeline containing one is never one of
+the legacy-eligible shapes below) writes `plan.md` at the run directory's
+own root, a snapshot of whatever it wrote to `plan.md` in the outbox, and
+its own `step-<K>-loop.json`, shaped differently from a review/maintain
+step's: `{cap, ended, detail, cost_usd, usage, retries}` plus an always
+empty `iterations` array, and no fix fields — there is no verdict-then-fix loop
+to record, just the one leg's own outcome. Its `ended` is `done`,
+`blocked` (the plan's own first line was `BLOCKED`), `committed` (the leg
+committed to the branch, which a plan leg must never do) or
+`harness-error`.
 
 A claude leg that failed on an auth or transient provider error is retried
 fresh (see "The loop stops on the first of four things" near the top of
@@ -553,8 +658,9 @@ string, or null for a plain-flags run — both fixed at launch. A review or
 maintain loop is one entry regardless of its cap; `i` counts iterations
 begun (or, for a code step with `repeat: N`, passes run so far), and
 `ended` takes the walker's own vocabulary verbatim (`approved`, `findings`,
-`cap`, `no-progress`, `harness-error`, `skipped`, `stop-requested`, …), same
-spelling as `review-loop.json`/`step-<K>-loop.json`'s own `ended` key. The
+`cap`, `no-progress`, `harness-error`, `skipped`, `stop-requested`, a
+`plan` step's own `done`, `blocked` and `committed`, …), same spelling as
+`review-loop.json`/`step-<K>-loop.json`'s own `ended` key. The
 run's own `state` is `failed` when the final exit code is non-zero *or* any
 step ended `failed` — a review-loop harness error does not by itself
 change the run's exit code (see "Composed runs" above), so this is the one
@@ -652,8 +758,8 @@ the syntax does not have, no engine — present or planned — has either:
   choose among.
 - **No `summarize` action**, or other steps that pass work along without
   fixing.
-- **No action beyond `code`/`review`/`maintain`**, and no branches or
-  graphs — a pipeline is always a single linear chain, of any length.
+- **No action beyond `code`/`review`/`maintain`/`plan`**, and no branches
+  or graphs — a pipeline is always a single linear chain, of any length.
 - **No per-seat args or refresh** beyond the first code step — a plumbing
   gap named by its own refusal, not a design position.
 - **No `input:` key.** The engine fixes the data flow — the code step

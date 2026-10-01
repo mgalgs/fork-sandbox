@@ -361,6 +361,11 @@ later turn, slows the launch, and line numbers go stale as other work
 lands. About a page is right; a one-line brief is too short, because the
 decisions and constraints never reach the run.
 
+When the pipeline has a `p` (plan) stage, this division of labor is
+structural, not just a writing habit: the plan leg is where the mechanics
+get worked out, from this same intent-level handoff, before any code
+leg runs (see docs/presets.md).
+
 ## Launching and watching
 
 The flags below are the shipped defaults from **Choosing a harness and a
