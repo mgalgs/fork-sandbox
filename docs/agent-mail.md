@@ -1135,7 +1135,7 @@ thread routes it.
    sender resets T the same way (see "Upstream moved").
 2. **Hops gate.** `X-Hops == 0` means no wakes from M. Flag T
    needs-operator, reason `hops exhausted at <message-id>`.
-3. **Thread budget.** Spawns so far ≥ budget (default 32,
+3. **Thread budget.** Spawns so far ≥ budget (default 96,
    `$FORK_SANDBOX_THREAD_BUDGET`) means no wake. Flag T, reason
    `thread budget <n> exhausted`. This is checked once per message, not
    once per candidate: a message addressing four agents with one slot

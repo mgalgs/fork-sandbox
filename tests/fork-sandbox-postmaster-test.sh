@@ -457,7 +457,7 @@ mid="$(send_msg '@alice' '@bob' 'cc budget gate' 'body' 8 '@carol')"
 tid="$(thread_of "$mid")"
 short="${tid:0:8}"
 mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns"
-seq 1 32 > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns/$tid"
+seq 1 96 > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns/$tid"
 : > "$STUB_ARGV_LOG"
 once
 check "thread budget exhausted gates a Cc wake too (carol)" 0 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
@@ -996,7 +996,7 @@ contains "X-Hops 0: flag event uses the fixed hops-exhausted keyword" \
     "$(cat "$work/once.out")" "pm flag thread=$short reason=hops-exhausted"
 
 # ============================================================
-printf '\n== thread budget: default 32, env override, flag on exhaust ==\n'
+printf '\n== thread budget: default 96, env override, flag on exhaust ==\n'
 # ============================================================
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
@@ -1005,15 +1005,15 @@ mid="$(send_msg '@alice' '@bob' 'budget default' 'body' 8)"
 tid="$(thread_of "$mid")"
 short="${tid:0:8}"
 mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns"
-seq 1 32 > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns/$tid"
+seq 1 96 > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns/$tid"
 : > "$STUB_ARGV_LOG"
 once
-check "budget default 32: no spawn once exhausted" 0 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
-contains "budget default 32: flag names the limit" \
-    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "thread budget 32 exhausted"
-contains "budget default 32: refuse event names bob" \
+check "budget default 96: no spawn once exhausted" 0 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
+contains "budget default 96: flag names the limit" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "thread budget 96 exhausted"
+contains "budget default 96: refuse event names bob" \
     "$(cat "$work/once.out")" "pm refuse thread=$short agent=bob reason=budget"
-contains "budget default 32: flag event uses the fixed budget-exhausted keyword" \
+contains "budget default 96: flag event uses the fixed budget-exhausted keyword" \
     "$(cat "$work/once.out")" "pm flag thread=$short reason=budget-exhausted"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
@@ -3264,7 +3264,7 @@ check "retry: the hops-0 schedule is dropped after refusal (no infinite loop)" 0
 bg_mid="$(send_msg '@carol' '@alice' 'budget exhausted retry' 'body' 8)"
 bg_tid="$(thread_of "$bg_mid")"
 mkdir -p -- "$PM_STATE_DIR/spawns"
-seq 1 32 > "$PM_STATE_DIR/spawns/$bg_tid"
+seq 1 96 > "$PM_STATE_DIR/spawns/$bg_tid"
 mkdir -p -- "$PM_STATE_DIR/retries/$bg_tid"
 printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$bg_mid" > "$PM_STATE_DIR/retries/$bg_tid/alice"
 : > "$STUB_ARGV_LOG"
@@ -5464,8 +5464,8 @@ check "upstream-head case 3: a later ken wake carries no --extra-ref" 0 "$(grep 
 uh_kickoff ken; uh4_mid="$UH_MID"
 uh4_tid="$(thread_of "$uh4_mid")"
 mkdir -p -- "$PM_STATE_DIR/needs-operator" "$PM_STATE_DIR/spawns"
-printf 'thread budget 32 exhausted\n' > "$PM_STATE_DIR/needs-operator/$uh4_tid"
-seq 1 32 > "$PM_STATE_DIR/spawns/$uh4_tid"
+printf 'thread budget 96 exhausted\n' > "$PM_STATE_DIR/needs-operator/$uh4_tid"
+seq 1 96 > "$PM_STATE_DIR/spawns/$uh4_tid"
 uh4_seq_before="$(wc -l < "$PM_STATE_DIR/seq/$uh4_tid")"
 reply_msg '@ci-demo' "$uh4_mid" 'pushed' --to '@ken' --upstream-head "$uh_branch:$uh_sha" >/dev/null
 once
