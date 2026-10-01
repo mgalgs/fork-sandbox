@@ -2856,6 +2856,8 @@ EOF
 #                above FS_OUTBOX_MAX_BYTES by --outbox-max. Defaults to
 #                FS_OUTBOX_MAX_BYTES so a caller that has no override still
 #                gets a true number. Unused when $5 is empty.
+# $8  plan_file  non-empty to reserve plan.md in the outbox section; ""
+#                (the default, and always so on --k8s) leaves it out.
 #
 # FS_PREAMBLE_CLONE_REUSED=true (a variable rather than an argument, so the
 # launcher sets it once for every leg's preamble) marks a reused persistent
@@ -2867,6 +2869,7 @@ fs_emit_prompt_preamble() {
     local outbox_dir="$5"
     local inbox_write="${6:-}"
     local outbox_max_bytes="${7:-$FS_OUTBOX_MAX_BYTES}"
+    local plan_file="${8:-}"
     cat <<EOF
 # Your working directory
 
@@ -2988,6 +2991,15 @@ changes belong in commits, not here.
 
 **\`handoff.md\` at the root of this directory is reserved** for this run's
 own self-refresh protocol. Do not write anything named that.
+EOF
+        if [[ -n "$plan_file" ]]; then
+            cat <<'EOF'
+
+**`plan.md`** is reserved the same way, for this run's own planning leg.
+Do not write anything named that either.
+EOF
+        fi
+        cat <<EOF
 
 The whole directory has a $((outbox_max_bytes / 1024 / 1024)) MiB budget.
 Go over it and the outbox is refused **as a whole, not truncated** -- one
@@ -3055,18 +3067,23 @@ EOF
 #                   at launch, so any failure here is a bug that must be
 #                   visible at prompt-build time (before any model runs),
 #                   not a silently missing section.
-# $2  flavor        "spec" (default) or "review-only" -- see
+# $2  flavor        "spec" (default), "review-only" or "plan" -- see
 #                   fs_emit_handoff_spec_section. The heading above the
 #                   embedded text and the wording of the fail-on-missing/
 #                   empty/unreadable checks below both change with it: the
 #                   review-only file is a review brief, not the branch's
-#                   spec, and the failure text should not call it one.
+#                   spec, and the failure text should not call it one; the
+#                   plan flavor is embedded before any branch exists to
+#                   call "built", so it is a brief, not a handoff.
 fs_append_handoff_brief() {
     local handoff_file="$1" flavor="${2:-spec}"
     local doc_desc build_desc
     if [[ "$flavor" == "review-only" ]]; then
         doc_desc="review brief"
         build_desc="the review brief for this run"
+    elif [[ "$flavor" == "plan" ]]; then
+        doc_desc="brief"
+        build_desc="the brief this plan is written against"
     else
         doc_desc="handoff"
         build_desc="the handoff the branch was built against"
@@ -3092,6 +3109,8 @@ fs_append_handoff_brief() {
     fi
     if [[ "$flavor" == "review-only" ]]; then
         printf '\n## The review brief\n\n'
+    elif [[ "$flavor" == "plan" ]]; then
+        printf '\n## The original brief\n\n'
     else
         printf '\n## The handoff this branch was built against\n\n'
     fi
@@ -3120,11 +3139,16 @@ fs_append_handoff_brief() {
 # text handed to the reviewer can itself be wrong, and saying so is a
 # finding.
 #
+# The "plan" flavor is the other exception: there is no branch yet for
+# rules 1 and 2 to judge, so it keeps only rule 3 (the brief can be wrong)
+# and routes it to BLOCKED instead of a verdict.
+#
 # $1  handoff_file  see fs_append_handoff_brief.
-# $2  flavor        "spec" (default) or "review-only", see above. Only the
-#                   local --review-only render site passes "review-only";
-#                   every other caller must keep rendering byte-identical
-#                   to the "spec" flavor.
+# $2  flavor        "spec" (default), "review-only" or "plan", see above.
+#                   Only the local --review-only render site passes
+#                   "review-only" and only fs_emit_plan_prompt_body passes
+#                   "plan"; every other caller must keep rendering
+#                   byte-identical to the "spec" flavor.
 fs_emit_handoff_spec_section() {
     local handoff_file="$1" flavor="${2:-spec}"
     if [[ "$flavor" == "review-only" ]]; then
@@ -3147,6 +3171,30 @@ branch's own code contradicts, an emphasis that misses the real risk. If you
 believe it is, say so and say why — that IS a finding, and it is the most
 valuable one you can report. Never withhold it because the brief sounds
 decided.
+EOF
+    elif [[ "$flavor" == "plan" ]]; then
+        cat <<'EOF'
+
+---
+
+## The brief is the spec — plan against it
+
+The text appended below is the brief this run was launched with. It is the
+only thing in this sandbox that says what was asked for, and the plan you
+write is an answer to it, not to anything else.
+
+There is no branch to compare it against yet — you are planning before any
+code exists, not reviewing a diff — so judge the brief on its own terms.
+Where it leaves something unresolved, that is an assumption (2, above), not
+a gap to report. Where it already decided something, plan to build that,
+even if a different approach occurs to you; say what you would have done
+differently in a rejected-alternative line (1, above) instead of quietly
+planning around the decision.
+
+The brief can still be wrong: a request this repository cannot support, a
+premise the code contradicts, a constraint that defeats its own goal. That
+is what `BLOCKED` is for, above — say so there, plainly, rather than
+planning around a brief you believe cannot be followed.
 EOF
     else
         cat <<'EOF'
@@ -3737,6 +3785,118 @@ Hold it to two rules.
    newer word.
 EOF
     fs_append_handoff_brief "$handoff_file"
+}
+
+# The plan leg's task text, ending with the brief in the "plan" flavor.
+#
+# $1  branch        the branch the plan is written against.
+# $2  base_sha      the commit the branch is compared against; the range
+#                    is $base_sha...HEAD, same as a review leg's.
+# $3  plan_outbox_file  the absolute path, inside the outbox, the leg
+#                    must write its plan to.
+# $4  handoff_file   the caller's original handoff, embedded at the end
+#                    of the body; see fs_append_handoff_brief.
+fs_emit_plan_prompt_body() {
+    local branch="$1" base_sha="$2" plan_outbox_file="$3" handoff_file="$4"
+    cat <<EOF
+
+---
+
+## Plan, don't code
+
+You are the planning leg of this pipeline: a strong model works out the
+approach before a cheaper one codes it. Your working tree is this branch
+(\`$branch\`, compared against \`$base_sha\`), but you do not write to
+it — you write a plan, nothing else. Make no commits; a plan leg that
+commits fails the run, so leave the clone exactly as you found it.
+
+Write your plan, as markdown, to:
+
+    $plan_outbox_file
+
+Make the plan earn that trust. It should:
+
+1. **Make one decision**, with each alternative you rejected on its own
+   line and why.
+2. **Turn every open question into an assumption**: state it, say why
+   you chose it, and say what the implementer should do if it turns out
+   to be wrong. You cannot ask; the implementer runs unattended, and a
+   question left open never gets answered.
+3. **Be grounded in this repository**: name existing patterns to copy,
+   and the files and functions to touch, each with a \`file:line\`
+   pointer.
+4. **State requirements as testable behavior** — "WHEN <condition> THE
+   SYSTEM SHALL <behavior>" or similar — and map every test in your test
+   list to exactly one requirement, each test placed at the highest
+   existing seam that can exercise it, not a new one invented for the
+   occasion.
+5. **Split the work into commits** that each leave the tree green and
+   wired in — no commit that adds code nothing calls yet. Any refactor
+   the plan needs comes first, its own commit.
+6. **Say what is out of scope.** An unattended coder otherwise widens
+   the task to fill the silence.
+7. **Meet this bar before you call it done**: every requirement from (4)
+   has a test, every file your plan touches belongs to a commit in (5),
+   and nothing is left undecided — no question without an assumption,
+   no "TBD".
+
+Open the plan with the assumptions list from (2), then the decision and
+the grounding from (1) and (3), then the test list from (4), then the
+commit split from (5), then what is out of scope from (6). Say what to
+build and why; the exact edits are the implementer's job, not yours.
+
+If this run should not proceed at all — the brief asks for something
+this repository cannot support, or contradicts itself beyond an
+assumption's reach — make the plan's first line the single word
+\`BLOCKED\`, then say why. That ends the run before any code is written:
+say so plainly rather than writing a plan you already know cannot be
+followed.
+EOF
+    fs_emit_handoff_spec_section "$handoff_file" plan
+}
+
+# Appended after the brief to every later leg's prompt in a run with a plan
+# step; a no-op when $1 is empty. A missing plan file fails loudly: the plan
+# step runs first, so by the time any later prompt is built it is a bug.
+#
+# $1  plan_file  the run-dir copy of the plan, or "" for no plan step.
+# $2  flavor     "review" (default): deviations are findings. "code": for
+#                code and fix legs, which are told to explain a deviation.
+fs_emit_plan_section() {
+    local plan_file="$1" flavor="${2:-review}"
+    [[ -n "$plan_file" ]] || return 0
+    if [[ ! -f "$plan_file" || ! -r "$plan_file" || ! -s "$plan_file" ]]; then
+        printf 'Error: the plan file %q is missing, unreadable or empty at' "$plan_file" >&2
+        printf ' prompt-build time. The plan cannot be embedded into the' >&2
+        printf ' prompt, so the prompt is not built rather than built' >&2
+        printf ' without it.\n' >&2
+        return 1
+    fi
+    if [[ "$flavor" == "code" ]]; then
+        cat <<'EOF'
+
+## The plan
+
+A planning leg worked out the approach below before this leg ran. Follow
+it; where it and the brief above disagree, the brief wins. If you deviate
+from it, say why -- in a commit message or your final report -- a reviewer
+is told to treat an unexplained deviation as a finding, and cannot tell a
+deliberate change from an oversight on its own.
+
+EOF
+    else
+        cat <<'EOF'
+
+## The plan
+
+A planning leg worked out the approach below before this leg ran. Follow
+it; where it and the brief above disagree, the brief wins. Treat a
+deviation from the plan with no stated reason, and an assumption in the
+plan that contradicts the brief, as findings.
+
+EOF
+    fi
+    cat -- "$plan_file"
 }
 
 # Appended to a review or maintainer prompt when the coding leg that

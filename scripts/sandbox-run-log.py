@@ -440,7 +440,7 @@ PIPELINE_FIX_KEYS = ("harness", "model", "repeat")
 # test_model_aliases_cover_pipeline_spec_models below holds the two tables
 # in step so a model added to one and not the other fails loudly.
 MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable", "terra", "sol", "luna", "astra")
-STAGE_LETTERS = {"code": "c", "review": "r", "maintain": "m"}
+STAGE_LETTERS = {"code": "c", "review": "r", "maintain": "m", "plan": "p"}
 
 STEP_LOOP_RE = re.compile(r"step-([0-9]+)-loop\.json")
 

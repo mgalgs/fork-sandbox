@@ -4,13 +4,18 @@
 Usage: fork-sandbox-preset-parse.py [--drop-code] <file> <name> <label>
 
 A preset is a YAML document shaped like a CI workflow file: an `agents`
-mapping and a `pipeline` list of steps -- each `action: code`, `review` or
-`maintain`, in any order and any count, so long as there is at least one.
-A `code` step is a coding leg; a `review`/`maintain` step is a loop with a
-`repeat` cap and an optional `fix_agent` of its own (see docs/presets.md).
+mapping and a `pipeline` list of steps -- each `action: code`, `review`,
+`maintain` or `plan`, in any order and any count, so long as there is at
+least one. A `code` step is a coding leg; a `review`/`maintain` step is a
+loop with a `repeat` cap and an optional `fix_agent` of its own (see
+docs/presets.md). A `plan` step is a one-shot leg that writes a plan and
+commits nothing; it takes `agent` and an optional `repeat`, which must be
+1, and every `plan` step must come before the pipeline's first `code`
+step -- a pipeline with a `plan` step and no `code` step is refused.
 A pipeline with no code step and no fix_agent is read-only: each step
 writes its verdict once. --drop-code (for --review-only) removes the code
-steps and fix seats, making any pipeline read-only.
+steps and fix seats, making any pipeline read-only; a `plan` step has no
+place in a read-only pipeline either, and --drop-code refuses one outright.
 This script owns everything about the FILE -- YAML validity, the schema,
 the pipeline structure, the engine-shape rules -- and emits the result as
 tab-separated lines on stdout for fork-sandbox.sh to compile into its own
@@ -25,7 +30,7 @@ ordered step list:
     agent <name> network <value>        (empty value when unset)
     pipeline steps <n>                  (the number of pipeline steps)
     pipeline readonly 1                 (read-only: no fix_* step lines)
-    step <k> action <code|review|maintain>   (k is 1-based, pipeline order)
+    step <k> action <code|review|maintain|plan>   (k is 1-based, pipeline order)
     step <k> agent <name>
     step <k> repeat <n>                 (code step only, when != 1)
     step <k> refresh_at <value>         (the first code step only, when set)
@@ -69,7 +74,7 @@ except ImportError:
 
 HARNESSES = ("claude", "pi", "pi-local", "codex")
 
-STEP_ACTIONS = ("code", "review", "maintain")
+STEP_ACTIONS = ("code", "review", "maintain", "plan")
 
 
 class DupKeyLoader(yaml.SafeLoader):
@@ -226,18 +231,20 @@ def main():
         return ref
 
     # ---- pipeline: pass 1, per-step structural validation ----
-    # No ordering or count constraints -- any sequence of code/review/maintain
-    # steps, so long as there is at least one (already checked above). A
-    # review step over an empty diff approves trivially; that is documented
-    # behavior (docs/presets.md), not something this parser enforces.
+    # No ordering or count constraints on code/review/maintain steps, so
+    # long as there is at least one (already checked above). A review step
+    # over an empty diff approves trivially; that is documented behavior
+    # (docs/presets.md), not something this parser enforces. A `plan` step
+    # is the one exception with an ordering rule of its own -- checked
+    # below, once every step's action is known.
     steps = []
     for i, item in enumerate(pipeline):
         path = f"pipeline[{i}]"
         item = step_map(item, path)
         verb = item.get("action")
         if verb not in STEP_ACTIONS:
-            fail(f"{path}: 'action' must be 'code', 'review' or 'maintain', "
-                 f"not '{verb}'")
+            fail(f"{path}: 'action' must be 'code', 'review', 'maintain' "
+                 f"or 'plan', not '{verb}'")
         if verb == "code":
             agent_ref = ""
             repeat_val = None
@@ -259,6 +266,26 @@ def main():
                 fail(f"{path}: the code step needs an agent")
             steps.append({"index": i, "action": "code", "agent": agent_ref,
                           "repeat": repeat_val})
+        elif verb == "plan":
+            agent_ref = ""
+            repeat_val = None
+            for prop, value in item.items():
+                ppath = f"{path}.{prop}"
+                if prop == "action":
+                    continue
+                if prop == "agent":
+                    agent_ref = known(value, ppath)
+                elif prop == "repeat":
+                    repeat_val = positive_int(value, ppath)
+                    if repeat_val != 1:
+                        fail(f"{ppath}: the repeat count on a plan step "
+                             f"must be 1 for now")
+                else:
+                    fail(f"{ppath}: unknown plan-step key; it takes "
+                         f"'agent' and 'repeat'")
+            if not agent_ref:
+                fail(f"{path}: the plan step needs an agent")
+            steps.append({"index": i, "action": "plan", "agent": agent_ref})
         else:
             reviewer = ""
             cap = None
@@ -285,17 +312,39 @@ def main():
             steps.append({"index": i, "action": verb, "agent": reviewer,
                           "cap": cap, "fix_ref": fix_ref})
 
+    # ---- plan steps: an ordering rule of their own ----
+    # A plan step plans for the code that follows it, so it must come
+    # before the pipeline's first code step, and a pipeline that never
+    # codes has nothing for a plan step to plan for.
+    plan_steps = [s for s in steps if s["action"] == "plan"]
+    if plan_steps:
+        first_code_idx = next((s["index"] for s in steps
+                                if s["action"] == "code"), None)
+        if first_code_idx is None:
+            fail("a pipeline with a 'plan' step needs a 'code' step; add "
+                 "one or drop the plan step")
+        out_of_order = [s for s in plan_steps if s["index"] > first_code_idx]
+        if out_of_order:
+            fail(f"pipeline[{out_of_order[0]['index']}]: a 'plan' step "
+                 f"must come before the pipeline's first 'code' step")
+
     # ---- read-only pipelines ----
     # With no code step and no fix_agent, nothing can act on a finding, so
     # the pipeline reviews an existing branch: each step writes its verdict
     # once. --drop-code (fork-sandbox.sh's --review-only over a preset)
     # makes any pipeline read-only by dropping its code steps and fix seats.
+    # A 'plan' step has no place there: dropping the code step it plans for
+    # leaves it planning for nothing, so the combination is refused outright
+    # rather than silently becoming the no-code case above.
     dropped_agents = set()
     early_warns = []
     if DROP_CODE:
+        if plan_steps:
+            fail("--review-only is refused when the pipeline has a 'plan' "
+                 "step: it drops the code step the plan was written for")
         dropped_agents = {s["agent"] for s in steps if s["action"] == "code"}
         dropped_agents |= {s["fix_ref"] for s in steps
-                           if s["action"] != "code" and s["fix_ref"]}
+                           if s["action"] not in ("code", "plan") and s["fix_ref"]}
         steps = [s for s in steps if s["action"] != "code"]
         if not steps:
             fail("--review-only drops the code step, and this pipeline has "
@@ -344,6 +393,8 @@ def main():
         if s["action"] == "code":
             s["repeat_eff"] = (s["repeat"] if s["repeat"] is not None
                                 else agents[s["agent"]]["repeat"])
+        elif s["action"] == "plan":
+            pass
         elif read_only:
             s["fix_resolved"] = None
         else:
@@ -364,7 +415,7 @@ def main():
                   if s["action"] in ("review", "maintain")} - {None}
     coding = code_step_agents | fix_agents
     seated = coding | {s["agent"] for s in steps
-                        if s["action"] in ("review", "maintain")}
+                        if s["action"] in ("review", "maintain", "plan")}
     if first_code_agent:
         impl = agents[first_code_agent]
         if (impl["refresh_at"] or impl["refresh_max"]) \
@@ -431,6 +482,8 @@ def main():
                     out.append(f"step\t{k}\trefresh_at\t{impl['refresh_at']}")
                 if impl["refresh_max"]:
                     out.append(f"step\t{k}\trefresh_max\t{impl['refresh_max']}")
+        elif s["action"] == "plan":
+            pass
         elif read_only:
             out.append(f"step\t{k}\tmax\t{s['cap']}")
         else:

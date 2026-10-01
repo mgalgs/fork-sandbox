@@ -210,12 +210,15 @@ fs_refresh_emit_addenda() {
 # $2 the hand-off, already moved to its record, $3 the destination path, $4
 # whether the hand-off is stale (0|1), $5 the header file (the static
 # preamble), $6 the original brief, $7 the record dir the addenda were
-# archived under. Order: header, framing, original brief, operator addenda
-# from earlier legs, a stale warning when $4 is 1, the previous hand-off.
+# archived under, $8 the plan file (see fs_emit_plan_section), empty when
+# this run has no plan step. Order: header, framing, original brief, the
+# plan (right after the brief, same place every other leg's prompt puts
+# it), operator addenda from earlier legs, a stale warning when $4 is 1,
+# the previous hand-off.
 # shellcheck disable=SC2016  # the backticks are literal prompt text
 fs_refresh_build_prompt() {
     local n="$1" handoff="$2" out="$3" stale="${4:-0}" header="$5" \
-        brief="$6" record_dir="$7" addenda_list d f
+        brief="$6" record_dir="$7" plan_file="${8:-}" addenda_list d f
     addenda_list="$(fs_refresh_addenda_dirs "$record_dir")"
     {
         cat -- "$header"
@@ -243,6 +246,26 @@ fs_refresh_build_prompt() {
         printf 'brief contains, the brief wins.\n\n'
         printf '\n---\n\n## The original brief\n\n'
         cat -- "$brief"
+        # A copy of fs_emit_plan_section's "code" flavor, kept in step by
+        # hand: this file ships standalone to k8s pods and cannot source
+        # fork-sandbox-lib.sh.
+        if [[ -n "$plan_file" ]]; then
+            if [[ ! -f "$plan_file" || ! -r "$plan_file" || ! -s "$plan_file" ]]; then
+                printf 'Error: the plan file %q is missing, unreadable or' "$plan_file" >&2
+                printf ' empty at prompt-build time. The plan cannot be' >&2
+                printf ' embedded into the prompt, so the prompt is not' >&2
+                printf ' built rather than built without it.\n' >&2
+                exit 1
+            fi
+            printf '\n## The plan\n\n'
+            printf 'A planning leg worked out the approach below before this leg ran.\n'
+            printf 'Follow it; where it and the brief above disagree, the brief wins. If\n'
+            printf 'you deviate from it, say why -- in a commit message or your final\n'
+            printf 'report -- a reviewer is told to treat an unexplained deviation as a\n'
+            printf 'finding, and cannot tell a deliberate change from an oversight on its\n'
+            printf 'own.\n\n'
+            cat -- "$plan_file"
+        fi
         if [[ -n "$addenda_list" ]]; then
             printf '\n---\n\n## Operator addenda delivered to earlier legs\n\n'
             printf 'The operator sent the messages below to an earlier leg of this same\n'

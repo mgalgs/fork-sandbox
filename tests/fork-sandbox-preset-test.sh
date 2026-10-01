@@ -1084,7 +1084,7 @@ pipeline:
 EOF
 
 bad "an unknown pipeline action is refused" \
-    "'action' must be 'code', 'review' or 'maintain'" <<'EOF'
+    "'action' must be 'code', 'review', 'maintain' or 'plan'" <<'EOF'
 agents:
   coder:
     harness: claude
@@ -1439,6 +1439,131 @@ out="$(run --preset spare 2>"$err")"
 contains "an agent that sits no seat draws a warning" "$(cat "$err")" \
     "agent 'spare' is defined but sits no seat"
 
+printf '\n== the plan stage: parser-level shapes and refusals ==\n'
+
+parses "a plan step before the first code step parses" \
+    "step	1	action	plan" "step	1	agent	planner" \
+    "step	2	action	code" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+EOF
+
+parses "an explicit repeat of 1 on a plan step is accepted and not emitted" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: plan
+    agent: planner
+    repeat: 1
+  - action: code
+    agent: coder
+EOF
+out_plan_repeat1="$(python3 "$preset_parser" "$tmp/parse.yaml" t t 2>/dev/null)"
+lacks "a plan step's repeat of 1 compiles no repeat line" "$out_plan_repeat1" "step	1	repeat"
+
+parse_refuses "a plan step after the first code step is refused" \
+    "a 'plan' step must come before the pipeline's first 'code' step" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: code
+    agent: coder
+  - action: plan
+    agent: planner
+EOF
+
+parse_refuses "a plan step with no code step anywhere is refused" \
+    "needs a 'code' step" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  reviewer:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: plan
+    agent: planner
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+
+parse_refuses "a plan step's repeat above 1 is refused" \
+    "the repeat count on a plan step must be 1 for now" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: plan
+    agent: planner
+    repeat: 2
+  - action: code
+    agent: coder
+EOF
+
+parse_refuses "a plan step takes no fix_agent" \
+    "unknown plan-step key" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: plan
+    agent: planner
+    fix_agent: coder
+  - action: code
+    agent: coder
+EOF
+
+cat > "$tmp/parse.yaml" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+EOF
+if python3 "$preset_parser" --drop-code "$tmp/parse.yaml" t t > /dev/null 2>"$err"; then
+    no "--drop-code refuses a plan-containing pipeline" "expected a refusal, got exit 0"
+else
+    contains "--drop-code refuses a plan-containing pipeline" "$(cat "$err")" \
+        "is refused when the pipeline has a 'plan' step"
+fi
+
 printf '\n== --pipeline: an inline preset in the composition-name grammar ==\n'
 
 # The same shape as a hand-written preset must compile to the same launch.
@@ -1495,6 +1620,38 @@ accepts "a maintain stage before the code stage compiles" \
 accepts "a repeated code stage compiles" --pipeline chaiku-csonnet
 accepts "a review stage after a maintain stage compiles" \
     --pipeline chaiku-mopus-rsol
+accepts "a plan stage before the code stage compiles" \
+    --pipeline pfable-csonnet
+
+# --refresh-at's continuation chain only ever runs for a pipeline's own
+# step 1, and a plan step always sits there ahead of the code step it
+# plans for -- so it never engages on a plan-first pipeline. --dry-run
+# must say so instead of printing refresh_at=/refresh_threshold_tokens=
+# as if the chain will run (the claude default of 0.5 included).
+"$launcher" --dry-run --pipeline pfable-csonnet --refresh-at 0.3 \
+    unused-project unused-handoff >/dev/null 2>"$err"
+contains "a plan-first --pipeline with --refresh-at warns it will not engage" \
+    "$(cat "$err")" "will not engage"
+"$launcher" --dry-run --pipeline pfable-csonnet \
+    unused-project unused-handoff >/dev/null 2>"$err"
+contains "the same warning fires on the claude refresh-at default too" \
+    "$(cat "$err")" "will not engage"
+"$launcher" --dry-run --pipeline csonnet --refresh-at 0.3 \
+    unused-project unused-handoff >/dev/null 2>"$err"
+lacks "an ordinary code-first pipeline's --refresh-at does not warn" \
+    "$(cat "$err")" "will not engage"
+python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" pfable1-csonnet2-ropus1-mastra1-mopus1 | \
+    parses "a plan-first spec parses to 5 distinct steps" \
+        "pipeline	steps	5" \
+        "step	1	action	plan" "step	1	agent	planner" \
+        "step	2	action	code" "step	2	agent	coder" "step	2	repeat	2"
+refuses "a plan stage after the code stage is refused" \
+    "a plan segment must come before the pipeline's first code segment" \
+    --pipeline csonnet-pfable
+refuses "a plan stage with no code stage is refused" \
+    "a pipeline with a plan segment needs a code segment" --pipeline pfable
+refuses "a plan stage's repeat above 1 is refused" \
+    "the repeat count on a plan segment must be 1 for now" --pipeline pfable2-csonnet
 # Two code stages, each on its own agent and harness; fix legs default to
 # the first code step's agent, since the compiler names no fix_agent.
 python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
@@ -1777,6 +1934,45 @@ badreq400)
     printf 'stub: scripted badreq400 failure on call %s\n' "$n" >&2
     printf '{"type":"result","subtype":"error","is_error":true,"result":"API Error: 400 invalid_request_error"}\n'
     exit 1
+    ;;
+# A plan leg's own output: not a verdict in the clone's .git, but a file
+# in the run's outbox -- clone_dir's grandparent is the run dir (the
+# SNAPSHOT_DIR comment above derives it the same way), so the outbox sits
+# right beside the clone dir this stub was already handed.
+plan)
+    plan_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    mkdir -p "$plan_run_dir/outbox"
+    printf '# Plan\n\n## Assumptions\n\nNone -- call %s.\n\n## Mechanism\n\nStub plan body.\n' "$n" \
+        > "$plan_run_dir/outbox/plan.md"
+    ;;
+plan-blocked)
+    plan_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    mkdir -p "$plan_run_dir/outbox"
+    printf 'BLOCKED\n\nStub plan refuses to proceed on call %s.\n' "$n" \
+        > "$plan_run_dir/outbox/plan.md"
+    ;;
+# Same refusal, but rendered the way a planner following the prompt's own
+# backticked "`BLOCKED`" literally might write it: wrapped in markdown
+# emphasis, on a heading line.
+plan-blocked-md)
+    plan_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    mkdir -p "$plan_run_dir/outbox"
+    printf '# **BLOCKED**\n\nStub plan refuses to proceed on call %s.\n' "$n" \
+        > "$plan_run_dir/outbox/plan.md"
+    ;;
+# The reason on the same line, after a leading blank line.
+plan-blocked-reason)
+    plan_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    mkdir -p "$plan_run_dir/outbox"
+    printf '\nBLOCKED: stub plan refuses to proceed on call %s.\n' "$n" \
+        > "$plan_run_dir/outbox/plan.md"
+    ;;
+# A plan whose first line merely starts with the letters must still run.
+plan-not-blocked)
+    plan_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    mkdir -p "$plan_run_dir/outbox"
+    printf 'BLOCKEDNESS is not a word, so this plan proceeds (call %s).\n' "$n" \
+        > "$plan_run_dir/outbox/plan.md"
     ;;
 esac
 
@@ -2770,6 +2966,211 @@ if rd_composed="$(run_stubbed --preset composed --branch "sandbox-test-composed-
 else
     no "composed walk launch succeeds"
 fi
+
+printf '\n== the engine: a plan stage (--foreground, stubs) ==\n'
+
+cat > "$real_presets/plan-code-review.yaml" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+# plan, code (commit), review (findings -> its default fix seat runs), then
+# maintain (approved) -- the findings/fix round exercises the plan reaching
+# a fix leg's prompt, and the maintain step exercises it reaching a
+# maintain leg's prompt too (both left uncovered before: the acceptance
+# criterion is that the plan's file "reaches every later leg's prompt").
+prep_stub $'plan\ncommit\nfindings\ncommit\napproved'
+if rd_plan="$(run_stubbed --preset plan-code-review --branch "sandbox-test-plan-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_plan")
+    check "plan: runs first and once, then code, review, fix, then maintain" "5" "$(cat "$count")"
+    check "plan: pipeline.json names the first step's action plan" \
+        "plan" "$(jq -r '.steps[0].action' "$rd_plan/pipeline.json")"
+    check "plan: progress.json's first step is done" \
+        "done" "$(jq -r '.steps[0].state' "$rd_plan/progress.json")"
+    check "plan: step-1-loop.json records the plan leg's own outcome" \
+        "done" "$(jq -r '.ended' "$rd_plan/step-1-loop.json")"
+    check "plan: step-1-loop.json records the plan leg's own cost" \
+        "0.01" "$(jq -r '.cost_usd' "$rd_plan/step-1-loop.json")"
+    check "plan: summary.json's total_cost_usd counts the plan leg too" \
+        "0.050000" "$(jq -r '.total_cost_usd' "$rd_plan/summary.json")"
+    contains "plan: its file survives in the run dir" \
+        "$(cat "$rd_plan/plan.md")" "Stub plan body"
+    contains "plan: its own prompt tells it to write plan.md" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "Write your plan, as markdown, to:"
+    lacks "plan: its own prompt does not reserve plan.md against itself" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "is reserved the same way, for this run's own planning leg"
+    contains "plan: its own prompt still reserves handoff.md" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "is reserved** for this run's"
+    contains "plan: reaches the code leg's own prompt, after the brief" \
+        "$(cat "$rd_plan/code-prompt-2-1.md")" "## The plan"
+    contains "plan: the code leg's prompt carries the plan's own text" \
+        "$(cat "$rd_plan/code-prompt-2-1.md")" "Stub plan body"
+    contains "plan: the outbox section reserves plan.md too, for a run that has one" \
+        "$(cat "$rd_plan/code-prompt-2-1.md")" "is reserved the same way, for this run's own planning leg"
+    plan_brief_line="$(grep -n -m1 'do the task' "$rd_plan/code-prompt-2-1.md" | cut -d: -f1)"
+    plan_section_line="$(grep -n -m1 '## The plan' "$rd_plan/code-prompt-2-1.md" | cut -d: -f1)"
+    if [[ -n "$plan_brief_line" && -n "$plan_section_line" \
+        && "$plan_brief_line" -lt "$plan_section_line" ]]; then
+        ok "plan: the brief precedes the plan in the code leg's prompt"
+    else
+        no "plan: the brief precedes the plan in the code leg's prompt" \
+            "brief at line $plan_brief_line, plan section at line $plan_section_line"
+    fi
+    contains "plan: the code leg's own plan section tells it to say why, not to find" \
+        "$(cat "$rd_plan/code-prompt-2-1.md")" "say why"
+    lacks "plan: the code leg's own plan section does not ask it to treat its own work as a finding" \
+        "$(cat "$rd_plan/code-prompt-2-1.md")" "as findings"
+    contains "plan: reaches the review leg's own prompt" \
+        "$(cat "$rd_plan/step-3-prompt-1.md")" "Stub plan body"
+    contains "plan: the review prompt says the brief wins where the two disagree" \
+        "$(cat "$rd_plan/step-3-prompt-1.md")" "the brief wins"
+    contains "plan: the review leg's own plan section asks it to treat deviations as findings" \
+        "$(cat "$rd_plan/step-3-prompt-1.md")" "as findings"
+    contains "plan: reaches the fix leg's own prompt" \
+        "$(cat "$rd_plan/s3-fix-prompt-1.md")" "Stub plan body"
+    contains "plan: the fix leg's own plan section tells it to say why, not to find" \
+        "$(cat "$rd_plan/s3-fix-prompt-1.md")" "say why"
+    contains "plan: reaches the maintain leg's own prompt" \
+        "$(cat "$rd_plan/step-4-prompt-1.md")" "Stub plan body"
+    contains "plan: the maintain leg's own plan section asks it to treat deviations as findings" \
+        "$(cat "$rd_plan/step-4-prompt-1.md")" "as findings"
+else
+    no "plan: composed walk launch succeeds"
+fi
+
+# BLOCKED on the plan's own first line ends the run before the code leg --
+# the shared "\$rc\" != \"0\"' skip the code branch already honors for an
+# earlier failed step (see "a composed pipeline's first code leg fails"
+# below) applies here unchanged, driven by the plan branch setting $rc.
+prep_stub $'plan-blocked'
+if rd_blocked="$(run_stubbed_expect_fail --preset plan-code-review \
+    --branch "sandbox-test-plan-blocked-$$-$RANDOM")"; then
+    rd_blocked_dir="${rd_blocked%%$'\t'*}"
+    rd_blocked_rc="${rd_blocked##*$'\t'}"
+    tmpdirs+=("$rd_blocked_dir")
+    check "plan BLOCKED: the run's own exit code is non-zero" "1" \
+        "$([[ "$rd_blocked_rc" != 0 ]] && echo 1 || echo 0)"
+    check "plan BLOCKED: the code leg never ran" "1" "$(cat "$count")"
+    check "plan BLOCKED: progress.json's plan step is failed" \
+        "failed" "$(jq -r '.steps[0].state' "$rd_blocked_dir/progress.json")"
+    check "plan BLOCKED: progress.json's plan step ended blocked" \
+        "blocked" "$(jq -r '.steps[0].ended' "$rd_blocked_dir/progress.json")"
+    check "plan BLOCKED: progress.json's code step is skipped" \
+        "skipped" "$(jq -r '.steps[1].state' "$rd_blocked_dir/progress.json")"
+    contains "plan BLOCKED: the plan's own text is still on disk" \
+        "$(cat "$rd_blocked_dir/plan.md")" "refuses to proceed"
+else
+    no "plan BLOCKED: launch reaches a run dir"
+fi
+
+# The same refusal still catches BLOCKED rendered as markdown emphasis on
+# a heading line ("# **BLOCKED**") -- the prompt names the word in
+# backticks as a literal, but the plan is markdown, so a planner that
+# renders rather than quotes it must not slip past the bare-word check.
+prep_stub $'plan-blocked-md'
+if rd_blocked_md="$(run_stubbed_expect_fail --preset plan-code-review \
+    --branch "sandbox-test-plan-blocked-md-$$-$RANDOM")"; then
+    rd_blocked_md_dir="${rd_blocked_md%%$'\t'*}"
+    rd_blocked_md_rc="${rd_blocked_md##*$'\t'}"
+    tmpdirs+=("$rd_blocked_md_dir")
+    check "plan BLOCKED (markdown): the run's own exit code is non-zero" "1" \
+        "$([[ "$rd_blocked_md_rc" != 0 ]] && echo 1 || echo 0)"
+    check "plan BLOCKED (markdown): the code leg never ran" "1" "$(cat "$count")"
+    check "plan BLOCKED (markdown): progress.json's plan step ended blocked" \
+        "blocked" "$(jq -r '.steps[0].ended' "$rd_blocked_md_dir/progress.json")"
+else
+    no "plan BLOCKED (markdown): launch reaches a run dir"
+fi
+
+prep_stub $'plan-blocked-reason'
+if rd_blocked_rs="$(run_stubbed_expect_fail --preset plan-code-review \
+    --branch "sandbox-test-plan-blocked-rs-$$-$RANDOM")"; then
+    rd_blocked_rs_dir="${rd_blocked_rs%%$'\t'*}"
+    tmpdirs+=("$rd_blocked_rs_dir")
+    check "plan BLOCKED (reason on the line): the code leg never ran" "1" "$(cat "$count")"
+    check "plan BLOCKED (reason on the line): the plan step ended blocked" \
+        "blocked" "$(jq -r '.steps[0].ended' "$rd_blocked_rs_dir/progress.json")"
+else
+    no "plan BLOCKED (reason on the line): launch reaches a run dir"
+fi
+
+prep_stub $'plan-not-blocked\ncommit\napproved\napproved'
+if rd_notblocked="$(run_stubbed --preset plan-code-review \
+    --branch "sandbox-test-plan-not-blocked-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_notblocked")
+    check "plan starting with BLOCKEDNESS: the plan step is done" \
+        "done" "$(jq -r '.steps[0].ended' "$rd_notblocked/progress.json")"
+    check "plan starting with BLOCKEDNESS: the code leg ran" "4" "$(cat "$count")"
+else
+    no "plan starting with BLOCKEDNESS: launch succeeds"
+fi
+
+# A plan leg that commits fails the run outright -- the inverted-polarity
+# head check (committing, not staying still, is this leg's failure signal)
+# is unconditional, not gated on the retry-exhaustion path a code/fix leg's
+# own head check rides.
+prep_stub $'commit'
+if rd_committed="$(run_stubbed_expect_fail --preset plan-code-review \
+    --branch "sandbox-test-plan-committed-$$-$RANDOM")"; then
+    rd_committed_dir="${rd_committed%%$'\t'*}"
+    rd_committed_rc="${rd_committed##*$'\t'}"
+    tmpdirs+=("$rd_committed_dir")
+    check "plan commits: the run's own exit code is non-zero" "1" \
+        "$([[ "$rd_committed_rc" != 0 ]] && echo 1 || echo 0)"
+    check "plan commits: the code leg never ran" "1" "$(cat "$count")"
+    check "plan commits: progress.json's plan step ended committed" \
+        "committed" "$(jq -r '.steps[0].ended' "$rd_committed_dir/progress.json")"
+    contains "plan commits: step-1-loop.json's detail names the violation" \
+        "$(jq -r '.detail' "$rd_committed_dir/step-1-loop.json")" "commits nothing"
+else
+    no "plan commits: launch reaches a run dir"
+fi
+
+# A plan-only --pipeline spec is refused for want of a code step, and --k8s
+# refuses any plan-containing pipeline outright (it is always composed) --
+# both already covered at the parser level above; this just pins the
+# same two refusals through the full launcher one more time, with a real
+# preset file rather than a --pipeline spec.
+# The three refusals below go through "refuses"/"run" (--dry-run against
+# $presets_dir, the static section's own presets directory above) rather
+# than the stubbed-engine section's $real_presets, so the fixture files
+# are written there too.
+cp -- "$real_presets/plan-code-review.yaml" "$presets_dir/plan-code-review.yaml"
+cat > "$presets_dir/plan-only.yaml" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: opus
+pipeline:
+  - action: plan
+    agent: planner
+EOF
+refuses "--review-only over a plan-containing preset is refused" \
+    "is refused when the pipeline has a 'plan' step" \
+    --preset plan-code-review --review-only
+refuses "a plan-only preset is refused" \
+    "needs a 'code' step" --preset plan-only
+refuses "--k8s refuses a plan-containing preset" \
+    "does not support a composed pipeline preset" \
+    --preset plan-code-review --k8s
 
 # A1b. cur_save's jq write is `... > "$f.part" && mv ... "$f.part" "$f"` --
 # on a jq failure the redirection still creates the .part file, and without

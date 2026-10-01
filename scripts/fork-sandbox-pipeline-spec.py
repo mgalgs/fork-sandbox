@@ -8,12 +8,14 @@ A spec is a preset's composition name used as the preset itself:
 `csonnet2-rsol2-mopus2` (code sonnet x2, review sol x2, maintain opus x2),
 or `ropus-msonnet` (opus review, sonnet maintain -- no code step at all).
 
-    stage    c (code), r (review) or m (maintain), in any order and any
-             count, exactly as a preset file's pipeline allows --
+    stage    c (code), r (review), m (maintain) or p (plan), in any order
+             and any count, exactly as a preset file's pipeline allows --
              UNLESS there is no c segment: a codeless spec compiles to a
              read-only pipeline (see fork-sandbox-preset-parse.py), which
              reviews an existing branch and runs each r and m step once,
-             so every repeat in it must be 1.
+             so every repeat in it must be 1. A p segment is further
+             restricted: it must come before the first c segment, a spec
+             with p and no c is refused, and its own repeat must be 1.
     model    a name from MODELS below. It runs on its native harness, the
              first one listed for it.
     harness  optional: claude, codex or pi, to seat the model on a
@@ -21,13 +23,14 @@ or `ropus-msonnet` (opus review, sonnet maintain -- no code step at all).
              harness in MODELS.
     repeat   optional, default 1. On the code step it is the agent's
              repeat, so it reaches the fix legs too, as in a hand-written
-             preset; on a review or maintain step it is the loop cap.
+             preset; on a review or maintain step it is the loop cap; on
+             a plan step it must be 1 -- there is no loop to cap.
 
 Each segment compiles to its own agent and its own pipeline step. A
 stage's first segment names its agent the plain way ("coder", "reviewer",
-"maintainer"); a second and later segment of the same stage numbers it
-from there ("reviewer2", "reviewer3", ...) -- deterministic on the spec's
-own segment order, not on the model or harness a segment names.
+"maintainer", "planner"); a second and later segment of the same stage
+numbers it from there ("reviewer2", "reviewer3", ...) -- deterministic on
+the spec's own segment order, not on the model or harness a segment names.
 
 Fix legs ride the first code seat: no step names a fix_agent, so the
 preset parser's default applies. Anything the
@@ -63,9 +66,9 @@ MODELS = {
 
 HARNESSES = ("claude", "codex", "pi")
 
-STAGES = {"c": "code", "r": "review", "m": "maintain"}
+STAGES = {"c": "code", "r": "review", "m": "maintain", "p": "plan"}
 
-AGENT_NAMES = {"c": "coder", "r": "reviewer", "m": "maintainer"}
+AGENT_NAMES = {"c": "coder", "r": "reviewer", "m": "maintainer", "p": "planner"}
 
 
 def fail(spec, msg):
@@ -94,7 +97,9 @@ def parse_seat(spec, seg, body):
 def compile_spec(spec):
     segments = spec.split("-")
     seats = []
-    occurrences = {"c": 0, "r": 0, "m": 0}
+    occurrences = {"c": 0, "r": 0, "m": 0, "p": 0}
+    seen_code = False
+    saw_plan = False
     for seg in segments:
         m = re.fullmatch(r"([a-z])([a-z]+)([0-9]*)", seg)
         if not m:
@@ -103,17 +108,31 @@ def compile_spec(spec):
         stage, body, digits = m.groups()
         if stage not in STAGES:
             fail(spec, f"segment '{seg}': stage '{stage}' is not c (code), "
-                       f"r (review) or m (maintain)")
+                       f"r (review), m (maintain) or p (plan)")
         if digits and (digits.startswith("0")):
             fail(spec, f"segment '{seg}': the repeat count is a positive "
                        f"integer without a leading zero")
         repeat = int(digits) if digits else 1
+        if stage == "p":
+            saw_plan = True
+            if seen_code:
+                fail(spec, f"segment '{seg}': a plan segment must come "
+                           f"before the pipeline's first code segment")
+            if repeat != 1:
+                fail(spec, f"segment '{seg}': the repeat count on a plan "
+                           f"segment must be 1 for now")
+        elif stage == "c":
+            seen_code = True
         harness, model_id = parse_seat(spec, seg, body)
         occurrences[stage] += 1
         occurrence = occurrences[stage]
         agent = (AGENT_NAMES[stage] if occurrence == 1
                  else f"{AGENT_NAMES[stage]}{occurrence}")
         seats.append((stage, harness, model_id, repeat, agent))
+
+    if saw_plan and not seen_code:
+        fail(spec, "a pipeline with a plan segment needs a code segment; "
+                   "add one or drop the plan segment")
 
     lines = [f"# Compiled from --pipeline {spec}", "agents:"]
     for stage, harness, model_id, repeat, agent in seats:
@@ -126,7 +145,7 @@ def compile_spec(spec):
     for stage, _, _, repeat, agent in seats:
         lines += [f"  - action: {STAGES[stage]}",
                   f"    agent: {agent}"]
-        if stage != "c":
+        if stage not in ("c", "p"):
             lines.append(f"    repeat: {repeat}")
     return "".join(line + "\n" for line in lines)
 

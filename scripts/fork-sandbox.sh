@@ -3735,6 +3735,16 @@ refresh_context_window="" refresh_threshold_tokens="" refresh_ceiling_tokens=""
 fs_refresh_resolve "$harness" "$refresh_at_arg" "$refresh_at_given" \
     "$refresh_max_arg" "$model" || exit 1
 
+# The continuation chain runs only for step 1 (fs_impl_leg_ran_at_step1,
+# below), so a pipeline whose step 1 is not code never refreshes.
+if (( refresh_enabled )) && [[ "$preset_is_legacy_shaped" != true \
+    && "${preset_step_action[1]:-}" != code ]]; then
+    echo "Warning: this pipeline's step 1 is" \
+        "'${preset_step_action[1]:-}', not 'code', so --refresh-at's" >&2
+    echo "continuation chain will not engage -- it only ever runs for a" >&2
+    echo "pipeline's own step 1. The run's refresh field reports 'none'." >&2
+fi
+
 # The resolved model values are what --dry-run prints, so they have to clear
 # the shell-safety check before it prints them. The full sweep over every
 # generated-runner value still runs below; this is the same check applied
@@ -5030,6 +5040,7 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
             "$preset_k_model" "s${preset_k}" \
             "${preset_agent_network[$preset_k_agent]}"
         if [[ "${preset_step_action[$preset_k]}" != code \
+            && "${preset_step_action[$preset_k]}" != plan \
             && "$preset_ro_multi" != true ]]; then
             preset_k_fix_model="${preset_step_fix_model[$preset_k]}"
             preset_k_fix_model_given=false
@@ -5092,6 +5103,10 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                 run_step_kind[preset_k]="maintainer"
                 run_step_cap[preset_k]="${preset_step_max[$preset_k]}"
                 ;;
+            plan)
+                run_step_kind[preset_k]="plan"
+                run_step_cap[preset_k]=1
+                ;;
         esac
         run_step_idx[preset_k]="s${preset_k}"
         run_step_prompt[preset_k]=""
@@ -5140,6 +5155,7 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
         preset_k_harness_var="s${preset_k}_harness"
         composed_step_sweep_values+=("${!preset_k_model_var}" "${!preset_k_harness_var}")
         if [[ "${preset_step_action[$preset_k]}" != code \
+            && "${preset_step_action[$preset_k]}" != plan \
             && "$preset_ro_multi" != true ]]; then
             preset_k_fix_model_var="s${preset_k}fix_model"
             preset_k_fix_harness_var="s${preset_k}fix_harness"
@@ -5329,6 +5345,7 @@ if [[ -n "$preset_name" ]]; then
             code) pipeline_action="code" ;;
             review) pipeline_action="review" ;;
             maintainer) pipeline_action="maintain" ;;
+            plan) pipeline_action="plan" ;;
         esac
         pipeline_fix_json=null
         if [[ "$preset_is_legacy_shaped" != true ]]; then
@@ -5350,6 +5367,7 @@ if [[ -n "$preset_name" ]]; then
                 pipeline_network="sealed"
             fi
             if [[ "${run_step_kind[$preset_k]}" != code \
+                && "${run_step_kind[$preset_k]}" != plan \
                 && "$preset_ro_multi" != true ]] \
                 && { [[ "${preset_step_fix_default[$preset_k]:-}" != "1" ]] \
                     || [[ "${preset_step_fix_repeat[$preset_k]:-1}" != "1" ]]; }; then
@@ -6206,6 +6224,19 @@ fs_emit_step_prompt_overlay() {
     for rel in "${fragments[@]}"; do printf '\n'; cat -- "$prompt_overlay_dir/$rel"; done
 }
 
+# The run-dir copy of the plan leg's output, which the walker writes once
+# the plan leg finishes; empty when the run has no plan step. Every later
+# leg embeds it, and every preamble but the plan leg's reserves plan.md.
+plan_file=""
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        if [[ "${preset_step_action[$preset_k]}" == plan ]]; then
+            plan_file="$run_dir/plan.md"
+            break
+        fi
+    done
+fi
+
 # Whether THIS run was asked to resume a prior conversation, across both id
 # modes: --resume-session names one to discover-then-resume (claude, codex),
 # --session-id supplies one for a create-if-missing harness (pi) where the
@@ -6218,7 +6249,7 @@ resume_named=false
 
 {
     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-        "$outbox_dir" "" "$outbox_max_bytes"
+        "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
     # A resumed session is the one case where the preamble above contradicts
     # something already in the model's context: the earlier part of this
     # conversation ran in a DIFFERENT sandbox and names that sandbox's clone,
@@ -6415,7 +6446,7 @@ if (( review_loop_cap > 0 )); then
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
             "$review_preamble_harness" "$review_preamble_network" "$outbox_dir" \
-            "" "$outbox_max_bytes"
+            "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay review
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
             "$review_verdict_file" "$inbox_dir" "$handoff_file" \
@@ -6442,7 +6473,7 @@ if [[ "$review_only" != true ]] \
     fs_reject_unsafe_chars "$fix_prompt_header"
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-            "$outbox_dir" "" "$outbox_max_bytes"
+            "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
         fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
     } > "$fix_prompt_header.part"
@@ -6454,7 +6485,7 @@ if [[ -n "$fix_harness" ]] && (( review_loop_cap > 0 )); then
     fs_reject_unsafe_chars "$fxr_fix_prompt_header"
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$fix_harness" \
-            "$fxr_preamble_network" "$outbox_dir" "" "$outbox_max_bytes"
+            "$fxr_preamble_network" "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
         fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
     } > "$fxr_fix_prompt_header.part"
@@ -6466,7 +6497,7 @@ if [[ -n "$mntfix_harness" ]] && (( maintainer_loop_cap > 0 )); then
     fs_reject_unsafe_chars "$fxm_fix_prompt_header"
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$mntfix_harness" \
-            "$fxm_preamble_network" "$outbox_dir" "" "$outbox_max_bytes"
+            "$fxm_preamble_network" "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
         fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
     } > "$fxm_fix_prompt_header.part"
@@ -6489,7 +6520,7 @@ if (( maintainer_loop_cap > 0 )); then
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
             "$maintainer_preamble_harness" "$maintainer_preamble_network" \
-            "$outbox_dir" "" "$outbox_max_bytes"
+            "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay maintainer
         fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
             "$maintainer_verdict_file" "$inbox_dir" "$mnt_inner_review" \
@@ -6520,6 +6551,7 @@ fi
 # build-then-rename file, following the same discipline as the block
 # above. The walker reads run_step_prompt for every step of every run, so
 # every branch below must leave it pointing at a real file.
+#
 if [[ "$preset_is_legacy_shaped" == true ]]; then
     for ((rsp_k = 1; rsp_k <= run_step_count; rsp_k++)); do
         case "${run_step_kind[rsp_k]}" in
@@ -6572,7 +6604,7 @@ else
                 {
                     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                         "$preset_k_preamble_harness" "$preset_k_preamble_network" \
-                        "$outbox_dir" "" "$outbox_max_bytes"
+                        "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
                     fs_emit_step_prompt_overlay review "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_review_prompt_body "$branch" "$base_sha" \
                         "$review_skill_dir" "$step_k_verdict_file" "$inbox_dir" \
@@ -6585,7 +6617,7 @@ else
                     {
                         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                             "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
-                            "$outbox_dir" "" "$outbox_max_bytes"
+                            "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
@@ -6616,7 +6648,7 @@ else
                 {
                     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                         "$preset_k_preamble_harness" "$preset_k_preamble_network" \
-                        "$outbox_dir" "" "$outbox_max_bytes"
+                        "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
                     fs_emit_step_prompt_overlay maintainer "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
                         "$step_k_verdict_file" "$inbox_dir" "$step_k_inner_review" \
@@ -6630,7 +6662,7 @@ else
                 {
                     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                         "$preset_k_preamble_harness" "$preset_k_preamble_network" \
-                        "$outbox_dir" "" "$outbox_max_bytes"
+                        "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
                     fs_emit_step_prompt_overlay maintainer "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
                         "$step_k_verdict_file" "$inbox_dir" yes "$handoff_file" \
@@ -6644,7 +6676,7 @@ else
                     {
                         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                             "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
-                            "$outbox_dir" "" "$outbox_max_bytes"
+                            "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
@@ -6653,6 +6685,22 @@ else
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
                 fi
+                ;;
+            plan)
+                step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
+                fs_reject_unsafe_chars "$step_k_prompt"
+                {
+                    # "" for plan_file: the plan leg must not be told plan.md
+                    # is reserved, since it is the one leg that writes it.
+                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                        "$preset_k_preamble_harness" "$preset_k_preamble_network" \
+                        "$outbox_dir" "" "$outbox_max_bytes" ""
+                    fs_emit_step_prompt_overlay plan "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
+                    fs_emit_plan_prompt_body "$branch" "$base_sha" \
+                        "$outbox_dir/plan.md" "$handoff_file"
+                } > "$step_k_prompt.part"
+                mv -- "$step_k_prompt.part" "$step_k_prompt"
+                run_step_prompt[preset_k]="$step_k_prompt"
                 ;;
         esac
     done
@@ -6671,7 +6719,7 @@ if (( refresh_enabled )); then
     fs_reject_unsafe_chars "$continuation_prompt_header"
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-            "$outbox_dir" "" "$outbox_max_bytes"
+            "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_headless_turn_section
     } > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
@@ -7335,6 +7383,7 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
         done
         fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
         if [[ "${preset_step_action[$preset_k]}" != code \
+            && "${preset_step_action[$preset_k]}" != plan \
             && "$preset_ro_multi" != true ]]; then
             fs_build_sandbox_cmd "s${preset_k}fix" "s${preset_k}fix_sandbox_cmd"
         fi
@@ -7784,6 +7833,7 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
             preset_k_var="s${preset_k}_model"
             printf 's%d_model=%q\n' "$preset_k" "${!preset_k_var}"
             if [[ "${preset_step_action[$preset_k]}" != code \
+                && "${preset_step_action[$preset_k]}" != plan \
                 && "$preset_ro_multi" != true ]]; then
                 preset_k_var="s${preset_k}fix_usage_source"
                 printf 's%dfix_usage_source=%q\n' "$preset_k" "${!preset_k_var}"
@@ -7833,6 +7883,7 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     printf 'outbox_max_bytes=%q\n' "$outbox_max_bytes"
     printf 'continuation_prompt_header=%q\n' "$continuation_prompt_header"
     printf 'handoff_original=%q\n' "$handoff_original"
+    printf 'plan_file=%q\n' "$plan_file"
     printf 'brief_warning=%q\n' "$brief_warning"
     printf 'run_scope_note=%q\n' "$run_scope_note"
     printf 'user_shell=%q\n' "$user_shell"
@@ -7913,6 +7964,7 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
             printf '%q ' "${preset_k_cmd_ref[@]}"
             printf ')\n'
             if [[ "${preset_step_action[$preset_k]}" != code \
+                && "${preset_step_action[$preset_k]}" != plan \
                 && "$preset_ro_multi" != true ]]; then
                 declare -n preset_k_cmd_ref="s${preset_k}fix_sandbox_cmd"
                 printf 's%dfix_sandbox_cmd=(' "$preset_k"
@@ -8566,7 +8618,11 @@ fi
 # sandbox's own messages go to stderr, which is copied to the log and shown
 # here too.
 rc=0
+# 0 when step 1 is not code: the first code leg then runs in the walker,
+# and the refresh loop and the total cost must not count an implement leg.
+fs_impl_leg_ran_at_step1=0
 if [[ "$mode" != "review-only" ]] && { [[ "${composed_pipeline:-0}" != 1 ]] || [[ "${run_step_kind[1]}" == code ]]; }; then
+fs_impl_leg_ran_at_step1=1
 # This block is always step 1's own pass 1 -- see the condition just above,
 # which only ever runs when run_step_kind[1] is code. The walker below
 # finalizes this step (to done or failed) once it knows there are no more
@@ -9098,10 +9154,10 @@ refresh_leg_was_nudged() {
 # verdict-style body to append here, unlike the fix leg's prompt.
 refresh_build_prompt() {
     fs_refresh_build_prompt "$1" "$2" "$3" "${4:-0}" "$continuation_prompt_header" \
-        "$handoff_original" "$run_dir"
+        "$handoff_original" "$run_dir" "$plan_file"
 }
 
-if [[ "$refresh_enabled" == "1" ]]; then
+if [[ "$refresh_enabled" == "1" && "$fs_impl_leg_ran_at_step1" == 1 ]]; then
     fs_refresh_window_mismatch "$events" "$refresh_context_window" \
         | tee -a "$sandbox_log"
     while :; do
@@ -9797,12 +9853,14 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             progress_write running
             # Built fresh for every pass, like the fix prompt below, so an
             # addendum archived by an earlier pass reaches this one. With
-            # none archived the prompt is the handoff itself, no copy.
+            # none archived, and no plan to embed either, the prompt is the
+            # handoff itself, no copy.
             cur_code_prompt="$handoff"
             cur_code_addenda="$(fs_refresh_emit_addenda "$run_dir")"
-            if [[ -n "$cur_code_addenda" ]]; then
+            if [[ -n "$cur_code_addenda" || -n "$plan_file" ]]; then
                 cur_code_prompt="$run_dir/code-prompt-$cur_step_no-$cur_pass.md"
-                { cat -- "$handoff"; printf '%s\n' "$cur_code_addenda"; } > "$cur_code_prompt.part"
+                { cat -- "$handoff"; fs_emit_plan_section "$plan_file" code || exit 1; \
+                  printf '%s\n' "$cur_code_addenda"; } > "$cur_code_prompt.part"
                 mv -f "$cur_code_prompt.part" "$cur_code_prompt"
             fi
             run_leg code "$cur_pass" "$cur_code_prompt" "$cur_step_idx"
@@ -9822,6 +9880,100 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             progress_state[cur_step_no]="failed"
             progress_any_step_failed=1
         fi
+        progress_write running
+        continue
+    fi
+    # A plan step: one leg, no loop. It writes the outbox plan and commits
+    # nothing; setting $rc on any failure is what skips every later step.
+    if [[ "$cur_kind" == plan ]]; then
+        if [[ "${stop_requested:-0}" == 1 ]]; then
+            progress_state[cur_step_no]="skipped"
+            progress_ended[cur_step_no]="stop-requested"
+            progress_write running
+            continue
+        fi
+        if [[ "$rc" != "0" ]]; then
+            progress_state[cur_step_no]="skipped"
+            progress_ended[cur_step_no]="skipped"
+            progress_write running
+            continue
+        fi
+        progress_state[cur_step_no]="running"
+        progress_i[cur_step_no]=1
+        progress_write running
+        cur_plan_outbox_file="$outbox_dir/plan.md"
+        rm -f -- "$cur_plan_outbox_file"
+        cur_plan_head_before="$(clone_branch_head)"
+        run_leg plan 1 "$cur_prompt" "$cur_step_idx"
+        rc="$leg_rc"
+        cur_plan_head_after="$(clone_branch_head)"
+        cur_plan_ended="" cur_plan_detail=""
+        if [[ "$rc" != "0" ]]; then
+            cur_plan_ended="harness-error"
+            cur_plan_detail="the plan leg exited $rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
+        elif [[ -z "$cur_plan_head_before" || -z "$cur_plan_head_after" \
+            || "$cur_plan_head_after" != "$cur_plan_head_before" ]]; then
+            cur_plan_ended="committed"
+            cur_plan_detail="the plan leg committed to the branch -- a plan leg writes its plan to the outbox and commits nothing"
+            rc=1
+        elif [[ -L "$cur_plan_outbox_file" || ! -s "$cur_plan_outbox_file" ]]; then
+            cur_plan_ended="harness-error"
+            cur_plan_detail="the plan leg left no plan at $cur_plan_outbox_file"
+            rc=1
+        else
+            cp -- "$cur_plan_outbox_file" "$plan_file.part" 2>/dev/null \
+                && mv -f "$plan_file.part" "$plan_file"
+            if [[ ! -s "$plan_file" ]]; then
+                cur_plan_ended="harness-error"
+                cur_plan_detail="the plan could not be copied from $cur_plan_outbox_file"
+                rc=1
+            else
+                # A missed BLOCKED runs a code leg against a plan that says
+                # not to, so match loosely: the first non-blank line, past
+                # any heading marker or emphasis, starting with the word
+                # ("# **BLOCKED**", "BLOCKED: <reason>").
+                cur_plan_first_line="$(awk 'NF { print; exit }' "$plan_file" \
+                    | tr -d '\000-\037\177' \
+                    | sed -E 's/^[[:space:]]*//; s/^#+[[:space:]]*//; s/^[*_`]+//')"
+                if [[ "$cur_plan_first_line" =~ ^BLOCKED([^[:alnum:]_]|$) ]]; then
+                    cur_plan_ended="blocked"
+                    cur_plan_detail="the plan is BLOCKED"
+                    rc=1
+                else
+                    cur_plan_ended="done"
+                fi
+            fi
+        fi
+        jq -n --argjson cap 1 \
+            --arg ended "$cur_plan_ended" --arg detail "$cur_plan_detail" \
+            --argjson cost "${leg_cost:-null}" --argjson usage "${leg_usage:-null}" \
+            --argjson retries "${leg_retries_json:-[]}" \
+            '{cap:$cap,
+              ended:(if $ended=="" then null else $ended end),
+              detail:(if $detail=="" then null else $detail end),
+              cost_usd:$cost, usage:$usage, retries:$retries}' \
+            > "$run_dir/step-${cur_step_no}-loop.json.part" 2>/dev/null \
+            && mv -f "$run_dir/step-${cur_step_no}-loop.json.part" \
+                "$run_dir/step-${cur_step_no}-loop.json"
+        # run_leg already folded this leg's cost into loop_cost_sum.
+        if [[ "$cur_plan_ended" == done ]]; then
+            progress_state[cur_step_no]="done"
+            printf 'fork-sandbox: plan: done\n'
+        else
+            progress_state[cur_step_no]="failed"
+            progress_any_step_failed=1
+            printf 'fork-sandbox: plan: %s%s\n' "$cur_plan_ended" \
+                "${cur_plan_detail:+ ($cur_plan_detail)}"
+            # BLOCKED ends the run before any code leg; the plan's own text,
+            # not just its outcome, is what the operator needs to see, so it
+            # is printed here rather than left to be found in the run dir.
+            if [[ "$cur_plan_ended" == blocked && -s "$plan_file" ]]; then
+                printf '\n'
+                cat -- "$plan_file"
+                printf '\n'
+            fi
+        fi
+        progress_ended[cur_step_no]="$cur_plan_ended"
         progress_write running
         continue
     fi
@@ -9949,6 +10101,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         [[ "$cur_legacy" == 1 ]] && cur_prompt_iter_out="$cur_prompt_iter.part"
         {
             cat -- "$cur_prompt_base"
+            fs_emit_plan_section "$plan_file" || exit 1
             if [[ "$cur_legacy" == 1 && -n "$cur_coding_rc" && "$cur_coding_rc" != "0" ]]; then
                 fs_emit_coding_exit_note "$cur_coding_rc"
             fi
@@ -10164,7 +10317,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
                                 cur_fix_prompt="$cur_fix_base.md"
                                 (( cur_fix_pass > 1 )) && cur_fix_prompt="$cur_fix_base-p$cur_fix_pass.md"
-                                { cat -- "$cur_fix_header"; printf '\n---\n\n'; \
+                                { cat -- "$cur_fix_header"; fs_emit_plan_section "$plan_file" code || exit 1; \
+                                  printf '\n---\n\n'; \
                                   awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
                                   fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt.part"
                                 mv -f "$cur_fix_prompt.part" "$cur_fix_prompt"
@@ -10236,7 +10390,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
                         cur_fix_prompt="$cur_fix_base.md"
                         (( cur_fix_pass > 1 )) && cur_fix_prompt="$cur_fix_base-p$cur_fix_pass.md"
-                        { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; \
+                        { cat -- "${!cur_fix_header_var}"; fs_emit_plan_section "$plan_file" code || exit 1; \
+                          printf '\n---\n\n'; \
                           awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
                           fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt"
                         # Leg-start/leg-end transitions for this fix pass, same
@@ -10597,12 +10752,20 @@ fi
 # What the whole run cost: the implement leg plus every loop leg. A sum is
 # only honest when every part is a number, so one leg the harness priced
 # nowhere -- codex prices none of them -- leaves the total null rather than
-# low. cost_usd keeps meaning the implement leg alone.
+# low. cost_usd keeps meaning the implement leg alone. A pipeline whose
+# step 1 is not code has no implement leg: every leg it ran went through
+# run_leg, so loop_cost_sum alone is the total.
 total_cost_fmt=""
+total_cost_impl=""
+if [[ "$fs_impl_leg_ran_at_step1" == 1 ]]; then
+    total_cost_impl="$run_cost_fmt"
+elif (( ${legs_run:-0} > 0 )); then
+    total_cost_impl=0
+fi
 if [[ "$mode" == "review-only" ]]; then
     total_cost_fmt="$run_cost_fmt"
-elif [[ -n "$run_cost_fmt" && "$loop_cost_unknown" != "1" ]]; then
-    total_cost_raw="$(jq -n --argjson a "$run_cost_fmt" --argjson b "$loop_cost_sum" \
+elif [[ -n "$total_cost_impl" && "$loop_cost_unknown" != "1" ]]; then
+    total_cost_raw="$(jq -n --argjson a "$total_cost_impl" --argjson b "$loop_cost_sum" \
         '(($a + $b) * 1000000 | round) / 1000000' 2>/dev/null)"
     if [[ "$total_cost_raw" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
         total_cost_fmt="$(printf '%.6f' "$total_cost_raw")"
