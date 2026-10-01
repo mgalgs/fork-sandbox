@@ -700,6 +700,164 @@ check "resolve-triage: explicit block overrides defaults" \
 
 printf '%s\n' "$saved_fleet_yaml" > "$FORK_SANDBOX_FLEET_FILE"
 
+printf '\n== budget-reserve: the per-thread spawn reserve ==\n'
+
+saved_fleet_for_reserve="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler: {}
+  tuner: {}
+EOF
+check "budget-reserve: no block, output is exactly two lines" \
+    "2" "$("$fleet" resolve-budget-reserve | wc -l)"
+check "budget-reserve: no block, both lines are empty" "" \
+    "$("$fleet" resolve-budget-reserve | tr -d '\n')"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+budget-reserve:
+  spawns: 4
+  agents: [riffler, tuner]
+agents:
+  riffler: {}
+  tuner: {}
+lists:
+  band:
+    members: [riffler]
+EOF
+check "budget-reserve: a valid block passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+check "budget-reserve: resolves spawns, then comma-joined agents" \
+    "$(printf '4\nriffler,tuner')" "$("$fleet" resolve-budget-reserve)"
+check "budget-reserve: the dump carries it as two lines" \
+    "$(printf 'budget_reserve\tspawns\t4\nbudget_reserve\tagents\triffler,tuner')" \
+    "$(python3 "$parse" dump "$FORK_SANDBOX_FLEET_FILE" fleet.yaml | grep '^budget_reserve')"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+budget-reserve:
+  spawns: 1
+  agents:
+    - tuner
+    - tuner
+agents:
+  riffler: {}
+  tuner: {}
+EOF
+check "budget-reserve: a repeated agent is listed once" \
+    "$(printf '1\ntuner')" "$("$fleet" resolve-budget-reserve)"
+
+for badspawns in 0 -1 4.5 four "'4'" true "[4]"; do
+    printf 'budget-reserve:\n  spawns: %s\n  agents: [riffler]\nagents:\n  riffler: {}\n' \
+        "$badspawns" > "$FORK_SANDBOX_FLEET_FILE"
+    out="$("$fleet" check 2>&1)"; rc=$?
+    if (( rc != 0 )) && [[ "$out" == *"budget-reserve.spawns: must be a positive integer"* ]]; then
+        ok "budget-reserve: refuses spawns [$badspawns]"
+    else
+        no "budget-reserve: refuses spawns [$badspawns]" "rc=$rc out=$out"
+    fi
+done
+
+bad "budget-reserve: an empty agents list is refused" \
+    "budget-reserve.agents: must be a non-empty list" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: []
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: a non-list agents is refused" \
+    "budget-reserve.agents: must be a non-empty list" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: riffler
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: an undeclared agent is refused" \
+    "'ghost' is not a defined agent" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: [riffler, ghost]
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: an empty agents entry is refused" \
+    "budget-reserve.agents[1]: empty value" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: [riffler, '']
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: a list name is refused" \
+    "'band' names a list" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: [band]
+agents:
+  riffler: {}
+lists:
+  band:
+    members: [riffler]
+EOF
+
+bad "budget-reserve: a reserved name is refused (all)" \
+    "'all' is reserved" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: [all]
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: a reserved name is refused (operator)" \
+    "'operator' is reserved" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: [operator]
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: an unknown key is refused" \
+    "budget-reserve.window: unknown key" <<'EOF'
+budget-reserve:
+  spawns: 2
+  agents: [riffler]
+  window: 5
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: spawns is required" \
+    "budget-reserve.spawns: required" <<'EOF'
+budget-reserve:
+  agents: [riffler]
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: agents is required" \
+    "budget-reserve.agents: required" <<'EOF'
+budget-reserve:
+  spawns: 2
+agents:
+  riffler: {}
+EOF
+
+bad "budget-reserve: a bare key with no value is refused" \
+    "budget-reserve: must be a mapping" <<'EOF'
+budget-reserve:
+agents:
+  riffler: {}
+EOF
+
+printf '%s\n' "$saved_fleet_for_reserve" > "$FORK_SANDBOX_FLEET_FILE"
+
 printf '\n== preset ==\n'
 
 new_root PRESETS_TEST_DIR

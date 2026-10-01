@@ -6,6 +6,7 @@
 # Usage: fork-sandbox-fleet.sh check [--cluster]
 #        fork-sandbox-fleet.sh resolve <name>
 #        fork-sandbox-fleet.sh resolve-triage
+#        fork-sandbox-fleet.sh resolve-budget-reserve
 #        fork-sandbox-fleet.sh expand <addr>[,<addr>...]
 #        fork-sandbox-fleet.sh roster
 #        fork-sandbox-fleet.sh teardown <agent> [--thread <id>]
@@ -27,7 +28,9 @@
 #     module docstring, not restated here), `lists` (name -> members, a
 #     list of agent names), and an optional top-level `triage` block
 #     (harness/model for the wake classifier's own sandbox seat -- see
-#     `resolve-triage` below).
+#     `resolve-triage` below) and an optional top-level `budget-reserve`
+#     block (spawns/agents: the last `spawns` of a thread's spawn budget
+#     are held for those seats -- see `resolve-budget-reserve` below).
 #     $FORK_SANDBOX_FLEET_FILE, default ~/.config/fork-sandbox/fleet.yaml.
 #
 # Precedence per seat field is fleet.yaml agent entry, then persona
@@ -134,6 +137,12 @@
 #                  network field: the classifier's egress is fixed by
 #                  harness (sealed for pi, pinned for claude), not
 #                  configurable, so there is nothing to report.
+#   resolve-budget-reserve
+#                  Print exactly two lines for the postmaster's per-thread
+#                  spawn-budget reserve: `spawns` (a positive integer) and
+#                  `agents` (comma-joined agent names, file order). Both
+#                  lines are empty when the fleet file has no
+#                  `budget-reserve:` block (no reserve).
 #   expand <addr>[,<addr>...]
 #                  Expand a comma-separated list of @-addresses: a
 #                  `@list` becomes its members' `@agent` addresses, a
@@ -570,6 +579,29 @@ fleet_read_triage() {
     done <<< "$dump"
 }
 
+# Populates reserve_spawns / reserve_agents from a dump's
+# `budget_reserve\t<field>\t<value>` lines -- empty when there is no
+# `budget-reserve:` block.
+fleet_read_budget_reserve() {
+    local dump="$1" kind field value
+    reserve_spawns="" reserve_agents=""
+    [[ -n "$dump" ]] || return 0
+    while IFS=$'\t' read -r kind field value; do
+        [[ "$kind" == budget_reserve ]] || continue
+        case "$field" in
+            spawns) reserve_spawns="$value" ;;
+            agents) reserve_agents="$value" ;;
+        esac
+    done <<< "$dump"
+}
+
+cmd_resolve_budget_reserve() {
+    local dump; dump="$(fleet_dump)"
+    fleet_read_budget_reserve "$dump"
+    printf '%s\n' "$reserve_spawns"
+    printf '%s\n' "$reserve_agents"
+}
+
 cmd_resolve_triage() {
     local dump; dump="$(fleet_dump)"
     fleet_read_triage "$dump"
@@ -931,6 +963,7 @@ case "${1-}" in
     check) shift; cmd_check "$@" ;;
     resolve) shift; cmd_resolve "$@" ;;
     resolve-triage) shift; cmd_resolve_triage "$@" ;;
+    resolve-budget-reserve) shift; cmd_resolve_budget_reserve "$@" ;;
     expand) shift; cmd_expand "$@" ;;
     roster) shift; cmd_roster "$@" ;;
     teardown) shift; cmd_teardown "$@" ;;

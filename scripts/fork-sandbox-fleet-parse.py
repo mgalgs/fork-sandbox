@@ -18,7 +18,12 @@ agent names), and an optional top-level `triage` block (harness/model for
 the wake classifier's own sandbox seat -- absent means triage is off
 fleet-wide. No `network` field: the classifier's own launch path fixes
 its network by harness -- sealed for pi, pinned for claude -- with
-nothing in the fleet file left to override it).
+nothing in the fleet file left to override it), and an optional top-level
+`budget-reserve` block (`spawns`, a positive integer, and `agents`, a
+non-empty list of declared agent names: the last `spawns` spawns of a
+thread's budget are held back for those seats -- see
+fork-sandbox-postmaster.sh. Absent means no reserve. Both keys are
+required, and `agents` may name neither a list nor a reserved name).
 A persona file is markdown with an optional YAML frontmatter block
 (delimited by `---` lines) carrying the same per-agent seat keys plus
 `description`, EXCEPT `handler`/`command` -- a handler seat is host
@@ -129,6 +134,10 @@ routine instead of two.
                                              `triage:` block is present;
                                              zero lines when the fleet
                                              file has no such block)
+    budget_reserve\tspawns\t<n>            (two lines, only when a
+    budget_reserve\tagents\t<a,b,...>       `budget-reserve:` block is
+                                             present; agents in file
+                                             order, comma-joined)
 
 `frontmatter` emits, for one persona file:
 
@@ -209,6 +218,7 @@ TRIAGE_SEAT_FIELDS = ("harness", "model")
 # for every TRIAGE_SEAT_FIELDS entry, the same way an unset per-agent
 # field resolves to an empty line rather than a missing one.
 TRIAGE_SEAT_DEFAULTS = {"harness": "claude", "model": ""}
+BUDGET_RESERVE_KEYS = ("spawns", "agents")
 
 # Names no agent or list may take, mapped to why. Both are reserved
 # everywhere (`check` and `dump` share this, so a broken fleet file
@@ -367,6 +377,55 @@ def check_triage_seat(value, label, errors):
     return seat
 
 
+def check_budget_reserve(value, label, errors):
+    """Shape of the top-level `budget-reserve:` block: both keys required,
+    `spawns` a YAML integer >= 1, `agents` a non-empty list of names.
+    Whether each name is a declared agent needs the agents and lists, so
+    that half is check_budget_reserve_agents, run once they are parsed.
+    Returns {"spawns": int, "agents": [name, ...]}."""
+    path = f"{label}: budget-reserve"
+    out = {"spawns": 0, "agents": []}
+    if not isinstance(value, dict):
+        errors.append(f"{path}: must be a mapping of spawns/agents")
+        return out
+    for key, v in value.items():
+        field_path = f"{path}.{key}"
+        if key == "spawns":
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                errors.append(f"{field_path}: must be a positive integer")
+            else:
+                out["spawns"] = v
+        elif key == "agents":
+            if not isinstance(v, list) or not v:
+                errors.append(f"{field_path}: must be a non-empty list of "
+                               f"agent names")
+                continue
+            for i, name in enumerate(v):
+                nv = scalar(name, f"{field_path}[{i}]", errors)
+                if nv is not None and nv not in out["agents"]:
+                    out["agents"].append(nv)
+        else:
+            errors.append(f"{field_path}: unknown key")
+    for key in BUDGET_RESERVE_KEYS:
+        if key not in value:
+            errors.append(f"{path}.{key}: required")
+    return out
+
+
+def check_budget_reserve_agents(reserve, agents, lists, reserved, label,
+                                errors):
+    for name in reserve["agents"]:
+        path = f"{label}: budget-reserve.agents"
+        if name in reserved:
+            errors.append(f"{path}: '{name}' is reserved ({reserved[name]}), "
+                           f"not an agent")
+        elif name in lists:
+            errors.append(f"{path}: '{name}' names a list; only agents can "
+                           f"hold a reserve")
+        elif name not in agents:
+            errors.append(f"{path}: '{name}' is not a defined agent")
+
+
 def check_wake_on_cc(value, path, errors):
     """Unlike every other seat field, this one must be a YAML boolean, not
     a string -- so it is checked directly against the raw YAML value
@@ -509,8 +568,10 @@ def check_backend_fields_pair(backend, endpoint, grant, path, errors):
 
 
 def load_and_validate(fleet_file, label, errors):
-    """Returns (agents, lists, triage), best-effort -- callers only trust
-    them when `errors` is still empty afterward. `triage` is None when the
+    """Returns (agents, lists, triage, budget_reserve), best-effort --
+    callers only trust them when `errors` is still empty afterward.
+    `budget_reserve` is None when the fleet file has no top-level
+    `budget-reserve:` key, else the checked {"spawns", "agents"} dict. `triage` is None when the
     fleet file has no top-level `triage:` key at all (triage off
     fleet-wide); otherwise a fully-defaulted {"harness", "model"} dict
     (see check_triage_seat for why there is no `network` key), even for
@@ -522,24 +583,27 @@ def load_and_validate(fleet_file, label, errors):
             doc = yaml.load(f, Loader=DupKeyLoader)
     except OSError as e:
         errors.append(f"{label}: unreadable: {e}")
-        return {}, {}, None
+        return {}, {}, None, None
     except (yaml.YAMLError, DupKeyError) as e:
         errors.append(f"{label}: not valid YAML: {e}")
-        return {}, {}, None
+        return {}, {}, None, None
 
     if doc is None:
         doc = {}
     if not isinstance(doc, dict):
         errors.append(f"{label}: the document must be a mapping with "
                        f"'agents' and/or 'lists'")
-        return {}, {}, None
+        return {}, {}, None, None
     for key in doc:
-        if key not in ("agents", "lists", "triage"):
+        if key not in ("agents", "lists", "triage", "budget-reserve"):
             errors.append(f"{label}: unknown top-level key '{key}'; a "
-                           f"fleet file has 'agents', 'lists' and 'triage'")
+                           f"fleet file has 'agents', 'lists', 'triage' "
+                           f"and 'budget-reserve'")
 
     triage = check_triage_seat(doc.get("triage"), label, errors) \
         if "triage" in doc else None
+    budget_reserve = check_budget_reserve(doc["budget-reserve"], label, errors) \
+        if "budget-reserve" in doc else None
 
     agents_doc = doc.get("agents") or {}
     lists_doc = doc.get("lists") or {}
@@ -694,7 +758,11 @@ def load_and_validate(fleet_file, label, errors):
                 errors.append(f"{label}: lists.{name}.members: '{m}' is "
                                f"not a defined agent")
 
-    return agents, lists, triage
+    if budget_reserve is not None:
+        check_budget_reserve_agents(budget_reserve, agents, lists, reserved,
+                                    label, errors)
+
+    return agents, lists, triage, budget_reserve
 
 
 def parse_frontmatter(path, label, errors):
@@ -772,7 +840,7 @@ def parse_frontmatter(path, label, errors):
 def cmd_check(fleet_file, label, personas_dir):
     errors = []
     reserved = reserved_names()
-    agents, lists, _triage = load_and_validate(fleet_file, label, errors)
+    agents, lists, _triage, _reserve = load_and_validate(fleet_file, label, errors)
     # Every non-handler agent's persona frontmatter is parsed below anyway
     # (to validate it) -- record each one's resolved `preset` (fleet.yaml's
     # own value if it set one, else the frontmatter's) along the way so the
@@ -902,7 +970,7 @@ def cmd_check(fleet_file, label, personas_dir):
 
 def cmd_dump(fleet_file, label):
     errors = []
-    agents, lists, triage = load_and_validate(fleet_file, label, errors)
+    agents, lists, triage, reserve = load_and_validate(fleet_file, label, errors)
     if errors:
         for e in errors:
             sys.stderr.write(f"Error: {e}\n")
@@ -918,6 +986,9 @@ def cmd_dump(fleet_file, label):
     if triage is not None:
         for field in TRIAGE_SEAT_FIELDS:
             out.append(f"triage\t{field}\t{triage[field]}")
+    if reserve is not None:
+        out.append(f"budget_reserve\tspawns\t{reserve['spawns']}")
+        out.append(f"budget_reserve\tagents\t{','.join(reserve['agents'])}")
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.exit(0)
 
