@@ -4120,31 +4120,48 @@ fs_refresh_resolve() {
     refresh_threshold_tokens=""
     refresh_ceiling_tokens=""
     if (( refresh_enabled )); then
-        # The claude CLI runs the current default models at 1,000,000 tokens;
-        # haiku is the known 200,000 exception; fs_refresh_window_mismatch
-        # (refresh.sh) warns when a leg reports otherwise. The env var wins.
-        refresh_context_window="${FORK_SANDBOX_CONTEXT_WINDOW:-}"
-        if [[ -z "$refresh_context_window" ]]; then
-            case "${model,,}" in
-                *haiku*) refresh_context_window=200000 ;;
-                *)       refresh_context_window=1000000 ;;
-            esac
-        fi
-        if awk -v v="$refresh_at" 'BEGIN{exit !(v<=1)}'; then
-            refresh_threshold_tokens="$(awk -v f="$refresh_at" \
-                -v w="$refresh_context_window" 'BEGIN{printf "%d", f*w}')"
-        else
-            refresh_threshold_tokens="$(awk -v f="$refresh_at" 'BEGIN{printf "%d", f}')"
-        fi
-        # The per-leg working-room ceiling the inbox hook measures a leg's
-        # OWN usage against, floor(0.8 * window): high enough to leave a
-        # leg real room to work before the harness's own compaction, low
-        # enough that a leg's nudge always fires before that compaction
-        # would. See the hook's own comment on the B + T formula this feeds.
-        refresh_ceiling_tokens="$(awk -v w="$refresh_context_window" \
-            'BEGIN{printf "%d", 0.8*w}')"
+        fs_refresh_window_for_model "$refresh_at" "$model"
     fi
     return 0
+}
+
+# Context window, threshold and ceiling for an arbitrary model, the same math
+# fs_refresh_resolve (above) applies to the run's own implement model --
+# factored out so every OTHER refresh-eligible leg (a code step seated on a
+# different model, a preset's own fix seat, ...) can size its own
+# --refresh-at chain against ITS model's window instead of the run's, per
+# decision 3 ("each leg's threshold is computed against that leg's own
+# model's context window"). $1 the already-resolved refresh_at fraction or
+# absolute token count (fs_refresh_resolve has already validated it is a
+# positive number by the time any caller reaches this), $2 the model. Sets,
+# in the caller's scope, the same three names fs_refresh_resolve sets:
+# refresh_context_window, refresh_threshold_tokens, refresh_ceiling_tokens.
+# shellcheck disable=SC2034  # the results are read by the caller
+fs_refresh_window_for_model() {
+    local refresh_at="$1" model="$2"
+    # The claude CLI runs the current default models at 1,000,000 tokens;
+    # haiku is the known 200,000 exception; fs_refresh_window_mismatch
+    # (refresh.sh) warns when a leg reports otherwise. The env var wins.
+    refresh_context_window="${FORK_SANDBOX_CONTEXT_WINDOW:-}"
+    if [[ -z "$refresh_context_window" ]]; then
+        case "${model,,}" in
+            *haiku*) refresh_context_window=200000 ;;
+            *)       refresh_context_window=1000000 ;;
+        esac
+    fi
+    if awk -v v="$refresh_at" 'BEGIN{exit !(v<=1)}'; then
+        refresh_threshold_tokens="$(awk -v f="$refresh_at" \
+            -v w="$refresh_context_window" 'BEGIN{printf "%d", f*w}')"
+    else
+        refresh_threshold_tokens="$(awk -v f="$refresh_at" 'BEGIN{printf "%d", f}')"
+    fi
+    # The per-leg working-room ceiling the inbox hook measures a leg's OWN
+    # usage against, floor(0.8 * window): high enough to leave a leg real
+    # room to work before the harness's own compaction, low enough that a
+    # leg's nudge always fires before that compaction would. See the hook's
+    # own comment on the B + T formula this feeds.
+    refresh_ceiling_tokens="$(awk -v w="$refresh_context_window" \
+        'BEGIN{printf "%d", 0.8*w}')"
 }
 
 # Usage: fs_refresh_warn_brief <brief-file> <threshold-tokens>

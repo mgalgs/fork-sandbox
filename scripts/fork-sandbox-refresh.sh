@@ -53,6 +53,11 @@ fs_refresh_window_mismatch() {
 fs_refresh_take_handoff() {
     local outbox_dir="$1" record_dir="$2" next_n="$3" log="$4"
     local src="$outbox_dir/handoff.md" record_name="handoff-$next_n.md" bytes
+    # Per-leg chains pass a tag ("s2-code-1-c1"); fold it into the refused
+    # names so two legs' refusals never overwrite each other. The step-1
+    # chain passes a bare number and keeps its historical names.
+    local refused="handoff-refused"
+    [[ "$next_n" =~ ^[0-9]+$ ]] || refused="handoff-$next_n-refused"
     # A session wrote this, so a symlink here is not a hand-off: refuse it
     # rather than follow it out of the clone.
     if [[ -L "$src" ]]; then
@@ -69,7 +74,7 @@ fs_refresh_take_handoff() {
             printf 'fork-sandbox: outbox handoff.md is %s bytes, ' "$bytes"
             printf 'over the 64 KiB cap; refusing it.\n'
         } >> "$log"
-        mv -f -- "$src" "$record_dir/handoff-refused-too-large.md" 2>/dev/null
+        mv -f -- "$src" "$record_dir/$refused-too-large.md" 2>/dev/null
         return 1
     fi
     # An empty or dangling hand-off (wc -c failing falls back to 0, which
@@ -77,7 +82,7 @@ fs_refresh_take_handoff() {
     if [[ ! -s "$src" ]]; then
         printf 'fork-sandbox: outbox handoff.md is empty; refusing it.\n' \
             >> "$log"
-        mv -f -- "$src" "$record_dir/handoff-refused-empty.md" 2>/dev/null
+        mv -f -- "$src" "$record_dir/$refused-empty.md" 2>/dev/null
         return 1
     fi
     mv -f -- "$src" "$record_dir/$record_name"
@@ -211,14 +216,18 @@ fs_refresh_emit_addenda() {
 # whether the hand-off is stale (0|1), $5 the header file (the static
 # preamble), $6 the original brief, $7 the record dir the addenda were
 # archived under, $8 the plan file (see fs_emit_plan_section), empty when
-# this run has no plan step. Order: header, framing, original brief, the
+# this run has no plan step, $9 (optional) a findings file -- a fix leg's
+# own verdict text, verbatim -- for a fix leg's own refresh chain: that
+# chain's continuation must carry what THIS leg was asked to fix, not just
+# the run's original brief. Order: header, framing, original brief, the
 # plan (right after the brief, same place every other leg's prompt puts
-# it), operator addenda from earlier legs, a stale warning when $4 is 1,
-# the previous hand-off.
+# it), the findings when $9 is given, operator addenda from earlier legs, a
+# stale warning when $4 is 1, the previous hand-off.
 # shellcheck disable=SC2016  # the backticks are literal prompt text
 fs_refresh_build_prompt() {
     local n="$1" handoff="$2" out="$3" stale="${4:-0}" header="$5" \
-        brief="$6" record_dir="$7" plan_file="${8:-}" addenda_list d f
+        brief="$6" record_dir="$7" plan_file="${8:-}" findings_file="${9:-}" \
+        addenda_list d f
     addenda_list="$(fs_refresh_addenda_dirs "$record_dir")"
     {
         cat -- "$header"
@@ -226,7 +235,16 @@ fs_refresh_build_prompt() {
         printf 'A previous session, in this same clone and on this same branch, used up\n'
         printf 'most of its context window and wrote a hand-off for a fresh session to\n'
         printf 'continue from. You are that fresh session, with none of its memory.\n'
-        if [[ -n "$addenda_list" ]]; then
+        if [[ -n "$findings_file" && -n "$addenda_list" ]]; then
+            printf 'Four documents follow: the original brief this run was launched\n'
+            printf 'with, the findings this leg was asked to fix, any operator addenda\n'
+            printf 'delivered to earlier legs of this run, and the hand-off the\n'
+            printf 'previous leg wrote against it.\n\n'
+        elif [[ -n "$findings_file" ]]; then
+            printf 'Three documents follow: the original brief this run was launched\n'
+            printf 'with, the findings this leg was asked to fix, and the hand-off the\n'
+            printf 'previous leg wrote against it.\n\n'
+        elif [[ -n "$addenda_list" ]]; then
             printf 'Three documents follow: the original brief this run was launched\n'
             printf 'with, any operator addenda delivered to earlier legs of this run,\n'
             printf 'and the hand-off the previous leg wrote against it.\n\n'
@@ -236,6 +254,11 @@ fs_refresh_build_prompt() {
         fi
         printf 'The brief is authoritative for what the task IS -- check its own list\n'
         printf 'of items, not the hand-off'"'"'s account of it, to decide what is left.\n'
+        if [[ -n "$findings_file" ]]; then
+            printf 'This leg itself was spawned to fix the findings below, not to work\n'
+            printf 'the brief from scratch -- treat them as the task, scoped by the\n'
+            printf 'brief.\n'
+        fi
         if [[ -n "$addenda_list" ]]; then
             printf 'The addenda carry the same authority as the brief and outrank it\n'
             printf 'where the two conflict -- see their own section below for what each\n'
@@ -265,6 +288,18 @@ fs_refresh_build_prompt() {
             printf 'finding, and cannot tell a deliberate change from an oversight on its\n'
             printf 'own.\n\n'
             cat -- "$plan_file"
+        fi
+        if [[ -n "$findings_file" ]]; then
+            if [[ ! -f "$findings_file" || ! -r "$findings_file" ]]; then
+                printf 'Error: the findings file %q is missing or unreadable at' \
+                    "$findings_file" >&2
+                printf ' prompt-build time. The findings cannot be embedded into' >&2
+                printf ' the prompt, so the prompt is not built rather than built' >&2
+                printf ' without them.\n' >&2
+                exit 1
+            fi
+            printf '\n---\n\n## The findings this leg was asked to fix\n\n'
+            cat -- "$findings_file"
         fi
         if [[ -n "$addenda_list" ]]; then
             printf '\n---\n\n## Operator addenda delivered to earlier legs\n\n'

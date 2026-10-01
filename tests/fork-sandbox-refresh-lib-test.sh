@@ -121,6 +121,16 @@ contains "the empty refusal is logged" "outbox handoff.md is empty; refusing it.
 marker="no"; [[ -f "$t/rec/handoff-refused-empty.md" ]] && marker=yes
 check "the empty hand-off is moved aside" yes "$marker"
 
+# A per-leg chain's tag keeps its refusals apart from another leg's.
+: > "$t/outbox/handoff.md"
+fs_refresh_take_handoff "$t/outbox" "$t/rec" s2-code-1-c1 "$t/log" > /dev/null
+head -c 65537 /dev/zero > "$t/outbox/handoff.md"
+fs_refresh_take_handoff "$t/outbox" "$t/rec" fix-1-c1 "$t/log" > /dev/null
+marker="no"; [[ -f "$t/rec/handoff-s2-code-1-c1-refused-empty.md" \
+    && -f "$t/rec/handoff-fix-1-c1-refused-too-large.md" \
+    && -f "$t/rec/handoff-refused-empty.md" ]] && marker=yes
+check "per-leg refusals are filed under their own leg tag" yes "$marker"
+
 t="$(new_tmp)"; mkdir -p "$t/outbox" "$t/rec"; : > "$t/log"
 printf 'again\n' > "$t/outbox/handoff.md"
 out="$(fs_refresh_take_handoff "$t/outbox" "$t/rec" 7 "$t/log")"
@@ -291,6 +301,39 @@ check "section order: brief, addenda, stale, hand-off" \
     "The original brief|Operator addenda delivered to earlier legs|Warning: this hand-off is stale|Hand-off from the previous leg|" \
     "$order"
 
+tf="$(new_tmp)"; mkdir -p "$tf/rec"
+printf 'HANDOFF BODY\n' > "$tf/rec/handoff-1.md"
+printf 'FINDINGS TEXT\n' > "$tf/findings.md"
+fs_refresh_build_prompt 3 "$tf/rec/handoff-1.md" "$tf/p3.md" 0 "$t/header.md" \
+    "$t/brief.md" "$tf/rec" "" "$tf/findings.md"
+p="$(cat "$tf/p3.md")"
+contains "findings: three documents (no addenda)" "Three documents follow" "$p"
+contains "findings: the findings this leg was asked to fix" \
+    "## The findings this leg was asked to fix" "$p"
+contains "findings: the findings text is embedded" "FINDINGS TEXT" "$p"
+order="$(grep -n '^## ' "$tf/p3.md" | sed 's/^[0-9]*:## //' | tr '\n' '|')"
+check "findings: section order (no addenda): brief, findings, hand-off" \
+    "The original brief|The findings this leg was asked to fix|Hand-off from the previous leg|" \
+    "$order"
+
+fs_refresh_build_prompt 4 "$t/rec/handoff-1.md" "$t/p4.md" 0 "$t/header.md" \
+    "$t/brief.md" "$t/rec" "" "$tf/findings.md"
+p="$(cat "$t/p4.md")"
+contains "findings + addenda: four documents" "Four documents follow" "$p"
+order="$(grep -n '^## ' "$t/p4.md" | sed 's/^[0-9]*:## //' | tr '\n' '|')"
+check "findings + addenda: section order" \
+    "The original brief|The findings this leg was asked to fix|Operator addenda delivered to earlier legs|Hand-off from the previous leg|" \
+    "$order"
+
+(
+    fs_refresh_build_prompt 5 "$t/rec/handoff-1.md" "$t/p5.md" 0 "$t/header.md" \
+        "$t/brief.md" "$t/rec" "" "$t/missing-findings.md" 2> "$t/err5"
+) ; rc=$?
+check "a missing findings file refuses rather than silently drops it" 1 "$rc"
+contains "the refusal names the findings file" "findings file" "$(cat "$t/err5")"
+marker="no"; [[ -e "$t/p5.md" ]] && marker=yes
+check "no prompt is written on a missing findings file" no "$marker"
+
 printf '\n== fs_refresh_resolve (fork-sandbox-lib.sh) ==\n'
 # Each case runs in a subshell that sources the library, so no result leaks
 # into the next. Prints "rc|at|enabled|max|window|tokens|ceiling" and, on
@@ -347,6 +390,32 @@ contains "a bad --refresh-max is refused" "Error: --refresh-max takes a non-nega
     "$(resolve claude "" false x m)"
 contains "--refresh-max with --refresh-at 0 is refused" "Error: --refresh-max requires --refresh-at" \
     "$(resolve claude 0 true 2 m)"
+
+printf '\n== fs_refresh_window_for_model (fork-sandbox-lib.sh) ==\n'
+# Each case runs in a subshell, same discipline as fs_refresh_resolve above.
+# Prints "window|threshold|ceiling".
+window_for_model() {
+    (
+        # shellcheck source=../scripts/fork-sandbox-lib.sh
+        # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+        source "$repo_dir/scripts/fork-sandbox-lib.sh"
+        fs_refresh_window_for_model "$@" > /dev/null
+        printf '%s|%s|%s\n' "$refresh_context_window" "$refresh_threshold_tokens" \
+            "$refresh_ceiling_tokens"
+    )
+}
+unset FORK_SANDBOX_CONTEXT_WINDOW
+check "a fraction against opus's 1M window" "1000000|500000|800000" \
+    "$(window_for_model 0.5 opus)"
+check "a fraction against haiku's 200k window" "200000|100000|160000" \
+    "$(window_for_model 0.5 claude-haiku-4-5)"
+check "an absolute token count ignores the window entirely" \
+    "1000000|150000|800000" "$(window_for_model 150000 opus)"
+check "FORK_SANDBOX_CONTEXT_WINDOW overrides the per-model guess" \
+    "300000|150000|240000" \
+    "$(FORK_SANDBOX_CONTEXT_WINDOW=300000 window_for_model 0.5 opus)"
+check "a different model from the same call site gets its own window" \
+    "200000|100000|160000" "$(window_for_model 0.5 Claude-Haiku-4-5)"
 
 printf '\n== fs_refresh_warn_brief (fork-sandbox-lib.sh) ==\n'
 warn_brief() {
