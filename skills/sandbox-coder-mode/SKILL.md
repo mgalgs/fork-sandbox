@@ -126,7 +126,7 @@ describes the mode; this section describes what running long demands.
 **The tiers.** Three, and the distinction between them is the whole point:
 
 - **Tier 1 — orchestrator and reviewer.** The expensive model: this session.
-  It reads the code to decide the design, writes the handoffs, reviews each
+  It decides the design at intent level, writes the handoffs, reviews each
   round per **Stay high level** — the report, the verdicts, the diffstat,
   and a spot-check of what executes on the host — integrates, and owns all
   host-side git (see **What stays in this session**). It writes no project
@@ -341,16 +341,25 @@ The `fork-sandbox` skill lists the required sections and the constraints —
 no global `~/.claude`, no secrets, no network credentials, name the test
 command in full, tell the session to commit. All of that still applies.
 
-What this mode adds: **the handoff carries the plan.** This session has
-already read the code and decided the approach. Write that down — the files
-to touch, the shape of the change, the interfaces involved, what to leave
-alone — instead of shipping the bare goal and paying a cheaper model to
-rediscover it. That is the trade that makes the economics work: the reading
-happened here once, at the good model's price, and every round after it
-starts from the answer.
+What this mode adds: **the handoff carries intent, not mechanics.** Write
+what only this session knows, close to the user's own request:
 
-Say what is out of scope, too. An unattended session with no one to ask will
-otherwise widen the task on its own.
+- the goal, and why;
+- the operator's decisions from this conversation, marked as not to be
+  changed, with any reference ("the approach we discussed") spelled out;
+- carried constraints and lessons the repo does not already state;
+- what is out of scope (an unattended session with no one to ask will
+  otherwise widen the task);
+- acceptance as properties the result must have. Reviewers verify only
+  what the handoff states, so every invariant that matters is written here.
+
+Leave the mechanics out: file and line pointers, the choice of mechanism,
+the test list. The implementer reads the code and finds them, in a short
+context that ends with the leg, and the review loops catch a wrong one.
+Reading code here to pin them costs this session's long context on every
+later turn, slows the launch, and line numbers go stale as other work
+lands. About a page is right; a one-line brief is too short, because the
+decisions and constraints never reach the run.
 
 ## Launching and watching
 
