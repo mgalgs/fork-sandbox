@@ -7527,6 +7527,44 @@ contains "reserve: the combined keyword lists both" "$(cat "$work/once.out")" \
     "pm flag thread=$short reason=wake-deferred,budget-reserved"
 check "reserve: combined, flagged once" 1 "$(wg_flags)"
 
+# on-quiescent reads the flag the deferral pass sets on the same pass. The
+# first pass on an empty store seeds the hook marks so the next one fires.
+wg_qhook() {
+    # shellcheck disable=SC2016  # expands in the hook, not here
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n%%s\\n" "$FS_HOOK_FLAGGED" "$FS_HOOK_FLAG_REASON" > "$WG_OUT/quiescent"\n' \
+        > "$WG_HOOKS/on-quiescent"
+    chmod +x "$WG_HOOKS/on-quiescent"
+    rm -f "$WG_OUT/quiescent"
+}
+wg_qseen() { sed -n "$1p" "$WG_OUT/quiescent" 2>/dev/null || true; }
+export FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline
+
+wg_new_store
+wg_gate 'exit 1'
+wg_qhook
+once
+mid="$(send_msg '@dana' '@hana' 'quiescent sees defer' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "quiescent hook: sees FS_HOOK_FLAGGED=1 for a standing defer" 1 "$(wg_qseen 1)"
+check "quiescent hook: sees the wake-deferred reason" \
+    "wake deferred: @hana at $mid and nothing woke it" "$(wg_qseen 2)"
+
+wg_new_store
+wg_gate 'exit 0'
+wg_qhook
+once
+mid="$(send_msg '@dana' '@bob,@carol' 'quiescent sees reserve' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 7
+once
+wg_finish_quiet carol
+once
+check "quiescent hook: sees FS_HOOK_FLAGGED=1 for a standing refusal" 1 "$(wg_qseen 1)"
+contains "quiescent hook: sees the budget-reserved reason" "$(wg_qseen 2)" "@bob refused at $mid"
+rm -f "$WG_HOOKS/on-quiescent"
+unset FORK_SANDBOX_POSTMASTER_HOOK_DETACH
+
 # Startup: a reserve that is not smaller than the budget refuses to start.
 wg_new_store
 wg_rc="$(FORK_SANDBOX_THREAD_BUDGET=3 once_rc)"

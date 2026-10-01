@@ -4747,6 +4747,7 @@ pm_thread_is_quiescent() {
 # every thread with a record, not only the ones with a review target. With
 # both records standing the flag is one, reasons joined by "; ", and its
 # keyword is built from the two booleans, never by matching the text.
+# Runs before pm_hook_pass so on-quiescent reads the flag this sets.
 pm_deferral_pass() {
     local f tid count reason keyword
     local -A seen=()
@@ -4956,8 +4957,8 @@ cmd_deliver() {
         pm_held_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
-        pm_hook_pass "$project"
         pm_deferral_pass
+        pm_hook_pass "$project"
         return 0
     fi
 
@@ -4969,8 +4970,8 @@ cmd_deliver() {
         pm_held_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
-        pm_hook_pass "$project"
         pm_deferral_pass
+        pm_hook_pass "$project"
         (( stop )) && break
         sleep "${FORK_SANDBOX_POSTMASTER_INTERVAL:-15}" || true
     done
