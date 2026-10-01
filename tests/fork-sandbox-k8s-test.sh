@@ -3801,6 +3801,167 @@ else
     no "an endpoint that did not opt in may have a base URL without /v1"
 fi
 
+embed_keyless_dir="$(newdir)"; tmpdirs+=("$embed_keyless_dir")
+embed_fixture "$embed_keyless_dir" 'K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1' '' primary
+embed_keyless_out="$(embed_render "$embed_keyless_dir")"; embed_rc=$?
+check "an opted-in keyless endpoints install --dry-run exits 0" 0 "$embed_rc"
+embed_v1="$(embed_block "$embed_keyless_out" '\/e\/primary\/v1\/embeddings')"
+embed_tei="$(embed_block "$embed_keyless_out" '\/e\/primary\/embed')"
+if grep -qF 'proxy_pass $upstream/embeddings;' <<< "$embed_v1" \
+    && grep -qF 'set $upstream "http://10.0.0.5:8001/v1";' <<< "$embed_v1"; then
+    ok "/e/<name>/v1/embeddings keeps the registered /v1 base"
+else
+    no "/e/<name>/v1/embeddings keeps the registered /v1 base" "$embed_v1"
+fi
+if grep -qF 'proxy_pass $upstream/embed;' <<< "$embed_tei" \
+    && grep -qF 'set $upstream "http://10.0.0.5:8001";' <<< "$embed_tei"; then
+    ok "/e/<name>/embed strips the trailing /v1 from the upstream"
+else
+    no "/e/<name>/embed strips the trailing /v1 from the upstream" "$embed_tei"
+fi
+if [[ -n "$embed_v1" && -n "$embed_tei" ]] && ! grep -q Authorization <<< "$embed_v1$embed_tei"; then
+    ok "an opted-in keyless endpoint's embeddings locations carry no Authorization header"
+else
+    no "an opted-in keyless endpoint's embeddings locations carry no Authorization header" "$embed_v1$embed_tei"
+fi
+if grep -qF 'limit_req zone=fork_sandbox_embed burst=100 nodelay;' <<< "$embed_v1" \
+    && grep -qF 'limit_req zone=fork_sandbox_embed burst=100 nodelay;' <<< "$embed_tei"; then
+    ok "both embeddings locations use the fork_sandbox_embed zone"
+else
+    no "both embeddings locations use the fork_sandbox_embed zone" "$embed_v1$embed_tei"
+fi
+if grep -qF 'proxy_ssl_verify on;' <<< "$embed_tei" && grep -qF 'proxy_set_header Host "10.0.0.5:8001";' <<< "$embed_tei" \
+    && grep -qF 'proxy_ssl_name "10.0.0.5:8001";' <<< "$embed_v1"; then
+    ok "the embeddings locations carry the same proxy_ssl_*/Host lines as the existing two"
+else
+    no "the embeddings locations carry the same proxy_ssl_*/Host lines as the existing two" "$embed_v1$embed_tei"
+fi
+embed_chat="$(embed_block "$embed_keyless_out" '\/e\/primary\/v1\/chat\/completions')"
+embed_models="$(embed_block "$embed_keyless_out" '\/e\/primary\/v1\/models')"
+if grep -qF 'zone=fork_sandbox burst=10 nodelay;' <<< "$embed_chat" \
+    && grep -qF 'zone=fork_sandbox burst=10 nodelay;' <<< "$embed_models"; then
+    ok "the chat and models locations still use the fork_sandbox zone"
+else
+    no "the chat and models locations still use the fork_sandbox zone" "$embed_chat$embed_models"
+fi
+if grep -qF 'limit_req_zone $binary_remote_addr zone=fork_sandbox_embed:10m rate=50r/s;' <<< "$embed_keyless_out"; then
+    ok "the fork_sandbox_embed zone is declared when an endpoint opts in"
+else
+    no "the fork_sandbox_embed zone is declared when an endpoint opts in" "$embed_keyless_out"
+fi
+embed_locations="$(grep -E '^ *location ' <<< "$embed_keyless_out")"
+if grep -q embed <<< "$embed_locations" \
+    && ! grep -vE '^ *location (= /e/|/ \{)' <<< "$embed_locations" | grep -q .; then
+    ok "every location stays exact-match (or the default deny)"
+else
+    no "every location stays exact-match (or the default deny)" "$embed_locations"
+fi
+
+# Two registered endpoints, one keyed, one opted in.
+embed_keyed_dir="$(newdir)"; tmpdirs+=("$embed_keyed_dir")
+embed_fixture "$embed_keyed_dir" "$embed_eps" secondary=MY_API_KEY secondary
+embed_keyed_out="$(embed_render "$embed_keyed_dir")"
+for embed_loc in '\/e\/secondary\/v1\/embeddings' '\/e\/secondary\/embed'; do
+    if grep -qF 'Authorization "Bearer $upstream_key_secondary"' <<< "$(embed_block "$embed_keyed_out" "$embed_loc")"; then
+        ok "an opted-in keyed endpoint's ${embed_loc//\\/} carries the Authorization header"
+    else
+        no "an opted-in keyed endpoint's ${embed_loc//\\/} carries the Authorization header" "$(embed_block "$embed_keyed_out" "$embed_loc")"
+    fi
+done
+if grep -qE 'location = /e/primary/(embed|v1/embeddings)' <<< "$embed_keyed_out"; then
+    no "an endpoint that did not opt in gets no embeddings locations" "$embed_keyed_out"
+elif grep -qE 'location = /e/secondary/embed ' <<< "$embed_keyed_out"; then
+    ok "an endpoint that did not opt in gets no embeddings locations"
+else
+    no "an endpoint that did not opt in gets no embeddings locations" "the opted-in endpoint has none either"
+fi
+
+# The zone line exists iff at least one endpoint opts in.
+embed_off_dir="$(newdir)"; tmpdirs+=("$embed_off_dir")
+embed_fixture "$embed_off_dir" "$embed_eps" secondary=MY_API_KEY ''
+embed_off_out="$(embed_render "$embed_off_dir")"
+if grep -q 'fork_sandbox_embed\|/embed' <<< "$embed_off_out"; then
+    no "with no opt-in there is no embed zone and no embed location" "$(grep 'fork_sandbox_embed\|/embed' <<< "$embed_off_out")"
+else
+    ok "with no opt-in there is no embed zone and no embed location"
+fi
+
+# Byte identity with the key unset (or empty), for all three shapes.
+embed_checksum() { grep -F 'checksum/nginx-conf' <<< "$1"; }
+embed_legacy_dir="$(newdir)"; tmpdirs+=("$embed_legacy_dir")
+embed_fixture "$embed_legacy_dir" 'K8S_PROXY_UPSTREAM=https://openrouter.ai' '' ''
+embed_keyless_off_dir="$(newdir)"; tmpdirs+=("$embed_keyless_off_dir")
+embed_fixture "$embed_keyless_off_dir" 'K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1' '' ''
+for embed_shape in legacy:"$embed_legacy_dir" keyless:"$embed_keyless_off_dir" keyed:"$embed_off_dir"; do
+    embed_shape_dir="${embed_shape#*:}"
+    embed_unset_out="$(embed_render "$embed_shape_dir")"
+    embed_empty_dir="$(newdir)"; tmpdirs+=("$embed_empty_dir")
+    cp -a "$embed_shape_dir/." "$embed_empty_dir/"
+    printf 'K8S_PROXY_ENDPOINT_EMBEDDINGS=\n' >> "$embed_empty_dir/k8s.env"
+    embed_empty_out="$(embed_render "$embed_empty_dir")"
+    if [[ -n "$embed_unset_out" && "$embed_unset_out" == "$embed_empty_out" ]] \
+        && [[ -n "$(embed_checksum "$embed_unset_out")" ]] \
+        && ! grep -q 'fork_sandbox_embed' <<< "$embed_unset_out"; then
+        ok "${embed_shape%%:*}: an unset embeddings key renders byte-identically to an empty one, no trace"
+    else
+        no "${embed_shape%%:*}: an unset embeddings key renders byte-identically to an empty one, no trace" \
+            "$(diff <(printf '%s\n' "$embed_unset_out") <(printf '%s\n' "$embed_empty_out") | head -20)"
+    fi
+    # No blank line or placeholder left where the zone line would be.
+    if grep -q '__PROXY_EMBED_ZONE__' <<< "$embed_unset_out" \
+        || ! grep -A2 'zone=fork_sandbox:10m' <<< "$embed_unset_out" | sed -n 2p | grep -q '^$'; then
+        no "${embed_shape%%:*}: the zone line leaves no placeholder or stray gap" \
+            "$(grep -A2 'zone=fork_sandbox:10m' <<< "$embed_unset_out")"
+    else
+        ok "${embed_shape%%:*}: the zone line leaves no placeholder or stray gap"
+    fi
+done
+# Opting in changes the checksum (the proxy must roll to pick it up).
+if [[ "$(embed_checksum "$embed_keyless_out")" != "$(embed_checksum "$(embed_render "$embed_keyless_off_dir")")" ]]; then
+    ok "opting an endpoint in changes checksum/nginx-conf"
+else
+    no "opting an endpoint in changes checksum/nginx-conf"
+fi
+
+# nginx must start on the opted-in render: a new limit_req_zone in http, two
+# new locations referencing it, and the keyed endpoint's per-name variable.
+# Reuses nginx_mode/run_nginx_t/extract_nginx_conf from the checks above.
+embed_keyed_file="$(newdir)/render.yaml"; tmpdirs+=("$(dirname "$embed_keyed_file")")
+printf '%s\n' "$embed_keyed_out" > "$embed_keyed_file"
+embed_nginx_conf="$(extract_nginx_conf "$embed_keyed_file")"
+if [[ -z "${nginx_mode:-}" ]]; then
+    printf '  SKIP  neither nginx nor a working docker on PATH\n'
+elif [[ -z "$embed_nginx_conf" ]]; then
+    no "extracted nginx.conf from the opted-in install --dry-run output"
+else
+    embed_nginx_dir="$(newdir)"; tmpdirs+=("$embed_nginx_dir")
+    printf '%s\n' "${embed_nginx_conf//kube-dns.kube-system.svc.cluster.local/127.0.0.1}" \
+        > "$embed_nginx_dir/nginx.conf"
+    # shellcheck disable=SC2016  # nginx config, not shell
+    printf 'set $upstream_key_secondary "dummy";\n' > "$embed_nginx_dir/upstream-key.conf"
+    out="$(run_nginx_t "$embed_nginx_dir")"; rc=$?
+    if (( rc == 0 )); then
+        ok "nginx -t accepts the rendered embeddings-opted-in proxy config"
+    else
+        no "nginx -t accepts the rendered embeddings-opted-in proxy config" "$out"
+    fi
+fi
+
+# A trailing slash after /v1 is normalized, as the parser already does.
+embed_slash_dir="$(newdir)"; tmpdirs+=("$embed_slash_dir")
+embed_fixture "$embed_slash_dir" 'K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1/' '' primary
+if grep -qF 'set $upstream "http://10.0.0.5:8001";' <<< "$(embed_render "$embed_slash_dir")"; then
+    ok "a trailing slash after /v1 is tolerated"
+else
+    no "a trailing slash after /v1 is tolerated"
+fi
+
+rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
+    /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
+    /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err \
+    /tmp/fs-k8s-test-svc-dns.out /tmp/fs-k8s-test-svc-dns.err \
+    /tmp/fs-k8s-test-custom-domain.out /tmp/fs-k8s-test-custom-domain.err
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude ==\n'
 # The default (--harness pi, i.e. submit_out above) renders no claude-proxy
 # object at all -- the per-run proxy is entirely opt-in.

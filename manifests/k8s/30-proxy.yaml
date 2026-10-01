@@ -39,6 +39,7 @@ data:
         client_max_body_size 0;
 
         limit_req_zone $binary_remote_addr zone=fork_sandbox:10m rate=5r/s;
+        __PROXY_EMBED_ZONE__
 
         server {
             listen 8080;

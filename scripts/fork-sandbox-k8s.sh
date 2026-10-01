@@ -2589,7 +2589,9 @@ render_proxy_egress_rules_sub() {
 # `proxy_set_header Authorization "Bearer $upstream_key_<name>"` -- an
 # endpoint whose key is only on the completions path leaves model discovery
 # 401ing, which surfaces pod-side as a dead run rather than a config error,
-# so both paths matter equally here. See cmd_install's Secret/include
+# so both paths matter equally here -- and the same goes for the two
+# embeddings locations an opted-in endpoint (is_embeddings_endpoint) adds.
+# See cmd_install's Secret/include
 # handling for the other half of that. Preserves the same
 # $upstream variable-in-proxy_pass
 # trick and resolver the legacy block uses (see manifests/k8s/30-proxy.yaml's
@@ -2849,6 +2851,39 @@ EOF
 
                 set \$upstream "$base";
                 proxy_pass \$upstream/models;
+
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "$host";
+                proxy_set_header Host "$host";${auth_header}
+            }
+EOF
+        is_embeddings_endpoint "$name" || continue
+        # The TEI-native route is served at the gateway root, not under /v1;
+        # parse_proxy_endpoint_embeddings guarantees $base ends in /v1.
+        cat <<EOF
+
+            location = /e/$name/v1/embeddings {
+                limit_req zone=fork_sandbox_embed burst=100 nodelay;
+
+                set \$upstream "$base";
+                proxy_pass \$upstream/embeddings;
+
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "$host";
+                proxy_set_header Host "$host";${auth_header}
+            }
+
+            location = /e/$name/embed {
+                limit_req zone=fork_sandbox_embed burst=100 nodelay;
+
+                set \$upstream "${base%/v1}";
+                proxy_pass \$upstream/embed;
 
                 proxy_ssl_verify on;
                 proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
@@ -3597,6 +3632,15 @@ cmd_install() {
             # own header for why), never left as a token for a later sed
             # pass to fill in.
             file_rendered="${file_rendered//__PROXY_LOCATIONS__/$(render_proxy_locations "$upstream_host")}"
+
+            # The embeddings rate-limit zone line exists only when some
+            # endpoint opts in; otherwise the placeholder's whole line goes,
+            # so an install without the key renders byte-identically.
+            if (( ${#EMBED_ENDPOINT_NAMES[@]} > 0 )); then
+                file_rendered="${file_rendered//__PROXY_EMBED_ZONE__/limit_req_zone \$binary_remote_addr zone=fork_sandbox_embed:10m rate=50r/s;}"
+            else
+                file_rendered="$(sed '/^ *__PROXY_EMBED_ZONE__$/d' <<< "$file_rendered")"
+            fi
 
             # The proxy's own NetworkPolicy egress rule(s) -- see
             # render_proxy_egress_rules's own header for why unset
