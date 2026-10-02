@@ -45,8 +45,15 @@
 # no flag), whether it has a grant, its spawn count, every run recorded for
 # it (harvested ones too, state "harvested" or "live"), every retry record
 # (all states, state as recorded, due_s floored at 0) and every held seat
-# (the full trigger id). Agent names are as stored, without the '@'. The
-# two flags must be given together: the text view is whole-store and the
+# (the full trigger id). Agent names are as stored, without the '@'. A thread
+# where a wake exited non-zero also carries `wake_failures` (the key is absent
+# otherwise, so a thread of clean wakes prints exactly what it always did):
+# one {run_id, agent, exit_code, at, log, cleared} entry per failed attempt,
+# oldest first, where log is {state, source[, lines, truncated, tail]} -- the
+# capped tail of the failed agent's own log (see pm_wake_exit_record for the
+# caps and the sanitizing) or, in state, why there is none -- and cleared is
+# null or {by, at} once a successful wake of the same seat (or the operator)
+# cleared the failure's flag reason. The two flags must be given together: the text view is whole-store and the
 # JSON view is per-thread, so either alone exits 2. Plain `status` output
 # is unchanged.
 #
@@ -70,7 +77,19 @@
 #   spawn        agent, thread, run=<run-dir basename>, via=to|cc
 #   harvest      agent, thread, replies=<count posted this pass>
 #   flag         thread, reason=<fixed keyword> (no agent -- a thread-level
-#                condition, not a per-agent one; see pm_flag_keyword)
+#                condition, not a per-agent one; see pm_flag_keyword). The
+#                reason=wake-exit flag also carries log=<run-id>: the run
+#                whose failure record (and capped log tail) the thread's
+#                `status --thread --json` holds under `wake_failures`.
+#                The key is left off when no record could be written. The
+#                log text itself never appears on this line.
+#   flag-clear   thread, agent, reason=wake-exit, run=<failed run id>,
+#                by=<recovering run id>, flagged=yes|no -- a wake of the
+#                same seat on the same thread exited 0 and cleared the
+#                wake-exit flag reason that seat's failed wake raised
+#                (flagged says whether the thread is still flagged for
+#                something else). One line per cleared attempt; nothing
+#                else is cleared. See pm_wake_exit_clear.
 #   defer        thread, agent, reason=wake-when -- the seat's wake gate
 #                (rule 5) answered "not now": no spawn, no budget slot
 #   wake-gate-error thread, agent, reason=exit-<N>|timeout|missing|context --
@@ -744,10 +763,24 @@
 #                                   cleared a flag -- a redundant unflag on
 #                                   an already-clear thread appends
 #                                   nothing (timestamp, kind, keyword,
-#                                   reason) -- operator-readable event
+#                                   reason), plus one `clear` line
+#                                   (keyword wake-exit, reason "<original
+#                                   reason> cleared by run <run id>") per
+#                                   wake-exit flag a seat's successful
+#                                   wake cleared (pm_wake_exit_clear) --
+#                                   operator-readable event
 #                                   count for `status`
 #                                   (e.g. "needs-operator (7 events)");
 #                                   nothing routes on it
+#   wake-exits/<thread-id>/<agent>/<run-id>.json  one failed wake's
+#                                   evidence: agent, run id, exit code and a
+#                                   capped tail of the failed agent's log
+#                                   (pm_wake_exit_record), written once; a
+#                                   sibling <run-id>.cleared (BY, AT) marks
+#                                   it cleared -- the record outlives the
+#                                   flag. `status --thread --json` serves
+#                                   these as wake_failures; nothing routes
+#                                   on them
 #   spawns/<thread-id>             one line appended per spawn, reset to
 #                                   empty by rule 1 -- line count is the
 #                                   thread's BUDGET count (rule 3). A
@@ -1756,12 +1789,13 @@ pm_flag_keyword() {
     esac
 }
 
-# Appends one line to $tid's journal: UTC timestamp, event (flag/unflag),
-# keyword, reason -- tab-separated so `cmd_status`'s event count
+# Appends one line to $tid's journal: UTC timestamp, event (flag, unflag,
+# or clear -- the last is pm_wake_exit_clear's), keyword, reason --
+# tab-separated so `cmd_status`'s event count
 # (awk -F'\t' '$2=="flag"') never has to parse the free-text reason field
 # to find the boundary. date -u's own output can't itself contain a tab or
-# newline, and "flag"/"unflag" are fixed literals this function alone
-# writes, so only the reason (field 4, last) can carry anything
+# newline, and "flag"/"unflag"/"clear" are fixed literals this function
+# alone writes, so only the reason (field 4, last) can carry anything
 # sender-influenced -- and being last, an embedded tab in IT still can't
 # shift $2.
 pm_flag_journal_append() {

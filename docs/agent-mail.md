@@ -857,6 +857,54 @@ thread with an upstream-head file.
 field: an object with `branch`, `sha`, `version`, `set_by`, `set_at`, or
 `null` when the thread has no review target.
 
+It also includes a `wake_failures` list, present only on a thread where a
+wake has exited non-zero (a thread whose wakes all succeeded has no such
+key, so its output is unchanged). One entry per failed attempt, oldest
+first, each keyed by that attempt's run id so a retry never replaces an
+earlier attempt's entry:
+
+```json
+{"run_id": "<run id>", "agent": "<seat>", "exit_code": 1,
+ "at": "<UTC timestamp>",
+ "log": {"state": "captured", "source": "pod-log-agent.log",
+         "lines": 40, "truncated": true, "tail": "<text>"},
+ "cleared": null}
+```
+
+`log.tail` is the end of the failed agent's own log, capped at the last 40
+lines and 8 KiB (`truncated` says whether anything was cut). For a k8s seat
+the source is the agent container's pod log that the fetch saved under the
+run's `evidence/` directory (`pod-log-agent.log`, never a sidecar's); for a
+local seat it is the run dir's `sandbox.log`. When there is no tail,
+`log.state` says why instead (`missing`: no such file, `empty`: zero bytes,
+`unavailable`: the run dir or log could not be read, or the log is a
+symlink, which is never followed) and the entry has no `tail`, `lines` or
+`truncated`. The tail is untrusted text from a sandboxed agent: ANSI
+escapes and other control characters other than newline and tab are
+stripped before the caps apply, and it reaches the JSON only as a string.
+It never reaches the event stream or the thread's mail. `cleared` is `null`
+while the failure still counts toward the thread's flag, or
+`{"by": "<run id>|operator", "at": "<UTC timestamp>"}` once it does not; a
+cleared entry keeps its tail. The `flag` event for a wake-exit carries
+`log=<run id>` to name the entry (see "The event stream"). Non-zero exits
+of seats that produced a `summary.json` are covered; a wake that never
+produced one is flagged as before and has no entry.
+
+### A successful retry clears its seat's wake-exit flag
+
+When a later wake of the same seat on the same thread exits 0 (a posted
+reply is not required; no reply is a valid outcome), the postmaster clears
+the wake-exit reason that seat's earlier failures raised, and nothing else:
+another seat's wake-exit, a `failed after N retries` flag, a budget flag or
+any other reason stays, and only a thread with nothing left is unflagged.
+Because the flag file holds one reason (a later flag overwrites it), what
+remains is read from the flag journal. The journal keeps the original
+`flag` lines and gains a `clear` line; the failed attempt's `wake_failures`
+entry keeps its log tail and gains `cleared`; and a `flag-clear` event
+reports it. Exhausted retries are not a wake-exit, so a success never
+clears them. An operator's `unflag` (or operator mail) marks open entries
+`cleared` by `operator`.
+
 ## The postmaster
 
 `fork-sandbox postmaster` is the host-side router: it watches the store,
@@ -916,10 +964,16 @@ Every route/harvest pass, `deliver` prints one porcelain line per action
 worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
 live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
-resolved fleet registry name, never raw header text. The fourteen events are
+resolved fleet registry name, never raw header text. The fifteen events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
 replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
-reason=<fixed keyword>), `retry` (thread, agent, trigger=<short-id>,
+reason=<fixed keyword>; the `wake-exit` flag adds `log=<run-id>`, the entry
+of `status --thread --json`'s `wake_failures` that holds that attempt's log
+tail, and omits it when no entry could be written), `flag-clear` (thread,
+agent, reason=wake-exit, run=<failed run id>, by=<recovering run id>,
+flagged=yes|no — a seat's successful wake cleared its earlier wake-exit
+flag; `flagged` says whether the thread is still flagged for something
+else; one line per cleared attempt), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
 `defer` (thread, agent, reason=wake-when — a seat's wake gate said not
 now; see rule 5), `wake-gate-error` (thread, agent,
@@ -968,9 +1022,10 @@ rule 1's reset in the same pass that performed it.
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
-event of its own in the fourteen above, so a thread being flagged and later
+event of its own in the fifteen above, so a thread being flagged and later
 auto-cleared (rule 1, operator mail) is invisible on this stream — only
-the flag is observable, not its clearing. This is a stable contract, not
+the flag is observable, not its clearing. The one exception is a wake-exit
+flag cleared by its seat's own successful wake, which has `flag-clear`. This is a stable contract, not
 a log file — stderr is unchanged (errors only), and nothing
 sender-controlled (Subject, body, raw From, attachment names) ever
 becomes a field value on one of these lines.
@@ -1535,7 +1590,8 @@ own thread scans never see it:
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
-| `needs-operator-journal/<thread-id>` | append-only history: one line per `pm_flag` call (timestamp, `flag`, keyword, reason) and one per `pm_unflag` call that actually cleared a flag (timestamp, `unflag`, empty keyword, empty reason) — a redundant unflag on an already-clear thread appends nothing. The flag-line count is what `status` shows next to the current reason, or `(no journal)` if this file doesn't exist yet for a thread flagged before the journal did. Operator-readable, nothing routes on it |
+| `needs-operator-journal/<thread-id>` | append-only history: one line per `pm_flag` call (timestamp, `flag`, keyword, reason) and one per `pm_unflag` call that actually cleared a flag (timestamp, `unflag`, empty keyword, empty reason) — a redundant unflag on an already-clear thread appends nothing — and one `clear` line (keyword `wake-exit`, reason `<the original reason> cleared by run <run id>`) per wake-exit flag a seat's successful wake cleared. The flag-line count is what `status` shows next to the current reason, or `(no journal)` if this file doesn't exist yet for a thread flagged before the journal did. Operator-readable, nothing routes on it |
+| `wake-exits/<thread-id>/<agent>/<run-id>.json` | one failed wake's evidence: agent, run id, exit code, capped log tail (see "Status"), written once and never rewritten. A sibling `<run-id>.cleared` (`BY`, `AT`) marks it cleared. Served as `wake_failures` by `status --thread --json`; nothing routes on it |
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 (and by an `X-Upstream-Head` message) — line count is the **budget** count |
 | `upstream-head/<thread-id>.env` | the thread's last upstream-moved announcement: `BRANCH`, `SHA`, `MSGID`, `SET_AT` — see "Upstream moved" |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
