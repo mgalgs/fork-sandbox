@@ -7795,6 +7795,152 @@ check "wake-exit: a clean wake writes no wake-exits state" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-exits" ]] && echo 1 || echo 0)"
 
 # ============================================================
+printf '\n== wake-exit clear: a successful retry clears its own wake-exit flag ==\n'
+# ============================================================
+
+# we_seed <thread> <agent> <run-id>: a failed attempt's record, as the
+# postmaster's own recorder would have left it.
+we_seed() {
+    local tid="$1" agent="$2" run="$3" dir="$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-exits/$1/$2"
+    mkdir -p -- "$dir"
+    printf '{"run_id": "%s", "agent": "%s", "exit_code": 1, "at": "2026-01-01T00:00:00Z", "log": {"state": "captured", "source": "pod-log-agent.log", "lines": 1, "truncated": false, "tail": "boom %s"}}\n' \
+        "$run" "$agent" "$run" > "$dir/$run.json"
+}
+# we_jline <thread> <kind> <keyword> <reason>
+we_jline() {
+    local jd="$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator-journal"
+    mkdir -p -- "$jd"
+    printf '2026-01-01T00:00:00Z\t%s\t%s\t%s\n' "$2" "$3" "$4" >> "$jd/$1"
+}
+we_exit_reason() { printf 'wake for %s exited 1 (run %s); outbox may be incomplete' "$1" "$2"; }
+we_cur() { cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$1" 2>/dev/null || true; }
+we_set_cur() { mkdir -p "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator"; printf '%s\n' "$2" > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$1"; }
+# we_fresh <subject>: a fresh root and a thread with one unrouted message to karen.
+we_fresh() {
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    we_mid="$(send_msg '@carol' '@karen' "$1" 'first' 8)"
+    we_tid="$(thread_of "$we_mid")"
+}
+
+# --- seat A fails, A's retry exits 0 (the whole path, nothing seeded) ---
+we_fresh 'clear: natural retry'
+seq 1 3 | sed 's/^/boom line /' > "$we_log"
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_AGENT_LOG="$we_log" once
+c1_rid1="$(basename "$(latest_env_for_agent karen)" .env)"
+check "clear: the failed wake flagged the thread" "1" "$([[ -e "$PM_STATE_DIR/needs-operator/$we_tid" ]] && echo 1 || echo 0)"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+c1_rid2="$(basename "$(latest_env_for_agent karen)" .env)"
+[[ "$c1_rid1" != "$c1_rid2" ]] || no "clear fixture: the retry ran as a second run" "$c1_rid1"
+c1_json="$(we_json "$we_tid")"
+check "clear: the thread is no longer flagged" None "$(we_py "$c1_json" 'd["flag"]')"
+check "clear: a clear event was emitted, one line, naming both runs" \
+    "pm flag-clear thread=${we_tid:0:8} agent=karen reason=wake-exit run=$c1_rid1 by=$c1_rid2 flagged=no" \
+    "$(grep '^pm flag-clear ' "$work/once.out")"
+check "clear: the failure is still in the record" "$c1_rid1" "$(we_py "$c1_json" 'd["wake_failures"][0]["run_id"]')"
+check "clear: the log tail is still in the record" "boom line 3" \
+    "$(we_py "$c1_json" 'd["wake_failures"][0]["log"]["tail"].split("\n")[-1]')"
+check "clear: the record says which run cleared it" "$c1_rid2" "$(we_py "$c1_json" 'd["wake_failures"][0]["cleared"]["by"]')"
+check "clear: the journal still has the original failure" 1 \
+    "$(grep -c "	flag	wake-exit	wake for karen exited 1 (run $c1_rid1)" "$PM_STATE_DIR/needs-operator-journal/$we_tid")"
+check "clear: the journal records the clear and the run that did it" 1 \
+    "$(grep -c "	clear	wake-exit	wake for karen exited 1 (run $c1_rid1).* cleared by run $c1_rid2\$" "$PM_STATE_DIR/needs-operator-journal/$we_tid")"
+reply_msg '@carol' "$we_mid" 'once more' --to '@karen' >/dev/null
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear: a later clean wake emits no further clear event" 0 "$(grep -c '^pm flag-clear ' "$work/once.out")"
+
+# --- A and B both failed; only A recovers: the thread stays flagged for B ---
+we_fresh 'clear: two seats, A recovers'
+we_seed "$we_tid" karen ra1; we_seed "$we_tid" kara rb1
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason karen ra1)"
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason kara rb1)"
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason karen ra1)"   # the file's own: A failed last
+we_set_cur "$we_tid" "$(we_exit_reason karen ra1)"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear 2seat: still flagged, now for B" "$(we_exit_reason kara rb1)" "$(we_cur "$we_tid")"
+check "clear 2seat: the event says the thread is still flagged" 1 \
+    "$(grep -c "^pm flag-clear thread=${we_tid:0:8} agent=karen reason=wake-exit run=ra1 by=.* flagged=yes\$" "$work/once.out")"
+c2_json="$(we_json "$we_tid")"
+check "clear 2seat: B's record is still open" None \
+    "$(we_py "$c2_json" '[r for r in d["wake_failures"] if r["agent"]=="kara"][0]["cleared"]')"
+check "clear 2seat: A's record is cleared" True \
+    "$(we_py "$c2_json" '[r for r in d["wake_failures"] if r["agent"]=="karen"][0]["cleared"] is not None')"
+
+we_fresh 'clear: two seats, B failed last'
+we_seed "$we_tid" karen ra1; we_seed "$we_tid" kara rb1
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason karen ra1)"
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason kara rb1)"
+we_set_cur "$we_tid" "$(we_exit_reason kara rb1)"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear 2seat: B's reason, already in the file, is untouched" "$(we_exit_reason kara rb1)" "$(we_cur "$we_tid")"
+
+# --- a wake-exit plus an unrelated reason: only the unrelated one remains ---
+we_fresh 'clear: unrelated reason that A overwrote'
+we_seed "$we_tid" karen ra1
+we_jline "$we_tid" flag budget-exhausted "thread budget 96 exhausted"
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason karen ra1)"
+we_set_cur "$we_tid" "$(we_exit_reason karen ra1)"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear unrelated-first: the older unrelated reason is back in the file" "thread budget 96 exhausted" "$(we_cur "$we_tid")"
+check "clear unrelated-first: the flag event count is unchanged" 2 \
+    "$(we_py "$(we_json "$we_tid")" 'd["flag"]["events"]')"
+
+we_fresh 'clear: unrelated reason that overwrote A'
+we_seed "$we_tid" karen ra1
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason karen ra1)"
+we_jline "$we_tid" flag budget-exhausted "thread budget 96 exhausted"
+we_set_cur "$we_tid" "thread budget 96 exhausted"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear unrelated-last: the unrelated reason stays" "thread budget 96 exhausted" "$(we_cur "$we_tid")"
+check "clear unrelated-last: A's failure is cleared anyway" True \
+    "$(we_py "$(we_json "$we_tid")" 'd["wake_failures"][0]["cleared"] is not None')"
+
+# --- retries exhausted: a success is not a wake-exit and never clears it ---
+we_fresh 'clear: retry exhaustion'
+we_seed "$we_tid" karen ra1
+we_jline "$we_tid" flag wake-exit "$(we_exit_reason karen ra1)"
+we_jline "$we_tid" flag retry-exhausted "wake for karen failed after 3 retries (trigger abcd1234)"
+we_set_cur "$we_tid" "wake for karen failed after 3 retries (trigger abcd1234)"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear exhausted: the thread stays flagged for the exhausted retries" \
+    "wake for karen failed after 3 retries (trigger abcd1234)" "$(we_cur "$we_tid")"
+
+# --- an operator's unflag closes open records, and a later success is silent ---
+we_fresh 'clear: operator unflag'
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_AGENT_LOG="$we_log" once
+"$postmaster" unflag "$we_tid" >/dev/null 2>&1
+c6_json="$(we_json "$we_tid")"
+check "clear operator: the record is marked cleared by the operator" operator \
+    "$(we_py "$c6_json" 'd["wake_failures"][0]["cleared"]["by"]')"
+check "clear operator: the record keeps its tail" captured "$(we_py "$c6_json" 'd["wake_failures"][0]["log"]["state"]')"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear operator: a later clean wake emits no clear event" 0 "$(grep -c '^pm flag-clear ' "$work/once.out")"
+check "clear operator: and the thread stays unflagged" None "$(we_py "$(we_json "$we_tid")" 'd["flag"]')"
+
+# --- two real seats fail on one thread; only one recovers ---
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+we_tid="$(thread_of "$(send_msg '@carol' '@karen,@kara' 'clear: two real seats' 'first' 8)")"
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_AGENT_LOG="$we_log" once
+check "clear real: both seats' failures are recorded" 2 "$(we_py "$(we_json "$we_tid")" 'len(d["wake_failures"])')"
+STUB_K8S_EXIT_MAP="karen=0 kara=1" STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_AGENT_LOG="$we_log" once
+c7_json="$(we_json "$we_tid")"
+contains "clear real: still flagged, and for the seat that did not recover" \
+    "$(we_py "$c7_json" 'd["flag"]["reason"]')" "wake for kara exited 1"
+check "clear real: the recovered seat's earlier failure is cleared" True \
+    "$(we_py "$c7_json" 'all(r["cleared"] is not None for r in d["wake_failures"] if r["agent"]=="karen")')"
+check "clear real: the other seat has an open failure" True \
+    "$(we_py "$c7_json" 'any(r["cleared"] is None for r in d["wake_failures"] if r["agent"]=="kara")')"
+
+# --- a clean wake on a never-failed thread touches nothing ---
+we_fresh 'clear: never failed'
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "clear: a thread that never failed has no clear event" 0 "$(grep -c '^pm flag-clear ' "$work/once.out")"
+check "clear: and no journal" 0 "$([[ -e "$PM_STATE_DIR/needs-operator-journal/$we_tid" ]] && echo 1 || echo 0)"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 

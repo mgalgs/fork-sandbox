@@ -1797,6 +1797,13 @@ pm_unflag() {
     # no-ops would drown the real transitions in noise.
     [[ -e "$NEEDS_OPERATOR/$tid" ]] && pm_flag_journal_append "$tid" unflag "" ""
     rm -f -- "$NEEDS_OPERATOR/$tid"
+    # Whatever wake-exit records were still open were part of the flag just
+    # cleared; the records stay, marked as cleared by the operator.
+    local wf
+    for wf in "$WAKE_EXITS/$tid"/*/*.json; do
+        [[ -f "$wf" ]] || continue
+        pm_wake_exit_mark_cleared "$tid" "$(basename -- "$(dirname -- "$wf")")" "$(basename -- "$wf" .json)" operator
+    done
 }
 
 # Keeps the evidence for one wake that exited non-zero: a single-line JSON
@@ -1919,6 +1926,109 @@ print(json.dumps({
     fi
     rm -f -- "$tmp"
     return 1
+}
+
+# Marks the wake-exit record of $3 (a run id) for agent $2 as cleared by $4
+# (the recovering run's id, or `operator`): a sibling <run-id>.cleared file
+# holding BY and AT, so the record itself is never rewritten and the
+# evidence outlives the flag. A no-op for a record that is absent or
+# already cleared.
+pm_wake_exit_mark_cleared() {
+    local tid="$1" agent="$2" run="$3" by="$4"
+    local dir="$WAKE_EXITS/$tid/$agent" tmp
+    [[ -f "$dir/$run.json" && ! -e "$dir/$run.cleared" ]] || return 0
+    tmp="$(mktemp "$dir/.tmp.XXXXXX" 2>/dev/null)" || return 0
+    if printf 'BY=%s\nAT=%s\n' "$by" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" \
+        && mv -f -- "$tmp" "$dir/$run.cleared"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 0
+}
+
+# A wake of $2 on thread $1 exited 0 (run $3): clears the wake-exit flag
+# reason(s) that seat's earlier failed wakes raised, and nothing else.
+#
+# The flag file holds one reason (pm_flag overwrites, see pm_flag_keyword),
+# so what a thread is flagged for is read from its journal: every `flag`
+# line since the last `unflag`, minus the wake-exit lines a `clear` line
+# has answered. Exit 0 is the criterion, not a posted reply -- no reply is
+# a valid outcome of a wake. Only `wake-exit` lines for this agent are
+# cleared; another seat's, a retry-exhausted ("failed after N retries"),
+# a budget flag, anything else stays. When the flag file currently shows
+# this agent's wake-exit reason it is replaced by the newest reason that
+# remains, or the thread is unflagged when none does; when it shows some
+# other reason it is left alone.
+#
+# History is kept: the original `flag` lines stay in the journal, a `clear`
+# line (UTC timestamp, clear, wake-exit, "<original reason> cleared by run
+# <run id>") joins them, the failed attempt's wake-exits record keeps its
+# log tail and gains a .cleared marker, and one `flag-clear` pm event is
+# emitted per cleared attempt. Silent, and touching nothing, when this
+# agent has no open wake-exit flag -- every ordinary successful wake.
+pm_wake_exit_clear() {
+    local tid="$1" agent="$2" rid="$3"
+    local jf="$NEEDS_OPERATOR_JOURNAL/$tid"
+    [[ -f "$jf" ]] || return 0
+    local scan
+    scan="$(awk -F'\t' -v agent="$agent" '
+        function runid(s) {
+            if (match(s, /\(run [^)]+\)/)) return substr(s, RSTART + 5, RLENGTH - 6)
+            return ""
+        }
+        $1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:]+Z$/ { next }
+        { reason = $0; sub(/^[^\t]*\t[^\t]*\t[^\t]*\t/, "", reason) }
+        $2 == "unflag" { n = 0; delete cleared; next }
+        $2 == "clear"  { r = runid(reason); if (r != "") cleared[r] = 1; next }
+        $2 == "flag"   { n++; kw[n] = $3; rs[n] = reason; next }
+        END {
+            pref = "wake for " agent " exited "
+            for (i = 1; i <= n; i++) {
+                r = runid(rs[i])
+                if (kw[i] == "wake-exit" && index(rs[i], pref) == 1 && !(r in cleared) && !(r in seen)) {
+                    if (r != "") seen[r] = 1
+                    print "open\t" (r == "" ? "-" : r) "\t" rs[i]
+                }
+            }
+            for (i = n; i >= 1; i--) {
+                r = runid(rs[i])
+                if (kw[i] == "wake-exit" && (index(rs[i], pref) == 1 || r in cleared)) continue
+                print "keep\t" kw[i] "\t" rs[i]
+                break
+            }
+        }' "$jf" 2>/dev/null)" || return 0
+    local kind a b keep_reason="" have_keep=0
+    local -a open_runs=() open_reasons=()
+    while IFS=$'\t' read -r kind a b; do
+        case "$kind" in
+            open) open_runs+=("$a"); open_reasons+=("$b") ;;
+            keep) have_keep=1; keep_reason="$b" ;;
+        esac
+    done <<< "$scan"
+    (( ${#open_runs[@]} )) || return 0
+
+    local cur="" i
+    [[ -f "$NEEDS_OPERATOR/$tid" ]] && cur="$(cat -- "$NEEDS_OPERATOR/$tid" 2>/dev/null || true)"
+    for i in "${!open_runs[@]}"; do
+        pm_wake_exit_mark_cleared "$tid" "$agent" "${open_runs[$i]}" "$rid"
+        pm_flag_journal_append "$tid" clear wake-exit "${open_reasons[$i]} cleared by run $rid"
+    done
+    if [[ "$cur" == "wake for $agent exited "* ]]; then
+        if (( have_keep )); then
+            printf '%s\n' "$keep_reason" > "$NEEDS_OPERATOR/$tid"
+        else
+            pm_unflag "$tid"
+        fi
+    fi
+    local flagged=no
+    [[ -e "$NEEDS_OPERATOR/$tid" ]] && flagged=yes
+    for i in "${!open_runs[@]}"; do
+        if [[ "${open_runs[$i]}" =~ $PM_WAKE_EXIT_ID_RE ]]; then
+            pm_event "flag-clear thread=${tid:0:8} agent=$agent reason=wake-exit run=${open_runs[$i]} by=$rid flagged=$flagged"
+        else
+            pm_event "flag-clear thread=${tid:0:8} agent=$agent reason=wake-exit by=$rid flagged=$flagged"
+        fi
+    done
 }
 
 # ---- lock ----
@@ -4589,6 +4699,9 @@ pm_harvest_run() {
             # of sessions_tracked -- a given-mode harness's clean finish is
             # just as much evidence of health as a discover-mode one's.
             pm_retry_recover "$tid" "$agent"
+            # A clean exit also answers this seat's earlier wake-exit
+            # flag(s) on the thread -- see pm_wake_exit_clear.
+            pm_wake_exit_clear "$tid" "$agent" "$rid" || true
         fi
     fi
 
