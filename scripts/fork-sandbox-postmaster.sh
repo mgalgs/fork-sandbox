@@ -981,6 +981,21 @@ UNRESOLVED_TO="$STATE/unresolved-to"
 # instead of only ever showing whichever reason happened to write last.
 # Nothing routes on it.
 NEEDS_OPERATOR_JOURNAL="$STATE/needs-operator-journal"
+# Per-thread evidence for a wake that exited non-zero, one JSON record per
+# failed attempt at $WAKE_EXITS/<thread-id>/<agent>/<run-id>.json (see
+# pm_wake_exit_record). Never read back by routing; `status --thread --json`
+# serves it as `wake_failures`.
+WAKE_EXITS="$STATE/wake-exits"
+# The caps on the log tail a wake-exit record keeps: the last 40 lines and,
+# whichever binds first, the last 8 KiB -- so one pathological line (a
+# minified blob, a progress bar redrawn without newlines) cannot blow up
+# the record, the status JSON, or the mail API response that serves it.
+PM_WAKE_EXIT_TAIL_LINES=40
+PM_WAKE_EXIT_TAIL_BYTES=8192
+# What an agent name and a run id must look like to name a record's
+# directory and file: both come from this script's own registry and uuid
+# generator, so this only guards the path against a corrupted run record.
+PM_WAKE_EXIT_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
 # Per-thread seat records, one `<agent> <message-id>` line per seat: a wake
 # the seat's wake-when gate deferred and that nothing has since replaced.
 # A seat's line goes when that seat actually spawns on the thread, by any
@@ -1779,6 +1794,128 @@ pm_unflag() {
     # no-ops would drown the real transitions in noise.
     [[ -e "$NEEDS_OPERATOR/$tid" ]] && pm_flag_journal_append "$tid" unflag "" ""
     rm -f -- "$NEEDS_OPERATOR/$tid"
+}
+
+# Keeps the evidence for one wake that exited non-zero: a single-line JSON
+# record at $WAKE_EXITS/<tid>/<agent>/<run-id>.json naming the agent, run id,
+# exit code and a capped tail of the failed agent's own log, so an operator
+# can see why a seat died without a shell on the host that ran it. One file
+# per run id, written once and never rewritten, so a retry's failure never
+# replaces an earlier attempt's tail.
+#
+# Which log: a k8s wake's is the agent container's log that
+# fork-sandbox-k8s.sh collect saved at <k8s run dir>/evidence/pod-log-agent.log
+# (the wake dir's k8s-run-dir names that run dir); a local wake leaves
+# <run dir>/sandbox.log, the sandbox's combined diagnostic output. The log
+# is untrusted text from a sandboxed agent, so it never touches the shell:
+# python3 reads it by path, refuses symlinks along the way, strips ANSI and
+# other control characters, applies the caps, and emits it only as a JSON
+# string. A log that is absent, empty or unreadable is recorded as such
+# (log.state missing|empty|unavailable) rather than skipped.
+#
+# Fails open: returns non-zero when no record could be written, and the
+# caller carries on flagging, harvesting and retrying exactly as before.
+# $1 = thread id, $2 = agent, $3 = run id, $4 = exit code (as read),
+# $5 = run dir, $6 = backend (k8s or local).
+pm_wake_exit_record() {
+    local tid="$1" agent="$2" rid="$3" code="$4" run_dir="$5" backend="$6"
+    [[ "$agent" =~ $PM_WAKE_EXIT_ID_RE && "$rid" =~ $PM_WAKE_EXIT_ID_RE ]] || return 1
+    local base="" rel="sandbox.log" source="sandbox.log"
+    if [[ "$backend" == k8s ]]; then
+        base="$(pm_trim "$(cat -- "$run_dir/k8s-run-dir" 2>/dev/null || true)")"
+        rel="evidence/pod-log-agent.log"
+        source="pod-log-agent.log"
+    else
+        base="$run_dir"
+    fi
+    local dir="$WAKE_EXITS/$tid/$agent" json tmp
+    mkdir -p -- "$dir" 2>/dev/null || return 1
+    json="$(python3 -c '
+import json, os, re, stat, sys, time
+
+agent, rid, code, base, rel, source, max_lines, max_bytes = sys.argv[1:9]
+max_lines, max_bytes = int(max_lines), int(max_bytes)
+
+def read_tail():
+    """(state, text, lines, truncated) -- never raises."""
+    if not base or not os.path.isabs(base) or ".." in base.split("/"):
+        return "unavailable", "", 0, False
+    path = base
+    parts = [p for p in rel.split("/") if p]
+    try:
+        for i, part in enumerate([""] + parts):
+            if part:
+                path = os.path.join(path, part)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                return "unavailable", "", 0, False
+            if i < len(parts) and not stat.S_ISDIR(st.st_mode):
+                return "unavailable", "", 0, False
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "missing", "", 0, False
+    except OSError:
+        return "unavailable", "", 0, False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return "unavailable", "", 0, False
+        if st.st_size == 0:
+            return "empty", "", 0, False
+        start = max(0, st.st_size - max_bytes)
+        os.lseek(fd, start, os.SEEK_SET)
+        data = b""
+        while len(data) < max_bytes:
+            chunk = os.read(fd, max_bytes - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return "unavailable", "", 0, False
+    finally:
+        os.close(fd)
+    truncated = start > 0
+    text = data.decode("utf-8", "replace")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", text)
+    text = text.replace("\r\n", "\n")
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", text)
+    if truncated and "\n" in text:
+        text = text.split("\n", 1)[1]
+    elif truncated:
+        text = text.lstrip("�")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated = True
+    text = "\n".join(lines)
+    enc = text.encode("utf-8")
+    if len(enc) > max_bytes:
+        text = enc[-max_bytes:].decode("utf-8", "ignore")
+        lines = text.split("\n")
+        truncated = True
+    return "captured", text, len(lines), truncated
+
+state, text, nlines, truncated = read_tail()
+log = {"state": state, "source": source}
+if state == "captured":
+    log.update({"lines": nlines, "truncated": truncated, "tail": text})
+print(json.dumps({
+    "run_id": rid, "agent": agent,
+    "exit_code": int(code) if re.fullmatch(r"[0-9]{1,9}", code) else None,
+    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "log": log}))
+' "$agent" "$rid" "$code" "$base" "$rel" "$source" \
+        "$PM_WAKE_EXIT_TAIL_LINES" "$PM_WAKE_EXIT_TAIL_BYTES" 2>/dev/null)" || return 1
+    [[ -n "$json" ]] || return 1
+    tmp="$(mktemp "$dir/.tmp.XXXXXX" 2>/dev/null)" || return 1
+    if printf '%s\n' "$json" > "$tmp" && mv -f -- "$tmp" "$dir/$rid.json"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
 }
 
 # ---- lock ----
@@ -4392,6 +4529,9 @@ pm_harvest_run() {
             # have written a file), but flag regardless: an empty outbox from
             # a non-zero exit is a failure, not the documented "no reply is a
             # valid outcome".
+            # The evidence first, so the flag never outruns it; a failure to
+            # write it changes nothing below.
+            pm_wake_exit_record "$tid" "$agent" "$rid" "$exit_code" "$run_dir" "$backend" || true
             pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
             # A crash's own summary.json, when present and id-shaped, is
             # exactly as trustworthy as the success path's (it may be the
@@ -5057,6 +5197,17 @@ cmd_status_json() {
             printf '%s\0' retry "$(basename -- "$rfile")" "$(fs_pm_env_get "$rfile" STATE)" "$rattempt" "$rdue"
         done
 
+        local wf wcb wca
+        for wf in "$WAKE_EXITS/$tid"/*/*.json; do
+            [[ -f "$wf" ]] || continue
+            wcb=""; wca=""
+            if [[ -f "${wf%.json}.cleared" ]]; then
+                wcb="$(fs_pm_env_get "${wf%.json}.cleared" BY)"
+                wca="$(fs_pm_env_get "${wf%.json}.cleared" AT)"
+            fi
+            printf '%s\0' wake_exit "$(cat -- "$wf")" "$wcb" "$wca"
+        done
+
         local hf hsince
         for hf in "$STATE/held/$tid"/*; do
             [[ -f "$hf" ]] || continue
@@ -5075,7 +5226,8 @@ out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
        "spawns": 0, "runs": [], "retries": [], "held": []}
 arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0,
          "review_target": 5, "spawns": 1,
-         "run": 5, "retry": 4, "held": 3}
+         "run": 5, "retry": 4, "held": 3, "wake_exit": 3}
+wake_exits = []
 i = 0
 while i < len(tok):
     tag = tok[i]
@@ -5103,6 +5255,28 @@ while i < len(tok):
                                "attempt": int(a[2]), "due_s": int(a[3])})
     elif tag == "held":
         out["held"].append({"agent": a[0], "trigger": a[1], "age_s": int(a[2])})
+    elif tag == "wake_exit":
+        # The record is a file under the state dir, so rebuild it field by
+        # field rather than pass it through: only these keys, only these
+        # types, the tail re-capped.
+        try:
+            r = json.loads(a[0])
+            lg = r["log"]
+            rec = {"run_id": str(r["run_id"]), "agent": str(r["agent"]),
+                   "exit_code": r["exit_code"] if isinstance(r["exit_code"], int) else None,
+                   "at": str(r["at"]),
+                   "log": {"state": str(lg["state"]), "source": str(lg["source"])},
+                   "cleared": {"by": a[1], "at": a[2]} if a[1] else None}
+            if lg["state"] == "captured":
+                rec["log"].update({"lines": int(lg["lines"]),
+                                   "truncated": bool(lg["truncated"]),
+                                   "tail": str(lg["tail"])[-8192:]})
+            wake_exits.append(rec)
+        except (ValueError, KeyError, TypeError):
+            pass
+if wake_exits:
+    wake_exits.sort(key=lambda r: (r["at"], r["run_id"]))
+    out["wake_failures"] = wake_exits
 print(json.dumps(out))
 '
 }
