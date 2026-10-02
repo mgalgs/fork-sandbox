@@ -7619,6 +7619,13 @@ seq 1 60 | sed 's/^/first attempt line /' > "$we_log"
 STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_AGENT_LOG="$we_log" once
 we1_rid1="$(basename "$(latest_env_for_agent karen)" .env)"
 we1_json="$(we_json "$we1_tid")"
+check "wake-exit event: the flag line names the run whose log to look up" \
+    "pm flag thread=${we1_tid:0:8} reason=wake-exit log=$we1_rid1" \
+    "$(grep '^pm flag ' "$work/once.out")"
+check "wake-exit event: still exactly one flag line, one line per event" 1 \
+    "$(grep -c '^pm flag ' "$work/once.out")"
+check "wake-exit event: every stdout line is a pm event" 0 \
+    "$(grep -vc '^pm ' "$work/once.out")"
 check "wake-exit: one failure record after the first failed wake" 1 "$(we_py "$we1_json" 'len(d["wake_failures"])')"
 check "wake-exit: the record names the agent" karen "$(we_py "$we1_json" 'd["wake_failures"][0]["agent"]')"
 check "wake-exit: the record names the run id" "$we1_rid1" "$(we_py "$we1_json" 'd["wake_failures"][0]["run_id"]')"
@@ -7757,6 +7764,25 @@ check "wake-exit local: the record names the sandbox log" sandbox.log \
 check "wake-exit local: the exit code is recorded" 137 "$(we_py "$we7_json" 'd["wake_failures"][0]["exit_code"]')"
 check "wake-exit local: the tail is the log" "agent crashed: out of memory" \
     "$(we_py "$we7_json" 'd["wake_failures"][0]["log"]["tail"].split("\n")[-1]')"
+
+# --- failing to write the record is not an error path ---
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+we9_tid="$(thread_of "$(send_msg '@carol' '@karen' 'wake exit unwritable' 'first' 8)")"
+mkdir -p "$PM_STATE_DIR"
+: > "$PM_STATE_DIR/wake-exits"   # a file where the directory must go
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_AGENT_LOG="$we_log" once
+check "wake-exit unwritable: the flag event is the old one, without log=" \
+    "pm flag thread=${we9_tid:0:8} reason=wake-exit" "$(grep '^pm flag ' "$work/once.out")"
+contains "wake-exit unwritable: the thread is still flagged" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$we9_tid" 2>/dev/null)" "wake for karen exited 1"
+contains "wake-exit unwritable: the retry is still scheduled" \
+    "$(cat "$PM_STATE_DIR/retries/$we9_tid/karen" 2>/dev/null)" "STATE=pending"
+check "wake-exit unwritable: the run is still harvested" 1 \
+    "$(find "$PM_STATE_DIR/harvested" -type f | wc -l)"
+check "wake-exit unwritable: status has no wake_failures key" False \
+    "$(we_py "$(we_json "$we9_tid")" '"wake_failures" in d')"
 
 # --- a clean wake leaves the status output without the new key ---
 new_scratch_root FORK_SANDBOX_MAIL_ROOT

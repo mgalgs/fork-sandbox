@@ -1771,8 +1771,11 @@ pm_flag_journal_append() {
         >> "$NEEDS_OPERATOR_JOURNAL/$tid"
 }
 
+# $4, when given, is one more `key=val` pair appended to the flag event
+# (the wake-exit flag's `log=<run-id>`); callers pass only a pair built
+# from a value this script generated, never one taken from agent output.
 pm_flag() {
-    local tid="$1" reason="$2" keyword="${3:-}"
+    local tid="$1" reason="$2" keyword="${3:-}" extra="${4:-}"
     mkdir -p -- "$NEEDS_OPERATOR"
     printf '%s\n' "$reason" > "$NEEDS_OPERATOR/$tid"
     [[ -n "$keyword" ]] || keyword="$(pm_flag_keyword "$reason")"
@@ -1783,7 +1786,7 @@ pm_flag() {
     # is what lets 12 needs-operator incidents on one thread read as 12
     # events instead of 1.
     pm_flag_journal_append "$tid" flag "$keyword" "$reason"
-    pm_event "flag thread=${tid:0:8} reason=$keyword"
+    pm_event "flag thread=${tid:0:8} reason=$keyword${extra:+ $extra}"
 }
 
 pm_unflag() {
@@ -4530,9 +4533,12 @@ pm_harvest_run() {
             # a non-zero exit is a failure, not the documented "no reply is a
             # valid outcome".
             # The evidence first, so the flag never outruns it; a failure to
-            # write it changes nothing below.
-            pm_wake_exit_record "$tid" "$agent" "$rid" "$exit_code" "$run_dir" "$backend" || true
-            pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
+            # write it changes nothing below except that the event carries
+            # no log= key, since there is no record for it to point at.
+            local log_key=""
+            pm_wake_exit_record "$tid" "$agent" "$rid" "$exit_code" "$run_dir" "$backend" \
+                && log_key="log=$rid"
+            pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete" "" "$log_key"
             # A crash's own summary.json, when present and id-shaped, is
             # exactly as trustworthy as the success path's (it may be the
             # id a --refresh-at mid-run credential rollover resumed onto) --
