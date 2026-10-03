@@ -3814,22 +3814,40 @@ Write your plan, as markdown, to:
 
     $plan_outbox_file
 
-Make the plan earn that trust. It should:
+Every later leg is told to follow this plan, so a wrong call in it
+becomes a wrong build. Make the plan earn that trust. It should:
 
 1. **Make one decision**, with each alternative you rejected on its own
-   line and why.
+   line and why. Where the repository already states a rule your change
+   touches — a header comment, a docs promise, a parser message, the way
+   a sibling option behaves — cite it and follow it; depart from it only
+   with a \`file:line\` showing why this case differs. Back every claim
+   about existing code ("X is the only caller", "Y already does Z") with
+   the line that shows it.
 2. **Turn every open question into an assumption**: state it, say why
    you chose it, and say what the implementer should do if it turns out
    to be wrong. You cannot ask; the implementer runs unattended, and a
-   question left open never gets answered.
+   question left open never gets answered. An assumption fills a gap the
+   brief leaves open and never overrides what the brief says; when one
+   rests on the brief's wording, quote that wording exactly. If you think
+   the brief is wrong, follow it anyway and say so — \`BLOCKED\`, below,
+   is for a brief that cannot be followed at all.
 3. **Be grounded in this repository**: name existing patterns to copy,
    and the files and functions to touch, each with a \`file:line\`
-   pointer.
+   pointer and the function it lands in. For every file name, field,
+   flag or output whose shape or meaning you change, find its readers —
+   code, tests, docs, comments — and list each one that must change
+   with it.
 4. **State requirements as testable behavior** — "WHEN <condition> THE
    SYSTEM SHALL <behavior>" or similar — and map every test in your test
    list to exactly one requirement, each test placed at the highest
    existing seam that can exercise it, not a new one invented for the
-   occasion.
+   occasion. Where a requirement or assumption lists cases (flag
+   spellings, file or lock names, step kinds, legs), test each listed
+   case, not one representative. When the change creates state that must
+   be cleaned up or finalized — files, locks, child processes, status
+   records — state requirements for a run that is interrupted, killed or
+   fails partway, not only for one that succeeds.
 5. **Split the work into commits** that each leave the tree green and
    wired in — no commit that adds code nothing calls yet. Any refactor
    the plan needs comes first, its own commit.
@@ -3838,12 +3856,15 @@ Make the plan earn that trust. It should:
 7. **Meet this bar before you call it done**: every requirement from (4)
    has a test, every file your plan touches belongs to a commit in (5),
    and nothing is left undecided — no question without an assumption,
-   no "TBD".
+   no "TBD". End the plan with a table mapping each requirement to its
+   test and the commit that lands both; a behavior whose test lands in a
+   later commit than the behavior itself is a defect in the plan.
 
 Open the plan with the assumptions list from (2), then the decision and
 the grounding from (1) and (3), then the test list from (4), then the
-commit split from (5), then what is out of scope from (6). Say what to
-build and why; the exact edits are the implementer's job, not yours.
+commit split from (5), then what is out of scope from (6), and close with
+the table from (7). Say what to build and why; the exact edits are the
+implementer's job, not yours.
 
 If this run should not proceed at all — the brief asks for something
 this repository cannot support, or contradicts itself beyond an

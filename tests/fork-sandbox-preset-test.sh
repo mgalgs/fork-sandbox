@@ -3021,6 +3021,18 @@ if rd_plan="$(run_stubbed --preset plan-code-review --branch "sandbox-test-plan-
         "$(cat "$rd_plan/plan.md")" "Stub plan body"
     contains "plan: its own prompt tells it to write plan.md" \
         "$(cat "$rd_plan/step-1-prompt.md")" "Write your plan, as markdown, to:"
+    contains "plan: its prompt binds the decision to the repo's stated rules" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "cite it and follow it"
+    contains "plan: its prompt says assumptions never override the brief" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "never overrides what the brief says"
+    contains "plan: its prompt asks for the readers of what changes" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "find its readers"
+    contains "plan: its prompt asks for every listed case to be tested" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "test each listed"
+    contains "plan: its prompt asks for the interrupted path" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "interrupted, killed or"
+    contains "plan: its prompt asks for the requirement-test-commit table" \
+        "$(cat "$rd_plan/step-1-prompt.md")" "End the plan with a table mapping each requirement"
     lacks "plan: its own prompt does not reserve plan.md against itself" \
         "$(cat "$rd_plan/step-1-prompt.md")" "is reserved the same way, for this run's own planning leg"
     contains "plan: its own prompt still reserves handoff.md" \
