@@ -7834,6 +7834,21 @@ we_jline() {
     mkdir -p -- "$jd"
     printf '2026-01-01T00:00:00Z\t%s\t%s\t%s\n' "$2" "$3" "$4" >> "$jd/$1"
 }
+# we_other_run <agent> <run-id>: the id of a run of <agent> that is not
+# <run-id>. For a thread with exactly two runs of a seat this names the
+# second without latest_env_for_agent's mtime ordering, whose one-second
+# resolution ties when both wakes land in the same second (and then orders
+# by the random run id).
+we_other_run() {
+    local f rid
+    for f in "$PM_STATE_DIR/runs"/*.env; do
+        [[ -e "$f" ]] || continue
+        grep -q "^AGENT=$1\$" "$f" || continue
+        rid="$(basename -- "$f" .env)"
+        [[ "$rid" == "$2" ]] || { printf '%s' "$rid"; return 0; }
+    done
+    return 1
+}
 we_exit_reason() { printf 'wake for %s exited 1 (run %s); outbox may be incomplete' "$1" "$2"; }
 we_cur() { cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$1" 2>/dev/null || true; }
 we_set_cur() { mkdir -p "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator"; printf '%s\n' "$2" > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$1"; }
@@ -7853,7 +7868,7 @@ STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_AGENT_LOG="$we_log" once
 c1_rid1="$(basename "$(latest_env_for_agent karen)" .env)"
 check "clear: the failed wake flagged the thread" "1" "$([[ -e "$PM_STATE_DIR/needs-operator/$we_tid" ]] && echo 1 || echo 0)"
 STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
-c1_rid2="$(basename "$(latest_env_for_agent karen)" .env)"
+c1_rid2="$(we_other_run karen "$c1_rid1")"
 [[ "$c1_rid1" != "$c1_rid2" ]] || no "clear fixture: the retry ran as a second run" "$c1_rid1"
 c1_json="$(we_json "$we_tid")"
 check "clear: the thread is no longer flagged" None "$(we_py "$c1_json" 'd["flag"]')"
