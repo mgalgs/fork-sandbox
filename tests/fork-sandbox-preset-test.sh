@@ -722,12 +722,12 @@ EOF
 accepts "the codex-coder/codex+claude-review/codex+claude-maintain goal shape launches" \
     --preset composed-codex-goal
 
-# claude-args/pi-args reach only the code seat's build today (fs_build_
-# sandbox_cmd splices them in for prefix "impl" alone); a composed pipeline's
-# code seat is built under an "s<K>" prefix instead, so the same value the
-# parser accepts (only the first code seat may carry it) would silently be
-# dropped once the run engine walks this preset. Refused by name now, the
-# same way the codex checks above are, so the gap survives past this round.
+# A composed pipeline's code seat's own claude-args/pi-args now reaches its
+# "s<K>" build (fs_resolve_harness/fs_build_sandbox_cmd take the seat's
+# arguments as an input instead of only ever splicing the "impl" flag
+# value), so these launch and show up on --dry-run under the seat's own
+# s<K>_<kind>_args= key -- see the stubbed argv tests further down for proof
+# the arguments actually reach the leg's command line.
 cat > "$presets_dir/composed-cargs.yaml" <<'EOF'
 agents:
   coder:
@@ -750,9 +750,11 @@ pipeline:
     repeat: 2
     agent: reviewer
 EOF
-refuses "a composed pipeline's code seat claude-args is refused by name" \
-    "sets claude_args on agent" \
+accepts "a composed pipeline's code seat claude-args is accepted" \
     --preset composed-cargs
+out="$(run --preset composed-cargs 2>"$err")"
+contains "the code seat's claude-args shows on --dry-run under its own seat" \
+    "$out" "s1_claude_args=--effort high"
 
 cat > "$presets_dir/composed-pargs.yaml" <<'EOF'
 agents:
@@ -776,9 +778,11 @@ pipeline:
     repeat: 2
     agent: reviewer
 EOF
-refuses "a composed pipeline's code seat pi-args is refused by name" \
-    "sets pi_args on agent" \
+accepts "a composed pipeline's code seat pi-args is accepted" \
     --preset composed-pargs
+out="$(run --preset composed-pargs 2>"$err")"
+contains "the code seat's pi-args shows on --dry-run under its own seat" \
+    "$out" "s1_pi_args=--thinking low"
 
 cat > "$presets_dir/composed-reviewfirst.yaml" <<'EOF'
 agents:
@@ -1110,8 +1114,8 @@ pipeline:
     agent: reviewer
 EOF
 
-bad "args on an agent off the first code seat are refused" \
-    "reach only that seat's legs" <<'EOF'
+bad "args on an agent off the code seat of a legacy-shaped pipeline are refused" \
+    "legacy-shaped" <<'EOF'
 agents:
   coder:
     harness: claude
@@ -1438,6 +1442,132 @@ fi
 out="$(run --preset spare 2>"$err")"
 contains "an agent that sits no seat draws a warning" "$(cat "$err")" \
     "agent 'spare' is defined but sits no seat"
+
+printf '\n== per-agent extra arguments: parser-level rules ==\n'
+
+# Every agent may carry its own claude-args/pi-args/codex-args, in any
+# shape -- not only the first code seat. The
+# one rule left is that the key must match the agent's own harness kind.
+parse_refuses "claude-args on a non-claude seat is refused" \
+    "claude-args passes flags to the claude CLI, which a 'pi' seat never starts" <<'EOF'
+agents:
+  coder:
+    harness: pi
+    model: vendor/some-model
+    claude-args: --effort high
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
+parse_refuses "pi-args on a non-pi seat is refused" \
+    "pi-args passes flags to pi, which a 'codex' seat never starts" <<'EOF'
+agents:
+  coder:
+    harness: codex
+    model: gpt-5.6-sol
+    pi-args: --thinking low
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
+parse_refuses "codex-args on a non-codex seat is refused" \
+    "codex-args passes flags to codex exec, which a 'claude' seat never starts" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    codex-args: -c model_reasoning_effort=high
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
+# pi-local is still a pi seat for this purpose -- pi-args is accepted.
+parses "pi-args on a pi-local seat parses" \
+    "agent	coder	pi_args	--thinking low" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+    pi-args: --thinking low
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
+# An agent with arguments but no seat in the pipeline has nowhere for them
+# to reach -- refused at parse time rather than silently dropped.
+parse_refuses "an unseated agent's extra arguments are refused" \
+    "agents.ghost: has extra arguments but sits no seat" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  ghost:
+    harness: claude
+    model: opus
+    claude-args: --effort low
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
+# The resolved fix seat's own arguments are emitted under step <k> fix_args,
+# of its own harness kind -- named, defaulted, or absent.
+parses "a named fix seat's codex-args are emitted as fix_args" \
+    "step	1	fix_agent	fixer" "step	1	fix_args	-c model_reasoning_effort=high" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+  fixer:
+    harness: codex
+    model: gpt-5.6-sol
+    codex-args: -c model_reasoning_effort=high
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: fixer
+  - action: code
+    agent: fixer
+EOF
+
+parses "a defaulted fix seat's claude-args are emitted as fix_args" \
+    "step	2	fix_default	1" "step	2	fix_args	--effort high" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    claude-args: --effort high
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+
+parses "a fix seat with no extra arguments emits an empty fix_args" \
+    "step	2	fix_args	" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
 
 printf '\n== the plan stage: parser-level shapes and refusals ==\n'
 
@@ -2411,6 +2541,21 @@ if [[ -n "${rd_codex_review_args:-}" ]]; then
         "$review_codex_cmd_line" 'model_reasoning_effort=high'
 fi
 
+# Same pin, on claude: --claude-args belongs to the implementation command's
+# "impl" build alone -- a separately resolved claude review harness (its own
+# "rev" build) must still pass through fs_resolve_harness's own arguments
+# parameter empty, exactly as it did before that parameter existed.
+prep_stub $'commit\nnoop'
+rd_claude_review_args="$(run_stubbed --claude-args '--effort high' \
+    --review-loop 1 --review-harness claude --review-model opus \
+    --branch "sandbox-test-claude-review-args-$$")" && tmpdirs+=("$rd_claude_review_args")
+if [[ -n "${rd_claude_review_args:-}" ]]; then
+    contains "the implement leg carries --claude-args" \
+        "$(sed -n 1p "$argv_log")" "--effort high"
+    lacks "the separately resolved review leg does not carry --claude-args" \
+        "$(sed -n 2p "$argv_log")" "--effort high"
+fi
+
 # The ordinary review and maintainer paths copy the implementation command,
 # rather than resolving a dedicated harness. They must remove the same
 # implementation-only Codex arguments before changing their models.
@@ -2782,6 +2927,74 @@ if out="$(HOME="$launcher_home" FORK_SANDBOX_CONFIG_DIR="$real_cfg" "$launcher" 
 else
     no "--review-only accepts a preset whose coder, with arguments, also reviews" \
         "$(cat "$err")"
+fi
+
+# A normal full run of ro-self never gives the coder's self-review leg its
+# own coding arguments (a legacy-shaped pipeline routes an agent's
+# own arguments to its code seat's legs alone) -- --review-only over the
+# same preset must not become a second, inconsistent way to reach that same
+# leg with them, just because dropping the code step lets the review step
+# reuse the coder's seat.
+prep_stub $'approved\napproved'
+if rd_ro_self="$(run_stubbed --preset ro-self --review-only \
+    --checkout "ro-target-$$" --review-base "$ro_base" \
+    --branch "sandbox-test-ro-self-$$")"; then
+    tmpdirs+=("$rd_ro_self")
+    check "--review-only over ro-self runs its review and maintain once each" \
+        "2" "$(cat "$count")"
+    lacks "the coder's self-review leg does not carry its own coding arguments" \
+        "$(sed -n 1p "$argv_log")" "--effort"
+else
+    no "--review-only over ro-self launches"
+fi
+
+# self_coded is a per-step signal from the parser, not just step 1's: a
+# coder that also sits the MAINTAIN seat (not the review seat) must have
+# its own coding arguments held back from that leg too, the same as the
+# self-review case above. A prior regression only ever read step 1's
+# self_coded flag, so a kept maintain step reusing the dropped coder's
+# seat was refused outright ("legacy-shaped ... Compose the pipeline")
+# instead of running with the coder's arguments silently withheld, as a
+# full run of the same preset already does.
+cat > "$real_presets/ro-self-maintain.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    claude-args: --effort high
+  elder:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: elder
+  - action: maintain
+    repeat: 1
+    agent: coder
+EOF
+if out="$(HOME="$launcher_home" FORK_SANDBOX_CONFIG_DIR="$real_cfg" "$launcher" \
+    --dry-run --preset ro-self-maintain --review-only --checkout "ro-target-$$" \
+    --review-base "$ro_base" "$proj" "$handoff" 2>"$err")"; then
+    ok "--review-only accepts a preset whose coder, with arguments, also maintains"
+else
+    no "--review-only accepts a preset whose coder, with arguments, also maintains" \
+        "$(cat "$err")"
+fi
+
+prep_stub $'approved\napproved'
+if rd_ro_self_mnt="$(run_stubbed --preset ro-self-maintain --review-only \
+    --checkout "ro-target-$$" --review-base "$ro_base" \
+    --branch "sandbox-test-ro-self-maintain-$$")"; then
+    tmpdirs+=("$rd_ro_self_mnt")
+    check "--review-only over ro-self-maintain runs its review and maintain once each" \
+        "2" "$(cat "$count")"
+    lacks "the coder's self-maintain leg does not carry its own coding arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort"
+else
+    no "--review-only over ro-self-maintain launches"
 fi
 
 ro_dry() {
@@ -3688,6 +3901,522 @@ if rd_h2="$(run_stubbed --preset skiptest \
 else
     no "skiptest (commit) launch succeeds"
 fi
+
+printf '\n== per-agent extra arguments reach every leg (--foreground, stubs) ==\n'
+
+# The motivating case: a plan+code+review+maintain composed pipeline where
+# every agent has its own, distinct extra arguments across all three
+# harnesses -- each leg must carry only its own seat's agent's arguments,
+# in the harness's own position, including the fix legs (both defaulted to
+# the first code agent, "coder").
+cat > "$real_presets/composed-args-all.yaml" <<'EOF'
+agents:
+  planner:
+    harness: claude/fable
+    claude-args: --effort max
+  coder:
+    harness: claude/sonnet
+    claude-args: --effort high
+  reviewer:
+    harness: codex/gpt-5.6-sol
+    codex-args: -c model_reasoning_effort=high
+  elder:
+    harness: pi/vendor/some-model
+    pi-args: --thinking low
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: elder
+EOF
+# Also staged under $presets_dir (a second copy, not a symlink: the two
+# config dirs are deliberately separate roots) so the --dry-run check below,
+# which runs through the plain `run` helper's own FORK_SANDBOX_CONFIG_DIR,
+# can find it too.
+cp "$real_presets/composed-args-all.yaml" "$presets_dir/composed-args-all.yaml"
+prep_stub $'plan\ncommit\nfindings\ncommit\nfindings\ncommit'
+if rd_args_all="$(run_stubbed --preset composed-args-all \
+    --branch "sandbox-test-args-all-$$")"; then
+    tmpdirs+=("$rd_args_all")
+    check "every leg of the plan+code+review+maintain pipeline ran" "6" "$(cat "$count")"
+    contains "the plan leg carries the planner's own arguments" \
+        "$(sed -n 1p "$argv_log")" "--effort max"
+    lacks "the plan leg does not carry the coder's arguments" \
+        "$(sed -n 1p "$argv_log")" "--effort high"
+    contains "the code leg carries the coder's own arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort high"
+    lacks "the code leg does not carry the planner's arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort max"
+    contains "the codex review leg carries the reviewer's own arguments, in position" \
+        "$(sed -n 3p "$argv_log")" "--model gpt-5.6-sol -c model_reasoning_effort=high -"
+    lacks "the codex review leg carries no claude-args" \
+        "$(sed -n 3p "$argv_log")" "--effort"
+    contains "the review step's defaulted fix leg carries the coder's own arguments" \
+        "$(sed -n 4p "$argv_log")" "--effort high"
+    lacks "the review step's fix leg does not carry the reviewer's codex-args" \
+        "$(sed -n 4p "$argv_log")" "model_reasoning_effort"
+    contains "the pi maintain leg carries the elder's own arguments, in position" \
+        "$(sed -n 5p "$argv_log")" "--model vendor/some-model --thinking low"
+    lacks "the pi maintain leg carries no claude-args" \
+        "$(sed -n 5p "$argv_log")" "--effort"
+    contains "the maintain step's defaulted fix leg carries the coder's own arguments" \
+        "$(sed -n 6p "$argv_log")" "--effort high"
+    lacks "the maintain step's fix leg does not carry the elder's pi-args" \
+        "$(sed -n 6p "$argv_log")" "--thinking"
+else
+    no "composed-args-all launch succeeds"
+fi
+
+# --dry-run shows the same picture before anything launches: one line per
+# seat that has its own arguments, under its own s<K>[fix]_<kind>_args= key,
+# and no line at all for a seat without any.
+out="$(run --preset composed-args-all 2>"$err")"
+check "composed --dry-run shows every seat's own arguments, and no others" \
+    $'s1_claude_args=--effort max\ns2_claude_args=--effort high\ns3_codex_args=-c model_reasoning_effort=high\ns3fix_claude_args=--effort high\ns4_pi_args=--thinking low\ns4fix_claude_args=--effort high' \
+    "$(printf '%s\n' "$out" | grep -E '^s[0-9]+(fix)?_(claude|pi|codex)_args=')"
+
+# A seat's own arguments must never leak onto another seat's legs -- a recent
+# bug class found exactly this. Two claude agents, one for the review verdict
+# and a DIFFERENT one for its fix leg, each with its own arguments.
+cat > "$real_presets/composed-args-cross.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reva:
+    harness: claude
+    model: opus
+    claude-args: --effort high
+  fixb:
+    harness: claude
+    model: haiku
+    claude-args: --effort low
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reva
+    fix_agent: fixb
+  - action: review
+    repeat: 1
+    agent: coder
+EOF
+prep_stub $'commit\nfindings\ncommit\napproved'
+if rd_args_cross="$(run_stubbed --preset composed-args-cross \
+    --branch "sandbox-test-args-cross-$$")"; then
+    tmpdirs+=("$rd_args_cross")
+    check "every leg of the cross-seat pipeline ran" "4" "$(cat "$count")"
+    lacks "the code leg carries no seat's arguments" "$(sed -n 1p "$argv_log")" "--effort"
+    contains "the review verdict leg carries its own agent's arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort high"
+    lacks "the review verdict leg does not carry its fix seat's arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort low"
+    contains "the fix leg carries its own (different) agent's arguments" \
+        "$(sed -n 3p "$argv_log")" "--effort low"
+    lacks "the fix leg does not carry the review seat's arguments" \
+        "$(sed -n 3p "$argv_log")" "--effort high"
+    lacks "the final review leg (a third, argument-less agent) carries no arguments" \
+        "$(sed -n 4p "$argv_log")" "--effort"
+else
+    no "composed-args-cross launch succeeds"
+fi
+
+# The same cross-seat isolation, now with both seats on codex -- the harness
+# whose --codex-args used to be silently dropped for every composed step.
+cat > "$real_presets/composed-args-cross-codex.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reva:
+    harness: codex
+    model: gpt-5.6-sol
+    codex-args: -c model_reasoning_effort=high
+  fixb:
+    harness: codex
+    model: gpt-5.6-astra
+    codex-args: -c model_reasoning_effort=low
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reva
+    fix_agent: fixb
+  - action: review
+    repeat: 1
+    agent: coder
+EOF
+prep_stub $'commit\nfindings\ncommit\napproved'
+if rd_args_cross_codex="$(run_stubbed --preset composed-args-cross-codex \
+    --branch "sandbox-test-args-cross-codex-$$")"; then
+    tmpdirs+=("$rd_args_cross_codex")
+    contains "the codex review leg carries its own agent's codex-args" \
+        "$(sed -n 2p "$argv_log")" "model_reasoning_effort=high"
+    lacks "the codex review leg does not carry its fix seat's codex-args" \
+        "$(sed -n 2p "$argv_log")" "model_reasoning_effort=low"
+    contains "the codex fix leg carries its own (different) agent's codex-args" \
+        "$(sed -n 3p "$argv_log")" "model_reasoning_effort=low"
+    lacks "the codex fix leg does not carry the review seat's codex-args" \
+        "$(sed -n 3p "$argv_log")" "model_reasoning_effort=high"
+else
+    no "composed-args-cross-codex launch succeeds"
+fi
+
+# A composed codex code seat's own codex-args, honored in position before the
+# trailing stdin marker -- the silent-drop gap the brief names explicitly.
+cat > "$real_presets/composed-codex-code-args.yaml" <<'EOF'
+agents:
+  coder:
+    harness: codex
+    model: gpt-5.6-sol
+    codex-args: -c model_reasoning_effort=high
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+prep_stub $'commit\napproved\napproved'
+if rd_codex_code_args="$(run_stubbed --preset composed-codex-code-args \
+    --branch "sandbox-test-codex-code-args-$$")"; then
+    tmpdirs+=("$rd_codex_code_args")
+    codex_code_line="$(sed -n 1p "$argv_log")"
+    contains "a composed codex code seat's codex-args land before the stdin marker" \
+        "$codex_code_line" "--model gpt-5.6-sol -c model_reasoning_effort=high -"
+    if [[ "$codex_code_line" == *'model_reasoning_effort=high -' ]]; then
+        ok "the codex stdin marker remains the final command argument"
+    else
+        no "the codex stdin marker remains the final command argument" "$codex_code_line"
+    fi
+    lacks "the claude review legs carry no codex-args" "$(sed -n 2p "$argv_log")" \
+        "model_reasoning_effort"
+    contains "the composed step's own sandbox_cmd carries the arguments" \
+        "$(grep '^s1_sandbox_cmd=' "$rd_codex_code_args/run.sh")" "model_reasoning_effort=high"
+else
+    no "composed-codex-code-args launch succeeds"
+fi
+
+# A legacy-shaped preset (code, then review) behaves exactly as before: the
+# code seat's own arguments reach the code leg and its defaulted fix leg, and
+# the review seat (a different, argument-less agent) gets none.
+cat > "$real_presets/legacy-args.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    claude-args: --effort high
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+# cur_cap's loop runs ONE iteration for repeat: 1 -- a verdict, and (since
+# this one finds something) one fix leg, then the step ends at its cap. No
+# final re-verdict follows, so this is 3 legs (code, review verdict, fix),
+# not 4: deviates from the plan's own sketch of this test, which assumed a
+# fourth "approved" call that the engine's `cur_i <= cur_cap` loop (see
+# scripts/fork-sandbox.sh) never makes for a one-round cap.
+prep_stub $'commit\nfindings\ncommit'
+if rd_legacy_args="$(run_stubbed --preset legacy-args \
+    --branch "sandbox-test-legacy-args-$$")"; then
+    tmpdirs+=("$rd_legacy_args")
+    check "every leg of the legacy code+review pipeline ran" "3" "$(cat "$count")"
+    contains "the code leg carries the code seat's own arguments" \
+        "$(sed -n 1p "$argv_log")" "--effort high"
+    lacks "the review verdict leg carries no arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort"
+    contains "the defaulted fix leg carries the code seat's own arguments" \
+        "$(sed -n 3p "$argv_log")" "--effort high"
+    sandbox_cmd_line="$(grep '^sandbox_cmd=' "$rd_legacy_args/run.sh")"
+    review_cmd_line="$(grep '^review_sandbox_cmd=' "$rd_legacy_args/run.sh")"
+    contains "run.sh's sandbox_cmd carries the code seat's arguments" \
+        "$sandbox_cmd_line" "--effort high"
+    lacks "run.sh's review_sandbox_cmd does not carry them" \
+        "$review_cmd_line" "--effort high"
+else
+    no "legacy-args launch succeeds"
+fi
+
+# A review step's fix_agent named explicitly, but naming the SAME agent as
+# the code seat, still rides that agent's own arguments on its fix leg --
+# the named fix seat is a fresh build (fs_build_sandbox_cmd fxr), not the
+# code seat's fallback copy, so it needs the code seat's arguments passed
+# to it too, exactly as the defaulted case already gets them.
+cat > "$real_presets/legacy-args-self-fix.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    claude-args: --effort high
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: coder
+EOF
+prep_stub $'commit\nfindings\ncommit'
+if rd_legacy_self_fix="$(run_stubbed --preset legacy-args-self-fix \
+    --branch "sandbox-test-legacy-self-fix-$$")"; then
+    tmpdirs+=("$rd_legacy_self_fix")
+    contains "the named fix seat still carries the code seat's own arguments" \
+        "$(sed -n 3p "$argv_log")" "--effort high"
+else
+    no "legacy-args-self-fix launch succeeds"
+fi
+
+# An agent whose arguments have no route in a legacy-shaped pipeline (here,
+# the review seat's own agent) is refused at launch, naming the shape.
+cat > "$presets_dir/legacy-args-bad-review.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+    claude-args: --effort high
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+refuses "a legacy-shaped review seat's own arguments are refused" \
+    "legacy-shaped" --preset legacy-args-bad-review
+
+# A read-only, maintain-only pipeline has no real implement leg at all (the
+# maintainer runs on the maintainer role, not the phantom implement seat),
+# so its own arguments are refused too, not applied to a leg that never runs.
+cat > "$presets_dir/legacy-args-bad-maintain-only.yaml" <<'EOF'
+agents:
+  maintainer:
+    harness: claude
+    model: opus
+    claude-args: --effort high
+pipeline:
+  - action: maintain
+    repeat: 1
+    agent: maintainer
+EOF
+refuses "a read-only maintain-only preset's own arguments are refused" \
+    "legacy-shaped" --preset legacy-args-bad-maintain-only
+
+# A natively-authored read-only preset (no code step at all, never run
+# through --review-only/--drop-code) seats its one agent on the implement
+# role so its own arguments reach its one leg, the same as --review-only
+# over a code+review preset already honors for a non-self-reviewing agent
+# (ro-composed-args, below) -- this is the legacy-shaped (not ro_multi)
+# counterpart of that case.
+cat > "$real_presets/ro-native-args.yaml" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+    claude-args: --effort high
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+git -C "$proj" branch -q "ro-native-target-$$"
+git -C "$proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit -q --allow-empty -m "work under review (native ro args)"
+git -C "$proj" branch -q -f "ro-native-target-$$" HEAD
+git -C "$proj" reset -q --hard "$ro_base"
+
+prep_stub 'findings'
+if rd_ro_native="$(run_stubbed --preset ro-native-args \
+    --checkout "ro-native-target-$$" --review-base "$ro_base" \
+    --branch "sandbox-test-ro-native-args-$$")"; then
+    tmpdirs+=("$rd_ro_native")
+    contains "a natively read-only review preset's own arguments are honored" \
+        "$(sed -n 1p "$argv_log")" "--effort high"
+else
+    no "ro-native-args launch succeeds"
+fi
+
+# --review-only over a composed, read-only pipeline honors each kept step's
+# own agent's arguments -- --drop-code keeps them.
+cat > "$real_presets/ro-composed-args.yaml" <<'EOF'
+agents:
+  reva:
+    harness: claude
+    model: opus
+    claude-args: --effort high
+  melder:
+    harness: claude
+    model: haiku
+    claude-args: --effort low
+  rcoder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reva
+  - action: maintain
+    repeat: 1
+    agent: melder
+  - action: review
+    repeat: 1
+    agent: rcoder
+EOF
+git -C "$proj" branch -q "ro-args-target-$$"
+git -C "$proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit -q --allow-empty -m "work under review (args)"
+git -C "$proj" branch -q -f "ro-args-target-$$" HEAD
+git -C "$proj" reset -q --hard "$ro_base"
+
+prep_stub $'approved\napproved\napproved'
+if rd_ro_args="$(run_stubbed --preset ro-composed-args --review-only \
+    --checkout "ro-args-target-$$" --review-base "$ro_base" \
+    --branch "sandbox-test-ro-args-$$")"; then
+    tmpdirs+=("$rd_ro_args")
+    contains "a kept read-only review step's own arguments are honored" \
+        "$(sed -n 1p "$argv_log")" "--effort high"
+    contains "a kept read-only maintain step's own (different) arguments are honored" \
+        "$(sed -n 2p "$argv_log")" "--effort low"
+    lacks "a kept read-only step without arguments carries none" \
+        "$(sed -n 3p "$argv_log")" "--effort"
+else
+    no "ro-composed-args --review-only launch succeeds"
+fi
+
+# A single quote in a composed seat's own arguments is refused before a
+# clone is even created -- the same rule --claude-args has always applied.
+# This check runs after --dry-run's own exit point (it shares the sweep the
+# flag-level check has always used), so it needs a real launch attempt, not
+# --dry-run -- the stubbed env keeps that attempt from reaching anything but
+# the refusal itself.
+cat > "$real_presets/composed-args-unsafe.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    claude-args: "--effort 'high'"
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+if HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image "$launcher" --foreground \
+    --preset composed-args-unsafe "$proj" "$handoff" > /dev/null 2>"$err"; then
+    no "a single quote in a composed seat's own arguments is refused" \
+        "expected a refusal, got exit 0"
+else
+    contains "a single quote in a composed seat's own arguments is refused" \
+        "$(cat "$err")" "contains a single quote"
+fi
+
+# The command-line --claude-args/--pi-args/--codex-args flags have no single
+# seat to land on in a composed pipeline, so each is refused by name, the
+# same way --model/--harness already are -- even though the preset's own
+# agent already carries a claude-args key of its own (composed-cargs, from
+# the "every agent may carry extra arguments" section above).
+refuses "--claude-args is refused against a composed pipeline preset" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --claude-args '--effort high'
+refuses "--pi-args is refused against a composed pipeline preset" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --pi-args '--thinking low'
+refuses "--codex-args is refused against a composed pipeline preset" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --codex-args '-c model_reasoning_effort=high'
+
+# The transcript store rides the implement seat's commands only, so a
+# composed step's seat would run without it (and its continuations without
+# the seat's model and arguments).
+composed_session_state_dir="$(mktemp -d)"; tmpdirs+=("$composed_session_state_dir")
+refuses "--session-state is refused against a composed pipeline preset" \
+    "a composed step's seat has no transcript store" \
+    --preset composed-cargs --session-state "$composed_session_state_dir"
+
+# Legacy shapes keep their routes: --pi-args reaches a separately built pi
+# review seat, as it always has.
+prep_stub $'commit\napproved'
+if rd_legacy_pi="$(run_stubbed --harness pi/vendor/some-model \
+    --pi-args '--thinking low' --review-loop 1 \
+    --review-harness pi/vendor/other-model \
+    --branch "sandbox-test-legacy-pi-args-$$")"; then
+    tmpdirs+=("$rd_legacy_pi")
+    contains "legacy --pi-args reaches the code leg" \
+        "$(sed -n 1p "$argv_log")" "--model vendor/some-model --thinking low"
+    contains "legacy --pi-args still reaches a --review-harness pi review leg" \
+        "$(sed -n 2p "$argv_log")" "--model vendor/other-model --thinking low"
+else
+    no "legacy --pi-args launch succeeds"
+fi
+
+# A legacy preset's named fix seat that is the code seat's own agent follows
+# the code seat's effective arguments, a --claude-args override included.
+cat > "$real_presets/legacy-fix-self.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude/sonnet
+    claude-args: --effort high
+  reviewer:
+    harness: claude/opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: coder
+EOF
+prep_stub $'commit\nfindings\ncommit'
+if rd_legacy_fix="$(run_stubbed --preset legacy-fix-self \
+    --claude-args '--effort max' --branch "sandbox-test-legacy-fix-$$")"; then
+    tmpdirs+=("$rd_legacy_fix")
+    contains "the code leg carries the --claude-args override" \
+        "$(sed -n 1p "$argv_log")" "--effort max"
+    lacks "the legacy review leg carries no coder arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort"
+    contains "a named fix seat on the code seat's agent carries the override" \
+        "$(sed -n 3p "$argv_log")" "--effort max"
+    lacks "a named fix seat on the code seat's agent drops the overridden value" \
+        "$(sed -n 3p "$argv_log")" "--effort high"
+else
+    no "legacy-fix-self launch succeeds"
+fi
+
+# --k8s still has no route for a composed pipeline's per-seat arguments --
+# refused the same way any composed preset already is under --k8s.
+refuses "--k8s refuses a composed preset with per-seat arguments" \
+    "does not support a composed pipeline preset ('composed-cargs')" \
+    --preset composed-cargs --k8s
 
 printf '\n== progress.json: a live per-step status file ==\n'
 

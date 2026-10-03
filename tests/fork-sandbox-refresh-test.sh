@@ -74,6 +74,14 @@ contains() {
     esac
 }
 
+lacks() {
+    local label="$1" needle="$2" hay="$3"
+    case "$hay" in
+        *"$needle"*) no "$label" "expected NOT to find '$needle' in: $hay" ;;
+        *) ok "$label" ;;
+    esac
+}
+
 # $1 label  $2 path  $3 want ("yes" the file must exist, "no" it must not)
 marker() {
     local label="$1" path="$2" want="$3" have="no"
@@ -495,6 +503,11 @@ n=0
 n=$(( n + 1 ))
 printf '%s' "$n" > "$FAKE_CLAUDE_COUNT_FILE"
 
+# Optional, same shape as fork-sandbox-preset-test.sh's own stub: one line
+# of "$*" per call, for scenarios that need to see a leg's actual argv
+# (a seat's own extra arguments, say) rather than just its count and effect.
+[[ -n "${FAKE_ARGV_LOG:-}" ]] && printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
+
 # The stub runs on the bare host, not inside bwrap, so it can read the
 # inbox's own .refresh-config directly -- fs_refresh_arm writes it before
 # EVERY armed leg and fs_refresh_disarm removes it right after, so a
@@ -712,6 +725,7 @@ run_real() {
         FAKE_VERDICT_FINDINGS_LEGS="${FAKE_VERDICT_FINDINGS_LEGS:-}" \
         FAKE_VERDICT_APPROVED_LEGS="${FAKE_VERDICT_APPROVED_LEGS:-}" \
         FAKE_COMMIT_LEGS="${FAKE_COMMIT_LEGS:-}" \
+        FAKE_ARGV_LOG="${FAKE_ARGV_LOG:-}" \
         timeout 60 "$launcher" --foreground "${harness_flag[@]}" --branch "$branch_name" "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -1621,12 +1635,14 @@ agents:
   coder:
     harness: claude
     model: sonnet
+    claude-args: --effort high
   reviewer:
     harness: claude
     model: opus
   haikufix:
     harness: claude
     model: haiku
+    claude-args: --effort low
 
 pipeline:
   - action: plan
@@ -1639,13 +1655,32 @@ pipeline:
     fix_agent: haikufix
 EOF
 count_file="$(mktemp)"; tmpdirs+=("$count_file")
+argv_log="$(mktemp)"; tmpdirs+=("$argv_log")
 FAKE_PLAN_LEGS=1 FAKE_VERDICT_FINDINGS_LEGS=4
-export FORK_SANDBOX_CONFIG_DIR="$preset_cfg_dir"
+export FORK_SANDBOX_CONFIG_DIR="$preset_cfg_dir" FAKE_ARGV_LOG="$argv_log"
 rd="$(run_real "$proj" "$count_file" "2,5" "2,5" --preset fs-refresh-leg-model-test --refresh-at 0.5)"
-unset FORK_SANDBOX_CONFIG_DIR
+unset FORK_SANDBOX_CONFIG_DIR FAKE_ARGV_LOG
 FAKE_PLAN_LEGS="" FAKE_VERDICT_FINDINGS_LEGS=""
 [[ -n "$rd" ]] && tmpdirs+=("$rd")
 if [[ -n "$rd" ]]; then
+    # The code seat's own claude-args reach both its own leg AND its
+    # --refresh-at continuation leg; the fix seat's own (different)
+    # claude-args reach its leg and ITS continuation -- never each other's,
+    # and never the plan or review legs', which carry none.
+    contains "the code leg carries the code seat's own arguments" \
+        "--effort high" "$(sed -n 2p "$argv_log")"
+    contains "the code leg's continuation carries the same arguments" \
+        "--effort high" "$(sed -n 3p "$argv_log")"
+    contains "the fix leg carries the fix seat's own (different) arguments" \
+        "--effort low" "$(sed -n 5p "$argv_log")"
+    contains "the fix leg's continuation carries the same arguments" \
+        "--effort low" "$(sed -n 6p "$argv_log")"
+    lacks "the fix leg does not carry the code seat's arguments" \
+        "--effort high" "$(sed -n 5p "$argv_log")"
+    lacks "the code leg does not carry the fix seat's arguments" \
+        "--effort low" "$(sed -n 2p "$argv_log")"
+    lacks "the plan leg carries no arguments" "--effort" "$(sed -n 1p "$argv_log")"
+    lacks "the review leg carries no arguments" "--effort" "$(sed -n 4p "$argv_log")"
     check "six legs ran (plan + code pass 1 + its continuation + review + fix pass 1 + its continuation)" \
         "6" "$(cat "$count_file")"
     check "the code leg (sonnet) is armed at half of its 1,000,000-token window" \

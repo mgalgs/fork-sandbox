@@ -42,6 +42,13 @@ ordered step list:
     step <k> fix_model <value>
     step <k> fix_repeat <n>
     step <k> fix_network <value>        (empty value when unset)
+    step <k> fix_args <value>           (the effective fix agent's, of its
+                                          own harness kind; empty when unset)
+    step <k> self_coded 1               (read-only only: this step's agent
+                                          also sat a code step --drop-code
+                                          removed, so its own leg must not
+                                          pick up that dropped leg's
+                                          arguments)
     warn <message>                      (advisory; fork-sandbox.sh prints it)
 
 Step-indexed rather than the old tier names (review/maintain), since a
@@ -73,6 +80,10 @@ except ImportError:
     sys.exit(1)
 
 HARNESSES = ("claude", "pi", "pi-local", "codex")
+
+# Which agent property carries a harness's own extra-argument flag.
+ARGS_KEY_FOR_HARNESS = {"claude": "claude_args", "pi": "pi_args",
+                        "pi-local": "pi_args", "codex": "codex_args"}
 
 STEP_ACTIONS = ("code", "review", "maintain", "plan")
 
@@ -337,12 +348,14 @@ def main():
     # leaves it planning for nothing, so the combination is refused outright
     # rather than silently becoming the no-code case above.
     dropped_agents = set()
+    dropped_code_agents = set()
     early_warns = []
     if DROP_CODE:
         if plan_steps:
             fail("--review-only is refused when the pipeline has a 'plan' "
                  "step: it drops the code step the plan was written for")
-        dropped_agents = {s["agent"] for s in steps if s["action"] == "code"}
+        dropped_code_agents = {s["agent"] for s in steps if s["action"] == "code"}
+        dropped_agents = set(dropped_code_agents)
         dropped_agents |= {s["fix_ref"] for s in steps
                            if s["action"] not in ("code", "plan") and s["fix_ref"]}
         steps = [s for s in steps if s["action"] != "code"]
@@ -365,16 +378,19 @@ def main():
                 s["cap"] = 1
         # Seats count from what remains: an agent that only sat a dropped
         # code step is neither checked nor warned about, and a kept one's
-        # coding-only properties (repeat, refresh, endpoint, and the
-        # arguments tuned for its coding legs) have nothing left to apply to.
+        # coding-only properties (repeat, refresh, endpoint) have nothing
+        # left to apply to. Its extra arguments stay: a kept step's leg
+        # honors them, unless the agent also sat the dropped code step
+        # (self_coded), whose arguments fork-sandbox.sh blanks.
+        for s in steps:
+            s["self_coded"] = s["agent"] in dropped_code_agents
         seated_ro = {s["agent"] for s in steps}
         agents = {n: a for n, a in agents.items()
                   if n in seated_ro or n not in dropped_agents}
         if DROP_CODE:
             for agent in agents.values():
                 agent.update(repeat=1, refresh_at="", refresh_max="",
-                             endpoint="", claude_args="", pi_args="",
-                             codex_args="")
+                             endpoint="")
 
     # ---- pipeline: pass 2, seat resolution ----
     # Fix seats default to the first code step's agent, in pipeline order,
@@ -425,12 +441,20 @@ def main():
                  f"is claude-only")
     warns = early_warns
     for name, agent in agents.items():
-        if name != first_code_agent and (agent["claude_args"] or agent["pi_args"]
-                                         or agent["codex_args"]):
-            fail(f"agents.{name}: has extra arguments but does not sit the "
-                 f"first code seat; claude-args, pi-args and codex-args reach only that "
-                 f"seat's legs today -- there is no per-seat argument "
-                 f"plumbing for any other leg yet")
+        if agent["claude_args"] and ARGS_KEY_FOR_HARNESS[agent["harness"]] != "claude_args":
+            fail(f"agents.{name}: claude-args passes flags to the claude "
+                 f"CLI, which a '{agent['harness']}' seat never starts")
+        if agent["pi_args"] and ARGS_KEY_FOR_HARNESS[agent["harness"]] != "pi_args":
+            fail(f"agents.{name}: pi-args passes flags to pi, which a "
+                 f"'{agent['harness']}' seat never starts")
+        if agent["codex_args"] and ARGS_KEY_FOR_HARNESS[agent["harness"]] != "codex_args":
+            fail(f"agents.{name}: codex-args passes flags to codex exec, "
+                 f"which a '{agent['harness']}' seat never starts")
+        if name not in seated and (agent["claude_args"] or agent["pi_args"]
+                                   or agent["codex_args"]):
+            fail(f"agents.{name}: has extra arguments but sits no seat in "
+                 f"the pipeline; claude-args/pi-args/codex-args reach a leg "
+                 f"only when the agent runs one")
         if name != first_code_agent and (agent["refresh_at"] or agent["refresh_max"]):
             fail(f"agents.{name}: has refresh keys but does not sit the "
                  f"first code seat; there is no per-seat refresh plumbing "
@@ -475,6 +499,8 @@ def main():
     for k, s in enumerate(steps, 1):
         out.append(f"step\t{k}\taction\t{s['action']}")
         out.append(f"step\t{k}\tagent\t{s['agent']}")
+        if read_only and s.get("self_coded"):
+            out.append(f"step\t{k}\tself_coded\t1")
         if s["action"] == "code":
             if s["repeat_eff"] != 1:
                 out.append(f"step\t{k}\trepeat\t{s['repeat_eff']}")
@@ -499,6 +525,8 @@ def main():
             out.append(f"step\t{k}\tfix_model\t{fixer['model']}")
             out.append(f"step\t{k}\tfix_repeat\t{fixer['repeat']}")
             out.append(f"step\t{k}\tfix_network\t{fixer['network']}")
+            out.append(f"step\t{k}\tfix_args\t"
+                       f"{fixer[ARGS_KEY_FOR_HARNESS[fixer['harness']]]}")
     for warn in warns:
         out.append(f"warn\t{warn}")
     sys.stdout.write("".join(line + "\n" for line in out))

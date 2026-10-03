@@ -99,26 +99,33 @@ An agent is a named seat: who types, on what, and how. Names match
 | `harness` | required — `claude`, `pi` or `codex`. The combined `harness/model` form the flags accept works here too, split at the first slash for the same reason (an OpenRouter model id carries its own slash). |
 | `network` | `pinned` (the default) or `sealed`, the same axis as `--network`: whether this seat's harness reaches the network at all. `sealed` requires `harness: pi` — `claude` and `codex` have no self-hosted-endpoint path, and `{harness: claude, network: sealed}` is refused at load time. Otherwise independent of `harness` — `{harness: pi, network: sealed}` is `--harness pi --network sealed`. |
 | `model` | the seat's model or model alias. Optional where the flag is optional, required where it is required (`pi` needs one, on any seat, unless `network: sealed`); conflicts with a combined `harness` form, exactly as `--model` conflicts with `--harness pi/x`. |
-| `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. |
-| `pi-args` | extra arguments for pi — e.g. `--thinking low`. |
-| `codex-args` | extra arguments for `codex exec` — e.g. `-c model_reasoning_effort="high"`. |
+| `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. Reaches every leg this agent sits in a composed pipeline; in a legacy-shaped pipeline (see "Composed runs" below), the implement seat's legs only. |
+| `pi-args` | extra arguments for pi — e.g. `--thinking low`. Same reach as `claude-args`. |
+| `codex-args` | extra arguments for `codex exec` — e.g. `-c model_reasoning_effort="high"`. Same reach as `claude-args`. |
 | `repeat` | run every coding leg this agent sits — a code step, or a loop's fix legs — as N passes on the same prompt. See "Repeat passes" below. A code step may set its own `repeat` (below) to override this agent-level default for that step only. |
 | `refresh-at` / `refresh-max` | context refresh for this agent's coding, same values and claude-only rule as the flags of these names. |
 | `endpoint` | which named `K8S_PROXY_ENDPOINTS` entry the seat talks to on a `--k8s` run, passed on to `fork-sandbox-k8s.sh run`, which resolves it against the registered endpoints. Refused on an agent that does not sit the first code step in pipeline order — the run has one proxy base URL for the whole run — and refused without `--k8s`: it names a cluster proxy path and means nothing locally. |
 
-Four of these reach less far than an agent definition suggests, and the
+Three of these reach less far than an agent definition suggests, and the
 parser refuses the cases the engine cannot honor rather than trimming
-them silently: `claude-args`/`pi-args`/`codex-args` reach only the first code step's
-legs (there is no per-seat argument plumbing for any other leg yet), the
-refresh keys may only be SET on the first code step's agent — there is no
-per-seat refresh plumbing, only the one run-level `--refresh-at`/
-`--refresh-max` pair — but once set there they become that pair and so
-govern every code and fix leg of the run exactly as the flags would (see
-"A run that refreshes itself" in `README.md`), not only the first code
-step's first pass. `repeat` is refused on an agent that never codes, and
-`endpoint` is refused on an agent that does not sit the first code step in
-pipeline order (the run has one proxy base URL for the whole run) and
-without `--k8s` (it names a cluster proxy path and means nothing there).
+them silently: the refresh keys may only be SET on the first code step's
+agent — there is no per-seat refresh plumbing, only the one run-level
+`--refresh-at`/`--refresh-max` pair — but once set there they become that
+pair and so govern every code and fix leg of the run exactly as the flags
+would (see "A run that refreshes itself" in `README.md`), not only the
+first code step's first pass. `repeat` is refused on an agent that never
+codes, and `endpoint` is refused on an agent that does not sit the first
+code step in pipeline order (the run has one proxy base URL for the whole
+run) and without `--k8s` (it names a cluster proxy path and means nothing
+there).
+
+`claude-args`/`pi-args`/`codex-args` reach every leg the agent sits in a
+composed pipeline (see "Composed runs" below) — only in a legacy-shaped
+pipeline are they narrower, reaching the implement seat's legs alone. The
+key must match the agent's own harness (`claude-args` on a `claude` seat,
+`pi-args` on `pi`/`pi-local`, `codex-args` on `codex`); a mismatch, or an
+agent that carries arguments but sits no seat at all, is refused at load
+time rather than silently dropped.
 
 ### `pipeline`
 
@@ -259,7 +266,10 @@ each step has its own seat and its own files in the run directory
 `step-<K>-loop.json`), and there is no single seat for a flag to land on, so
 the seat-override flags (`--model`, `--harness`, `--review-*`,
 `--maintainer-*`, `--review-loop`, `--maintainer-loop`, `--claude-args`,
-`--pi-args`, `--codex-args`) are refused. Edit the pipeline instead.
+`--pi-args`, `--codex-args`) are refused. Edit the pipeline instead — a
+preset's own per-agent `claude-args`/`pi-args`/`codex-args` key is the
+route onto one of these steps, same as a composed pipeline with a code
+step.
 
 `--review-only` is a deprecated bare-flag alias for this: without a preset
 it is the one-review-leg case, seated by `--harness`/`--model`. Over a
@@ -346,10 +356,13 @@ names.
 
 The spec compiles to the preset document a hand-written preset with the
 same shape would be, and from there runs the `--preset` path unchanged:
-the same parser, the same rules, the same flag overrides (`--claude-args`
-reaches the code seat as it does over a preset). Fix legs ride the code
-seat. `--dry-run` prints the compiled seats, and the run records the
-spec in `preset.json` as `pipeline`, with the spec as its `name`.
+the same parser, the same rules, the same flag overrides — for a
+legacy-shaped spec, `--claude-args` reaches the code seat as it does over
+a legacy-shaped preset file; a composed spec (more than one review or
+maintain segment, say) refuses the flag the same way a composed preset
+file does. Fix legs ride the code seat. `--dry-run` prints the compiled
+seats, and the run records the spec in `preset.json` as `pipeline`, with
+the spec as its `name`.
 
 What the grammar cannot say — a `fix_agent`, per-seat arguments, a
 network — stays a preset file. `--pipeline` and `--preset` are mutually
@@ -505,6 +518,11 @@ pipeline:
     repeat: 2
     agent: coder
 ```
+
+This is a legacy-shaped pipeline (one code step, then one review step), so
+`claude-args` reaches only the code seat's legs: the self-review loop runs
+without `--effort high`. Add another step (making the
+pipeline composed) to route the coder's own arguments to its review leg too.
 
 **free-typing** — a self-hosted model types for free while a paid model
 reviews, the coder-mode economics as one word:
@@ -798,15 +816,13 @@ the syntax does not have, no engine — present or planned — has either:
   fixing.
 - **No action beyond `code`/`review`/`maintain`/`plan`**, and no branches
   or graphs — a pipeline is always a single linear chain, of any length.
-- **No per-seat args, or per-seat `refresh-at`/`refresh-max`.** Both reach
-  only the first code step's agent — `claude-args`/`pi-args`/`codex-args`
-  because there is no per-seat argument plumbing for any other leg yet; an
-  agent's own `refresh-at`/`refresh-max` key because there is no per-seat
-  *refresh* plumbing either, only the one run-level `--refresh-at`/
-  `--refresh-max` pair a preset's key becomes once accepted — so it governs
-  every code and fix leg of the run, not just the seat it was written on
-  (see "A run that refreshes itself" in `README.md`). Both are plumbing
-  gaps named by their own refusal, not a design position.
+- **No per-seat `refresh-at`/`refresh-max`.** An agent's own key reaches
+  only the first code step's agent, because there is no per-seat *refresh*
+  plumbing — only the one run-level `--refresh-at`/`--refresh-max` pair a
+  preset's key becomes once accepted — so it governs every code and fix
+  leg of the run, not just the seat it was written on (see "A run that
+  refreshes itself" in `README.md`). This is a plumbing gap named by its
+  own refusal, not a design position.
 - **No `input:` key.** The engine fixes the data flow — the code step
   reads the handoff, fix legs read the verdict, review prompts are
   generated — so a key that names a prompt source would promise a choice

@@ -153,16 +153,22 @@
 #                        with their caps. A loop may seat a fix agent of its
 #                        own (fix_agent), and a coding agent may declare
 #                        repeat: N to run every coding leg as N passes --
-#                        both are preset-only, with no flag equivalent. A
-#                        preset value passes through exactly the validation
-#                        the equivalent flag would, and an explicit flag
-#                        overrides its preset counterpart -- except against
-#                        a composed (non-legacy-shaped) pipeline, which has
-#                        no single review/maintain seat, or code seat past
-#                        the first, for a flag to override: there,
-#                        --model/--harness/--review-*/--maintainer-*/--k8s
-#                        are refused outright instead. The run engine walks
-#                        an arbitrary step list, so a composed pipeline runs
+#                        both are preset-only, with no flag equivalent. An
+#                        agent's own claude-args/pi-args/codex-args key
+#                        reaches every leg that agent sits in a composed
+#                        pipeline -- only the implement seat's legs in a
+#                        legacy-shaped one. A preset value passes through
+#                        exactly the validation the equivalent flag would,
+#                        and an explicit flag overrides its preset
+#                        counterpart -- except against a composed
+#                        (non-legacy-shaped) pipeline, which has no single
+#                        review/maintain seat, or code seat past the first,
+#                        for a flag to override: there,
+#                        --model/--harness/--review-*/--maintainer-*/
+#                        --claude-args/--pi-args/--codex-args/--k8s are
+#                        refused outright instead -- give the agent its own
+#                        key in the preset. The run engine walks an
+#                        arbitrary step list, so a composed pipeline runs
 #                        locally exactly as authored -- --k8s is the one
 #                        path that still only accepts a legacy-shaped
 #                        pipeline (one code step, then at most one review
@@ -1665,10 +1671,12 @@ fix_harness=""
 fix_model=""
 fix_repeat=1
 fix_network=""
+fix_extra_args=""
 mntfix_harness=""
 mntfix_model=""
 mntfix_repeat=1
 mntfix_network=""
+mntfix_extra_args=""
 code_repeat=1
 review_only=false
 mode=run
@@ -2126,6 +2134,8 @@ if [[ -n "$preset_name" ]]; then
     declare -a preset_step_fix_model=()
     declare -a preset_step_fix_repeat=()
     declare -a preset_step_fix_network=()
+    declare -a preset_step_fix_args=()
+    declare -a preset_step_self_coded=()
     preset_impl_agent=""
     preset_impl_refresh_at=""
     preset_impl_refresh_max=""
@@ -2138,6 +2148,7 @@ if [[ -n "$preset_name" ]]; then
     preset_review_fix_model=""
     preset_review_fix_repeat=1
     preset_review_fix_network=""
+    preset_review_fix_args=""
     preset_maintain_agent=""
     preset_maintain_max=""
     preset_maintain_fix_default=""
@@ -2146,6 +2157,7 @@ if [[ -n "$preset_name" ]]; then
     preset_maintain_fix_model=""
     preset_maintain_fix_repeat=1
     preset_maintain_fix_network=""
+    preset_maintain_fix_args=""
 
     # Stage the definition's bytes before parsing, so the parser, the
     # hash and the run dir's copy all describe that one staged file, the
@@ -2214,6 +2226,8 @@ if [[ -n "$preset_name" ]]; then
                     fix_model) preset_step_fix_model[preset_step_k]="$preset_f4" ;;
                     fix_repeat) preset_step_fix_repeat[preset_step_k]="$preset_f4" ;;
                     fix_network) preset_step_fix_network[preset_step_k]="$preset_f4" ;;
+                    fix_args) preset_step_fix_args[preset_step_k]="$preset_f4" ;;
+                    self_coded) preset_step_self_coded[preset_step_k]="$preset_f4" ;;
                 esac
                 ;;
             warn)
@@ -2346,6 +2360,7 @@ if [[ -n "$preset_name" ]]; then
                     preset_review_fix_model="${preset_step_fix_model[$preset_k]}"
                     preset_review_fix_repeat="${preset_step_fix_repeat[$preset_k]}"
                     preset_review_fix_network="${preset_step_fix_network[$preset_k]}"
+                    preset_review_fix_args="${preset_step_fix_args[$preset_k]:-}"
                     ;;
                 maintain)
                     preset_maintain_agent="${preset_step_agent[$preset_k]}"
@@ -2355,9 +2370,51 @@ if [[ -n "$preset_name" ]]; then
                     preset_maintain_fix_harness="${preset_step_fix_harness[$preset_k]}"
                     preset_maintain_fix_model="${preset_step_fix_model[$preset_k]}"
                     preset_maintain_fix_repeat="${preset_step_fix_repeat[$preset_k]}"
+                    preset_maintain_fix_args="${preset_step_fix_args[$preset_k]:-}"
                     preset_maintain_fix_network="${preset_step_fix_network[$preset_k]}"
                     ;;
             esac
+        done
+    fi
+
+    # A legacy-shaped pipeline routes extra arguments to its code seat's
+    # agent only, so any other agent's are refused rather than dropped. A
+    # read-only review step rides the implement role and keeps its own
+    # arguments, unless --review-only dropped a code step sat by that same
+    # agent (self_coded): a full run never gives its self-review leg its
+    # coding arguments either. A read-only maintain step has no implement
+    # leg at all (phantom), so every agent's arguments are refused there.
+    if [[ "$preset_is_legacy_shaped" == true ]]; then
+        preset_impl_seat_phantom=false
+        [[ "$preset_read_only" == true && "$preset_ro_review" != true ]] \
+            && preset_impl_seat_phantom=true
+        if [[ "$preset_read_only" == true ]]; then
+            for ((preset_sc_k = 1; preset_sc_k <= preset_step_count; preset_sc_k++)); do
+                if [[ "${preset_step_self_coded[$preset_sc_k]:-}" == "1" ]]; then
+                    preset_sc_agent="${preset_step_agent[$preset_sc_k]}"
+                    preset_agent_cargs[$preset_sc_agent]=""
+                    preset_agent_pargs[$preset_sc_agent]=""
+                    preset_agent_xargs[$preset_sc_agent]=""
+                fi
+            done
+        fi
+        for preset_args_agent in "${!preset_agent_harness[@]}"; do
+            if [[ -z "${preset_agent_cargs[$preset_args_agent]:-}" \
+                && -z "${preset_agent_pargs[$preset_args_agent]:-}" \
+                && -z "${preset_agent_xargs[$preset_args_agent]:-}" ]]; then
+                continue
+            fi
+            if [[ "$preset_impl_seat_phantom" == true ]] \
+                || [[ "$preset_args_agent" != "$preset_impl_agent" ]]; then
+                echo "Error: preset '$preset_name': agent '$preset_args_agent' sets" >&2
+                echo "claude-args, pi-args or codex-args, but this pipeline is" >&2
+                echo "legacy-shaped (one code step, then at most one review step," >&2
+                echo "then at most one maintain step) -- only its code seat's agent" >&2
+                echo "routes arguments to a leg there. Compose the pipeline (add" >&2
+                echo "another step, or reorder it) to route this agent's own" >&2
+                echo "arguments to its own leg, or drop them." >&2
+                exit 1
+            fi
         done
     fi
 
@@ -2370,6 +2427,31 @@ if [[ -n "$preset_name" ]]; then
         else
             printf '%s (%s)' "$agent" "$h"
         fi
+    }
+
+    # An agent's own extra arguments, the one of claude_args/pi_args/
+    # codex_args that matches its own harness (the parser already refused
+    # any other combination) -- used by the composed seat loop, its sweep
+    # and --dry-run to pick a seat's value without hard-coding which
+    # per-kind dict it lives in.
+    preset_agent_args() {
+        local agent="$1"
+        case "${preset_agent_harness[$agent]}" in
+            claude) printf '%s' "${preset_agent_cargs[$agent]}" ;;
+            pi|pi-local) printf '%s' "${preset_agent_pargs[$agent]}" ;;
+            codex) printf '%s' "${preset_agent_xargs[$agent]}" ;;
+        esac
+    }
+
+    # The dry-run key suffix ("claude_args", "pi_args" or "codex_args") for
+    # a harness value, pi-local folding to pi_args like every other seat
+    # record does.
+    preset_args_kind() {
+        case "$1" in
+            claude) printf 'claude_args' ;;
+            pi|pi-local) printf 'pi_args' ;;
+            codex) printf 'codex_args' ;;
+        esac
     }
 
     # A composed (non-legacy-shaped) pipeline has no single code/review/
@@ -2552,6 +2634,11 @@ if [[ -n "$preset_name" ]]; then
             fix_model="$preset_review_fix_model"
             fix_repeat="$preset_review_fix_repeat"
             fix_network="$preset_review_fix_network"
+            # A named fix seat is a fresh build (fs_build_sandbox_cmd fxr),
+            # not the implement command's fallback copy, so it needs its
+            # resolved agent's own arguments passed to it explicitly, even
+            # when that agent is also the implement seat's.
+            fix_extra_args="$preset_review_fix_args"
             # Same permanent alias as --harness pi-local, expanded the same
             # way. There is no --fix-harness flag; a preset's fix_harness
             # key is the only route here.
@@ -2599,6 +2686,11 @@ if [[ -n "$preset_name" ]]; then
             mntfix_model="$preset_maintain_fix_model"
             mntfix_repeat="$preset_maintain_fix_repeat"
             mntfix_network="$preset_maintain_fix_network"
+            # Same reasoning as the review loop's fix seat above: a named
+            # fix seat always builds fresh, so it needs its resolved
+            # agent's own arguments even when that agent is also the
+            # implement seat's.
+            mntfix_extra_args="$preset_maintain_fix_args"
             # Same permanent alias, expanded the same way. There is no
             # --mntfix-harness flag; a preset's fix_harness key on the
             # maintain seat is the only route here.
@@ -3567,37 +3659,38 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
         echo "composed pipeline; edit the preset or pick another." >&2
         exit 1
     fi
-    # A composed preset's claude_args/pi_args has the same silent-drop gap:
-    # the parser (fork-sandbox-preset-parse.py) already refuses claude_args
-    # or pi_args on any agent but the pipeline's first code seat, so if
-    # either survived parsing here it belongs to that step -- but
-    # fs_build_sandbox_cmd only splices --claude-args/--pi-args into a
-    # command built with prefix "impl", never a composed step's own "s<K>"
-    # prefix, so that step would launch with them silently dropped. The
-    # walker runs a composed pipeline today, so -- same as the codex check
-    # above -- this is a live refusal, not a placeholder for a gap that
-    # only matters once some other block stops blocking composed launches
-    # first.
-    for preset_cargs_agent in "${!preset_agent_cargs[@]}"; do
-        if [[ -n "${preset_agent_cargs[$preset_cargs_agent]}" ]]; then
-            echo "Error: preset '$preset_name' sets claude_args on agent" >&2
-            echo "'$preset_cargs_agent' -- a composed pipeline step's own" >&2
-            echo "claude-args are not yet wired into its build and would be" >&2
-            echo "silently dropped. Drop claude_args from the preset, or seat" >&2
-            echo "that agent in a legacy-shaped preset instead." >&2
-            exit 1
-        fi
-    done
-    for preset_pargs_agent in "${!preset_agent_pargs[@]}"; do
-        if [[ -n "${preset_agent_pargs[$preset_pargs_agent]}" ]]; then
-            echo "Error: preset '$preset_name' sets pi_args on agent" >&2
-            echo "'$preset_pargs_agent' -- a composed pipeline step's own" >&2
-            echo "pi-args are not yet wired into its build and would be" >&2
-            echo "silently dropped. Drop pi_args from the preset, or seat" >&2
-            echo "that agent in a legacy-shaped preset instead." >&2
-            exit 1
-        fi
-    done
+    # A composed pipeline has no single seat for a command-line
+    # --claude-args/--pi-args/--codex-args to land on either -- each agent
+    # already carries its own claude-args/pi-args/codex-args key, which now
+    # reaches every leg that agent sits (see the composed seat-resolution
+    # loop and fs_build_sandbox_cmd below), so the route is the preset, not
+    # the flag. Refuse outright, the same shape as the flags just above,
+    # rather than silently applying a flag's value to every seat of its
+    # harness or picking one seat to override.
+    if [[ -n "$claude_extra_args" ]]; then
+        echo "Error: --claude-args cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; give the agent its own claude-args key instead." >&2
+        exit 1
+    fi
+    if [[ -n "$pi_extra_args" ]]; then
+        echo "Error: --pi-args cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; give the agent its own pi-args key instead." >&2
+        exit 1
+    fi
+    if [[ -n "$codex_extra_args" ]]; then
+        echo "Error: --codex-args cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; give the agent its own codex-args key instead." >&2
+        exit 1
+    fi
+    # The transcript store is wired into the implement seat's commands only
+    # (impl_sandbox_cmd/cont_sandbox_cmd), never into a composed step's own
+    # seat, so the first code step's leg and its continuations would run
+    # without the store, or without the seat's model and arguments.
+    if [[ -n "$session_state" ]]; then
+        echo "Error: --session-state cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; a composed step's seat has no transcript store." >&2
+        exit 1
+    fi
 fi
 
 # Validated here, above the dry-run exit, rather than beside the rest of the
@@ -4086,6 +4179,29 @@ if [[ "$dry_run" == true ]]; then
     # seat's defaults; step 1 is what actually runs.
     if [[ "$preset_is_legacy_shaped" != true ]]; then
         printf 'harness=%s\nmodel=%s\n' "$composed_step1_harness" "$composed_step1_model"
+        # Every seat's own extra arguments, one line per seat that has any --
+        # printed from the raw preset_* tables rather than the "s<K>_*"
+        # fs_resolve_harness leaves behind, since the seat-resolution loop
+        # that populates those has not run yet at this point.
+        for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+            preset_k_agent="${preset_step_agent[$preset_k]}"
+            preset_k_args="$(preset_agent_args "$preset_k_agent")"
+            if [[ -n "$preset_k_args" ]]; then
+                printf 's%s_%s=%s\n' "$preset_k" \
+                    "$(preset_args_kind "${preset_agent_harness[$preset_k_agent]}")" \
+                    "$preset_k_args"
+            fi
+            if [[ "${preset_step_action[$preset_k]}" != code \
+                && "${preset_step_action[$preset_k]}" != plan \
+                && "$preset_ro_multi" != true ]]; then
+                preset_k_fix_args="${preset_step_fix_args[$preset_k]:-}"
+                if [[ -n "$preset_k_fix_args" ]]; then
+                    printf 's%sfix_%s=%s\n' "$preset_k" \
+                        "$(preset_args_kind "${preset_step_fix_harness[$preset_k]}")" \
+                        "$preset_k_fix_args"
+                fi
+            fi
+        done
     else
         printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     fi
@@ -4394,10 +4510,6 @@ if [[ -n "$pi_extra_args" && "$harness" != "pi" ]]; then
     echo "never starts. Drop it, or use --harness pi." >&2
     exit 1
 fi
-pi_extra_argv=()
-if [[ -n "$pi_extra_args" ]]; then
-    read -r -a pi_extra_argv <<< "$pi_extra_args"
-fi
 
 # --codex-args names codex exec, which no other harness starts.
 if [[ -n "$codex_extra_args" && "$harness" != "codex" ]]; then
@@ -4451,9 +4563,17 @@ image_toolchain_version="image:${FORK_SANDBOX_CONTAINER_IMAGE:-unnamed}"
 # $rh_model parameter instead -- everything else below is untouched,
 # comments included.
 fs_resolve_harness() {
-    local rh_harness="$1" rh_model="$2" prefix="$3" rh_network="${4:-}"
+    local rh_harness="$1" rh_model="$2" prefix="$3" rh_network="${4:-}" rh_extra_args="${5:-}"
     local rh_kind="$rh_harness"
     [[ "$rh_harness" == "pi" && "$rh_network" == "sealed" ]] && rh_kind="pi-local"
+    # Deliberate word splitting, no quoting support -- the same shape the
+    # legacy --pi-args/--codex-args flags have always split their value
+    # with (codex_extra_argv, below, still does this for its one remaining
+    # reader, fs_strip_impl_codex_args).
+    local -a rh_extra_argv=()
+    if [[ -n "$rh_extra_args" ]]; then
+        read -r -a rh_extra_argv <<< "$rh_extra_args"
+    fi
 
     local -n harness_bin="${prefix}_harness_bin"
     local -n harness_version="${prefix}_harness_version"
@@ -4480,6 +4600,9 @@ fs_resolve_harness() {
     local -n out_prefix_harness="${prefix}_harness"
     # shellcheck disable=SC2034
     local -n out_prefix_model="${prefix}_model"
+    # shellcheck disable=SC2034  # read by fs_build_sandbox_cmd's claude arm,
+    # across the same nameref-name boundary.
+    local -n out_prefix_extra_args="${prefix}_extra_args"
 
     harness_bin=""
     harness_version=""
@@ -4495,6 +4618,8 @@ fs_resolve_harness() {
     out_prefix_harness="$rh_kind"
     # shellcheck disable=SC2034
     out_prefix_model="$rh_model"
+    # shellcheck disable=SC2034
+    out_prefix_extra_args="$rh_extra_args"
 
     case "$rh_kind" in
     claude)
@@ -4558,8 +4683,8 @@ pi)
     # pi reads its prompt on stdin, like every other harness. --skill comes
     # later, with the review kit; --mode json and -p come last, from the runner.
     harness_cmd=("${FS_PI_ARGV0[@]}" --provider openrouter --model "$rh_model")
-    if (( ${#pi_extra_argv[@]} )); then
-        harness_cmd+=("${pi_extra_argv[@]}")
+    if (( ${#rh_extra_argv[@]} )); then
+        harness_cmd+=("${rh_extra_argv[@]}")
     fi
     harness_exec=1
     # pi speaks plain text, not stream-json, so there is nothing for the
@@ -4613,8 +4738,8 @@ pi-local)
     # harness_cmd lands after the clone dir, where agent-sandboxed passes
     # argv through to pi -- harness_flags would hit agent-sandboxed's own
     # option parser instead.
-    if (( ${#pi_extra_argv[@]} )); then
-        harness_cmd+=("${pi_extra_argv[@]}")
+    if (( ${#rh_extra_argv[@]} )); then
+        harness_cmd+=("${rh_extra_argv[@]}")
     fi
     run_formatter=""
     fs_reject_unsafe_chars "$harness_sandbox_bin" "$FS_PI_REAL" "$FS_PI_NODE"
@@ -4786,10 +4911,12 @@ codex)
     if [[ -n "$rh_model" ]]; then
         harness_cmd+=(--model "$rh_model")
     fi
-    # --codex-args has no per-leg form, so it applies only to the
-    # implementation command, like --claude-args below.
-    if [[ "$prefix" == impl ]] && (( ${#codex_extra_argv[@]} )); then
-        harness_cmd+=("${codex_extra_argv[@]}")
+    # Each seat's own codex-args, resolved by the caller into $rh_extra_args
+    # above -- see fs_strip_impl_codex_args for the one legacy fallback leg
+    # that must still remove the implement seat's suffix from a borrowed
+    # command.
+    if (( ${#rh_extra_argv[@]} )); then
+        harness_cmd+=("${rh_extra_argv[@]}")
     fi
     harness_cmd+=(-)
     # shellcheck disable=SC2034  # read by fs_build_sandbox_cmd via its own
@@ -4937,8 +5064,20 @@ if [[ "$impl_seat_is_phantom" == true ]]; then
     impl_harness=""
     # shellcheck disable=SC2034
     impl_model=""
+    # shellcheck disable=SC2034
+    impl_extra_args=""
 else
-    fs_resolve_harness "$harness" "$model" impl "$network"
+    # At most one of these three is non-empty here: the flag-vs-harness
+    # checks above (--claude-args needs harness claude, etc.) already
+    # refused any other combination, so picking by $harness never drops one
+    # meant for a different harness.
+    impl_extra_args_in=""
+    case "$harness" in
+        claude) impl_extra_args_in="$claude_extra_args" ;;
+        pi) impl_extra_args_in="$pi_extra_args" ;;
+        codex) impl_extra_args_in="$codex_extra_args" ;;
+    esac
+    fs_resolve_harness "$harness" "$model" impl "$network" "$impl_extra_args_in"
 fi
 # Compatibility copy: the run record (run.env, the generated runner) and
 # the review-loop accounting below still read these bare names -- moving
@@ -4970,21 +5109,43 @@ fi
 # expensive) coding leg, then die at the very first review leg with
 # nothing to show for it -- precisely the failure "fail before the clone"
 # exists to prevent for the implement harness alone.
+# The legacy seats' extra arguments. A named fix seat's arguments are
+# non-empty only when its agent is the code seat's own (any other agent's
+# are refused above), so it follows the code seat's effective value, a
+# --claude-args/--pi-args/--codex-args override included -- unless --harness
+# overrode the code seat, which leaves the fix seat the preset's. --pi-args
+# also reaches every separately built pi seat that has none of its own: it
+# always has, unlike --claude-args/--codex-args.
+fs_legacy_seat_args() {
+    local seat_harness="$1" seat_args="$2"
+    if [[ -n "$seat_args" && "$seat_harness" == "$harness" \
+        && "${preset_impl_overridden:-false}" != true ]]; then
+        printf '%s' "${impl_extra_args_in:-}"
+    elif [[ -z "$seat_args" && "$seat_harness" == pi ]]; then
+        printf '%s' "$pi_extra_args"
+    else
+        printf '%s' "$seat_args"
+    fi
+}
 if [[ -n "$fix_harness" ]]; then
-    fs_resolve_harness "$fix_harness" "$fix_model" fxr "$fix_network"
+    fs_resolve_harness "$fix_harness" "$fix_model" fxr "$fix_network" \
+        "$(fs_legacy_seat_args "$fix_harness" "$fix_extra_args")"
 fi
 if [[ -n "$mntfix_harness" ]]; then
-    fs_resolve_harness "$mntfix_harness" "$mntfix_model" fxm "$mntfix_network"
+    fs_resolve_harness "$mntfix_harness" "$mntfix_model" fxm "$mntfix_network" \
+        "$(fs_legacy_seat_args "$mntfix_harness" "$mntfix_extra_args")"
 fi
 if [[ "$review_harness_given" == true ]]; then
-    fs_resolve_harness "$review_harness" "$review_model" rev "$review_network"
+    fs_resolve_harness "$review_harness" "$review_model" rev "$review_network" \
+        "$(fs_legacy_seat_args "$review_harness" "")"
 fi
 
 # Same for the maintainer harness when --maintainer-harness named one.
 # (It cannot be named without --maintainer-loop, which always carries a
 # model, so this always has a model to resolve with.)
 if [[ "$maintainer_harness_given" == true ]]; then
-    fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt "$maintainer_network"
+    fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt "$maintainer_network" \
+        "$(fs_legacy_seat_args "$maintainer_harness" "")"
 fi
 
 # run.env/summary.json's flat harness/harness_version/model fields, read by
@@ -5030,7 +5191,8 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
             "${preset_agent_harness[$preset_k_agent]}" || exit 1
         fs_resolve_harness "${preset_agent_harness[$preset_k_agent]}" \
             "$preset_k_model" "s${preset_k}" \
-            "${preset_agent_network[$preset_k_agent]}"
+            "${preset_agent_network[$preset_k_agent]}" \
+            "$(preset_agent_args "$preset_k_agent")"
         if [[ "${preset_step_action[$preset_k]}" != code \
             && "${preset_step_action[$preset_k]}" != plan \
             && "$preset_ro_multi" != true ]]; then
@@ -5041,7 +5203,8 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                 "${preset_step_fix_harness[$preset_k]}" || exit 1
             fs_resolve_harness "${preset_step_fix_harness[$preset_k]}" \
                 "$preset_k_fix_model" "s${preset_k}fix" \
-                "${preset_step_fix_network[$preset_k]}"
+                "${preset_step_fix_network[$preset_k]}" \
+                "${preset_step_fix_args[$preset_k]:-}"
         fi
     done
 fi
@@ -5145,14 +5308,19 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         preset_k_model_var="s${preset_k}_model"
         preset_k_harness_var="s${preset_k}_harness"
-        composed_step_sweep_values+=("${!preset_k_model_var}" "${!preset_k_harness_var}")
+        preset_k_extra_args_var="s${preset_k}_extra_args"
+        composed_step_sweep_values+=(
+            "${!preset_k_model_var}" "${!preset_k_harness_var}" "${!preset_k_extra_args_var}"
+        )
         if [[ "${preset_step_action[$preset_k]}" != code \
             && "${preset_step_action[$preset_k]}" != plan \
             && "$preset_ro_multi" != true ]]; then
             preset_k_fix_model_var="s${preset_k}fix_model"
             preset_k_fix_harness_var="s${preset_k}fix_harness"
+            preset_k_fix_extra_args_var="s${preset_k}fix_extra_args"
             composed_step_sweep_values+=(
                 "${!preset_k_fix_model_var}" "${!preset_k_fix_harness_var}"
+                "${!preset_k_fix_extra_args_var}"
             )
         fi
     done
@@ -5165,6 +5333,7 @@ fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$checkout_ref"
     "$model" "$review_model" "$review_harness" "$maintainer_model" \
     "$maintainer_harness" "$fix_model" "$fix_harness" "$mntfix_model" \
     "$mntfix_harness" "$claude_extra_args" "$sandbox_args" \
+    "$fix_extra_args" "$mntfix_extra_args" \
     "${composed_step_sweep_values[@]}"
 
 # --task-meta never enters the generated runner -- it is written straight to
@@ -6744,6 +6913,7 @@ fs_build_sandbox_cmd() {
 
     local -n b_harness="${prefix}_harness"
     local -n b_model="${prefix}_model"
+    local -n b_extra_args="${prefix}_extra_args"
     local -n b_harness_env_file="${prefix}_harness_env_file"
     local -n b_harness_exec="${prefix}_harness_exec"
     local -n b_harness_sandbox_bin="${prefix}_harness_sandbox_bin"
@@ -7024,13 +7194,12 @@ fs_build_sandbox_cmd() {
         if [[ -n "$b_model" ]]; then
             out+=(--model "$b_model")
         fi
-        # --claude-args has no per-leg form -- see the check beside
-        # --pi-args, above, which refuses it against anything but the
-        # implement harness. It applies to the implement leg alone, so
-        # only the "impl" build picks it up here.
-        if [[ "$prefix" == impl && -n "$claude_extra_args" ]]; then
+        # Each seat's own claude-args, resolved by the caller into
+        # "${prefix}_extra_args" via fs_resolve_harness -- every build picks
+        # up its own seat's value, never another seat's.
+        if [[ -n "$b_extra_args" ]]; then
             # shellcheck disable=SC2206
-            out+=($claude_extra_args)
+            out+=($b_extra_args)
         fi
     fi
 }
