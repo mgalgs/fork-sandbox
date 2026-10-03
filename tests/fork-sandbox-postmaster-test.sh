@@ -30,6 +30,7 @@ tmpdirs=()
 
 cleanup() {
     local d
+    [[ -n "${we_tmux_dir:-}" ]] && TMUX_TMPDIR="$we_tmux_dir" tmux kill-server >/dev/null 2>&1
     for d in "${tmpdirs[@]-}"; do
         [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
     done
@@ -7603,7 +7604,28 @@ rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/hana.md" "$FORK_SANDBOX_PERSONAS_DIR/hugo.m
 printf '\n== wake-exit evidence: the log tail of a failed wake, in status --thread --json ==\n'
 # ============================================================
 
+# This section owns its k8s seams. The k8s section above unsets
+# K8S_DETACH, K8S and CONFIG_DIR once it is done, and a wake that is not run
+# inline is detached and asynchronous -- the whole section would then
+# depend on how the host's tmux happens to be set up (see below).
+export FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline
+export FORK_SANDBOX_POSTMASTER_K8S="$K8S_WAKE_BIN/fork-sandbox-k8s.sh"
+new_root FORK_SANDBOX_CONFIG_DIR
+export FORK_SANDBOX_CONFIG_DIR
 export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+# A tmux server that predates every wake below, as a host that already runs
+# tmux has, and whose environment carries none of this suite's STUB_*
+# variables. A wake started with --detach runs in a session that inherits
+# the SERVER's environment, so on such a host the stub launcher dies on its
+# first unbound STUB_* variable: no run dir, no saved log, and (the wake
+# being asynchronous) a harvest that can land before the wake finished. A
+# private socket keeps it off the operator's own server.
+if command -v tmux >/dev/null 2>&1; then
+    new_root we_tmux_dir
+    TMUX_TMPDIR="$we_tmux_dir" env -i PATH="$PATH" HOME="$HOME" TMUX_TMPDIR="$we_tmux_dir" \
+        tmux new-session -d -s we-bystander 'sleep 900' >/dev/null 2>&1 || true
+    export TMUX_TMPDIR="$we_tmux_dir"
+fi
 we_json() { "$postmaster" status --thread "$1" --json; }
 # we_py <json> <python expr over d>: prints the expression's value.
 we_py() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$1" "$2"; }
@@ -7939,6 +7961,11 @@ we_fresh 'clear: never failed'
 STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
 check "clear: a thread that never failed has no clear event" 0 "$(grep -c '^pm flag-clear ' "$work/once.out")"
 check "clear: and no journal" 0 "$([[ -e "$PM_STATE_DIR/needs-operator-journal/$we_tid" ]] && echo 1 || echo 0)"
+
+# Leave nothing exported for the sections after these two.
+[[ -z "${we_tmux_dir:-}" ]] || tmux kill-server >/dev/null 2>&1
+unset TMUX_TMPDIR FORK_SANDBOX_POSTMASTER_K8S_DETACH FORK_SANDBOX_POSTMASTER_K8S \
+    FORK_SANDBOX_CONFIG_DIR FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
 # ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
