@@ -483,6 +483,12 @@ something still running. Only committed work leaves the sandbox, so commit
 before you end your turn; anything left uncommitted is discarded with the
 clone.
 
+Commit the change as soon as its tests pass, before any further
+verification or evidence-gathering. Keep that verification proportional to
+the change: if building the evidence is taking longer than the change
+itself did, stop refining it, report what you did measure, name what you
+did not run and why, and finish.
+
 ---
 
 do the task
@@ -1005,6 +1011,12 @@ builds in the foreground and wait for them -- never end your turn on
 something still running. Only committed work leaves the sandbox, so commit
 before you end your turn; anything left uncommitted is discarded with the
 clone.
+
+Commit the change as soon as its tests pass, before any further
+verification or evidence-gathering. Keep that verification proportional to
+the change: if building the evidence is taking longer than the change
+itself did, stop refining it, report what you did measure, name what you
+did not run and why, and finish.
 
 Some of what follows may be wrong: the reviewer read the same code you are
 about to read and could have misread it. **Do not change code to satisfy a

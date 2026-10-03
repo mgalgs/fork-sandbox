@@ -39,7 +39,12 @@ reach it — see "What it gives up".)
    - **Context** — why, and what the caller expects.
    - **Current state** — what already works, what does not.
    - **Details** — the files, APIs and contracts involved.
-   - **Acceptance criteria** — how the session knows it is done.
+   - **Acceptance criteria** — how the session knows it is done. When you
+     ask for verification, say what it must show and roughly how much effort
+     it deserves, and leave the run to pick the cheapest method that would
+     convince a reviewer. Do not specify a harness for it to build: an
+     unattended run treats a long list of measurements as a mandate and can
+     spend hours on tooling for a small change.
    - **Commit the work.** Say this explicitly. Uncommitted work has nothing to
      fetch back and is lost when the clone is deleted.
    - **Report** — ask for two or three sentences on what it did, whether tests
