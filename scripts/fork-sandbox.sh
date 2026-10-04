@@ -6110,6 +6110,7 @@ fs_reject_unsafe_chars "$inbox_dir"
 # — see fs_archive_inbox's own comment on why the two are kept apart.
 inbox_hook=""
 inbox_settings=""
+inbox_settings_ro=""
 # One hook and one settings file cover every claude leg this run has, not
 # just the implement one: --review-harness claude (with a non-claude
 # implement harness) still starts a claude session for its review leg, and
@@ -6136,6 +6137,7 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
     fi
     inbox_hook="$inbox_dir/.inbox-hook.sh"
     inbox_settings="$inbox_dir/.settings.json"
+    inbox_settings_ro="$inbox_dir/.settings-readonly.json"
     install -m 755 "$inbox_hook_src" "$inbox_hook"
     # jq builds it so the path is escaped properly rather than interpolated
     # into hand-written JSON. Stop takes no matcher; PostToolUse matches every
@@ -6145,6 +6147,12 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
     # for a background command's result, so background tasks are switched
     # off; the Bash timeout cap is raised so a long suite can run in the
     # foreground instead. Mirrored in fork-sandbox-k8s-entrypoint.sh.
+    #
+    # Two settings files, identical today: a follow-up splits them so a
+    # read-only leg (review, maintainer, plan) gets one with no commit-guard
+    # Stop hook once that hook exists, while an editing leg keeps both hooks.
+    # fs_build_sandbox_cmd's claude arm already picks between the two by its
+    # own prefix argument, so the split point is only ever this file.
     jq -n --arg hook "$inbox_hook" '{
         env: {
             CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
@@ -6156,7 +6164,8 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
             Stop: [ { hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
         },
     }' > "$inbox_settings"
-    fs_reject_unsafe_chars "$inbox_hook" "$inbox_settings"
+    cp -- "$inbox_settings" "$inbox_settings_ro"
+    fs_reject_unsafe_chars "$inbox_hook" "$inbox_settings" "$inbox_settings_ro"
 fi
 
 # The artifact outbox: the ONE writable path outside the clone, bound
@@ -6893,6 +6902,54 @@ run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
 [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
 [[ -x "$run_log_bin" ]] || run_log_bin=""
 
+# Which of the two claude settings files a leg gets, by fs_build_sandbox_cmd's
+# own prefix argument: "rev" and "mnt" (the fixed, named --review-harness/
+# --maintainer-harness seats) are always read-only; a composed "s<K>" step is
+# read-only when run_step_kind[K] (populated above, before this function is
+# ever called) is anything but "code" -- review, maintainer and plan steps
+# alike. Every other prefix -- "impl", "fxr", "fxm", and any "s<K>fix" fix
+# seat -- is an editing leg, since a fix seat's whole job is to commit a fix.
+# Printed rather than returned by nameref: every caller wants the one string,
+# and command substitution is clearer at each of the few call sites than a
+# nameref out-param would be here.
+fs_leg_settings_for_prefix() {
+    local prefix="$1"
+    case "$prefix" in
+        rev|mnt)
+            printf '%s' "$inbox_settings_ro"
+            return 0
+            ;;
+    esac
+    if [[ "$prefix" =~ ^s([0-9]+)$ ]]; then
+        local step_k="${BASH_REMATCH[1]}"
+        if [[ "${run_step_kind[$step_k]:-}" != code ]]; then
+            printf '%s' "$inbox_settings_ro"
+            return 0
+        fi
+    fi
+    printf '%s' "$inbox_settings"
+}
+
+# Walks a sandbox_cmd array (by name, via nameref) built for an editing leg
+# and swaps $inbox_settings for $inbox_settings_ro wherever it appears --
+# used right after review_sandbox_cmd/maintainer_sandbox_cmd are copied
+# verbatim from the implement leg's own (editing) sandbox_cmd, below, since a
+# default (no --review-harness/--maintainer-harness) review or maintainer leg
+# is read-only even though the command it starts from is not. A no-op when
+# $inbox_settings is empty, which is every run whose implement harness is not
+# claude (fs_build_sandbox_cmd never wrote the flag into the array at all).
+fs_use_readonly_settings() {
+    local -n settings_arr="$1"
+    [[ -n "$inbox_settings" ]] || return 0
+    local i
+    for i in "${!settings_arr[@]}"; do
+        if [[ "${settings_arr[$i]}" == "$inbox_settings" ]]; then
+            settings_arr[i]="$inbox_settings_ro"
+        fi
+    done
+    return 0
+}
+
 # Builds one harness's full sandbox_cmd argv from fs_resolve_harness's
 # "${prefix}_*" output, plus every bind flag that is the same regardless of
 # which harness runs -- the alternates, the node toolchain, provision-ro,
@@ -7189,7 +7246,7 @@ fs_build_sandbox_cmd() {
         # --monitor can report a delivery. It costs two extra log lines
         # per tool call; the log is the only thing that grows.
         if [[ -n "$inbox_settings" ]]; then
-            out+=(--settings "$inbox_settings" --include-hook-events)
+            out+=(--settings "$(fs_leg_settings_for_prefix "$prefix")" --include-hook-events)
         fi
         if [[ -n "$b_model" ]]; then
             out+=(--model "$b_model")
@@ -7308,6 +7365,7 @@ else
     # positive as fs_resolve_harness's "impl_*"/"rev_*" outputs.
     # shellcheck disable=SC2154
     review_sandbox_cmd=("${sandbox_cmd[@]}")
+    fs_use_readonly_settings review_sandbox_cmd
     if [[ "$harness" == "codex" ]]; then
         fs_strip_impl_codex_args review_sandbox_cmd
     fi
@@ -7405,6 +7463,7 @@ if (( maintainer_loop_cap > 0 )); then
         # -- the same false positive as the review fallback's.
         # shellcheck disable=SC2154
         maintainer_sandbox_cmd=("${sandbox_cmd[@]}")
+        fs_use_readonly_settings maintainer_sandbox_cmd
         if [[ "$harness" == "codex" ]]; then
             fs_strip_impl_codex_args maintainer_sandbox_cmd
         fi

@@ -399,6 +399,14 @@ if [[ -n "$rd_d" ]]; then
         "--model sonnet" "$mnt_line"
     check "the runner state names the loop cap" "maintainer_loop_cap=1" \
         "$(grep '^maintainer_loop_cap=' "$rd_d/run.sh")"
+    impl_line="$(grep '^sandbox_cmd=' "$rd_d/run.sh")"
+    rev_line="$(grep '^review_sandbox_cmd=' "$rd_d/run.sh")"
+    contains "the implement command carries the editing settings file" \
+        "--settings $rd_d/inbox/.settings.json" "$impl_line"
+    contains "the default review fallback copy is switched to the read-only settings file" \
+        "--settings $rd_d/inbox/.settings-readonly.json" "$rev_line"
+    contains "the default maintainer fallback copy is switched to the read-only settings file" \
+        "--settings $rd_d/inbox/.settings-readonly.json" "$mnt_line"
 fi
 rd_nm="$(run_real --harness claude)" && tmpdirs+=("$rd_nm")
 if [[ -n "$rd_nm" ]]; then
@@ -451,10 +459,11 @@ rd_mc="$(run_real --harness pi-local --model some-local-model \
     --maintainer-loop 1 --maintainer-harness claude --maintainer-model sonnet)" \
     && tmpdirs+=("$rd_mc")
 if [[ -n "$rd_mc" ]]; then
-    if [[ -f "$rd_mc/inbox/.inbox-hook.sh" && -f "$rd_mc/inbox/.settings.json" ]]; then
-        ok "a claude maintainer leg gets the inbox hook and settings"
+    if [[ -f "$rd_mc/inbox/.inbox-hook.sh" && -f "$rd_mc/inbox/.settings.json" \
+        && -f "$rd_mc/inbox/.settings-readonly.json" ]]; then
+        ok "a claude maintainer leg gets the inbox hook and both settings files"
     else
-        no "a claude maintainer leg gets the inbox hook and settings" \
+        no "a claude maintainer leg gets the inbox hook and both settings files" \
             "$(ls -A "$rd_mc/inbox" 2>/dev/null | tr '\n' ' ')"
     fi
     contains "the maintainer settings file names the hook" \
@@ -464,22 +473,38 @@ if [[ -n "$rd_mc" ]]; then
     check "the settings file raises the Bash timeout cap to an hour" "3600000" \
         "$(jq -r '.env.BASH_MAX_TIMEOUT_MS' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
     mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_mc/run.sh")"
-    contains "the claude maintainer command carries the inbox settings" \
-        "--settings $rd_mc/inbox/.settings.json" "$mnt_line"
+    contains "a named claude maintainer leg (read-only) carries the read-only settings file" \
+        "--settings $rd_mc/inbox/.settings-readonly.json" "$mnt_line"
     contains "the claude maintainer command includes hook events" \
         "--include-hook-events" "$mnt_line"
 else
     no "a pi-local/claude-maintainer run produced a run directory" "run_real failed"
+fi
+
+# A named --review-harness claude (fresh "rev" build, same split as "mnt"
+# above): a review leg is read-only, so it must carry the read-only settings
+# file too, even though it is a freshly-built command rather than a fallback
+# copy of the implement one.
+rd_rc="$(run_real --harness pi-local --model some-local-model \
+    --review-loop 1 --review-harness claude --review-model sonnet)" \
+    && tmpdirs+=("$rd_rc")
+if [[ -n "$rd_rc" ]]; then
+    rev_line="$(grep '^review_sandbox_cmd=' "$rd_rc/run.sh")"
+    contains "a named claude review leg (read-only) carries the read-only settings file" \
+        "--settings $rd_rc/inbox/.settings-readonly.json" "$rev_line"
+else
+    no "a pi-local/claude-review run produced a run directory" "run_real failed"
 fi
 rd_pl="$(run_real --harness pi-local --model some-local-model \
     --maintainer-loop 1 --maintainer-harness pi-local \
     --maintainer-model some-other-local-model)" \
     && tmpdirs+=("$rd_pl")
 if [[ -n "$rd_pl" ]]; then
-    if [[ ! -e "$rd_pl/inbox/.inbox-hook.sh" && ! -e "$rd_pl/inbox/.settings.json" ]]; then
-        ok "an all-non-claude run installs no inbox hook"
+    if [[ ! -e "$rd_pl/inbox/.inbox-hook.sh" && ! -e "$rd_pl/inbox/.settings.json" \
+        && ! -e "$rd_pl/inbox/.settings-readonly.json" ]]; then
+        ok "an all-non-claude run installs no inbox hook or settings files"
     else
-        no "an all-non-claude run installs no inbox hook" \
+        no "an all-non-claude run installs no inbox hook or settings files" \
             "$(ls -A "$rd_pl/inbox" 2>/dev/null | tr '\n' ' ')"
     fi
 else

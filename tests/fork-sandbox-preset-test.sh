@@ -3283,6 +3283,16 @@ if rd_plan="$(run_stubbed --preset plan-code-review --branch "sandbox-test-plan-
         "$(cat "$rd_plan/step-4-prompt-1.md")" "Stub plan body"
     contains "plan: the maintain leg's own plan section asks it to treat deviations as findings" \
         "$(cat "$rd_plan/step-4-prompt-1.md")" "as findings"
+    contains "plan: the plan step's own command is read-only" \
+        "$(grep '^s1_sandbox_cmd=' "$rd_plan/run.sh")" "--settings $rd_plan/inbox/.settings-readonly.json"
+    contains "plan: the code step's own command is editing" \
+        "$(grep '^s2_sandbox_cmd=' "$rd_plan/run.sh")" "--settings $rd_plan/inbox/.settings.json"
+    contains "plan: the review step's own command is read-only" \
+        "$(grep '^s3_sandbox_cmd=' "$rd_plan/run.sh")" "--settings $rd_plan/inbox/.settings-readonly.json"
+    contains "plan: the review step's fix seat is editing" \
+        "$(grep '^s3fix_sandbox_cmd=' "$rd_plan/run.sh")" "--settings $rd_plan/inbox/.settings.json"
+    contains "plan: the maintain step's own command is read-only" \
+        "$(grep '^s4_sandbox_cmd=' "$rd_plan/run.sh")" "--settings $rd_plan/inbox/.settings-readonly.json"
 else
     no "plan: composed walk launch succeeds"
 fi
@@ -3781,6 +3791,8 @@ if rd_b="$(run_stubbed \
     fi
     contains "run.sh froze the fix seat's own command" \
         "$(grep '^fix_sandbox_cmd=' "$rd_b/run.sh")" "--model haiku"
+    contains "the fix seat is an editing leg, not read-only" \
+        "$(grep '^fix_sandbox_cmd=' "$rd_b/run.sh")" "--settings $rd_b/inbox/.settings.json"
     check "pipeline.json's step 0 is the code action with the coder's model" \
         "code/fable" \
         "$(jq -r '.steps[0] | "\(.action)/\(.model)"' "$rd_b/pipeline.json")"
