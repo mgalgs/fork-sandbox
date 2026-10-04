@@ -307,9 +307,13 @@ touched. In detail:
 
 Only committed work is fetched — a file the session edited but never
 committed is never brought into step 4; it stays behind in the clone,
-unreviewed. The run checks for this itself right before it ends: `git
-status --porcelain`, run inside the sandbox rather than against the clone
-on the host. A leftover file shows up as `uncommitted_files` (a count) and
+unreviewed. On a claude leg, a Stop hook already catches most of this
+during the run itself, refusing to let an editing leg end its turn while
+its clone holds uncommitted work or a background shell it started is still
+running (see `docs/sandbox-quickstart.md`). The run also checks for this
+itself right before it ends, regardless of harness: `git status
+--porcelain`, run inside the sandbox rather than against the clone on the
+host. A leftover file shows up as `uncommitted_files` (a count) and
 `uncommitted_files_list` (up to 20 of the paths) in `summary.json`, and as
 a `WARNING` naming them and the clone path in the printed summary and
 `fork-sandbox status`, whether or not the run also committed something

@@ -3471,10 +3471,10 @@ fs_emit_headless_turn_para() {
     cat <<'EOF'
 This session is headless: when your turn ends, the run ends, and nothing
 wakes you later to deliver a background command's result. Run tests and
-builds in the foreground and wait for them -- never end your turn on
-something still running. Only committed work leaves the sandbox, so commit
-before you end your turn; anything left uncommitted is discarded with the
-clone.
+builds in the foreground, or wait for every background command you started
+to finish (or kill it); either way, commit before you end your turn.
+Only committed work leaves the sandbox, so anything left uncommitted is
+discarded with the clone.
 
 Commit the change as soon as its tests pass, before any further
 verification or evidence-gathering. Keep that verification proportional to

@@ -6139,23 +6139,49 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
     inbox_settings="$inbox_dir/.settings.json"
     inbox_settings_ro="$inbox_dir/.settings-readonly.json"
     install -m 755 "$inbox_hook_src" "$inbox_hook"
+
+    # The commit guard: a second Stop hook, registered only in the EDITING
+    # settings file, that refuses to let a leg finish with uncommitted work
+    # in its clone -- see fork-sandbox-stop-guard.sh's header.
+    stop_guard_hook_src="$script_dir/fork-sandbox-stop-guard.sh"
+    if [[ ! -r "$stop_guard_hook_src" ]]; then
+        echo "Error: $stop_guard_hook_src is missing. It stops a claude leg" >&2
+        echo "from ending its turn with uncommitted work. Run install.sh in" >&2
+        echo "the fork-sandbox repo." >&2
+        exit 1
+    fi
+    stop_guard_hook="$inbox_dir/.stop-guard.sh"
+    install -m 755 "$stop_guard_hook_src" "$stop_guard_hook"
+    # Staged in the inbox: the run dir is never bound into the sandbox.
+    stop_guard_config="$inbox_dir/.stop-guard-config"
+    printf 'CLONE_DIR=%s\n' "$clone_dir" > "$stop_guard_config"
+    fs_reject_unsafe_chars "$stop_guard_hook" "$stop_guard_config"
+
     # jq builds it so the path is escaped properly rather than interpolated
     # into hand-written JSON. Stop takes no matcher; PostToolUse matches every
     # tool, because an addendum is not about any particular one.
     #
-    # env: a headless session ends when its turn does, and nothing wakes it
-    # for a background command's result, so background tasks are switched
-    # off; the Bash timeout cap is raised so a long suite can run in the
-    # foreground instead. Mirrored in fork-sandbox-k8s-entrypoint.sh.
+    # env: the Bash timeout cap is raised so a long suite can run in the
+    # foreground without tripping it. Mirrored in
+    # fork-sandbox-k8s-entrypoint.sh.
     #
-    # Two settings files, identical today: a follow-up splits them so a
-    # read-only leg (review, maintainer, plan) gets one with no commit-guard
-    # Stop hook once that hook exists, while an editing leg keeps both hooks.
-    # fs_build_sandbox_cmd's claude arm already picks between the two by its
-    # own prefix argument, so the split point is only ever this file.
+    # Two settings files, differing only in the commit guard: a read-only leg
+    # (review, maintainer, plan) gets .settings-readonly.json, since the
+    # guard would trap it waiting for a commit it must never make.
+    # fs_leg_settings_for_prefix picks between them.
+    jq -n --arg hook "$inbox_hook" --arg guard "$stop_guard_hook" '{
+        env: {
+            BASH_MAX_TIMEOUT_MS: "3600000",
+        },
+        hooks: {
+            PostToolUse: [ { matcher: "*",
+                             hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
+            Stop: [ { hooks: [ { type: "command", command: $hook, timeout: 20 },
+                               { type: "command", command: $guard, timeout: 30 } ] } ],
+        },
+    }' > "$inbox_settings"
     jq -n --arg hook "$inbox_hook" '{
         env: {
-            CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
             BASH_MAX_TIMEOUT_MS: "3600000",
         },
         hooks: {
@@ -6163,8 +6189,7 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
                              hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
             Stop: [ { hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
         },
-    }' > "$inbox_settings"
-    cp -- "$inbox_settings" "$inbox_settings_ro"
+    }' > "$inbox_settings_ro"
     fs_reject_unsafe_chars "$inbox_hook" "$inbox_settings" "$inbox_settings_ro"
 fi
 

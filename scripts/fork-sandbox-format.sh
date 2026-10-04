@@ -92,11 +92,14 @@ def inboxline:
   # The operator-inbox hook writes one tagged line to stderr when it hands
   # addenda to the session, and --include-hook-events puts that stderr in the
   # stream. It is the only evidence a delivery happened, so both the full
-  # render and the notable filter report it. Everything else about a hook
-  # firing is noise here.
+  # render and the notable filter report it. The commit guard
+  # (fork-sandbox-stop-guard.sh) tags its own refusals the same way, so a
+  # blocked Stop shows up here too. Everything else about a hook firing is
+  # noise here.
   select(.type == "system" and .subtype == "hook_response")
   | ((.stderr // "") | flat)
-  | select(startswith("fork-sandbox-inbox:") or startswith("fork-sandbox-refresh:"))
+  | select(startswith("fork-sandbox-inbox:") or startswith("fork-sandbox-refresh:")
+        or startswith("fork-sandbox-stop-guard:"))
   | "◆ \(.)";
 def refreshline:
   # --refresh-at own marker, written directly into events.jsonl by

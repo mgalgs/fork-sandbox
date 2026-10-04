@@ -460,18 +460,49 @@ rd_mc="$(run_real --harness pi-local --model some-local-model \
     && tmpdirs+=("$rd_mc")
 if [[ -n "$rd_mc" ]]; then
     if [[ -f "$rd_mc/inbox/.inbox-hook.sh" && -f "$rd_mc/inbox/.settings.json" \
-        && -f "$rd_mc/inbox/.settings-readonly.json" ]]; then
-        ok "a claude maintainer leg gets the inbox hook and both settings files"
+        && -f "$rd_mc/inbox/.settings-readonly.json" \
+        && -f "$rd_mc/inbox/.stop-guard.sh" && -f "$rd_mc/inbox/.stop-guard-config" ]]; then
+        ok "a claude maintainer leg gets the inbox hook, the commit guard and both settings files"
     else
-        no "a claude maintainer leg gets the inbox hook and both settings files" \
+        no "a claude maintainer leg gets the inbox hook, the commit guard and both settings files" \
             "$(ls -A "$rd_mc/inbox" 2>/dev/null | tr '\n' ' ')"
     fi
+    if [[ -x "$rd_mc/inbox/.stop-guard.sh" ]]; then
+        ok "the commit guard script is executable"
+    else
+        no "the commit guard script is executable" "$(ls -l "$rd_mc/inbox/.stop-guard.sh" 2>&1)"
+    fi
+    mc_clone_dir="$(grep '^clone_dir=' "$rd_mc/run.env" | cut -d= -f2-)"
+    check "the commit guard's config names this run's clone" \
+        "CLONE_DIR=$mc_clone_dir" "$(cat "$rd_mc/inbox/.stop-guard-config" 2>/dev/null)"
     contains "the maintainer settings file names the hook" \
         "$rd_mc/inbox/.inbox-hook.sh" "$(cat "$rd_mc/inbox/.settings.json" 2>/dev/null)"
-    check "the settings file switches background tasks off" "1" \
+    check "neither settings file switches background tasks off any more" "null" \
         "$(jq -r '.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    check "the read-only settings file also carries no background-tasks key" "null" \
+        "$(jq -r '.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' "$rd_mc/inbox/.settings-readonly.json" 2>/dev/null)"
     check "the settings file raises the Bash timeout cap to an hour" "3600000" \
         "$(jq -r '.env.BASH_MAX_TIMEOUT_MS' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    check "the read-only settings file raises the Bash timeout cap too" "3600000" \
+        "$(jq -r '.env.BASH_MAX_TIMEOUT_MS' "$rd_mc/inbox/.settings-readonly.json" 2>/dev/null)"
+    check "the editing settings file registers both hooks on Stop" "2" \
+        "$(jq -r '.hooks.Stop[0].hooks | length' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    contains "the editing settings file's Stop hooks name the inbox hook" \
+        "$rd_mc/inbox/.inbox-hook.sh" \
+        "$(jq -r '.hooks.Stop[0].hooks[].command' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    contains "the editing settings file's Stop hooks name the commit guard" \
+        "$rd_mc/inbox/.stop-guard.sh" \
+        "$(jq -r '.hooks.Stop[0].hooks[].command' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    check "the commit guard's own Stop hook entry times out at 30s" "30" \
+        "$(jq -r --arg c "$rd_mc/inbox/.stop-guard.sh" \
+            '.hooks.Stop[0].hooks[] | select(.command == $c) | .timeout' \
+            "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    check "the editing settings file's PostToolUse hooks carry only the inbox hook" "1" \
+        "$(jq -r '.hooks.PostToolUse[0].hooks | length' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    check "the read-only settings file's Stop hooks carry only the inbox hook" "1" \
+        "$(jq -r '.hooks.Stop[0].hooks | length' "$rd_mc/inbox/.settings-readonly.json" 2>/dev/null)"
+    lacks "the read-only settings file names no commit guard anywhere" \
+        ".stop-guard.sh" "$(cat "$rd_mc/inbox/.settings-readonly.json" 2>/dev/null)"
     mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_mc/run.sh")"
     contains "a named claude maintainer leg (read-only) carries the read-only settings file" \
         "--settings $rd_mc/inbox/.settings-readonly.json" "$mnt_line"
@@ -501,10 +532,11 @@ rd_pl="$(run_real --harness pi-local --model some-local-model \
     && tmpdirs+=("$rd_pl")
 if [[ -n "$rd_pl" ]]; then
     if [[ ! -e "$rd_pl/inbox/.inbox-hook.sh" && ! -e "$rd_pl/inbox/.settings.json" \
-        && ! -e "$rd_pl/inbox/.settings-readonly.json" ]]; then
-        ok "an all-non-claude run installs no inbox hook or settings files"
+        && ! -e "$rd_pl/inbox/.settings-readonly.json" \
+        && ! -e "$rd_pl/inbox/.stop-guard.sh" && ! -e "$rd_pl/inbox/.stop-guard-config" ]]; then
+        ok "an all-non-claude run installs no inbox hook, settings or commit guard files"
     else
-        no "an all-non-claude run installs no inbox hook or settings files" \
+        no "an all-non-claude run installs no inbox hook, settings or commit guard files" \
             "$(ls -A "$rd_pl/inbox" 2>/dev/null | tr '\n' ' ')"
     fi
 else

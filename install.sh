@@ -341,6 +341,7 @@ PLUMBING=(
     fork-sandbox-postmaster-pod-init.sh
     fork-sandbox-preset-parse.py
     fork-sandbox-refresh.sh
+    fork-sandbox-stop-guard.sh
     sandbox-backend-bwrap
     sandbox-backend-container
 )

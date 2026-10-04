@@ -15,13 +15,20 @@ permission check bypassed, which is safe *because* the sandbox holds nothing
 worth stealing and no way to push.
 
 The session is one turn: when it stops, the run ends, and nothing wakes it
-later. So a Claude session runs with background tasks switched off
-(`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) and a one-hour Bash timeout cap,
-which keeps a long test suite in the foreground rather than killed at exit
-along with the session's uncommitted work. Every harness's prompt — claude,
-pi, codex — also says this in plain words, coding and fix legs included:
-run tests and builds in the foreground, and commit before ending the turn,
-since only committed work leaves the sandbox.
+later. A Claude session's background tasks are on, and a one-hour Bash
+timeout cap keeps a long test suite from being killed early -- but an
+editing claude leg (the coding leg, a fix leg, a repeat pass, a
+`--refresh-at` continuation) also carries a Stop hook that refuses to let
+the turn end while its clone still holds uncommitted work, or while a
+background shell it started is still running, up to three refusals; after
+that the leg is allowed to stop and the run's own end-of-run check reports
+whatever is left as a `WARNING`. A read-only leg (review, maintainer, plan)
+carries no such hook, since it must never commit. Every harness's
+prompt — claude, pi, codex — also spells out the invariant in plain words,
+coding and fix legs included: run tests and builds in the foreground, or
+wait for a background command you started to finish (or kill it), and
+commit before ending the turn, since only committed work leaves the
+sandbox.
 
 Results come home on their own:
 

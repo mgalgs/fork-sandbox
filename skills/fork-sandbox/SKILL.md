@@ -360,7 +360,7 @@ That is the whole interface. The file is timestamped and generated; you never na
 
 | Harness | Delivery | How |
 |---|---|---|
-| `claude` | next tool call | A `PostToolUse` hook puts it beside the tool result. A `Stop` hook refuses to let the session finish while an addendum is unread, so it cannot be missed. |
+| `claude` | next tool call | A `PostToolUse` hook puts it beside the tool result. A `Stop` hook refuses to let the session finish while an addendum is unread, so it cannot be missed. An editing leg also carries a second `Stop` hook, the commit guard: it refuses to let the turn end while the clone holds uncommitted work or a background shell is still running (see `docs/sandbox-quickstart.md`). A read-only leg (review, maintainer, plan) does not get it. |
 | `pi`, `codex` | within ~25 tool calls | No hook system. The generated prompt tells the session to read the inbox on a tool-call floor, around long commands, before each commit, and before its final report. |
 
 So steering a `pi` run is bounded by tool calls, not by commits — a long build no longer swallows an addendum until the session happens to commit. It still lands later than it would on `claude`. Send it anyway — the instruction to read the inbox before the final report means it will not finish without seeing it.

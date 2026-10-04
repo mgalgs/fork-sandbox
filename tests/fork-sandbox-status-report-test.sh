@@ -398,6 +398,18 @@ out="$("$repo_dir/scripts/fork-sandbox-format.sh" --notable "$pi_events")"
 [[ "$out" == *"commit: git commit -m one"* ]] \
     || { echo "notable pi commit line missing: $out"; exit 1; }
 
+# 7e. The commit-guard Stop hook (fork-sandbox-stop-guard.sh) tags its own
+# refusals on stderr the same way the inbox hook tags a delivery, so a
+# refusal shows up in --notable (and therefore --monitor) too.
+guard_events="$(mktemp)"
+run_dirs+=("$guard_events")
+cat > "$guard_events" <<'EOF'
+{"type":"system","subtype":"hook_response","stderr":"fork-sandbox-stop-guard: refused 1/3 (2 uncommitted, 0 background shells)\n"}
+EOF
+out="$("$repo_dir/scripts/fork-sandbox-format.sh" --notable "$guard_events")"
+[[ "$out" == *"◆ fork-sandbox-stop-guard: refused 1/3 (2 uncommitted, 0 background shells)"* ]] \
+    || { echo "notable stop-guard refusal line missing: $out"; exit 1; }
+
 # 8. The activity line names the active leg and how long since it moved, so
 # a healthy multi-leg run no longer reads as wedged.
 
