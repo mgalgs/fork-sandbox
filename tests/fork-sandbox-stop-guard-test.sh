@@ -117,24 +117,18 @@ printf '== pin: background tasks are no longer disabled anywhere in the repo ==\
 # R1/T1d: the env key this hook's existence replaces must be gone from every
 # script, doc and README this run touches -- a leftover reference would mean
 # a leg still had its background tasks turned off even though this hook now
-# exists to guard the alternative.
-#
-# fork-sandbox-k8s-entrypoint.sh keeps setting it until the k8s wiring
-# commit lands the guard on that path too (same brief, a later commit) --
-# excluded here for that one commit's span and folded back into this same
-# grep once it does, so the pin stays comprehensive again rather than
-# permanently carving out an exception.
+# exists to guard the alternative. Covers both the local settings block and
+# the k8s entrypoint (fork-sandbox-k8s-entrypoint.sh), which carries its own
+# commit guard now too.
 if grep -rl 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' \
     "$repo_dir/scripts" "$repo_dir/docs" "$repo_dir/README.md" \
-    "$repo_dir/skills" 2>/dev/null \
-    | grep -v '/fork-sandbox-k8s-entrypoint\.sh$' | grep -q .; then
-    no "no local script, doc or skill still disables background tasks" \
+    "$repo_dir/skills" 2>/dev/null | grep -q .; then
+    no "no script, doc or skill still disables background tasks" \
         "$(grep -rl 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' \
             "$repo_dir/scripts" "$repo_dir/docs" "$repo_dir/README.md" \
-            "$repo_dir/skills" 2>/dev/null \
-            | grep -v '/fork-sandbox-k8s-entrypoint\.sh$')"
+            "$repo_dir/skills" 2>/dev/null)"
 else
-    ok "no local script, doc or skill still disables background tasks"
+    ok "no script, doc or skill still disables background tasks"
 fi
 
 printf '\n== R2/T2a: a dirty clone blocks, naming both paths, refusal 1 of 3 ==\n'

@@ -1690,24 +1690,28 @@ render_review_loop_env() {
 ENV
 }
 
-# The three --harness claude-only ConfigMap keys: the placeholder credential
+# The four --harness claude-only ConfigMap keys: the placeholder credential
 # (already sanitized by the caller -- see cmd_submit's credential preflight),
 # the operator-inbox hook, shipped in so the entrypoint can copy it to
 # /work/inbox/.inbox-hook.sh and register it exactly like a local claude
 # run's --settings does (fork-sandbox.sh's own inbox-hook install, around
-# its own harness == claude guard), and fork-sandbox-lib.sh itself -- so the
-# entrypoint's own claude-leg retry (see run_claude_attempt's wrapper) can
-# source fs_leg_error_retryable and fs_harness_error from the exact same
-# file the local runner does, rather than a second copy that could drift.
-# Only shipped for claude: a pi run's entrypoint has no use for either lib
-# function. Indented 2 spaces to sit beside the other ConfigMap data keys.
+# its own harness == claude guard), the commit-guard Stop hook
+# (fork-sandbox-stop-guard.sh), installed and registered the same way, and
+# fork-sandbox-lib.sh itself -- so the entrypoint's own claude-leg retry (see
+# run_claude_attempt's wrapper) can source fs_leg_error_retryable and
+# fs_harness_error from the exact same file the local runner does, rather
+# than a second copy that could drift. Only shipped for claude: a pi run's
+# entrypoint has no use for any of the three. Indented 2 spaces to sit
+# beside the other ConfigMap data keys.
 render_claude_configmap_keys() {
-    local configmap_cred="$1" inbox_hook_src="$2" lib_sh_src="$3"
+    local configmap_cred="$1" inbox_hook_src="$2" stop_guard_src="$3" lib_sh_src="$4"
     cat <<KEYS
   claude-credentials.json: |
 $(printf '%s\n' "$configmap_cred" | indent_block)
   inbox-hook.sh: |
 $(indent_block < "$inbox_hook_src")
+  stop-guard.sh: |
+$(indent_block < "$stop_guard_src")
   lib.sh: |
 $(indent_block < "$lib_sh_src")
 KEYS
@@ -5297,25 +5301,29 @@ cmd_submit() {
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
     local context_extract_sh="$script_dir/fork-sandbox-k8s-context-extract.sh"
     local inbox_hook_sh="$script_dir/fork-sandbox-inbox-hook.sh"
+    local stop_guard_sh="$script_dir/fork-sandbox-stop-guard.sh"
     local refresh_sh="$script_dir/fork-sandbox-refresh.sh"
     local lib_sh="$script_dir/fork-sandbox-lib.sh"
     for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$context_extract_sh"; do
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
 
-    # The three --harness claude-only ConfigMap keys: the placeholder
-    # credential, the operator-inbox hook and fork-sandbox-lib.sh itself --
-    # see render_claude_configmap_keys's own header. Same newline-prefix
-    # convention as review_loop_configmap_keys below, so an empty string
-    # here changes nothing about the no-claude render.
+    # The four --harness claude-only ConfigMap keys: the placeholder
+    # credential, the operator-inbox hook, the commit-guard Stop hook and
+    # fork-sandbox-lib.sh itself -- see render_claude_configmap_keys's own
+    # header. Same newline-prefix convention as review_loop_configmap_keys
+    # below, so an empty string here changes nothing about the no-claude
+    # render.
     local claude_configmap_keys=""
     if [[ "$harness" == claude ]]; then
         [[ -x "$inbox_hook_sh" ]] \
             || { echo "Error: $inbox_hook_sh is missing or not executable." >&2; exit 1; }
+        [[ -x "$stop_guard_sh" ]] \
+            || { echo "Error: $stop_guard_sh is missing or not executable." >&2; exit 1; }
         [[ -r "$lib_sh" ]] \
             || { echo "Error: $lib_sh is missing or unreadable." >&2; exit 1; }
         claude_configmap_keys=$'\n'"$(render_claude_configmap_keys \
-            "$claude_configmap_cred" "$inbox_hook_sh" "$lib_sh")"
+            "$claude_configmap_cred" "$inbox_hook_sh" "$stop_guard_sh" "$lib_sh")"
     fi
 
     # Must track fork-sandbox-k8s-entrypoint.sh's own work_dir/clone_dir --

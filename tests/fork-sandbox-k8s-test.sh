@@ -4224,6 +4224,17 @@ if grep -q 'inbox-hook.sh: |' "$claude_submit_out"; then
 else
     no "rendered ConfigMap carries the inbox-hook.sh key" "not found in $claude_submit_out"
 fi
+if grep -q 'stop-guard.sh: |' "$claude_submit_out"; then
+    ok "rendered ConfigMap carries the stop-guard.sh key"
+else
+    no "rendered ConfigMap carries the stop-guard.sh key" "not found in $claude_submit_out"
+fi
+if grep -q 'stop-guard.sh: |' "$submit_out"; then
+    no "a pi-harness render carries no stop-guard.sh key" \
+        "found in $submit_out"
+else
+    ok "a pi-harness render carries no stop-guard.sh key"
+fi
 if grep -qF 'naming its file in this directory' "$claude_submit_out"; then
     ok "rendered handoff.md preamble is worded for the claude harness (a pointer, not polled)"
 else
@@ -11496,7 +11507,6 @@ claude_launch_checks=(
     'ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL"'
     'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1'
     'DISABLE_AUTOUPDATER=1'
-    'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1'
     'BASH_MAX_TIMEOUT_MS=3600000'
     'TERM=dumb'
     'env "${leg_env[@]}" "${claude_argv[@]}"'
@@ -11518,6 +11528,16 @@ if [[ -z "$claude_launch_missing" ]]; then
 else
     no "entrypoint's claude launch line carries every required flag/env/redirect" \
         "$claude_launch_missing"
+fi
+
+# T1b: background tasks are enabled again -- the commit guard (wired into
+# inbox-settings.json above) is what replaces the old env switch, so no
+# trace of it should remain in the entrypoint's own launch env.
+if grep -qF 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' "$entrypoint_sh"; then
+    no "the entrypoint no longer disables background tasks" \
+        "$(grep -nF 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' "$entrypoint_sh")"
+else
+    ok "the entrypoint no longer disables background tasks"
 fi
 
 # Behind the seat's proxy the CLI falls back to a 200k window unless the
@@ -11600,11 +11620,18 @@ claude_block_run() {
     printf 'Do the thing.\n' > "$mounts/handoff.md"
     printf '{}' > "$mounts/claude-credentials.json"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/inbox-hook.sh"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/stop-guard.sh"
     # The real entrypoint sources this from its own ConfigMap-mounted copy
     # (see render_claude_configmap_keys); staged here the same way.
     cp "$repo_dir/scripts/fork-sandbox-lib.sh" "$mounts/lib.sh"
     printf '%s\n' '#!/usr/bin/env bash' \
         'printf "%s\n" "$*" >> "$CLAUDE_STUB_RECORD"' \
+        'g="${FORK_SANDBOX_STOP_GUARD_STATE:-}"' \
+        'if [[ -n "$g" ]]; then' \
+        '  if [[ -e "$g" ]]; then s=stale; else s=fresh; fi' \
+        '  printf "%s %s\n" "$s" "$g" >> "$CLAUDE_STUB_RECORD.guard"' \
+        '  printf 3 > "$g"' \
+        'fi' \
         'case "$CLAUDE_STUB_MODE" in' \
         '  resume-fail)' \
         '    if printf "%s" "$*" | grep -q -- "--resume"; then' \
@@ -11637,7 +11664,7 @@ claude_block_run() {
     CLAUDE_BLOCK_CLONE="$clone"
     CLAUDE_BLOCK_RECORD="$record"
     if [[ -n "${3:-}" ]]; then eval "$3"; fi
-    CLAUDE_BLOCK_OUT="$(PATH="$stub_dir:$PATH" HOME="$home" \
+    CLAUDE_BLOCK_OUT="$(PATH="$stub_dir:$PATH" HOME="$home" TMPDIR="$work" \
         HARNESS=claude MODEL="claude-test-model" \
         CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-proxy.invalid" \
         mounts_dir="$mounts" work_dir="$work" clone_dir="$clone" inbox_dir="$work/inbox" \
@@ -11693,6 +11720,38 @@ else
         "calls=$CLAUDE_BLOCK_CALLS record: $(cat "$CLAUDE_BLOCK_RECORD") pi_rc=$CLAUDE_BLOCK_PI_RC"
 fi
 
+# T14a/T14b: the commit guard is installed, configured and registered
+# exactly like the inbox hook is, on this pod's one (always editing)
+# claude leg.
+claude_block_run ok ""
+claude_block_work="$(dirname "$CLAUDE_BLOCK_CLONE")"
+if grep -qF 'install -m 755 "$mounts_dir/stop-guard.sh" "$inbox_dir/.stop-guard.sh"' "$entrypoint_sh"; then
+    ok "the entrypoint installs the commit-guard script into the inbox"
+else
+    no "the entrypoint installs the commit-guard script into the inbox" \
+        "missing install line in $entrypoint_sh"
+fi
+if [[ -x "$claude_block_work/inbox/.stop-guard.sh" ]]; then
+    ok "the commit-guard script lands in the inbox, executable"
+else
+    no "the commit-guard script lands in the inbox, executable" \
+        "$(ls -l "$claude_block_work/inbox" 2>&1)"
+fi
+check "the commit guard's config names this run's clone" \
+    "CLONE_DIR=$CLAUDE_BLOCK_CLONE" \
+    "$(cat "$claude_block_work/inbox/.stop-guard-config" 2>/dev/null)"
+check "the commit guard is registered on Stop" "1" \
+    "$(jq --arg c "$claude_block_work/inbox/.stop-guard.sh" \
+        '[.hooks.Stop[0].hooks[] | select(.command == $c)] | length' \
+        "$claude_block_work/inbox-settings.json" 2>/dev/null)"
+check "the commit guard is not registered on PostToolUse" "0" \
+    "$(jq --arg c "$claude_block_work/inbox/.stop-guard.sh" \
+        '[.hooks.PostToolUse[0].hooks[] | select(.command == $c)] | length' \
+        "$claude_block_work/inbox-settings.json" 2>/dev/null)"
+check "inbox-settings.json still carries no background-tasks env key" "null" \
+    "$(jq -r '.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' \
+        "$claude_block_work/inbox-settings.json" 2>/dev/null)"
+
 printf '\n== entrypoint: claude coding leg retries a transient provider error ==\n'
 # A claude leg that fails once on a 401-revoked stream-json error is
 # restarted fresh, exactly once, and the retry's success is what pi_rc
@@ -11710,6 +11769,12 @@ else
     no "a 401-revoked claude failure is retried once, fresh, and logs the retry and its success" \
         "calls=$CLAUDE_BLOCK_CALLS pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
 fi
+# The stub writes 3 (the cap) into the guard's counter on every attempt; the
+# retry must still start from a fresh one, even with refresh off.
+check "every attempt, a retry included, starts the commit guard's count from zero" \
+    "fresh $(dirname "$CLAUDE_BLOCK_CLONE")/stop-guard-refusals
+fresh $(dirname "$CLAUDE_BLOCK_CLONE")/stop-guard-refusals" \
+    "$(cat "$CLAUDE_BLOCK_RECORD.guard" 2>/dev/null)"
 # The retry restarts FRESH, never resuming the session that just failed --
 # same rule the resume-failure retry above follows.
 claude_block_run transient-then-ok resumeid-0001-aaaa-bbbb-cccccccccccc
@@ -11906,15 +11971,16 @@ refresh_block_run() {
     cp "$repo_dir/scripts/fork-sandbox-refresh.sh" "$mounts/refresh.sh"
     printf '{}' > "$mounts/claude-credentials.json"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/inbox-hook.sh"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/stop-guard.sh"
     # shellcheck disable=SC1003  # a literal backslash inside the generated stub
     printf '%s\n' '#!/usr/bin/env bash' \
         'n=$(( $(cat "$RB_REC/count" 2>/dev/null || echo 0) + 1 ))' \
         'echo "$n" > "$RB_REC/count"' \
         'printf "%s\n" "$*" >> "$RB_REC/argv"' \
         'cat > "$RB_REC/stdin-$n.txt"' \
-        'printf "%s|%s|%s|%s\n" "${FORK_SANDBOX_NUDGE_MARKER:-}" \' \
+        'printf "%s|%s|%s|%s|%s\n" "${FORK_SANDBOX_NUDGE_MARKER:-}" \' \
         '  "${FORK_SANDBOX_NUDGE_REMINDED:-}" "${FORK_SANDBOX_STALE_REMINDED:-}" \' \
-        '  "${FORK_SANDBOX_INBOX_SEEN:-}" >> "$RB_REC/envs"' \
+        '  "${FORK_SANDBOX_INBOX_SEEN:-}" "${FORK_SANDBOX_STOP_GUARD_STATE:-}" >> "$RB_REC/envs"' \
         'mkdir -p "$HOME/.claude/projects/-stub-slug"' \
         'echo "{}" > "$HOME/.claude/projects/-stub-slug/leg-$n.jsonl"' \
         'touch -d "@$((1700000000 + n))" "$HOME/.claude/projects/-stub-slug/leg-$n.jsonl"' \
@@ -12001,6 +12067,7 @@ printf 'x\n' > "$refresh_cfg_mounts/continuation-header.md"
 printf 'x\n' > "$refresh_cfg_mounts/handoff-original.md"
 printf '{}' > "$refresh_cfg_mounts/claude-credentials.json"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$refresh_cfg_mounts/inbox-hook.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$refresh_cfg_mounts/stop-guard.sh"
 cp "$repo_dir/scripts/fork-sandbox-refresh.sh" "$refresh_cfg_mounts/refresh.sh"
 PATH="$refresh_cfg_stub_dir:$PATH" HOME="$(newdir)" TMPDIR="$(newdir)" HARNESS=claude \
     MODEL=m CLAUDE_PROXY_BASE_URL=http://fs-k8s-test-proxy.invalid \
@@ -12186,8 +12253,8 @@ fi
 refresh_block_run 100000 "1 2" "" 6
 refresh_env_dirs="$(cut -d'|' -f1 "$RB_REC/envs" | xargs -n1 dirname | sort -u | wc -l)"
 if [[ "$RB_CALLS" == 3 && "$refresh_env_dirs" == 3 ]] \
-    && [[ "$(sed -n 1p "$RB_REC/envs")" == "$RB_REC/fs-hook-leg-1/nudged|$RB_REC/fs-hook-leg-1/nudge-reminded|$RB_REC/fs-hook-leg-1/stale-reminded|$RB_REC/fs-hook-leg-1/inbox-seen" ]] \
-    && [[ "$(sed -n 3p "$RB_REC/envs")" == "$RB_REC/fs-hook-leg-3/nudged|"* ]]; then
+    && [[ "$(sed -n 1p "$RB_REC/envs")" == "$RB_REC/fs-hook-leg-1/nudged|$RB_REC/fs-hook-leg-1/nudge-reminded|$RB_REC/fs-hook-leg-1/stale-reminded|$RB_REC/fs-hook-leg-1/inbox-seen|$RB_REC/fs-hook-leg-1/stop-guard-refusals" ]] \
+    && [[ "$(sed -n 3p "$RB_REC/envs")" == "$RB_REC/fs-hook-leg-3/nudged|"*"|$RB_REC/fs-hook-leg-3/stop-guard-refusals" ]]; then
     ok "every leg runs with its own fresh hook-state directory"
 else
     no "every leg runs with its own fresh hook-state directory" \
@@ -12204,11 +12271,12 @@ else
         "store: $(ls -lt "$RB_WORK"/session-store/-stub-slug/ 2>&1)"
 fi
 
-# Refresh off: no config, no loop, no hook env, no refresh.json.
+# Refresh off: no config, no loop, no refresh hook env, no refresh.json. The
+# commit guard's counter path is set regardless, under TMPDIR.
 refresh_block_run "" "1" "" 6
 if [[ "$RB_CALLS" == 1 && "$RB_RC" == 0 ]] \
     && [[ ! -e "$RB_WORK/inbox/.refresh-config" && ! -e "$RB_WORK/refresh.json" ]] \
-    && [[ "$(cat "$RB_REC/envs")" == '|||' ]] \
+    && [[ "$(cat "$RB_REC/envs")" == "||||$RB_REC/stop-guard-refusals" ]] \
     && [[ -f "$RB_WORK/outbox/handoff.md" ]]; then
     ok "REFRESH_THRESHOLD_TOKENS empty: no config, no loop, no hook env, no refresh.json"
 else

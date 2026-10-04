@@ -1023,11 +1023,18 @@ else
     # installs it, so `fork-sandbox-k8s.sh say` addenda are delivered on
     # the next tool call and block a Stop while unread.
     install -m 755 "$mounts_dir/inbox-hook.sh" "$inbox_dir/.inbox-hook.sh"
-    jq -n --arg hook "$inbox_dir/.inbox-hook.sh" '{
+
+    # The commit guard, as a local EDITING leg gets it. Always installed:
+    # the review loop below runs pi regardless of HARNESS, so this pod's
+    # only claude leg is the coding leg.
+    install -m 755 "$mounts_dir/stop-guard.sh" "$inbox_dir/.stop-guard.sh"
+    printf 'CLONE_DIR=%s\n' "$clone_dir" > "$inbox_dir/.stop-guard-config"
+    jq -n --arg hook "$inbox_dir/.inbox-hook.sh" --arg guard "$inbox_dir/.stop-guard.sh" '{
         hooks: {
             PostToolUse: [ { matcher: "*",
                              hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
-            Stop: [ { hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
+            Stop: [ { hooks: [ { type: "command", command: $hook, timeout: 20 },
+                               { type: "command", command: $guard, timeout: 30 } ] } ],
         },
     }' > "$work_dir/inbox-settings.json"
 
@@ -1085,12 +1092,17 @@ else
     # continuation names its own. The inbox hook's state paths are set
     # only while a refreshing run has a per-leg directory (claude_hook_dir).
     run_claude_attempt() {
-        # No background tasks, and a raised Bash timeout cap: see the env
-        # block in fork-sandbox.sh's inbox settings file.
+        # A raised Bash timeout cap, same as the env block in
+        # fork-sandbox.sh's own inbox settings file.
         local -a leg_env=(ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL"
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1
-            CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 BASH_MAX_TIMEOUT_MS=3600000
+            BASH_MAX_TIMEOUT_MS=3600000
             TERM=dumb)
+        # The pod's /tmp outlives every attempt, so each attempt (a retry
+        # included) starts the commit guard's refusal count from zero.
+        local guard_state="${claude_hook_dir:-${TMPDIR:-/tmp}}/stop-guard-refusals"
+        rm -f "$guard_state"
+        leg_env+=("FORK_SANDBOX_STOP_GUARD_STATE=$guard_state")
         if [[ -n "${claude_hook_dir:-}" ]]; then
             leg_env+=("FORK_SANDBOX_NUDGE_MARKER=$claude_hook_dir/nudged"
                 "FORK_SANDBOX_NUDGE_REMINDED=$claude_hook_dir/nudge-reminded"

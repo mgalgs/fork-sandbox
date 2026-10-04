@@ -790,6 +790,19 @@ run has no host run directory, so an operator who calls `say` today has no
 way to confirm what has already been sent short of the pod's own eventual
 commit or final report. Worth its own round, not solved here.
 
+**`--harness claude` also carries the commit guard.** A second Stop hook,
+`scripts/fork-sandbox-stop-guard.sh`, ships in the ConfigMap the same way
+the inbox hook does (a fourth `--harness claude`-only key, `stop-guard.sh`)
+and the entrypoint installs it at `/work/inbox/.stop-guard.sh`, writes its
+config (`/work/inbox/.stop-guard-config`, naming the pod's own clone), and
+registers it on `Stop` in `inbox-settings.json`. It behaves exactly as on
+a local editing claude leg (see `docs/sandbox-quickstart.md`). The pod's one
+claude leg is always the coding leg -- the review loop above always runs
+`pi`, regardless of `--harness` -- so `inbox-settings.json` always carries
+the guard, with no read-only counterpart to pick between the way the local
+launcher has. Its refusal count starts from zero on every attempt,
+including a transient-error retry.
+
 ## The cluster review loop
 
 `fork-sandbox-k8s.sh submit`/`run --review-loop N` is the cluster analogue
