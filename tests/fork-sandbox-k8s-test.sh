@@ -7271,6 +7271,25 @@ else
         "rc=$rc: $(cat "$wait_err2b")"
 fi
 
+# 2c. Same, when the log is read but cannot be SAVED (a read-only
+# evidence directory): still the terminal code 2, never set -e's 1.
+wait_log2c="$(newdir)/kubectl.log"; wait_out2c="$(newdir)/out2c.txt"; wait_err2c="$(newdir)/err2c.txt"
+tmpdirs+=("$(dirname "$wait_log2c")")
+wait2c_rd="$(newdir)"; tmpdirs+=("$wait2c_rd")
+mkdir -p "$wait2c_rd/evidence"
+chmod 555 "$wait2c_rd/evidence"
+rc=0
+K8S_STUB_POD_PHASE=Failed \
+    waitstub_wait "$wait_log2c" "$wait_out2c" "$wait_err2c" \
+    --branch fs-k8s-test-wait-podfailed-savefail --timeout 5 --run-dir "$wait2c_rd" || rc=$?
+chmod 755 "$wait2c_rd/evidence"
+if (( rc == 2 )) && grep -q 'could not save the agent log' "$wait_err2c"; then
+    ok "a Failed pod whose log cannot be saved still exits the terminal code 2"
+else
+    no "a Failed pod whose log cannot be saved still exits the terminal code 2" \
+        "rc=$rc: $(cat "$wait_err2c")"
+fi
+
 # 3. A Failed job condition: the wait itself fails with the terminal
 # code 2, naming the job. Under --probe, no log capture runs at all: a
 # probe loop calls this every few seconds and must never shell out to

@@ -6906,9 +6906,14 @@ k8s_teardown_claude_proxy() {
 # the exact path pm_wake_exit_record (fork-sandbox-postmaster.sh) already
 # reads for a k8s wake's own failure tail.
 k8s_capture_failed_agent_log() {
-    local pod_name="$1" run_dir="$2" log_tmp err_tmp
-    log_tmp="$(mktemp)"
-    err_tmp="$(mktemp)"
+    local pod_name="$1" run_dir="$2" log_tmp="" err_tmp=""
+    # Every step is guarded: the caller runs this right before its terminal
+    # exit 2, under set -e, and a failure here must not turn that into 1.
+    if ! log_tmp="$(mktemp)" || ! err_tmp="$(mktemp)"; then
+        echo "fork-sandbox-k8s: could not create a temp file; agent log not captured." >&2
+        rm -f -- "$log_tmp"
+        return 0
+    fi
     if ! kubectl logs "$pod_name" -c agent --request-timeout=60s > "$log_tmp" 2>"$err_tmp"; then
         echo "fork-sandbox-k8s: could not capture $pod_name's agent log." >&2
         fs_report_captured_stderr "kubectl logs $pod_name -c agent" "$err_tmp"
@@ -6917,12 +6922,11 @@ k8s_capture_failed_agent_log() {
     fi
     rm -f -- "$err_tmp"
     echo "fork-sandbox-k8s: $pod_name's agent log (last 40 lines):" >&2
-    tail -n 40 -- "$log_tmp" | sed 's/^/    /' >&2
+    tail -n 40 -- "$log_tmp" | sed 's/^/    /' >&2 || true
     if [[ -n "$run_dir" ]]; then
-        if mkdir -p -- "$run_dir/evidence" 2>/dev/null; then
-            cp -- "$log_tmp" "$run_dir/evidence/pod-log-agent.log"
-        else
-            echo "fork-sandbox-k8s: could not create $run_dir/evidence; agent log not saved there." >&2
+        if ! { mkdir -p -- "$run_dir/evidence" \
+            && cp -- "$log_tmp" "$run_dir/evidence/pod-log-agent.log"; } 2>/dev/null; then
+            echo "fork-sandbox-k8s: could not save the agent log to $run_dir/evidence." >&2
         fi
     fi
     rm -f -- "$log_tmp"
