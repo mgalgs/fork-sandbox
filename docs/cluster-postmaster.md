@@ -308,6 +308,12 @@ any non-fleet sender. The mail API only lets a token with the `upstream` cap
 (or an operator) produce it, so the cap is the authorization; see "Upstream
 moved" in [docs/agent-mail.md](agent-mail.md).
 
+`mail reply --upstream-state closed|open` takes the same `upstream` cap. A
+`closed` from any non-fleet sender stops the postmaster waking seats on that
+thread (CI sends it when the pull request closes, since that also tears the
+environment down); it resets nothing. See "Upstream closed" in
+[docs/agent-mail.md](agent-mail.md).
+
 Install refuses when:
 
 - an element is not an `@name` matching `^@[a-z0-9][a-z0-9-]*$`, or is

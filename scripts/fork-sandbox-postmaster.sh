@@ -55,7 +55,12 @@
 # null or {by, at} once a successful wake of the same seat (or the operator)
 # cleared the failure's flag reason. The two flags must be given together:
 # the text view is whole-store and the JSON view is per-thread, so either
-# alone exits 2. Plain `status` output is unchanged.
+# alone exits 2. A thread that has seen X-Upstream-State also carries
+# `upstream_state`: {state: "open"} or, closed, {state: "closed", message_id,
+# at} (the closing message and its time); the key is absent on a thread that
+# never did. Plain `status` output is unchanged, except that it ends with an
+# "upstream closed:" section (one `<thread>: CLOSED at <time> (msg <id>)`
+# line each) when any thread is closed.
 #
 # flag/unflag set or clear a thread's needs-operator flag by hand, e.g. to
 # silence a thread the operator intends to leave alone, or to re-arm one
@@ -94,8 +99,8 @@
 #                (rule 5) answered "not now": no spawn, no budget slot
 #   wake-gate-error thread, agent, reason=exit-<N>|timeout|missing|context --
 #                a wake gate could not answer, so the seat was woken anyway
-#   refuse       agent, thread, reason=hops|budget|budget-reserved|no-grant --
-#                an agent's
+#   refuse       agent, thread, reason=hops|budget|budget-reserved|no-grant|
+#                upstream-closed -- an agent's
 #                wake was refused (X-Hops or thread-budget gate, a seat
 #                outside the budget reserve while the thread is in its
 #                band (rule 3), or a
@@ -116,7 +121,10 @@
 #                who was originally woken via Cc, so a Cc-woken seat's
 #                follow-up can still produce a refuse line. reason=no-grant
 #                fires from pm_spawn_wake itself, not pm_followup_wake --
-#                see "Cluster seats" below.
+#                see "Cluster seats" below. reason=upstream-closed is the
+#                thread's upstream state (see UPSTREAM STATE below): every
+#                spawn path refuses, spends no budget and flags nothing.
+#                At route-pass time it names To: candidates only.
 #   held-release thread, agent, trigger=<short-id> -- a held `backend: k8s`
 #                seat (reason=no-grant above) was released by pm_held_pass:
 #                its grant file showed up, or its seat stopped resolving
@@ -150,6 +158,13 @@
 #                message carried X-Upstream-Head but nothing was recorded
 #                (a fleet agent never moves the upstream; the value was not
 #                `<branch> <40-hex sha>`).
+#   upstream-state thread, state=closed|open, msg=<short-id> -- a
+#                non-fleet sender's message moved the thread's upstream state
+#                (a redundant one emits nothing). See UPSTREAM STATE below.
+#   upstream-state-ignored thread, reason=fleet-sender|malformed -- a message
+#                carried X-Upstream-State but nothing was recorded (a fleet
+#                agent never closes or reopens a thread; the value was
+#                neither `closed` nor `open`).
 #   upstream-head-local-seat thread, agent -- a local (non-k8s) `sets` seat
 #                was woken on a thread with an upstream-head file; local
 #                seats get no `upstream` branch, so nothing was passed.
@@ -209,6 +224,34 @@
 # deleted), the reply is accepted and stamped with the CURRENT target's
 # branch and sha and the new X-Version; the review-target file keeps its sha
 # and takes the new VERSION.
+#
+# UPSTREAM STATE
+#
+# `mail reply --upstream-state <closed|open>` stamps X-Upstream-State on a
+# reply (see fork-sandbox-mail.sh and docs/agent-mail.md): the pull request
+# the thread reviews was closed or merged (`closed`), or reopened (`open`).
+# Only mail whose From does not resolve as a fleet agent counts (rule 1's
+# test, without the operator-list narrowing -- external client mail is how CI
+# sends it); a fleet agent's copy is delivered but ignored and logged.
+#
+# `closed` is written to $STATE/upstream-state/<thread-id>.env (STATE, MSGID,
+# AT), survives a restart, and from the moment the closing message is routed:
+#   - refuses every spawn on the thread -- new messages, follow-ups at
+#     harvest, retries, held-seat releases -- with a `refuse ...
+#     reason=upstream-closed` event and no budget spent; the closing message
+#     itself wakes no one, whatever its To/Cc say;
+#   - clears the thread's needs-operator flag (journaled as an unflag) and
+#     flags nothing afterwards for any of this: a wake still running at close
+#     is left to finish, and when it exits non-zero its wake-exit record is
+#     kept but no flag is raised and no retry is scheduled (the same holds for
+#     a wake that never produced summary.json, whose run dir vanished, or
+#     whose k8s wait timed out). Its harvested mail is archived and wakes no
+#     one. Pending retries and held seats are dropped when they come due,
+#     with a refuse event, and do not keep the thread from going quiescent;
+#   - leaves mail delivery to the archive untouched.
+# The thread reopens on a non-fleet `open`, or on any non-fleet message that
+# records an X-Upstream-Head; routing is then as before the close. Plain
+# operator mail without either header does not reopen it.
 #
 # HOOKS
 #
@@ -756,6 +799,9 @@
 #                                   message-id, run-id) -- an audit trail
 #                                   for the routing decision, not read back
 #                                   by anything (pm_ledger_delivered_live)
+#   upstream-state/<thread-id>.env STATE=closed|open, MSGID (the message
+#                                   that set it), AT -- see UPSTREAM STATE.
+#                                   Absent means open
 #   needs-operator/<thread-id>     flag file; content is the reason
 #   needs-operator-journal/<thread-id>  append-only per-thread history:
 #                                   one line per pm_flag call, plus one
@@ -1053,6 +1099,9 @@ WAKE_DEFERRED="$STATE/wake-deferred"
 # it flags at quiescence too, never at the moment of refusal.
 BUDGET_RESERVED="$STATE/budget-reserved"
 DEFERRAL_MARKS="$STATE/deferral-marks"
+# Per-thread upstream state, $UPSTREAM_STATE/<thread-id>.env (STATE=closed|open,
+# MSGID, AT) -- see UPSTREAM STATE in the header. No file means open.
+UPSTREAM_STATE="$STATE/upstream-state"
 PM_SEAT_RECORD_DIRS=("$WAKE_DEFERRED" "$BUDGET_RESERVED")
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
@@ -2157,7 +2206,8 @@ pm_hook_env() {
     local event="$1" tid="$2"
     shift 2
     PM_HOOK_ENV=("FS_HOOK_EVENT=$event" "FS_HOOK_THREAD=$tid"
-        "FS_HOOK_MAIL_ROOT=$MAIL_ROOT" "FS_HOOK_REPO=$PM_PROJECT")
+        "FS_HOOK_MAIL_ROOT=$MAIL_ROOT" "FS_HOOK_REPO=$PM_PROJECT"
+        "FS_HOOK_UPSTREAM_STATE=$(pm_upstream_state "$tid")")
     local rt="$STATE/review-target/$tid.env"
     if [[ -f "$rt" ]]; then
         PM_HOOK_ENV+=("FS_TARGET_BRANCH=$(fs_pm_env_get "$rt" BRANCH)"
@@ -2742,6 +2792,73 @@ pm_record_upstream_head() {
     return 0
 }
 
+# The thread's upstream state, open or closed (see UPSTREAM STATE in the
+# header); a thread that never saw X-Upstream-State is open.
+pm_upstream_state() {
+    local st
+    st="$(fs_pm_env_get "$UPSTREAM_STATE/$1.env" STATE)"
+    [[ "$st" == closed ]] && printf closed || printf open
+}
+
+pm_upstream_closed() {
+    [[ "$(pm_upstream_state "$1")" == closed ]]
+}
+
+# The one refusal every spawn path emits for a closed thread. Spends no
+# budget and flags nothing: a closed thread is finished, not broken.
+pm_upstream_refuse() {
+    pm_event "refuse thread=${1:0:8} agent=$2 reason=upstream-closed"
+}
+
+# pm_flag for a failure that is a consequence of the environment going away
+# (a wake that died or timed out): on a closed thread there is nothing for
+# the operator to act on, so nothing is flagged.
+pm_flag_unless_closed() {
+    pm_upstream_closed "$1" || pm_flag "$@"
+}
+
+# Moves thread <tid> to upstream state <closed|open> on message <mid>. A
+# redundant transition changes nothing and emits nothing. Closing clears the
+# thread's needs-operator flag (journaled by pm_unflag like any other clear).
+# Atomic tmp+mv, so a reader never sees a partial record.
+pm_set_upstream_state() {
+    local tid="$1" state="$2" mid="$3"
+    [[ "$(pm_upstream_state "$tid")" == "$state" ]] && return 0
+    mkdir -p -- "$UPSTREAM_STATE" || return 1
+    local tmp
+    tmp="$(mktemp "$UPSTREAM_STATE/.tmp.XXXXXX")" || return 1
+    {
+        printf 'STATE=%s\n' "$state"
+        printf 'MSGID=%s\n' "$mid"
+        printf 'AT=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -- "$tmp" "$UPSTREAM_STATE/$tid.env" || { rm -f -- "$tmp"; return 1; }
+    pm_event "upstream-state thread=${tid:0:8} state=$state msg=${mid:0:8}"
+    [[ "$state" == open ]] || pm_unflag "$tid"
+    return 0
+}
+
+# Handles an X-Upstream-State header on message <mid> of <tid> from
+# <from_name> (see UPSTREAM STATE in the header). Succeeds only when the
+# header was acted on; a fleet sender's or an unknown value is ignored and
+# logged -- a fleet seat can neither close nor reopen a thread.
+pm_record_upstream_state() {
+    local tid="$1" mid="$2" from_name="$3" value="$4"
+    if "$FLEET" resolve "$from_name" >/dev/null 2>&1; then
+        pm_event "upstream-state-ignored thread=${tid:0:8} reason=fleet-sender"
+        return 1
+    fi
+    if [[ "$value" != closed && "$value" != open ]]; then
+        pm_event "upstream-state-ignored thread=${tid:0:8} reason=malformed"
+        return 1
+    fi
+    if ! pm_set_upstream_state "$tid" "$value" "$mid"; then
+        echo "Error: postmaster: could not write the upstream-state file for thread $tid" >&2
+        return 1
+    fi
+    return 0
+}
+
 pm_append_pending() {
     local rid="$1" mid="$2"
     local f="$RUNS/$rid.env" existing
@@ -3182,6 +3299,13 @@ pm_wake_gate() {
 
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4" is_retry="${5:-}"
+    # Every spawn path -- new message, follow-up, retry, held release --
+    # passes here, so a closed thread is refused once, before anything is
+    # resolved, gated or written (see UPSTREAM STATE in the header).
+    if pm_upstream_closed "$tid"; then
+        pm_upstream_refuse "$tid" "$agent"
+        return 0
+    fi
     local harness model thinking network persona_path description wake_on_cc \
           refresh_at triage preset handler command backend endpoint grant \
           review_target wake_when
@@ -3702,8 +3826,9 @@ pm_process_message() {
     cc="$(pm_header "$f" Cc)"
     x_hops="$(pm_header "$f" X-Hops)"
     local from_name="${from#@}"
-    local uh_value
+    local uh_value us_value
     uh_value="$(pm_header "$f" X-Upstream-Head)"
+    us_value="$(pm_header "$f" X-Upstream-State)"
 
     if ! "$FLEET" resolve "$from_name" >/dev/null 2>&1; then
         if (( ! PM_CLUSTER )) || pm_is_operator "$from"; then
@@ -3721,10 +3846,23 @@ pm_process_message() {
     # the thread the way operator mail does, whoever the non-fleet sender is:
     # only mail reply --upstream-head can produce the header, and the mail
     # API gates that flag on a cap, so reaching here is the authorization.
+    local uh_recorded=0 us_applied=0
     if [[ -n "$uh_value" ]] && pm_record_upstream_head "$tid" "$mid" "$from_name" "$uh_value"; then
         pm_unflag "$tid"
         mkdir -p -- "$SPAWNS"
         : > "$SPAWNS/$tid"
+        uh_recorded=1
+    fi
+
+    # Upstream state (see UPSTREAM STATE in the header), applied before any
+    # wake is considered so the closing message itself wakes no one. An
+    # explicit header wins; absent one, a recorded upstream head means the
+    # upstream moved, which reopens a closed thread.
+    if [[ -n "$us_value" ]] && pm_record_upstream_state "$tid" "$mid" "$from_name" "$us_value"; then
+        us_applied=1
+    fi
+    if (( uh_recorded && ! us_applied )); then
+        pm_set_upstream_state "$tid" open "$mid" || true
     fi
 
     # Expanded regardless of the gate below: a refused message still needs
@@ -3762,6 +3900,17 @@ pm_process_message() {
         [[ "$cand" == "$from_name" ]] && continue
         to_candidates+=("$cand")
     done
+
+    # A closed thread wakes no one: no gate, no Cc resolution or triage, no
+    # flag (the hops/budget path below names To: candidates the same way).
+    # The message is routed -- it is in the archive -- and nothing more.
+    if pm_upstream_closed "$tid"; then
+        : > "$ROUTED/$mid"
+        for cand in "${to_candidates[@]}"; do
+            pm_upstream_refuse "$tid" "$cand"
+        done
+        return 0
+    fi
 
     # An @-shaped To: name that never expanded is a typo'd seat or a
     # missing fleet file, not an external address (rule 0 already let
@@ -4312,6 +4461,10 @@ pm_followup_wake() {
     # schedule in place would just retry into the same gate on every later
     # pass. The pre-existing pending-message caller (pm_harvest_run) never
     # checked this return and still doesn't need to.
+    if pm_upstream_closed "$tid"; then
+        pm_upstream_refuse "$tid" "$agent"
+        return 1
+    fi
     f="$(pm_find_by_id "$mid" || true)"
     if [[ -z "$f" ]]; then
         pm_flag "$tid" "pending message $mid vanished before follow-up wake"
@@ -4627,7 +4780,7 @@ pm_harvest_run() {
         # a timeout or a tracked pid (see LIMITATIONS), so it is treated
         # as a terminal failure: flag the thread and unblock the agent
         # instead of leaving fs_pm_find_live_run wedged on it forever.
-        pm_flag "$tid" "run dir for $agent vanished (run $rid)"
+        pm_flag_unless_closed "$tid" "run dir for $agent vanished (run $rid)"
         # Session state lives under this script's own state dir, not the
         # run dir that just vanished -- it is unaffected, so it is left
         # standing rather than cleared on evidence this branch never had.
@@ -4662,7 +4815,7 @@ pm_harvest_run() {
         # below. No summary.json means no evidence either way about the
         # session, so the prior recorded id (if any) is left standing
         # rather than cleared on nothing.
-        pm_flag "$tid" "wake never produced summary.json: $rid$adopt_failed"
+        pm_flag_unless_closed "$tid" "wake never produced summary.json: $rid$adopt_failed"
         was_failure=1
     else
         local exit_code
@@ -4687,7 +4840,7 @@ pm_harvest_run() {
             # retry is ever scheduled on this path, and the still-running
             # Job is left alone for an operator to fetch or remove by
             # hand.
-            pm_flag "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job is still running -- fetch it with fork-sandbox-k8s.sh fetch --branch $branch, or remove it with fork-sandbox-k8s.sh rm --branch $branch"
+            pm_flag_unless_closed "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job is still running -- fetch it with fork-sandbox-k8s.sh fetch --branch $branch, or remove it with fork-sandbox-k8s.sh rm --branch $branch"
             k8s_still_running=1
         elif [[ "$exit_code" != "0" ]]; then
             # Harvest whatever outbox there is (a crash mid-reply may still
@@ -4700,7 +4853,7 @@ pm_harvest_run() {
             local log_key=""
             pm_wake_exit_record "$tid" "$agent" "$rid" "$exit_code" "$run_dir" "$backend" \
                 && log_key="log=$rid"
-            pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete" "" "$log_key"
+            pm_flag_unless_closed "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete" "" "$log_key"
             # A crash's own summary.json, when present and id-shaped, is
             # exactly as trustworthy as the success path's (it may be the
             # id a --refresh-at mid-run credential rollover resumed onto) --
@@ -4851,7 +5004,7 @@ pm_harvest_run() {
         else
             pm_followup_wake "$project" "$agent" "$tid" "$newest"
         fi
-    elif (( was_failure )); then
+    elif (( was_failure )) && ! pm_upstream_closed "$tid"; then
         pm_retry_schedule "$tid" "$agent" "$trigger" "$rid"
     fi
 
@@ -4907,6 +5060,14 @@ pm_retry_pass() {
             [[ "$not_before" =~ ^[0-9]+$ ]] || continue
             (( $(date +%s) >= not_before )) || continue
             if fs_pm_find_live_run "$agent" "$tid" >/dev/null; then
+                continue
+            fi
+            if pm_upstream_closed "$tid"; then
+                # A refusal like the hops/budget ones: permanent for this
+                # trigger, so the schedule is dropped, not retried again.
+                pm_upstream_refuse "$tid" "$agent"
+                pm_retry_raw_write "$tid" "$agent" "$(pm_retry_fails_get "$tid" "$agent")" \
+                    "" "" "" "" "" "$(fs_pm_env_get "$f" LAST_FAILED_RUN)" ""
                 continue
             fi
             local fails attempt rstate max last_failed_run
@@ -4987,6 +5148,11 @@ pm_held_pass() {
                 fi
             fi
             (( release )) || continue
+            if pm_upstream_closed "$tid"; then
+                rm -f -- "$f"
+                pm_upstream_refuse "$tid" "$agent"
+                continue
+            fi
             local trigger retry_flag is_retry=""
             trigger="$(fs_pm_env_get "$f" TRIGGER)"
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
@@ -5041,6 +5207,9 @@ pm_thread_is_quiescent() {
         [[ -e "$HARVESTED/$rid" ]] || return 1
     done
     [[ "$(pm_thread_unrouted_count "$tid")" == 0 ]] || return 1
+    # On a closed thread a pending retry or a held seat will never fire (the
+    # retry and held passes refuse and drop them), so neither keeps it busy.
+    pm_upstream_closed "$tid" && return 0
     for f in "$RETRIES/$tid"/*; do
         [[ -f "$f" ]] || continue
         [[ "$(fs_pm_env_get "$f" STATE)" == pending ]] && return 1
@@ -5069,6 +5238,9 @@ pm_deferral_pass() {
         seen[$tid]=1
         count="$(pm_thread_message_count "$tid")"
         (( count > 0 )) || continue
+        # A closed thread is finished: a deferred or reserved wake is
+        # nothing the operator needs to hear about.
+        pm_upstream_closed "$tid" && continue
         [[ "$(cat -- "$DEFERRAL_MARKS/$tid" 2>/dev/null)" == "$count" ]] && continue
         pm_thread_is_quiescent "$tid" || continue
         pm_hook_mark "$DEFERRAL_MARKS" "$tid" "$count"
@@ -5330,6 +5502,14 @@ cmd_status_json() {
             printf '%s\0' grant
         fi
 
+        # Only a thread that has ever seen X-Upstream-State carries the key
+        # (a thread that never did prints exactly what it always did).
+        if [[ -f "$UPSTREAM_STATE/$tid.env" ]]; then
+            printf '%s\0' upstream_state "$(pm_upstream_state "$tid")" \
+                "$(fs_pm_env_get "$UPSTREAM_STATE/$tid.env" MSGID)" \
+                "$(fs_pm_env_get "$UPSTREAM_STATE/$tid.env" AT)"
+        fi
+
         if [[ -f "$STATE/review-target/$tid.env" ]]; then
             local rtf="$STATE/review-target/$tid.env"
             printf '%s\0' review_target \
@@ -5395,7 +5575,7 @@ if tok and tok[-1] == "":
 out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
        "review_target": None,
        "spawns": 0, "runs": [], "retries": [], "held": []}
-arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0,
+arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "upstream_state": 3,
          "review_target": 5, "spawns": 1,
          "run": 5, "retry": 4, "held": 3, "wake_exit": 3}
 wake_exits = []
@@ -5412,6 +5592,10 @@ while i < len(tok):
         out["flag"] = {"reason": a[0], "events": int(a[1]) if a[1] else None}
     elif tag == "grant":
         out["grant"] = True
+    elif tag == "upstream_state":
+        out["upstream_state"] = {"state": a[0]}
+        if a[0] == "closed":
+            out["upstream_state"].update({"message_id": a[1], "at": a[2]})
     elif tag == "review_target":
         out["review_target"] = {"branch": a[0], "sha": a[1],
                                  "version": int(a[2]) if a[2] else None,
@@ -5617,6 +5801,19 @@ cmd_status() {
         triaged_count=$(( triaged_count + $(wc -l < "$f") ))
     done
     printf '\ntriaged: %s\n' "$triaged_count"
+
+    # Only when there is one, so a store that never saw X-Upstream-State
+    # prints exactly what it always did.
+    local any_closed=0 uf utid
+    for uf in "$UPSTREAM_STATE"/*.env; do
+        [[ -e "$uf" ]] || continue
+        utid="$(basename -- "$uf" .env)"
+        pm_upstream_closed "$utid" || continue
+        (( any_closed )) || printf '\nupstream closed:\n'
+        printf '  %s: CLOSED at %s (msg %s)\n' "$utid" \
+            "$(fs_pm_env_get "$uf" AT)" "$(fs_pm_env_get "$uf" MSGID)"
+        any_closed=1
+    done
 }
 
 cmd_flag() {

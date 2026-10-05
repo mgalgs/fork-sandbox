@@ -7970,6 +7970,234 @@ unset FORK_SANDBOX_POSTMASTER_K8S_DETACH FORK_SANDBOX_POSTMASTER_K8S \
     FORK_SANDBOX_CONFIG_DIR FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
 # ============================================================
+printf '\n== upstream state: X-Upstream-State closed stops a thread waking its seats ==\n'
+# ============================================================
+
+# Nothing in this group may reach a real wake wrapper (a k8s seat is held
+# before any launch, but a regression must not start tmux either).
+export FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT=/bin/true
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+
+us_calls() { grep -c -- '----CALL----' "$STUB_ARGV_LOG"; }
+us_has() { [[ -e "$1" ]] && echo 1 || echo 0; }
+us_close() { reply_msg '@ci-demo' "$1" "${2:-the pull request was closed}" --to "${3:-@alice}" --upstream-state closed; }
+
+# -- one thread through the whole life: running wake at close, a flag, a
+# fleet sender's attempts, later mail, a hops-0 message, a restart --
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+hk_install on-quiescent on-harvest
+
+: > "$STUB_ARGV_LOG"
+us1_mid="$(send_msg '@carol' '@alice' 'closing topic' 'please review' 8)"
+us1_tid="$(thread_of "$us1_mid")"
+us1_short="${us1_tid:0:8}"
+once
+check "upstream-state: alice's wake spawned while the thread was open" 1 "$(us_calls)"
+check "upstream-state: a thread that never saw the header has no state file" 0 \
+    "$(us_has "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+check "upstream-state: an unseen thread has no upstream_state key in status --json" 0 \
+    "$("$postmaster" status --thread "$us1_tid" --json | grep -c upstream_state)"
+
+# A fleet seat can neither close nor reopen: delivered, header ignored.
+reply_msg '@bob' "$us1_mid" 'bob tries to close it' --to '@carol' --upstream-state closed >/dev/null
+: > "$work/once.out"
+once
+contains "upstream-state: a fleet sender's header is ignored and logged" "$(cat "$work/once.out")" \
+    "pm upstream-state-ignored thread=$us1_short reason=fleet-sender"
+check "upstream-state: a fleet sender writes no state file" 0 \
+    "$(us_has "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+check "upstream-state: the fleet sender's message still woke its addressee" 2 "$(us_calls)"
+
+# A flag present at close, and a message pending on the running wake.
+mkdir -p -- "$PM_STATE_DIR/needs-operator"
+printf 'something went wrong earlier\n' > "$PM_STATE_DIR/needs-operator/$us1_tid"
+reply_msg '@carol' "$us1_mid" 'one more thing for alice' --to '@alice' >/dev/null
+once
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+us_close "$us1_mid" >/dev/null
+once
+us1_close_mid="$(grep -l '^From: @ci-demo$' "$FORK_SANDBOX_MAIL_ROOT/threads/$us1_tid"/*.msg | xargs grep -l '^X-Upstream-State: closed$' | head -n1 | xargs sed -n 's/^Message-ID: //p')"
+contains "upstream-state: closing emits an upstream-state event" "$(cat "$work/once.out")" \
+    "pm upstream-state thread=$us1_short state=closed msg=${us1_close_mid:0:8}"
+check "upstream-state: STATE=closed is persisted" "closed" \
+    "$(sed -n 's/^STATE=//p' "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+check "upstream-state: the state records the closing message" "$us1_close_mid" \
+    "$(sed -n 's/^MSGID=//p' "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+check "upstream-state: the closing message woke no one" 0 "$(us_calls)"
+contains "upstream-state: the closing message's To: seat is refused" "$(cat "$work/once.out")" \
+    "pm refuse thread=$us1_short agent=alice reason=upstream-closed"
+check "upstream-state: a needs-operator flag present at close is cleared" 0 \
+    "$(us_has "$PM_STATE_DIR/needs-operator/$us1_tid")"
+check "upstream-state: the clear is journaled like an unflag" 1 \
+    "$(awk -F'\t' '$2=="unflag"{c++} END{print c+0}' "$PM_STATE_DIR/needs-operator-journal/$us1_tid")"
+check "upstream-state: the closing message is routed" 1 "$(us_has "$PM_STATE_DIR/routed/$us1_close_mid")"
+
+# Redundant closed: no event, no change.
+us_close "$us1_mid" 'closed again' >/dev/null
+: > "$work/once.out"
+once
+not_contains "upstream-state: a redundant closed emits no state event" "$(cat "$work/once.out")" "pm upstream-state "
+
+# The wake that was running at close fails: evidence kept, nothing else.
+finish_run alice 1
+: > "$work/once.out"
+once
+check "upstream-state: a running wake failing after close raises no flag" 0 \
+    "$(us_has "$PM_STATE_DIR/needs-operator/$us1_tid")"
+not_contains "upstream-state: ... and no flag event" "$(cat "$work/once.out")" "pm flag "
+check "upstream-state: ... but its wake-exit record is still written" 1 \
+    "$(find "$PM_STATE_DIR/wake-exits/$us1_tid/alice" -name "*.json" 2>/dev/null | wc -l)"
+contains "upstream-state: ... and status --json serves it" \
+    "$("$postmaster" status --thread "$us1_tid" --json)" '"wake_failures"'
+check "upstream-state: ... no retry is scheduled" 0 \
+    "$(grep -l 'STATE=pending' "$PM_STATE_DIR/retries/$us1_tid"/* 2>/dev/null | wc -l)"
+contains "upstream-state: ... the pending message's follow-up wake is refused" "$(cat "$work/once.out")" \
+    "pm refuse thread=$us1_short agent=alice reason=upstream-closed"
+check "upstream-state: ... and spawned nothing" 0 "$(us_calls)"
+
+# Later mail: archived, routed, no wake, no flag -- even a hops-0 message.
+reply_msg '@carol' "$us1_mid" 'late mail' --to '@bob,@alice' >/dev/null
+reply_msg '@carol' "$us1_mid" 'exhausted' --to '@bob' --hops 0 >/dev/null
+: > "$work/once.out"
+once
+check "upstream-state: later mail wakes no one" 0 "$(us_calls)"
+contains "upstream-state: later mail's refusals are named" "$(cat "$work/once.out")" \
+    "pm refuse thread=$us1_short agent=bob reason=upstream-closed"
+check "upstream-state: a hops-0 message on a closed thread flags nothing" 0 \
+    "$(us_has "$PM_STATE_DIR/needs-operator/$us1_tid")"
+check "upstream-state: no mail is left unrouted" 0 \
+    "$("$postmaster" status --thread "$us1_tid" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["unrouted"])')"
+
+# Visibility: status --json, the human status, hooks.
+us1_json="$("$postmaster" status --thread "$us1_tid" --json)"
+check "upstream-state: status --json shows closed, the closing message and a time" "closed $us1_close_mid 1" \
+    "$(python3 -c 'import json,sys; u=json.loads(sys.argv[1])["upstream_state"]; print(u["state"], u["message_id"], int(bool(u["at"])))' "$us1_json")"
+contains "upstream-state: the human status shows the thread as CLOSED" \
+    "$("$postmaster" status 2>&1)" "$us1_tid: CLOSED"
+finish_run carol 0
+once
+once
+check "upstream-state: a closed thread fires on-quiescent" 1 "$([[ "$(hk_count on-quiescent)" -ge 1 ]] && echo 1 || echo 0)"
+check "upstream-state: on-quiescent gets FS_HOOK_UPSTREAM_STATE=closed" "closed" "$(hk_env on-quiescent FS_HOOK_UPSTREAM_STATE)"
+check "upstream-state: the thread is not flagged when it goes quiet" 0 \
+    "$(us_has "$PM_STATE_DIR/needs-operator/$us1_tid")"
+
+# Plain operator mail does NOT reopen; the state survives the restart (each
+# `once` is a fresh process).
+: > "$STUB_ARGV_LOG"
+reply_msg '@ci-demo' "$us1_mid" 'a plain operator word' --to '@alice' >/dev/null
+once
+check "upstream-state: plain operator mail does not reopen a closed thread" "closed" \
+    "$(sed -n 's/^STATE=//p' "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+check "upstream-state: ... and wakes no one" 0 "$(us_calls)"
+
+# A fleet seat cannot reopen either.
+reply_msg '@bob' "$us1_mid" 'bob tries to reopen' --to '@carol' --upstream-state open >/dev/null
+once
+check "upstream-state: a fleet sender cannot reopen" "closed" \
+    "$(sed -n 's/^STATE=//p' "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+
+# open reopens; routing is as before, rule 1's reset applies.
+: > "$work/once.out"
+reply_msg '@ci-demo' "$us1_mid" 'reopened' --to '@alice' --upstream-state open >/dev/null
+once
+contains "upstream-state: open emits an upstream-state event" "$(cat "$work/once.out")" \
+    "pm upstream-state thread=$us1_short state=open msg="
+check "upstream-state: open woke the addressed seat again" 1 "$(us_calls)"
+check "upstream-state: status --json shows open once reopened" "open" \
+    "$("$postmaster" status --thread "$us1_tid" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["upstream_state"]["state"])')"
+check "upstream-state: the human status no longer lists it as CLOSED" 0 \
+    "$("$postmaster" status 2>&1 | grep -c "$us1_tid: CLOSED")"
+
+# -- a non-fleet X-Upstream-Head reopens; both flags on one reply: state wins --
+us_head_sha="$(printf 'a%.0s' {1..40})"
+us_close "$us1_mid" 'closed once more' >/dev/null
+once
+check "upstream-state: closed again" "closed" "$(sed -n 's/^STATE=//p' "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+: > "$work/once.out"
+reply_msg '@ci-demo' "$us1_mid" 'pushed after reopen' --to '@alice' --upstream-head "feature/y:$us_head_sha" >/dev/null
+once
+check "upstream-state: a non-fleet X-Upstream-Head reopens a closed thread" "open" \
+    "$(sed -n 's/^STATE=//p' "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+contains "upstream-state: ... with the state event" "$(cat "$work/once.out")" "pm upstream-state thread=$us1_short state=open"
+reply_msg '@ci-demo' "$us1_mid" 'closed and pushed' --to '@alice' \
+    --upstream-head "feature/y:$us_head_sha" --upstream-state closed >/dev/null
+once
+check "upstream-state: both flags on one reply: the explicit state wins" "closed" \
+    "$(sed -n 's/^STATE=//p' "$PM_STATE_DIR/upstream-state/$us1_tid.env")"
+hk_uninstall
+
+# -- a closed thread's retry is refused and dropped when it comes due --
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+us2_mid="$(send_msg '@carol' '@alice' 'retry then close' 'first' 8)"
+us2_tid="$(thread_of "$us2_mid")"
+us2_short="${us2_tid:0:8}"
+once
+finish_run alice 1
+once
+check "upstream-state retry: the failure scheduled a pending retry" 1 \
+    "$(grep -l 'STATE=pending' "$PM_STATE_DIR/retries/$us2_tid"/* 2>/dev/null | wc -l)"
+us_close "$us2_mid" >/dev/null
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "upstream-state retry: the due retry spawned nothing" 0 "$(us_calls)"
+contains "upstream-state retry: the retry is refused with the closed reason" "$(cat "$work/once.out")" \
+    "pm refuse thread=$us2_short agent=alice reason=upstream-closed"
+not_contains "upstream-state retry: no retry event is emitted" "$(cat "$work/once.out")" "pm retry "
+check "upstream-state retry: the schedule is dropped" 0 \
+    "$(grep -l 'STATE=pending' "$PM_STATE_DIR/retries/$us2_tid"/* 2>/dev/null | wc -l)"
+check "upstream-state retry: the thread is not flagged" 0 "$(us_has "$PM_STATE_DIR/needs-operator/$us2_tid")"
+
+# -- a clean wake that finishes after the close: its mail is archived, wakes no one --
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+us3_mid="$(send_msg '@carol' '@alice' 'harvest after close' 'first' 8)"
+us3_tid="$(thread_of "$us3_mid")"
+once
+us_close "$us3_mid" >/dev/null
+once
+finish_run alice 0
+printf 'To: @bob\nSubject: late finding\n\nfound it\n' > "$(sed -n 's/^RUN_DIR=//p' "$(env_file_for_agent alice)")/outbox/mail-1.md"
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+once
+check "upstream-state harvest: the late reply is archived" 1 \
+    "$(grep -l '^Subject: late finding' "$FORK_SANDBOX_MAIL_ROOT/threads/$us3_tid"/*.msg 2>/dev/null | wc -l)"
+check "upstream-state harvest: ... and wakes no one" 0 "$(us_calls)"
+check "upstream-state harvest: ... and flags nothing" 0 "$(us_has "$PM_STATE_DIR/needs-operator/$us3_tid")"
+
+# -- a held seat's release is refused, and the held record goes --
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+us4_mid="$(send_msg '@carol' '@karl' 'held then close' 'first' 8)"
+us4_tid="$(thread_of "$us4_mid")"
+us4_short="${us4_tid:0:8}"
+once
+check "upstream-state held: the seat is held awaiting a grant" 1 "$(us_has "$PM_STATE_DIR/held/$us4_tid/karl")"
+us_close "$us4_mid" 'closed' '@karl' >/dev/null
+once
+"$MAIL" grant "$us4_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "upstream-state held: the granted seat is not launched" 0 "$(us_calls)"
+contains "upstream-state held: the release is refused with the closed reason" "$(cat "$work/once.out")" \
+    "pm refuse thread=$us4_short agent=karl reason=upstream-closed"
+not_contains "upstream-state held: no held-release event" "$(cat "$work/once.out")" "pm held-release"
+check "upstream-state held: the held record is removed" 0 "$(us_has "$PM_STATE_DIR/held/$us4_tid/karl")"
+
+unset FORK_SANDBOX_POSTMASTER_K8S_DETACH FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 

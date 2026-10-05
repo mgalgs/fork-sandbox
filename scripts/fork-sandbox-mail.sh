@@ -15,6 +15,7 @@
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
 #                              [--header 'X-Name: value']...
 #                              [--upstream-head <branch>:<sha>]
+#                              [--upstream-state closed|open]
 #        fork-sandbox-mail.sh show <message-id>
 #        fork-sandbox-mail.sh tree <thread-id>
 #        fork-sandbox-mail.sh export <thread-id> --json
@@ -62,6 +63,16 @@
 # `send --upstream-head` is refused, since there is no thread to move. It is
 # the ONLY way to produce the header -- a raw `--header X-Upstream-Head: ...`
 # is refused here and at the mail API.
+#
+# `reply --upstream-state closed|open` tells the postmaster the upstream pull
+# request the thread reviews was closed or merged (`closed`: it stops waking
+# seats on the thread and treats it as finished) or reopened (`open`). It
+# stamps `X-Upstream-State: closed|open` on the reply (docs/agent-mail.md,
+# "Upstream closed"), and may be given together with --upstream-head. Reply
+# only, for the same reason as --upstream-head, and the ONLY way to produce
+# the header: a raw `--header X-Upstream-State: ...` (any letter case) is
+# refused here and at the mail API. The postmaster honors it from a sender
+# that is not a fleet agent only.
 #
 # Layout, under $FORK_SANDBOX_MAIL_ROOT (default
 # /var/tmp/claude-scratch/agent-mail):
@@ -113,9 +124,11 @@
 #                                 X- headers may be set this way; core
 #                                 headers are refused by the name pattern
 #                                 alone) and may not be X-Hops,
-#                                 X-Attachment or X-Upstream-Head, which
-#                                 this store writes itself (the last only
-#                                 via `reply --upstream-head`). --header
+#                                 X-Attachment, X-Upstream-Head or
+#                                 X-Upstream-State (any letter case), which
+#                                 this store writes itself (the last two only
+#                                 via `reply --upstream-head` and
+#                                 `reply --upstream-state`). --header
 #                                 does not refuse
 #                                 X-Review-Target/X-Review-Target-Set/
 #                                 X-Version -- those are stamped by
@@ -139,6 +152,10 @@
 #                                 <branch>:<sha>` only: the upstream moved
 #                                 to that commit -- see the paragraph on
 #                                 `reply --upstream-head` above
+#   X-Upstream-State: closed|open          `reply --upstream-state` only: the
+#                                 upstream pull request was closed or
+#                                 reopened -- see the paragraph on
+#                                 `reply --upstream-state` above
 #
 # Unlike the RFC-2822-style angle-bracket/domain ids this repo's old
 # lkml-mailbox.sh used, ids here are bare uuids with no "<...>" wrapping and
@@ -248,7 +265,7 @@ mail_validate_no_newline() {
 # any name that isn't ^X-[A-Za-z0-9-]+$ (core, non-X headers are refused by
 # this pattern alone -- only custom X- headers may be set this way), and the
 # reserved names this store writes itself (X-Hops, X-Attachment,
-# X-Upstream-Head).
+# X-Upstream-Head, X-Upstream-State), in any letter case.
 mail_validate_header() {
     local raw="$1" name value
     mail_validate_no_newline "$raw" "--header" || return 1
@@ -263,8 +280,8 @@ mail_validate_header() {
         echo "Error: --header name '$name' must match 'X-[A-Za-z0-9-]+' -- only custom X- headers may be set." >&2
         return 1
     fi
-    case "$name" in
-        X-Hops|X-Attachment|X-Upstream-Head)
+    case "${name^^}" in
+        X-HOPS|X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE)
             echo "Error: --header may not set reserved header '$name'." >&2
             return 1
             ;;
@@ -462,6 +479,17 @@ mail_validate_upstream_head() {
         return 1
     fi
     printf '%s\t%s' "$branch" "$sha"
+}
+
+# Validates a `--upstream-state <closed|open>` value and prints it back.
+mail_validate_upstream_state() {
+    local raw="$1"
+    mail_validate_no_newline "$raw" "--upstream-state" || return 1
+    if [[ "$raw" != closed && "$raw" != open ]]; then
+        echo "Error: --upstream-state '$raw' must be 'closed' or 'open'." >&2
+        return 1
+    fi
+    printf '%s' "$raw"
 }
 
 # Writes the per-thread review-target state file for <tid>, atomically
@@ -707,6 +735,11 @@ cmd_send() {
                 echo "upstream to move." >&2
                 return 1
                 ;;
+            --upstream-state)
+                echo "Error: send: --upstream-state applies to a reply only (mail reply); a new thread has no" >&2
+                echo "upstream to close." >&2
+                return 1
+                ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -848,7 +881,7 @@ cmd_send() {
 cmd_reply() {
     local from="" reply_to="" body_arg="" to="" cc="" subject_override="" hops_override=""
     local -a attach_files=() extra_headers=()
-    local upstream_head_arg=""
+    local upstream_head_arg="" upstream_state_arg=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -861,6 +894,7 @@ cmd_reply() {
             --hops) hops_override="${2:?--hops requires a number}"; shift 2 ;;
             --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
             --upstream-head) upstream_head_arg="${2:?--upstream-head requires <branch>:<sha>}"; shift 2 ;;
+            --upstream-state) upstream_state_arg="${2:?--upstream-state requires closed or open}"; shift 2 ;;
             --allow-namespace|--reach-probe|--context-ro|--context-secret)
                 echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
                 echo "fork-sandbox mail grant <thread-id> ..." >&2
@@ -892,6 +926,12 @@ cmd_reply() {
         local uh_out
         uh_out="$(mail_validate_upstream_head "$upstream_head_arg")" || return 1
         upstream_head_hline="X-Upstream-Head: ${uh_out%%$'\t'*} ${uh_out#*$'\t'}"
+    fi
+    local upstream_state_hline=""
+    if [[ -n "$upstream_state_arg" ]]; then
+        local us_out
+        us_out="$(mail_validate_upstream_state "$upstream_state_arg")" || return 1
+        upstream_state_hline="X-Upstream-State: $us_out"
     fi
 
     mail_validate_addr "$from" || return 1
@@ -989,6 +1029,7 @@ cmd_reply() {
     hlines+=("References: $references")
     hlines+=("X-Hops: ${hops_override:-$p_hops}")
     [[ -n "$upstream_head_hline" ]] && hlines+=("$upstream_head_hline")
+    [[ -n "$upstream_state_hline" ]] && hlines+=("$upstream_state_hline")
     for hline in "${validated_headers[@]:-}"; do
         [[ -n "$hline" ]] && hlines+=("$hline")
     done

@@ -140,6 +140,8 @@ Under `$FORK_SANDBOX_MAIL_ROOT` (default
 <root>/.postmaster/upstream-head/<thread-id>.env  the last upstream-moved
                                                    announcement (see "Upstream
                                                    moved" below)
+<root>/.postmaster/upstream-state/<thread-id>.env  open or closed (see
+                                                   "Upstream closed" below)
 ```
 
 A thread id is the Message-ID of the message that started it, so a thread
@@ -178,8 +180,9 @@ router's job, not the store's, and `--hops` is the override the router
 
 `--header 'X-Name: value'` on `send`/`reply` may be repeated and sets an
 arbitrary custom header; the name must match `^X-[A-Za-z0-9-]+$` and may
-not be `X-Hops`, `X-Attachment` or `X-Upstream-Head`, which the store
-writes itself (the last only through `reply --upstream-head`). The
+not be `X-Hops`, `X-Attachment`, `X-Upstream-Head` or `X-Upstream-State`
+(any letter case), which the store writes itself (the last two only through
+`reply --upstream-head` and `reply --upstream-state`). The
 postmaster uses this to stamp `X-AI-Persona`/`X-AI-Harness`/`X-AI-Model`/
 `X-AI-Network` attribution on every harvested reply (see "The event
 stream" in the postmaster section); the `--text` render view shows it as
@@ -265,6 +268,12 @@ authority is written down.
   token, by the mail API). Only a message from a sender that is not a
   fleet agent is acted on; a fleet agent's copy is ignored. See "Upstream
   moved" below.
+- **`X-Upstream-State`**: `closed` or `open`, stamped only by `mail reply
+  --upstream-state closed|open`: the upstream pull request was closed or
+  merged, or reopened. Never settable through `--header` (refused by the
+  store and, for every token, by the mail API). Only a message from a sender
+  that is not a fleet agent is acted on; a fleet agent's copy is delivered
+  and ignored. See "Upstream closed" below.
 - **`X-Version`**: the version of the review target a message belongs to.
   On the setter message, the new version. On a `follow` reply, the
   spawned target's version. On any other harvested reply from the `sets`
@@ -851,11 +860,83 @@ Local (non-k8s) seats get no `upstream` branch: the postmaster only logs an
 `upstream-head-local-seat` event when a local `sets` seat wakes on a
 thread with an upstream-head file.
 
+### Upstream closed: `mail reply --upstream-state closed|open`
+
+When the pull request a panel reviews is merged or closed, whatever runs
+the seats' environment is torn down, and a wake into it fails. The
+postmaster is the only party that can stop spawning them, so the system
+that closes the PR tells it:
+
+```
+fork-sandbox-mail.sh reply --from @ci-demo --reply-to <message-id> \
+    --to @pr-author --upstream-state closed --body ...
+```
+
+The value must be `closed` or `open`. The reply is stamped
+`X-Upstream-State: <value>`. It is reply-only (`send --upstream-state` is
+refused), may be combined with `--upstream-head`, and is the only way to
+produce the header: a raw `--header X-Upstream-State: ...` is refused by
+`mail` and by the mail API, case-insensitively and for an operator token too.
+Over the mail API the flag needs the `upstream` cap, exactly like
+`--upstream-head` (see [docs/mail-api.md](mail-api.md)).
+
+Only a message **from a sender that is not a fleet agent** (operator or
+external/client mail — rule 1's test, but not narrowed to the operator list
+under `--cluster`) changes the thread's state. A fleet seat's copy is
+delivered normally and logged as `upstream-state-ignored`
+(`reason=fleet-sender`; an unknown value is `reason=malformed`): a seat can
+neither close nor reopen a thread. The state is persisted in
+`.postmaster/upstream-state/<thread-id>.env` (`STATE`, `MSGID`, `AT`) and
+survives a postmaster restart. A thread that never saw the header is open.
+
+From the moment the closing message is routed, the thread is **closed**:
+
+- **Nothing spawns.** New-message wakes, follow-up wakes at harvest, retries
+  of failed wakes and held-seat releases are all refused, each with a
+  `refuse thread=… agent=… reason=upstream-closed` event. No spawn budget is
+  spent. (At route time the event names only the message's `To:`
+  candidates; Cc resolution and triage are skipped, as for a refused
+  message.) The closing message itself wakes no one, whatever its `To:`/`Cc:`
+  say. A pending retry or held seat is dropped when it comes due, and neither
+  keeps the thread from going quiescent.
+- **Nothing is flagged for it.** An existing needs-operator flag is cleared
+  when `closed` arrives, journaled like an unflag. A wake that was already
+  running is left to finish (the postmaster has no way to stop one). If it
+  exits non-zero, its wake-exit record is still written (see "Status") but
+  no wake-exit flag is raised and no retry is scheduled; likewise for a wake
+  that never produced `summary.json`, whose run dir vanished, or whose k8s
+  wait timed out. If it exits 0 and its harvest posts mail, that mail is
+  archived and wakes no one.
+- **Mail still delivers.** The archive is unaffected; only wakes stop.
+
+The thread **reopens** on a non-fleet `X-Upstream-State: open`, or on any
+non-fleet message that records an `X-Upstream-Head` (a reopened PR that got
+a push). Routing is then exactly as before the close: rule 1's reset applies
+as it does today. Plain operator mail without either header does **not**
+reopen a closed thread; the operator reopens deliberately with
+`--upstream-state open`. When one message carries both `--upstream-head`
+and `--upstream-state`, the explicit state wins.
+
+A state change emits `upstream-state thread=<8> state=closed|open msg=<8>`;
+a redundant `closed` on a closed thread changes nothing and emits nothing.
+The thread's state is in `postmaster status --thread <tid> --json` (see
+"Status") and in `FS_HOOK_UPSTREAM_STATE` for every hook; the human `status`
+view lists closed threads as CLOSED. A closed thread fires `on-quiescent`
+once when it goes quiet, as any thread does.
+
 ### Status
 
 `postmaster status --thread <tid> --json` includes a `review_target`
 field: an object with `branch`, `sha`, `version`, `set_by`, `set_at`, or
 `null` when the thread has no review target.
+
+A thread that has ever seen `X-Upstream-State` also has an `upstream_state`
+field: `{"state": "open"}`, or, when closed, `{"state": "closed",
+"message_id": "<the closing message>", "at": "<UTC timestamp>"}`. The key is
+absent on a thread that never did, so its output is unchanged. The plain
+(human) `status` ends with an `upstream closed:` section, one
+`<thread-id>: CLOSED at <time> (msg <id>)` line per closed thread, printed
+only when there is one.
 
 It also includes a `wake_failures` list, present only on a thread where a
 wake has exited non-zero (a thread whose wakes all succeeded has no such
@@ -979,7 +1060,7 @@ attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
 now; see rule 5), `wake-gate-error` (thread, agent,
 reason=exit-<N>|timeout|missing|context — a gate could not answer and
 the seat was woken anyway),
-`refuse` (agent, thread, reason=hops|budget|budget-reserved — at
+`refuse` (agent, thread, reason=hops|budget|budget-reserved|upstream-closed — at
 route-pass time this names only the message's `To:` candidates, since a
 refused message skips Cc resolution outright, but the same gate is
 re-checked at follow-up-wake time against whichever agent owns the live
@@ -988,6 +1069,9 @@ woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
 line), `upstream-head` (thread, sha=<12 hex> — an upstream-moved announcement was
 recorded), `upstream-head-ignored` (thread, reason=fleet-sender|malformed),
 `upstream-head-local-seat` (thread, agent — see "Upstream moved" above),
+`upstream-state` (thread, state=closed|open, msg=<8 hex> — the thread's
+upstream state changed), `upstream-state-ignored` (thread,
+reason=fleet-sender|malformed — see "Upstream closed" above),
 `triage-skip` (agent, thread), `handler` (agent,
 thread, exit=<status>), `hook` (thread, hook=<event>, file=<basename>,
 exit=<n|timeout|lost|launch>; a hook finished or failed to launch; it
@@ -1066,6 +1150,7 @@ A hook inherits the postmaster's own environment, plus:
 | `FS_HOOK_THREAD` | always | the full thread id |
 | `FS_HOOK_MAIL_ROOT` | always | the mail root |
 | `FS_HOOK_REPO` | always | the `deliver --project` repo path |
+| `FS_HOOK_UPSTREAM_STATE` | always (and the wake gate) | `open` or `closed`: the thread's upstream state — see "Upstream closed" |
 | `FS_TARGET_BRANCH`, `FS_TARGET_SHA`, `FS_TARGET_VERSION`, `FS_TARGET_SET_BY`, `FS_TARGET_SET_AT` | the thread has a review target, on every event | the fields of the thread's review target |
 | `FS_TARGET_REPO` | the thread has a review target, on every event | same value as `FS_HOOK_REPO` |
 | `FS_HOOK_MESSAGES` | `on-harvest` | ids of the messages that run's harvest posted, space-separated, in posting order |
@@ -1226,7 +1311,10 @@ thread routes it.
    hops is separate, and needs `mail send --hops` on a fresh thread — an
    operator's `mail reply` copies the parent's `X-Hops` verbatim like any
    other reply. A message carrying `X-Upstream-Head` from a non-fleet
-   sender resets T the same way (see "Upstream moved").
+   sender resets T the same way (see "Upstream moved"). Right after this
+   rule, and before any wake is considered, the message's `X-Upstream-State`
+   is applied (see "Upstream closed"): when T is closed, M is archived and
+   routed, wakes no one, and rules 2–5 are skipped.
 2. **Hops gate.** `X-Hops == 0` means no wakes from M. Flag T
    needs-operator, reason `hops exhausted at <message-id>`.
 3. **Thread budget.** Spawns so far ≥ budget (default 96,
@@ -1295,7 +1383,8 @@ thread routes it.
      inherit the lock fd.
    - **What it gets.** The environment every hook gets (`FS_HOOK_EVENT`
      is `wake-when`, plus `FS_HOOK_THREAD`, `FS_HOOK_MAIL_ROOT`,
-     `FS_HOOK_REPO` and the review-target variables), plus
+     `FS_HOOK_REPO`, `FS_HOOK_UPSTREAM_STATE` and the review-target
+     variables), plus
      `FS_HOOK_AGENT` (the seat), `FS_HOOK_MESSAGE` (the trigger's
      message id), `FS_HOOK_MESSAGE_FILE` (absolute path of that message
      in the store, to read its headers without searching),
@@ -1593,6 +1682,7 @@ own thread scans never see it:
 | `needs-operator-journal/<thread-id>` | append-only history: one line per `pm_flag` call (timestamp, `flag`, keyword, reason) and one per `pm_unflag` call that actually cleared a flag (timestamp, `unflag`, empty keyword, empty reason) — a redundant unflag on an already-clear thread appends nothing — and one `clear` line (keyword `wake-exit`, reason `<the original reason> cleared by run <run id>`) per wake-exit flag a seat's successful wake cleared. The flag-line count is what `status` shows next to the current reason, or `(no journal)` if this file doesn't exist yet for a thread flagged before the journal did. Operator-readable, but not display-only: a successful retry's clear reads it, so the `flag`/`unflag`/`clear` kind, the keyword and a wake-exit reason's `wake for <agent> exited ` prefix and `(run <id>)` shape are load-bearing |
 | `wake-exits/<thread-id>/<agent>/<run-id>.json` | one failed wake's evidence: agent, run id, exit code, capped log tail (see "Status"), written once and never rewritten. A sibling `<run-id>.cleared` (`BY`, `AT`) marks it cleared. Served as `wake_failures` by `status --thread --json`; nothing routes on it |
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 (and by an `X-Upstream-Head` message) — line count is the **budget** count |
+| `upstream-state/<thread-id>.env` | the thread's upstream state: `STATE` (`closed` or `open`), `MSGID` (the message that set it), `AT`. No file means open — see "Upstream closed" |
 | `upstream-head/<thread-id>.env` | the thread's last upstream-moved announcement: `BRANCH`, `SHA`, `MSGID`, `SET_AT` — see "Upstream moved" |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |

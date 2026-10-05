@@ -784,6 +784,49 @@ check "the flag alongside a raw header is refused for an operator" "403" \
 check "the refused calls wrote no message" "$uh_msgs_before" \
     "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
 
+printf '== 11c. upstream-state: same cap as --upstream-head, and header refusal ==\n'
+
+us_msgs_before="$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+check "no upstream cap: reply --upstream-state: 403" "403" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- reply --from @bot --reply-to "$rt_tid" --body - --upstream-state closed)"
+contains "... says which cap is missing" "$(rjson error)" "'upstream' cap"
+check "a target cap alone does not carry it: 403" "403" \
+    "$(xr "$tok/targeter" --tool mail --stdin hi -- reply --from @targeter --reply-to "$rt_tid" --body - --upstream-state closed)"
+check "no upstream cap: nothing written" "$us_msgs_before" "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+check "upstream cap: reply --upstream-state closed: 200" "200" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- reply --from @upstreamer --reply-to "$rt_tid" --body - --upstream-state closed)"
+check "upstream cap: that reply ran: rc 0" "0" "$(rjson rc)"
+us_id="$(rjson stdout | tr -d '\n')"
+contains "upstream cap: the reply carries X-Upstream-State" "$("$mail" show "$us_id")" "X-Upstream-State: closed"
+check "upstream cap: --upstream-state with --upstream-head: 200" "200" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- reply --from @upstreamer --reply-to "$rt_tid" --body - --upstream-state open --upstream-head "feature/x:$uh_sha")"
+check "operator: reply --upstream-state: 200" "200" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$rt_tid" --body - --upstream-state closed)"
+check "upstream cap does not allow --from another identity: 403" "403" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- reply --from @bot --reply-to "$rt_tid" --body - --upstream-state closed)"
+check "send --upstream-state: 403 for the upstream cap" "403" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- send --from @upstreamer --to @x --subject u --body - --upstream-state closed)"
+check "send --upstream-state: 403 for an operator token too" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject u --body - --upstream-state closed)"
+
+us_msgs_before="$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+check "raw X-Upstream-State header refused on reply (upstream cap)" "403" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- reply --from @upstreamer --reply-to "$rt_tid" --body - --header "X-Upstream-State: closed")"
+contains "... says why" "$(rjson error)" "X-Upstream-State"
+check "raw x-upstream-state header (lowercase) refused on reply" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$rt_tid" --body - --header "x-upstream-state: closed")"
+check "raw X-UPSTREAM-STATE header (uppercase) refused on reply" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$rt_tid" --body - --header "X-UPSTREAM-STATE: closed")"
+check "raw X-Upstream-State header refused on send" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Upstream-State: closed")"
+check "raw X-Upstream-State header refused for an operator token on reply" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$rt_tid" --body - --header "X-Upstream-State: closed")"
+check "raw X-Upstream-State header refused for an operator token on send" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject h --body - --header "X-Upstream-State: closed")"
+check "the flag alongside a raw header is refused for an operator" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$rt_tid" --body - --upstream-state closed --header "X-Upstream-State: open")"
+check "the refused calls wrote no message" "$us_msgs_before" "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+
 printf '== 12. list --json --header for a read token ==\n'
 
 demo_tid="$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject demo --body - --header "X-Demo-PR: 42" >/dev/null; rjson stdout | tr -d '\n')"

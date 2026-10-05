@@ -856,6 +856,66 @@ check "the refused replies still wrote no message" "$uh_msgs_before" \
 
 contains "usage header documents reply --upstream-head" "$("$mail" --help 2>&1 || true)" "--upstream-head <branch>:<sha>"
 
+printf '\n== reply: --upstream-state ==\n'
+
+us_msgs_before="$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+for us_val in closed open; do
+    us_id="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+        --upstream-state "$us_val" --body - <<< "state" 2>diag.txt)"
+    check "reply --upstream-state $us_val exits 0" "0" "$?"
+    us_raw="$("$mail" show "$us_id")"
+    contains "reply --upstream-state $us_val stamps X-Upstream-State" "$us_raw" "X-Upstream-State: $us_val"
+    check "the state header appears exactly once" "1" "$(grep -c '^X-Upstream-State:' <<< "$us_raw")"
+done
+
+us_both="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+    --upstream-head "feature/x:$uh_sha" --upstream-state closed --body - <<< "both" 2>/dev/null)"
+check "--upstream-state and --upstream-head together: exits 0" "0" "$?"
+us_raw="$("$mail" show "$us_both")"
+contains "... both headers are stamped (head)" "$us_raw" "X-Upstream-Head: feature/x $uh_sha"
+contains "... both headers are stamped (state)" "$us_raw" "X-Upstream-State: closed"
+
+us_plain="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author --body - <<< "plain" 2>/dev/null)"
+check "a reply without the flag carries no X-Upstream-State" "0" \
+    "$("$mail" show "$us_plain" | grep -c '^X-Upstream-State:')"
+
+us_threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+out="$("$mail" send --from @ci-demo --to @pr-author --subject "No thread to close" --body - \
+    --upstream-state closed <<< "x" 2>&1)"
+check "send --upstream-state exits 1" "1" "$?"
+contains "send's refusal says it applies to a reply only" "$out" "applies to a reply only"
+check "send --upstream-state creates no thread" "$us_threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+
+us_msgs_before="$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+for us_bad in merged Closed "" $'closed\nX-Hops: 99' "closed open"; do
+    out="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+        --upstream-state "$us_bad" --body - <<< "x" 2>&1)"
+    check "reply --upstream-state '${us_bad//$'\n'/ }' exits 1" "1" "$?"
+done
+check "the refused replies wrote no message" "$us_msgs_before" \
+    "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+
+for us_hdr in "X-Upstream-State: closed" "X-UPSTREAM-STATE: closed" "X-Upstream-state: open"; do
+    out="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+        --header "$us_hdr" --body - <<< "x" 2>&1)"
+    check "reply with a raw --header '$us_hdr' exits 1" "1" "$?"
+    contains "... naming a reserved header" "$out" "reserved header"
+done
+out="$("$mail" send --from @ci-demo --to @pr-author --subject "Raw" --body - \
+    --header "X-Upstream-State: closed" <<< "x" 2>&1)"
+check "send with a raw --header X-Upstream-State exits 1" "1" "$?"
+"$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+    --upstream-state closed --header "X-UPSTREAM-STATE: open" --body - <<< "x" >/dev/null 2>&1
+check "a raw header alongside the flag is still refused" "1" "$?"
+out="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+    --header "X-UPSTREAM-HEAD: feature/x $uh_sha" --body - <<< "x" 2>&1)"
+check "the reserved names are refused in any letter case (X-UPSTREAM-HEAD)" "1" "$?"
+check "the refused replies still wrote no message" "$us_msgs_before" \
+    "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+
+contains "usage header documents reply --upstream-state" "$("$mail" --help 2>&1 || true)" "--upstream-state closed|open"
+
 printf '\n== export --json ==\n'
 
 new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT

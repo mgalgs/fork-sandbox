@@ -74,8 +74,9 @@ mail:
             grant flags also need cap grant, --review-target needs cap
             target)
     reply   0; --from --reply-to --body --to* --cc* --subject --attach* --hops
-            --header* --upstream-head; --from in the token's identities
-            (--upstream-head also needs cap upstream)
+            --header* --upstream-head --upstream-state; --from in the token's
+            identities (--upstream-head and --upstream-state also need cap
+            upstream)
     show tree export inbox: read (export needs --json; inbox takes --all)
     list    0; --json --header*; read
     seen    1+; the first positional in the identities, and cap seen
@@ -87,10 +88,11 @@ postmaster:
     flag unflag: operator only
 (* = repeatable.) On mail send and mail reply (never on list, whose --header
 is a read-only filter), --header may not set
-X-Version, X-Upstream-Head or a name that starts with X-Review-Target
-(case-insensitively): the review-target headers are that contract's, and only
-mail's own --review-target flag and the postmaster may write them, and
-X-Upstream-Head only comes from mail reply --upstream-head -- these refusals
+X-Version, X-Upstream-Head, X-Upstream-State or a name that starts with
+X-Review-Target (case-insensitively): the review-target headers are that
+contract's, and only mail's own --review-target flag and the postmaster may
+write them, X-Upstream-Head only comes from mail reply --upstream-head and
+X-Upstream-State only from mail reply --upstream-state -- these refusals
 apply to an operator token too. An operator passes every other check.
 --body must be '-': the
 body comes in stdin_b64. --attach names a key of "files" (a plain basename,
@@ -157,7 +159,7 @@ SPEC = {
             "--from": VALUE, "--reply-to": VALUE, "--body": VALUE,
             "--to": MULTI, "--cc": MULTI, "--subject": VALUE,
             "--attach": MULTI, "--hops": VALUE, "--header": MULTI,
-            "--upstream-head": VALUE}),
+            "--upstream-head": VALUE, "--upstream-state": VALUE}),
         "show": (1, 1, {}),
         "tree": (1, 1, {}),
         "list": (0, 0, {"--json": BOOL, "--header": MULTI}),
@@ -203,6 +205,12 @@ UPSTREAM_HEAD_HEADER_WHY = (
     "may set it")
 
 
+# And X-Upstream-State: only reply --upstream-state (same cap) produces it.
+UPSTREAM_STATE_HEADER_WHY = (
+    "--header may not set X-Upstream-State: only reply --upstream-state "
+    "may set it")
+
+
 def refused_header_name(raw):
     """The reason --header may not set this header, or None if it may."""
     name = raw.split(":", 1)[0].strip().upper()
@@ -210,6 +218,8 @@ def refused_header_name(raw):
         return REVIEW_TARGET_HEADER_WHY
     if name == "X-UPSTREAM-HEAD":
         return UPSTREAM_HEAD_HEADER_WHY
+    if name == "X-UPSTREAM-STATE":
+        return UPSTREAM_STATE_HEADER_WHY
     return None
 
 
@@ -423,7 +433,8 @@ def authorize(entry, tool, verb, positionals, flags):
             need(entry, "grant")
         if key == ("mail", "send") and "--review-target" in flags:
             need(entry, "target")
-        if key == ("mail", "reply") and "--upstream-head" in flags:
+        if key == ("mail", "reply") and (
+                "--upstream-head" in flags or "--upstream-state" in flags):
             need(entry, "upstream")
         return
     if key == ("mail", "seen"):
