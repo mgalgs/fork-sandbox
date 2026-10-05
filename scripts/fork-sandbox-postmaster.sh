@@ -2822,19 +2822,19 @@ pm_flag_unless_closed() {
 # thread's needs-operator flag (journaled by pm_unflag like any other clear).
 # Atomic tmp+mv, so a reader never sees a partial record.
 pm_set_upstream_state() {
-    local tid="$1" state="$2" mid="$3"
-    [[ "$(pm_upstream_state "$tid")" == "$state" ]] && return 0
+    local tid="$1" ustate="$2" mid="$3"
+    [[ "$(pm_upstream_state "$tid")" == "$ustate" ]] && return 0
     mkdir -p -- "$UPSTREAM_STATE" || return 1
     local tmp
     tmp="$(mktemp "$UPSTREAM_STATE/.tmp.XXXXXX")" || return 1
     {
-        printf 'STATE=%s\n' "$state"
+        printf 'STATE=%s\n' "$ustate"
         printf 'MSGID=%s\n' "$mid"
         printf 'AT=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     } > "$tmp" || { rm -f -- "$tmp"; return 1; }
     mv -- "$tmp" "$UPSTREAM_STATE/$tid.env" || { rm -f -- "$tmp"; return 1; }
-    pm_event "upstream-state thread=${tid:0:8} state=$state msg=${mid:0:8}"
-    [[ "$state" == open ]] || pm_unflag "$tid"
+    pm_event "upstream-state thread=${tid:0:8} state=$ustate msg=${mid:0:8}"
+    [[ "$ustate" == open ]] || pm_unflag "$tid"
     return 0
 }
 
