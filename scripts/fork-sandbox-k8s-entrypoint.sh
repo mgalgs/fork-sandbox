@@ -174,6 +174,17 @@
 #                   the context window (tokens) REFRESH_THRESHOLD_TOKENS was
 #                   computed against. Only used to warn when a leg reports a
 #                   different one (fs_refresh_window_mismatch).
+#   PROVISION_TIMEOUT
+#                   seconds to let an image-supplied provisioning
+#                   executable (PROVISION_EXE) run before the whole run
+#                   fails. Default 300. Not rendered by submit, so this is
+#                   a fixed default this round, not a k8s.env key.
+#   PROVISION_EXE   test seam: overrides the fixed, documented path a
+#                   derived image may carry provisioning at
+#                   (/opt/fork-sandbox/provision -- see "Provisioning the
+#                   clone from the image" in docs/kubernetes-runs.md). Real
+#                   runs never set this; a test cannot write to /opt, so it
+#                   points this at a fixture executable instead.
 #
 
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
@@ -223,6 +234,23 @@
 # Also creates /work/outbox: the artifact outbox, read back out of the pod
 # by `fork-sandbox-k8s.sh run` over kubectl exec once the agent finishes.
 # Same sibling-of-clone_dir reasoning as /work/inbox above.
+#
+# Provisioning: once the clone is checked out, run_image_provisioning runs
+# PROVISION_EXE (real runs: the fixed path, see PROVISION_EXE above) when
+# it exists and is executable, as this container's own user, with cwd set
+# to the clone and FORK_SANDBOX_CLONE_DIR naming it. A non-zero exit or a
+# PROVISION_TIMEOUT timeout fails the run before any leg. On success, every
+# untracked path the run left behind is appended to .git/info/exclude (the
+# same mechanism .env.sandbox above already uses), so it is never
+# committed and never counts as uncommitted work; a TRACKED file the
+# provisioner touched fails the run instead, naming the path -- silently
+# committing an image's own edits into the agent's branch, with no author,
+# is the worse outcome. The base image ships no such executable at all, so
+# an unmodified install sees no change here whatsoever. See "Provisioning
+# the clone from the image" in docs/kubernetes-runs.md for the full
+# contract and the trust rationale (the image is the operator's own
+# trust anchor; the repo, agent-editable, never chooses it or supplies
+# code that runs outside the agent).
 
 set -euo pipefail
 
@@ -257,6 +285,8 @@ fi
 : "${REFRESH_MAX:=6}"
 : "${REFRESH_CEILING_TOKENS:=}"
 : "${REFRESH_CONTEXT_WINDOW:=}"
+: "${PROVISION_TIMEOUT:=300}"
+: "${PROVISION_EXE:=/opt/fork-sandbox/provision}"
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
     if [[ "$HARNESS" == claude && -z "$REVIEW_MODEL" ]]; then
@@ -723,6 +753,105 @@ git config user.name "$GIT_USER_NAME"
 git config user.email "$GIT_USER_EMAIL"
 git config commit.gpgsign false
 git config tag.gpgsign false
+
+# After the provisioner exits 0, finds every path `git status --porcelain
+# -z --untracked-files=normal` reports as untracked (??) and appends it to
+# .git/info/exclude, anchored, guarded against a duplicate line exactly as
+# .env.sandbox's own exclude entry above -- so a link or file provisioning
+# created is never committed and never counts as uncommitted work. Any
+# entry that is NOT untracked (the provisioner modified or deleted a
+# TRACKED file) fails the run naming the paths: exclusion cannot hide
+# that, and committing an image's own edits into the agent's branch, with
+# no author, would be the worse outcome. An untracked path containing a
+# gitignore metacharacter (anything outside [A-Za-z0-9._/-]) also fails the
+# run, naming the path, rather than writing an exclude line that means
+# something other than "this exact path".
+run_image_provisioning_exclude() {
+    local entry xy path
+    local -a untracked=() tracked_changed=()
+    while IFS= read -r -d '' entry; do
+        [[ -z "$entry" ]] && continue
+        xy="${entry:0:2}"
+        path="${entry:3}"
+        if [[ "$xy" == *R* ]]; then
+            # A rename carries the old path as a second NUL-terminated
+            # field -- consume it so the next read() stays aligned. Only
+            # reachable for a TRACKED change (a rename never applies to an
+            # untracked path), which already fails the run below.
+            read -r -d '' _ || true
+        fi
+        if [[ "$xy" == "??" ]]; then
+            untracked+=("$path")
+        else
+            tracked_changed+=("$path")
+        fi
+    done < <(git status --porcelain -z --untracked-files=normal)
+
+    if (( ${#tracked_changed[@]} > 0 )); then
+        echo "Error: fork-sandbox-k8s-entrypoint: provisioning modified or" >&2
+        echo "deleted a tracked file -- refusing to let it ride into the" >&2
+        echo "agent's own branch:" >&2
+        printf '  %s\n' "${tracked_changed[@]}" >&2
+        exit 1
+    fi
+
+    local -a bad=()
+    for path in "${untracked[@]}"; do
+        [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]] || bad+=("$path")
+    done
+    if (( ${#bad[@]} > 0 )); then
+        echo "Error: fork-sandbox-k8s-entrypoint: provisioning created a path" >&2
+        echo "with a character an exclude-file entry cannot safely name:" >&2
+        printf '  %s\n' "${bad[@]}" >&2
+        exit 1
+    fi
+
+    for path in "${untracked[@]}"; do
+        if ! grep -qxF "/$path" .git/info/exclude 2>/dev/null; then
+            printf '/%s\n' "$path" >> .git/info/exclude
+        fi
+    done
+}
+
+# Runs an image-supplied provisioning executable, if the image carries one
+# -- see "Provisioning the clone from the image" in
+# docs/kubernetes-runs.md for the full contract. Absent (the base image's
+# own state, and PROVISION_EXE's default never exists there): returns 0
+# with no log, no exclude edit and no output at all, so an unmodified
+# install sees no change here whatsoever. Present and executable: narrates,
+# runs it once with cwd set to the clone and FORK_SANDBOX_CLONE_DIR naming
+# it, captures its combined output to $work_dir/provision.log, and on a
+# non-zero exit (timeout included -- `timeout` itself exits 124) prints the
+# last 40 lines of that log, prefixed, and fails the run before any leg --
+# no .run-complete, no harness call. On success, hands off to
+# run_image_provisioning_exclude above.
+run_image_provisioning() {
+    [[ -x "$PROVISION_EXE" ]] || return 0
+    echo "fork-sandbox-k8s-entrypoint: provisioning with $PROVISION_EXE" >&2
+    local provision_log="$work_dir/provision.log" provision_rc=0
+    # Not `if ! cmd; then rc=$?`: under the negation, $? inside the then
+    # branch is the status of `! cmd` itself (always 0 or 1), never cmd's
+    # real exit code -- a classic bash trap that would always read a
+    # timeout back as "exited 1". `cmd && rc=0 || rc=$?` keeps the real
+    # code, and the whole line still exits 0 so `set -e` never fires on a
+    # failing provisioner.
+    (cd "$clone_dir" \
+        && FORK_SANDBOX_CLONE_DIR="$clone_dir" timeout "$PROVISION_TIMEOUT" "$PROVISION_EXE") \
+        > "$provision_log" 2>&1 && provision_rc=0 || provision_rc=$?
+    if (( provision_rc != 0 )); then
+        if (( provision_rc == 124 )); then
+            echo "Error: fork-sandbox-k8s-entrypoint: provision timed out after" >&2
+            echo "${PROVISION_TIMEOUT}s." >&2
+        else
+            echo "Error: fork-sandbox-k8s-entrypoint: provision exited $provision_rc." >&2
+        fi
+        echo "fork-sandbox-k8s-entrypoint: provision: last 40 lines of its output:" >&2
+        tail -n 40 -- "$provision_log" | sed 's/^/fork-sandbox-k8s-entrypoint: provision: /' >&2
+        exit 1
+    fi
+    run_image_provisioning_exclude
+}
+run_image_provisioning
 
 # Builds ~/.pi/agent/models.json + settings.json pointed at the pi proxy,
 # for one primary model id and, optionally, a second (REVIEW_MODEL) --

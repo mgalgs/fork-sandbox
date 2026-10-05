@@ -15379,6 +15379,237 @@ check "submit: a properly labeled Secret gets past the check to the apply" "yes"
 check "submit: the label check reads the named Secret as JSON" "yes" \
     "$(grep -q 'get secret preview-ctx -o json' "$cs_log" && echo yes || echo no)"
 
+printf '\n== image-supplied clone provisioning ==\n'
+# run_image_provisioning (and the exclusion helper it calls on success),
+# extracted from the entrypoint's own source and run standalone against a
+# real throwaway git clone -- the same function-extraction pattern as
+# run_pi_coding_leg above, and the highest seam available: the pod path
+# itself is only reachable with a real cluster.
+provision_fn="$(sed -n '/^run_image_provisioning_exclude() {/,/^}/p;/^run_image_provisioning() {/,/^}/p' "$entrypoint_sh")"
+provision_fn_file="$(newdir)/run-provisioning.sh"; tmpdirs+=("$(dirname "$provision_fn_file")")
+if [[ -n "$provision_fn" ]]; then
+    printf '%s\n' 'set -euo pipefail' \
+        ': "${PROVISION_TIMEOUT:=300}"' \
+        ': "${PROVISION_EXE:=/opt/fork-sandbox/provision}"' \
+        "$provision_fn" \
+        'run_image_provisioning' > "$provision_fn_file"
+    ok "run_image_provisioning is a standalone function in the entrypoint"
+else
+    no "run_image_provisioning is a standalone function in the entrypoint" \
+        "function not found in $entrypoint_sh"
+fi
+
+# A fresh real clone: one tracked file, and build/ already gitignored (so
+# T11 below can prove a path the repo's own .gitignore already covers gets
+# no new exclude line).
+provision_make_clone() {
+    local base clone; base="$(newdir)"; tmpdirs+=("$base")
+    clone="$base/clone"; mkdir -p "$clone"
+    git -C "$clone" init -q
+    git -C "$clone" config user.email t@fork-sandbox.invalid
+    git -C "$clone" config user.name Tester
+    printf 'tracked\n' > "$clone/tracked.txt"
+    printf 'build/\n' > "$clone/.gitignore"
+    git -C "$clone" -c commit.gpgsign=false add tracked.txt .gitignore
+    git -C "$clone" -c commit.gpgsign=false commit -q -m init
+    printf '%s' "$clone"
+}
+# $1 = clone dir (as provision_make_clone returns), $2 = PROVISION_EXE
+# path, $3 = PROVISION_TIMEOUT (optional). Runs with cwd = clone dir, same
+# as the real entrypoint (which cd's into clone_dir long before this
+# call); work_dir is the clone's own sibling directory, same layout as the
+# real pod's /work (clone_dir="/work/clone"). Stdout/stderr land in
+# $PROVISION_OUT/$PROVISION_ERR; $PROVISION_RC holds the exit code.
+PROVISION_OUT=""; PROVISION_ERR=""; PROVISION_RC=0
+provision_run() {
+    local clone="$1" exe="$2" timeout_val="${3:-300}" work
+    work="$(dirname "$clone")"
+    PROVISION_OUT="$(newdir)/out.txt"; PROVISION_ERR="$(newdir)/err.txt"
+    tmpdirs+=("$(dirname "$PROVISION_OUT")" "$(dirname "$PROVISION_ERR")")
+    PROVISION_RC=0
+    ( cd "$clone" \
+        && clone_dir="$clone" work_dir="$work" \
+        PROVISION_EXE="$exe" PROVISION_TIMEOUT="$timeout_val" \
+        bash "$provision_fn_file" ) > "$PROVISION_OUT" 2> "$PROVISION_ERR" \
+        || PROVISION_RC=$?
+}
+
+# T9 (R9): PROVISION_EXE (the test seam) names a missing file -- run no
+# provisioner at all: rc 0, no output, no exclude edit, no provision.log.
+provision_t9_clone="$(provision_make_clone)"
+provision_t9_exclude_before="$(cat "$provision_t9_clone/.git/info/exclude" 2>/dev/null || true)"
+provision_run "$provision_t9_clone" "$provision_t9_clone/does-not-exist"
+if (( PROVISION_RC == 0 )) && [[ ! -s "$PROVISION_OUT" && ! -s "$PROVISION_ERR" ]]; then
+    ok "a missing PROVISION_EXE runs no provisioner and exits 0"
+else
+    no "a missing PROVISION_EXE runs no provisioner and exits 0" \
+        "rc=$PROVISION_RC out=$(cat "$PROVISION_OUT") err=$(cat "$PROVISION_ERR")"
+fi
+check "a missing PROVISION_EXE leaves .git/info/exclude unchanged" \
+    "$provision_t9_exclude_before" "$(cat "$provision_t9_clone/.git/info/exclude" 2>/dev/null || true)"
+check "a missing PROVISION_EXE writes no provision.log" \
+    "false" "$([[ -f "$provision_t9_clone/../provision.log" ]] && echo true || echo false)"
+
+# T10 (R10): a present, executable PROVISION_EXE runs from the clone's own
+# directory, with FORK_SANDBOX_CLONE_DIR naming it, as this process's own
+# uid (there is no other uid to switch to outside a real pod).
+provision_t10_clone="$(provision_make_clone)"
+provision_t10_record="$(newdir)/record.txt"; tmpdirs+=("$(dirname "$provision_t10_record")")
+provision_t10_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t10_stub")")
+cat > "$provision_t10_stub" <<STUB
+#!/usr/bin/env bash
+{ printf '%s\n' "\$PWD"; printf '%s\n' "\$FORK_SANDBOX_CLONE_DIR"; printf '%s\n' "\$(id -u)"; } > "$provision_t10_record"
+STUB
+chmod +x "$provision_t10_stub"
+provision_run "$provision_t10_clone" "$provision_t10_stub"
+provision_t10_resolved_clone="$(cd "$provision_t10_clone" && pwd)"
+if (( PROVISION_RC == 0 )) && [[ -f "$provision_t10_record" ]]; then
+    check "the provisioner's cwd is the clone" \
+        "$provision_t10_resolved_clone" "$(sed -n 1p "$provision_t10_record")"
+    check "FORK_SANDBOX_CLONE_DIR names the clone's absolute path" \
+        "$provision_t10_resolved_clone" "$(sed -n 2p "$provision_t10_record")"
+    check "the provisioner runs as this process's own uid" \
+        "$(id -u)" "$(sed -n 3p "$provision_t10_record")"
+else
+    no "a present, executable PROVISION_EXE runs" "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+# Source-order: after .env.sandbox is written and git identity is set,
+# before synthesize_pi_config (the harness branch).
+provision_order_gpgsign_line="$(grep -n 'git config tag.gpgsign false' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+provision_order_call_line="$(grep -n '^run_image_provisioning$' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+provision_order_synth_line="$(grep -n '^synthesize_pi_config() {' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+if [[ -n "$provision_order_gpgsign_line" && -n "$provision_order_call_line" \
+    && -n "$provision_order_synth_line" ]] \
+    && (( provision_order_gpgsign_line < provision_order_call_line \
+        && provision_order_call_line < provision_order_synth_line )); then
+    ok "run_image_provisioning is called after git identity is set and before synthesize_pi_config"
+else
+    no "run_image_provisioning is called after git identity is set and before synthesize_pi_config" \
+        "gpgsign=$provision_order_gpgsign_line call=$provision_order_call_line synth=$provision_order_synth_line"
+fi
+
+# T11 (R11): a symlink, a directory, and a path the repo's own .gitignore
+# already covers are each handled -- the exclude file gets lines for the
+# first two only, and the working tree is clean either way. Running the
+# exclusion step twice adds no duplicate line.
+provision_t11_clone="$(provision_make_clone)"
+provision_t11_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t11_stub")")
+cat > "$provision_t11_stub" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+ln -s /nonexistent-venv-target "$FORK_SANDBOX_CLONE_DIR/.venv"
+mkdir -p "$FORK_SANDBOX_CLONE_DIR/seed"
+printf 'data\n' > "$FORK_SANDBOX_CLONE_DIR/seed/data.bin"
+mkdir -p "$FORK_SANDBOX_CLONE_DIR/build"
+printf 'out\n' > "$FORK_SANDBOX_CLONE_DIR/build/output.bin"
+STUB
+chmod +x "$provision_t11_stub"
+provision_run "$provision_t11_clone" "$provision_t11_stub"
+if (( PROVISION_RC == 0 )); then
+    ok "the symlink/directory/.gitignore-covered provisioner exits 0"
+else
+    no "the symlink/directory/.gitignore-covered provisioner exits 0" \
+        "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+check "the exclude file gets a line for the symlink" \
+    "yes" "$(grep -qxF '/.venv' "$provision_t11_clone/.git/info/exclude" && echo yes || echo no)"
+check "the exclude file gets a line for the directory" \
+    "yes" "$(grep -qxF '/seed/' "$provision_t11_clone/.git/info/exclude" && echo yes || echo no)"
+check "the exclude file gets no line for a path .gitignore already covers" \
+    "no" "$(grep -qxF '/build' "$provision_t11_clone/.git/info/exclude" && echo yes || echo no)"
+check "the working tree is clean after exclusion" \
+    "" "$(cd "$provision_t11_clone" && git status --porcelain)"
+provision_t11_exclude_before="$(cat "$provision_t11_clone/.git/info/exclude")"
+( cd "$provision_t11_clone" && \
+    bash -c "$(sed -n '/^run_image_provisioning_exclude() {/,/^}/p' "$entrypoint_sh")
+run_image_provisioning_exclude" )
+check "running the exclusion step again adds no duplicate line" \
+    "$provision_t11_exclude_before" "$(cat "$provision_t11_clone/.git/info/exclude")"
+
+# T12 (R12): a non-zero exit and a timeout each fail the run (rc 1), with
+# the last 40 lines of the provisioner's output on stderr, prefixed, and
+# naming the exit code or the timeout.
+provision_t12_clone="$(provision_make_clone)"
+provision_t12_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t12_stub")")
+cat > "$provision_t12_stub" <<'STUB'
+#!/usr/bin/env bash
+for i in $(seq 1 50); do printf 'line %s\n' "$i"; done
+exit 3
+STUB
+chmod +x "$provision_t12_stub"
+provision_run "$provision_t12_clone" "$provision_t12_stub"
+if (( PROVISION_RC == 1 )) && grep -q 'exited 3' "$PROVISION_ERR" \
+    && grep -q 'provision: line 50' "$PROVISION_ERR" \
+    && ! grep -q 'provision: line 9$' "$PROVISION_ERR"; then
+    ok "a non-zero exit fails the run with the last 40 lines on stderr, prefixed"
+else
+    no "a non-zero exit fails the run with the last 40 lines on stderr, prefixed" \
+        "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+provision_t12b_timeout_clone="$(provision_make_clone)"
+provision_t12_sleep_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t12_sleep_stub")")
+cat > "$provision_t12_sleep_stub" <<'STUB'
+#!/usr/bin/env bash
+sleep 5
+STUB
+chmod +x "$provision_t12_sleep_stub"
+provision_run "$provision_t12b_timeout_clone" "$provision_t12_sleep_stub" 1
+if (( PROVISION_RC == 1 )) && grep -qi 'timed out' "$PROVISION_ERR"; then
+    ok "a provisioner exceeding PROVISION_TIMEOUT fails the run, naming it a timeout"
+else
+    no "a provisioner exceeding PROVISION_TIMEOUT fails the run, naming it a timeout" \
+        "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+
+# T13 (R13): a provisioner that edits a tracked file, or creates a path
+# with a character an exclude line cannot safely name, fails the run
+# naming the path.
+provision_t13a_clone="$(provision_make_clone)"
+provision_t13a_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t13a_stub")")
+cat > "$provision_t13a_stub" <<'STUB'
+#!/usr/bin/env bash
+printf 'tampered\n' >> "$FORK_SANDBOX_CLONE_DIR/tracked.txt"
+STUB
+chmod +x "$provision_t13a_stub"
+provision_run "$provision_t13a_clone" "$provision_t13a_stub"
+if (( PROVISION_RC == 1 )) && grep -q 'tracked.txt' "$PROVISION_ERR"; then
+    ok "editing a tracked file fails the run, naming the path"
+else
+    no "editing a tracked file fails the run, naming the path" \
+        "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+provision_t13b_clone="$(provision_make_clone)"
+provision_t13b_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t13b_stub")")
+cat > "$provision_t13b_stub" <<'STUB'
+#!/usr/bin/env bash
+printf 'x\n' > "$FORK_SANDBOX_CLONE_DIR/odd name"
+STUB
+chmod +x "$provision_t13b_stub"
+provision_run "$provision_t13b_clone" "$provision_t13b_stub"
+if (( PROVISION_RC == 1 )) && grep -q 'odd name' "$PROVISION_ERR"; then
+    ok "an untracked path with an unsafe character fails the run, naming it"
+else
+    no "an untracked path with an unsafe character fails the run, naming it" \
+        "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+
+# T14 (R14): the base image ships no provisioning executable, and the docs
+# name the contract's fixed path.
+if grep -c 'provision' "$repo_dir/images/sandbox/Dockerfile" | grep -qx 1; then
+    ok "the base Dockerfile mentions 'provision' exactly once (the comment, no COPY/RUN)"
+else
+    no "the base Dockerfile mentions 'provision' exactly once (the comment, no COPY/RUN)" \
+        "$(grep -n 'provision' "$repo_dir/images/sandbox/Dockerfile")"
+fi
+if grep -qE '^(COPY|ADD|RUN).*provision' "$repo_dir/images/sandbox/Dockerfile"; then
+    no "the base Dockerfile has no COPY/ADD/RUN line creating the provisioning path" \
+        "$(grep -nE '^(COPY|ADD|RUN).*provision' "$repo_dir/images/sandbox/Dockerfile")"
+else
+    ok "the base Dockerfile has no COPY/ADD/RUN line creating the provisioning path"
+fi
+check "the docs name the fixed provisioning path" \
+    "yes" "$(grep -qF '/opt/fork-sandbox/provision' "$repo_dir/docs/kubernetes-runs.md" && echo yes || echo no)"
+
 printf '\n== install --postmaster ==\n'
 # A real kubectl refuses --context=<name> for a context that does not
 # exist in the active kubeconfig, even for a pure --dry-run=client

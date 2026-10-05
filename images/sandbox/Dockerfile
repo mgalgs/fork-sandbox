@@ -11,7 +11,12 @@
 #
 # This is a BASE, not a universal answer. A repo whose suites need a compiler,
 # a database client or a browser should build its own image FROM this one and
-# name that instead. Keeping this one small is deliberate.
+# name that instead. Keeping this one small is deliberate. On a --k8s run, a
+# derived image may also carry an executable at /opt/fork-sandbox/provision,
+# which the pod runs once before the agent starts to link its own prebuilt
+# tooling into the clone -- see "Provisioning the clone from the image" in
+# docs/kubernetes-runs.md. This base image deliberately ships no such
+# executable.
 #
 # It is also a supply-chain surface, and worth naming as one: it holds the
 # agent CLIs, and a run gives them the user's access token. Build it yourself
