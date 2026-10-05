@@ -13215,9 +13215,14 @@ other_project_dir="$(mk_image_config 'K8S_PROJECT_IMAGES=other-project=registry.
 other_project_out="$(newdir)/other-project.yaml"; tmpdirs+=("$(dirname "$other_project_out")")
 FORK_SANDBOX_CONFIG_DIR="$other_project_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$other_project_out" 2>/dev/null
+    "$proj_dir" "$handoff_file" > "$other_project_out" 2>/tmp/fs-k8s-test-other-project.err
 check "a K8S_PROJECT_IMAGES entry for a different project renders byte-identically" \
     "same" "$(cmp -s "$submit_out" "$other_project_out" && echo same || echo different)"
+check "a K8S_PROJECT_IMAGES miss is announced on stderr" \
+    "1" "$(grep -c "no K8S_PROJECT_IMAGES entry for project" /tmp/fs-k8s-test-other-project.err)"
+check "the miss notice names the project's basename" \
+    "1" "$(grep -cF "'$proj_basename'; using K8S_IMAGE." /tmp/fs-k8s-test-other-project.err)"
+rm -f /tmp/fs-k8s-test-other-project.err
 
 # T2 (R2): --image wins over a matching K8S_PROJECT_IMAGES entry and over
 # K8S_IMAGE, and announces the source on stderr.

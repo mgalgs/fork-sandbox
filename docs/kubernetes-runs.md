@@ -2133,7 +2133,11 @@ never read from the repo being run:
   `k8s.env`: a default image for a project, keyed by the basename of that
   project's repo top level (the same identity `fork-sandbox.sh` already
   uses for a local clone). Two repos that happen to share a basename share
-  the default; use `--image` for the exception.
+  the default; use `--image` for the exception. The top level is resolved
+  by git, so a linked worktree or a symlinked checkout is keyed by its
+  own directory name, not the main checkout's: list that name too, or
+  pass `--image`. When the key is set and no entry matches, the run says so
+  on stderr and uses `K8S_IMAGE`.
 
 Precedence: `--image` wins over a matching `K8S_PROJECT_IMAGES` entry, which
 wins over `K8S_IMAGE`. With neither set, every run behaves exactly as
@@ -2149,8 +2153,8 @@ egress-gate and agent containers (the gate needs only bash, `timeout`,
 `ping` and `/dev/tcp`, which a derived image keeps since it is `FROM` the
 base), is recorded in the run's `run.env` and `summary.json` as `image`/
 `image_source` (`flag`, `project` or `k8s-env`), and appears in
-`--dry-run` output. A non-default choice is announced on stderr; an
-unconfigured run stays silent.
+`--dry-run` output. A non-default choice is announced on stderr; a run
+with neither `--image` nor `K8S_PROJECT_IMAGES` stays silent.
 
 ## Provisioning the clone from the image
 

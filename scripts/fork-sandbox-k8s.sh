@@ -1629,8 +1629,8 @@ parse_project_images() {
 # K8S_PROJECT_IMAGES's entry for PROJECT_BASENAME, which wins over K8S_IMAGE
 # -- the precedence acceptance 2 requires. Sets the module-global RUN_IMAGE
 # and RUN_IMAGE_SOURCE ("flag"|"project"|"k8s-env"). Announces the source on
-# stderr for "flag"/"project" only -- an unconfigured run (the "k8s-env"
-# case, meaning nothing new applies) must stay silent, same as the
+# stderr for "flag"/"project", and a K8S_PROJECT_IMAGES miss; a run with
+# neither key nor flag (nothing new applies) must stay silent, same as the
 # --endpoint/--label precedence resolvers above announcing only a
 # non-default choice. Returns 1 (not exit) on a bad ref, matching every
 # other resolver in this file, so cmd_submit can `|| exit 1` it.
@@ -1658,6 +1658,12 @@ resolve_run_image() {
             return 0
         fi
     done
+    # Only when the key is set: a worktree or symlinked checkout has a
+    # different basename and would otherwise drop to K8S_IMAGE unnoticed.
+    if (( ${#PROJECT_IMAGE_NAMES[@]} > 0 )); then
+        echo "fork-sandbox-k8s: no K8S_PROJECT_IMAGES entry for project" >&2
+        echo "'$project_basename'; using K8S_IMAGE." >&2
+    fi
 
     RUN_IMAGE="$K8S_IMAGE"
     RUN_IMAGE_SOURCE="k8s-env"
