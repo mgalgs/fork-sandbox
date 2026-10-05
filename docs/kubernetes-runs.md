@@ -303,7 +303,10 @@ default `/var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox`. This is
 the cluster counterpart of the local sandbox's own unconditional
 `$run_dir/outbox`: a place for something a human will look at that does not
 belong in a commit, described to the agent in `fs_emit_prompt_preamble`'s
-"## Artifact outbox" preamble section.
+"## Artifact outbox" preamble section. That section also tells the agent to
+append each clean-tree test-suite run to `test-runs.jsonl` there (the
+[test-run ledger](test-ledger.md)); the file comes back with the rest of the
+outbox, but nothing in the pod reads it yet.
 
 The pull-back is:
 

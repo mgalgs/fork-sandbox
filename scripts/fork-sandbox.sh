@@ -10672,6 +10672,12 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             if [[ "$cur_legacy" == 1 && -n "$cur_coding_rc" && "$cur_coding_rc" != "0" ]]; then
                 fs_emit_coding_exit_note "$cur_coding_rc"
             fi
+            # Suite runs earlier legs recorded against exactly this HEAD,
+            # read fresh each pass: a fix leg's commit moves it, and the
+            # earlier record then stops matching. Untrusted text from the
+            # sandbox's outbox; the emitter never fails the run.
+            fs_emit_test_record_section "$outbox_dir/$FS_TEST_LEDGER_NAME" \
+                "$(clone_branch_head)" review
             cur_addenda_list="$(fs_addenda_dirs)"
             if [[ -n "$cur_addenda_list" ]]; then
                 printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
@@ -10914,6 +10920,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 { cat -- "$cur_fix_header"; fs_emit_plan_section "$plan_file" code || exit 1; \
                                   printf '\n---\n\n'; \
                                   awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
+                                  fs_emit_test_record_section "$outbox_dir/$FS_TEST_LEDGER_NAME" \
+                                      "$(clone_branch_head)" fix; \
                                   fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt.part"
                                 mv -f "$cur_fix_prompt.part" "$cur_fix_prompt"
                                 # Leg-start/leg-end transitions for this fix pass --
@@ -11022,6 +11030,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         { cat -- "${!cur_fix_header_var}"; fs_emit_plan_section "$plan_file" code || exit 1; \
                           printf '\n---\n\n'; \
                           awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
+                          fs_emit_test_record_section "$outbox_dir/$FS_TEST_LEDGER_NAME" \
+                              "$(clone_branch_head)" fix; \
                           fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt"
                         # Leg-start/leg-end transitions for this fix pass, same
                         # reason as the legacy fix block above.

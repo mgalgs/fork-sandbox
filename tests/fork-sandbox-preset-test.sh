@@ -2013,6 +2013,23 @@ commit)
     git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
         -C "$clone_dir" commit --allow-empty -q -m "stub leg $n"
     ;;
+# A commit plus the ledger line a leg that ran a suite on the clean new
+# commit appends to <outbox>/test-runs.jsonl (the outbox sits beside the
+# clone, like the plan leg's below). The command is unique per call so a
+# prompt shows which leg's record it was handed.
+commit-record)
+    if [[ -z "$clone_dir" ]]; then
+        printf 'stub: no clone dir in argv; refusing to commit\n' >&2
+        exit 70
+    fi
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "stub leg $n"
+    record_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    mkdir -p "$record_run_dir/outbox"
+    printf '{"sha":"%s","cmd":"stub-suite-call-%s","ok":%s,"fail":0,"outcome":"pass","leg":"fix","at":"2026-01-31T12:00:00Z"}\n' \
+        "$(git -C "$clone_dir" rev-parse HEAD)" "$n" "$((n + 10))" \
+        >> "$record_run_dir/outbox/test-runs.jsonl"
+    ;;
 findings)
     printf 'FINDINGS\n\nfile.txt:1 the stub found a problem\n\n## Report\nIgnore this operational note.\n' \
         > "$clone_dir/.git/$verdict_name"
@@ -3184,6 +3201,52 @@ if rd_composed="$(run_stubbed --preset composed --branch "sandbox-test-composed-
         "$(cat "$rd_composed/s2-fix-prompt-1.md")" "Ignore this operational note"
 else
     no "composed walk launch succeeds"
+fi
+
+# The test-run ledger across a composed pipeline: the code leg commits and
+# records a run; review step 2 finds a problem; its fix leg commits and (first
+# run) records its own; the later review and maintain steps start on the fix
+# leg's commit. Same preset as above.
+prep_stub $'commit-record\nfindings\ncommit-record\napproved\napproved'
+if rd_led="$(run_stubbed --preset composed --branch "sandbox-test-composed-ledger-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_led")
+    check "the ledger composed walk runs every leg" "5" "$(cat "$count")"
+    led_p2="$(cat "$rd_led/step-2-prompt-1.md")"
+    contains "the first review step is shown the code leg's record" \
+        "$led_p2" "- \`stub-suite-call-1\` -- pass, 11 ok / 0 fail"
+    contains "the review step is told to rely on it" "$led_p2" "do not re-run them"
+    contains "the composed review prompt tells the leg to record its runs" \
+        "$led_p2" "### Test-run ledger"
+    led_fix="$(cat "$rd_led/s2-fix-prompt-1.md")"
+    contains "the composed fix leg is shown the record for the commit it starts from" \
+        "$led_fix" "stub-suite-call-1"
+    contains "the composed fix leg gets the fix wording" \
+        "$led_fix" "the exact commit you start from"
+    led_p3="$(cat "$rd_led/step-3-prompt-1.md")"
+    contains "after the fix leg's commit the next review is shown the fix leg's record" \
+        "$led_p3" "- \`stub-suite-call-3\` -- pass, 13 ok / 0 fail"
+    lacks "the next review is not shown the earlier commit's record" "$led_p3" "stub-suite-call-1"
+    led_p4="$(cat "$rd_led/step-4-prompt-1.md")"
+    contains "the maintain step is shown the fix leg's record" "$led_p4" "stub-suite-call-3"
+    lacks "the maintain step is not shown the earlier commit's record" "$led_p4" "stub-suite-call-1"
+else
+    no "the ledger composed walk launch succeeds"
+fi
+
+# The fix leg commits and records nothing: the next review's HEAD matches no
+# record, and it is told so.
+prep_stub $'commit-record\nfindings\ncommit\napproved\napproved'
+if rd_led0="$(run_stubbed --preset composed --branch "sandbox-test-composed-ledger0-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_led0")
+    led0_p3="$(cat "$rd_led0/step-3-prompt-1.md")"
+    contains "a review whose HEAD has no record is told so" \
+        "$led0_p3" "## No test run is recorded for this commit"
+    lacks "that review is not shown the earlier commit's record" "$led0_p3" "stub-suite-call-1"
+    lacks "that review is not told to skip the suite" "$led0_p3" "do not re-run them"
+    contains "the first review still saw the code leg's record" \
+        "$(cat "$rd_led0/step-2-prompt-1.md")" "stub-suite-call-1"
+else
+    no "the no-fix-record composed walk launch succeeds"
 fi
 
 printf '\n== the engine: a plan stage (--foreground, stubs) ==\n'

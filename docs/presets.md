@@ -193,6 +193,11 @@ pipeline:
     agent: coder
 ```
 
+Every leg is also told to record a suite it runs, against a clean commit, in
+`test-runs.jsonl` in the same outbox; a later review, maintain or fix leg that
+starts on that exact commit is shown the record and told not to re-run the
+suite (see [test-ledger.md](test-ledger.md)).
+
 The plan leg writes its plan, as markdown, to `plan.md` in the run's
 outbox (reserved there the same way `handoff.md` is, for every leg —
 see "Artifact outbox" in the prompt every leg gets) and makes no

@@ -469,6 +469,33 @@ oversized artifact means everything in here is lost, not just the large
 file. If you are about to write something big, downscale a screenshot or
 write one image instead of forty rather than risk the rest.
 
+### Test-run ledger
+
+When you run a project's test suite, record the run for the legs that come
+after you: append exactly one JSON line to
+
+    $rd/outbox/test-runs.jsonl
+
+right after the run finishes, and **only if the working tree was clean at that
+commit** (\`git status --porcelain\` prints nothing, apart from files the sandbox
+itself placed, such as \`.env.sandbox\`). A run made with uncommitted edits
+describes no commit, so record nothing for it; to get a recordable run, commit
+first and run the suite on the clean tree. Append only: never rewrite or
+delete an earlier line. The line has these fields, all required:
+
+    {"sha":"<git rev-parse HEAD, all 40 hex digits>",
+     "cmd":"<the exact command>",
+     "ok":<passed count>, "fail":<failed count>,
+     "outcome":"pass" or "fail",
+     "leg":"<implement, review, fix or maintain>",
+     "at":"<UTC time, e.g. 2026-01-31T12:00:00Z>"}
+
+The object is wrapped here only to fit: write it on a single line.
+
+Record a suite you actually ran, on the commit it describes, once per suite.
+A later leg that starts on that exact commit is shown the line and told not
+to re-run the suite, so a false line costs the run a real check.
+
 ## Browser
 
 No browser is available in this sandbox. Do not spend tool calls
@@ -780,6 +807,33 @@ oversized artifact means everything in here is lost, not just the large
 file. If you are about to write something big, downscale a screenshot or
 write one image instead of forty rather than risk the rest.
 
+### Test-run ledger
+
+When you run a project's test suite, record the run for the legs that come
+after you: append exactly one JSON line to
+
+    $rd4/outbox/test-runs.jsonl
+
+right after the run finishes, and **only if the working tree was clean at that
+commit** (\`git status --porcelain\` prints nothing, apart from files the sandbox
+itself placed, such as \`.env.sandbox\`). A run made with uncommitted edits
+describes no commit, so record nothing for it; to get a recordable run, commit
+first and run the suite on the clean tree. Append only: never rewrite or
+delete an earlier line. The line has these fields, all required:
+
+    {"sha":"<git rev-parse HEAD, all 40 hex digits>",
+     "cmd":"<the exact command>",
+     "ok":<passed count>, "fail":<failed count>,
+     "outcome":"pass" or "fail",
+     "leg":"<implement, review, fix or maintain>",
+     "at":"<UTC time, e.g. 2026-01-31T12:00:00Z>"}
+
+The object is wrapped here only to fit: write it on a single line.
+
+Record a suite you actually ran, on the commit it describes, once per suite.
+A later leg that starts on that exact commit is shown the line and told not
+to re-run the suite, so a false line costs the run a real check.
+
 ---
 
 # Your task: review this branch, and only review it
@@ -867,9 +921,11 @@ session and can talk a working branch into a change it did not need.
 After the verdict body, you may add a \`## Report\` heading and five short
 paragraphs for the orchestrator, in this order: (1) files touched; (2) tests
 — what you RAN and observed, \`N ok / M fail\`, not what the author claimed;
-(3) decisions visible in the diff that a reader would not guess, one line
-each; (4) what is left open — on a FINDINGS verdict, include the findings
-above; (5) what you are unsure of. If you include a report, use exactly one
+or, for a suite you relied on instead of re-running because this prompt has a
+"Recorded test runs for this commit" section, \`reused: <command> at <short
+sha> from the <leg> leg, N ok / M fail\`; (3) decisions visible in the diff
+that a reader would not guess, one line each; (4) what is left open — on a
+FINDINGS verdict, include the findings above; (5) what you are unsure of. If you include a report, use exactly one
 heading and write this account from the branch and the diff, never from the
 author's message. The orchestrator reads this report instead of the author's
 own account. Keep the \`Checked:\` paragraph where it is, in the verdict body,
@@ -993,6 +1049,33 @@ Go over it and the outbox is refused **as a whole, not truncated** -- one
 oversized artifact means everything in here is lost, not just the large
 file. If you are about to write something big, downscale a screenshot or
 write one image instead of forty rather than risk the rest.
+
+### Test-run ledger
+
+When you run a project's test suite, record the run for the legs that come
+after you: append exactly one JSON line to
+
+    $rd4/outbox/test-runs.jsonl
+
+right after the run finishes, and **only if the working tree was clean at that
+commit** (\`git status --porcelain\` prints nothing, apart from files the sandbox
+itself placed, such as \`.env.sandbox\`). A run made with uncommitted edits
+describes no commit, so record nothing for it; to get a recordable run, commit
+first and run the suite on the clean tree. Append only: never rewrite or
+delete an earlier line. The line has these fields, all required:
+
+    {"sha":"<git rev-parse HEAD, all 40 hex digits>",
+     "cmd":"<the exact command>",
+     "ok":<passed count>, "fail":<failed count>,
+     "outcome":"pass" or "fail",
+     "leg":"<implement, review, fix or maintain>",
+     "at":"<UTC time, e.g. 2026-01-31T12:00:00Z>"}
+
+The object is wrapped here only to fit: write it on a single line.
+
+Record a suite you actually ran, on the commit it describes, once per suite.
+A later leg that starts on that exact commit is shown the line and told not
+to re-run the suite, so a false line costs the run a real check.
 
 ---
 

@@ -1154,6 +1154,152 @@ else
         "rc=$rcB_mntnz: $outB_mntnz"
 fi
 
+printf '\n== the test-run ledger reaches later legs for the same commit only ==\n'
+
+# Four legs on the legacy tiers (--review-loop 1 then --maintainer-loop 1):
+# implement commits and records a suite run against its own commit, the
+# reviewer finds a problem, the fix leg commits (and records a run of its own
+# only when FAKE_FIX_RECORDS=1), the maintainer approves. The stub plays the
+# part of a model that appends to <outbox>/test-runs.jsonl as the prompt
+# tells it to, and saves the prompt each leg was given.
+ledger_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-ledger.XXXXXX)"
+tmpdirs+=("$ledger_stub")
+cat > "$ledger_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+
+clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+prompt="$(cat)"
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+outbox="$(dirname "$(dirname "$clone_dir")")/outbox"
+printf '%s\n' "$prompt" > "$FAKE_PROMPT_DIR/prompt-$n"
+
+record() {
+    local sha
+    sha="$(git -C "$clone_dir" rev-parse HEAD)"
+    printf '{"sha":"%s","cmd":"%s","ok":%s,"fail":0,"outcome":"pass","leg":"%s","at":"2026-01-31T12:00:00Z"}\n' \
+        "$sha" "$1" "$2" "$3" >> "$outbox/test-runs.jsonl"
+}
+commit() {
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "$1"
+}
+
+case "$n" in
+1)
+    commit "ledger implement"
+    # Hostile company for the honest line: the run must survive all of it.
+    printf 'this is not json\n[1]\n{"sha":"zz"}\n' >> "$outbox/test-runs.jsonl"
+    printf '{"sha":"%s","cmd":"%s"}\n' "$(git -C "$clone_dir" rev-parse HEAD)" \
+        "$(head -c 6000 /dev/zero | tr '\0' 'q')" >> "$outbox/test-runs.jsonl"
+    record "suite-run-by-implement" 41 implement
+    ;;
+2)
+    printf 'FINDINGS\n\nfile.txt:1 the new line breaks the invariant it sits next to\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+3)
+    commit "ledger fix"
+    [[ "${FAKE_FIX_RECORDS:-}" == 1 ]] && record "suite-run-by-fix" 42 fix
+    ;;
+4)
+    printf 'APPROVED\n\nChecked: the surrounding callers.\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    ;;
+esac
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$ledger_stub/claude-sandboxed"
+
+run_ledger() {
+    local fix_records="$1" out rc rd
+    # ledger_count/ledger_prompts are allocated by the caller: this runs in a
+    # command substitution, where an assignment would die with the subshell.
+    out="$(HOME="$launcher_home" PATH="$ledger_stub:$real_stub:$PATH" \
+        FAKE_COUNT_FILE="$ledger_count" FAKE_PROMPT_DIR="$ledger_prompts" \
+        FAKE_FIX_RECORDS="$fix_records" \
+        FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        timeout 60 "$launcher" --foreground --harness claude \
+        --review-loop 1 --maintainer-loop 1 --maintainer-model sonnet \
+        --branch "sandbox-test-ledger-$fix_records-$$" \
+        "$proj" "$handoff" 2>&1)"
+    rc=$?
+    rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    if (( rc != 0 )) || [[ -z "$rd" ]]; then
+        printf 'run_ledger failed (rc=%s):\n%s\n' "$rc" "$out" >&2
+        return 1
+    fi
+    printf '%s' "$rd"
+}
+
+ledger_prompts="$(mktemp -d)"; tmpdirs+=("$ledger_prompts")
+ledger_count="$(mktemp)"; tmpdirs+=("$ledger_count")
+# A fix leg that records its own run.
+if rd_l1="$(run_ledger 1)"; then
+    tmpdirs+=("$rd_l1")
+    check "the four-leg ledger run ran every leg" "4" "$(cat "$ledger_count")"
+    check "the ledger run ended approved" "approved" \
+        "$(jq -r '.ended' "$rd_l1/maintainer-loop.json")"
+    ledger_file="$rd_l1/outbox/test-runs.jsonl"
+    impl_sha="$(jq -R -r 'fromjson? | select(type == "object" and .cmd == "suite-run-by-implement") | .sha' "$ledger_file" 2>/dev/null | head -1)"
+    fix_sha="$(jq -R -r 'fromjson? | select(type == "object" and .cmd == "suite-run-by-fix") | .sha' "$ledger_file" 2>/dev/null | head -1)"
+    if [[ "$impl_sha" =~ ^[0-9a-f]{40}$ && "$fix_sha" =~ ^[0-9a-f]{40}$ && "$impl_sha" != "$fix_sha" ]]; then
+        ok "the implement and fix legs recorded runs against two different commits"
+    else
+        no "the implement and fix legs recorded runs against two different commits" \
+            "impl=$impl_sha fix=$fix_sha"
+    fi
+    review_p="$(cat "$rd_l1/review-prompt-1.md")"
+    contains "the review leg is shown the implement leg's record" \
+        "- \`suite-run-by-implement\` -- pass, 41 ok / 0 fail (implement leg" "$review_p"
+    contains "the review leg's section states the HEAD it matched" \
+        "HEAD is \`$impl_sha\`" "$review_p"
+    contains "the review leg is told not to re-run the suite" "do not re-run them" "$review_p"
+    check "the review leg's section appears once" "1" \
+        "$(grep -c '^## Recorded test runs for this commit$' "$rd_l1/review-prompt-1.md")"
+    lacks "the hostile ledger lines never reach the review prompt" "qqqqqqqq" "$review_p"
+    contains "the review prompt reports the unreadable lines it skipped" \
+        "unreadable line(s) in the ledger were ignored" "$review_p"
+    contains "the review prompt tells the leg to record its own runs" \
+        "### Test-run ledger" "$review_p"
+    fix_p="$(cat "$rd_l1/fix-prompt-1.md")"
+    contains "the fix leg is shown the record for the commit it starts from" \
+        "- \`suite-run-by-implement\`" "$fix_p"
+    contains "the fix leg gets the fix wording" "the exact commit you start from" "$fix_p"
+    mnt_p="$(cat "$rd_l1/maintainer-prompt-1.md")"
+    contains "after a fix commit the maintainer is shown the fix leg's record" \
+        "- \`suite-run-by-fix\` -- pass, 42 ok / 0 fail (fix leg" "$mnt_p"
+    contains "the maintainer's section states the fix leg's commit" "HEAD is \`$fix_sha\`" "$mnt_p"
+    lacks "the maintainer is not shown the earlier commit's record" "suite-run-by-implement" "$mnt_p"
+    lacks "the maintainer is not told nothing was recorded for its HEAD" \
+        "No test run is recorded" "$mnt_p"
+fi
+
+# A fix leg that commits and records nothing: the maintainer's HEAD no longer
+# matches the implement leg's record, and is told so rather than shown it.
+ledger_count="$(mktemp)"; tmpdirs+=("$ledger_count")
+if rd_l0="$(run_ledger 0)"; then
+    tmpdirs+=("$rd_l0")
+    check "the no-fix-record run ran every leg" "4" "$(cat "$ledger_count")"
+    mnt_p="$(cat "$rd_l0/maintainer-prompt-1.md")"
+    contains "a HEAD with no record is told nothing was recorded for it" \
+        "## No test run is recorded for this commit" "$mnt_p"
+    lacks "the earlier commit's record is not carried over" "suite-run-by-implement" "$mnt_p"
+    lacks "no record section is shown for a HEAD with none" \
+        "## Recorded test runs for this commit" "$mnt_p"
+    lacks "the maintainer is not told to skip the suite" "do not re-run them" "$mnt_p"
+    contains "the review leg still got the implement leg's record" \
+        "- \`suite-run-by-implement\`" "$(cat "$rd_l0/review-prompt-1.md")"
+fi
+
 printf '\n== maintainer surfacing: summary, run.env, status, run log ==\n'
 
 if [[ -n "$rd2" && -d "$rd2" ]]; then
