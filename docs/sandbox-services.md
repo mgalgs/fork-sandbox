@@ -266,9 +266,9 @@ It applies the per-run caps the cluster path would — `K8S_SERVICES_MAX` /
 `k8s.env` when set, otherwise the same built-in defaults — and prints which
 limits it applied with their source, so a pass is only a guarantee under the
 limits it names. The same applies to `K8S_SERVICE_REGISTRY` /
-`K8S_SERVICE_REGISTRIES`: the second line says which rule resolved every
-`services[].image` in the spec. On failure it exits non-zero with the same
-field-naming messages the cluster path gives.
+`K8S_SERVICE_REGISTRIES`: the `image refs:` line says which rule resolved
+every `services[].image` in the spec. On failure it exits non-zero with the
+same field-naming messages the cluster path gives.
 
 ### What the harness guarantees on every sidecar, never from the spec
 
