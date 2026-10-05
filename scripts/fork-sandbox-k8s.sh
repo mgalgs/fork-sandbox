@@ -6887,6 +6887,41 @@ k8s_teardown_claude_proxy() {
 # wait can succeed, and whatever is left in the pod is at best already
 # fetched), while exit 1 is the probe's own deadline (the run may still be
 # going) or a usage error.
+#
+# Captures the agent container's log when cmd_wait finds a Failed pod or a
+# Failed job condition -- a pod that died before any leg never reaches
+# cmd_collect's own evidence capture (k8s_run_tail below exits on a
+# non-zero wait before collect ever runs), so this is the only chance to
+# carry the tail into the run's own log and status. Prints the last 40
+# lines to stderr, bounded (--request-timeout=60s, like every other
+# evidence read in this file) and best effort: a read failure is reported
+# but never changes the caller's exit code. Given a non-empty $2 (the run
+# directory), also saves the full log to $2/evidence/pod-log-agent.log --
+# the exact path pm_wake_exit_record (fork-sandbox-postmaster.sh) already
+# reads for a k8s wake's own failure tail.
+k8s_capture_failed_agent_log() {
+    local pod_name="$1" run_dir="$2" log_tmp err_tmp
+    log_tmp="$(mktemp)"
+    err_tmp="$(mktemp)"
+    if ! kubectl logs "$pod_name" -c agent --request-timeout=60s > "$log_tmp" 2>"$err_tmp"; then
+        echo "fork-sandbox-k8s: could not capture $pod_name's agent log." >&2
+        fs_report_captured_stderr "kubectl logs $pod_name -c agent" "$err_tmp"
+        rm -f -- "$log_tmp" "$err_tmp"
+        return 0
+    fi
+    rm -f -- "$err_tmp"
+    echo "fork-sandbox-k8s: $pod_name's agent log (last 40 lines):" >&2
+    tail -n 40 -- "$log_tmp" | sed 's/^/    /' >&2
+    if [[ -n "$run_dir" ]]; then
+        if mkdir -p -- "$run_dir/evidence" 2>/dev/null; then
+            cp -- "$log_tmp" "$run_dir/evidence/pod-log-agent.log"
+        else
+            echo "fork-sandbox-k8s: could not create $run_dir/evidence; agent log not saved there." >&2
+        fi
+    fi
+    rm -f -- "$log_tmp"
+    return 0
+}
 cmd_wait() {
     local timeout=3600 branch="" project_path="${project_path-}" probe=false run_dir=""
     # Set just before a terminal exit 2 once the pod is known, never under
@@ -7049,7 +7084,7 @@ cmd_wait() {
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            [[ "$probe" == true ]] || wait_terminal_teardown=true
+            [[ "$probe" == true ]] || { wait_terminal_teardown=true; k8s_capture_failed_agent_log "$pod_name" "$run_dir"; }
             exit 2
         fi
         if [[ "$phase" == Succeeded ]]; then
@@ -7077,7 +7112,7 @@ cmd_wait() {
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            [[ "$probe" == true ]] || wait_terminal_teardown=true
+            [[ "$probe" == true ]] || { wait_terminal_teardown=true; k8s_capture_failed_agent_log "$pod_name" "$run_dir"; }
             exit 2
         fi
 

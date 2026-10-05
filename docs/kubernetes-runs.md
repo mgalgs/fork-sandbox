@@ -392,6 +392,19 @@ untouched — an artifact failure never costs the branch — because a failed
 outbox pull is not evidence the run is broken, while a failed transcript
 pull usually is.
 
+**A pod that never got that far.** The evidence pull-back above only runs
+once `wait` sees the run finish — but a pod that dies before any leg (a
+Failed pod, or a Failed job condition) never reaches it: `wait` itself
+exits 2 first, and `collect` never runs. For exactly that case, `wait`
+captures the agent container's own log directly: the last 40 lines go to
+stderr, and, when it was given `--run-dir` (as `run` always passes, and a
+cluster postmaster's own wake does too), the full log is saved to
+`<run-dir>/evidence/pod-log-agent.log` — the same path a cluster
+postmaster's `pm_wake_exit_record` already reads for a k8s wake's own
+failure tail (see [docs/cluster-postmaster.md](cluster-postmaster.md)).
+Best-effort, like the pull-back above: a failed log read never changes
+`wait`'s own exit code.
+
 **The zero-harvest suspicion.** A run that ends with all three of these
 is flagged **SUSPICIOUS** and treated differently:
 

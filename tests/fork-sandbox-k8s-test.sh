@@ -7177,6 +7177,14 @@ case " $* " in
     *" cat /work/.run-complete "*)
         [[ -n "${K8S_STUB_RUN_COMPLETE:-}" ]] && printf '%s\n' "$K8S_STUB_RUN_COMPLETE"
         exit "${K8S_STUB_SENTINEL_RC:-1}" ;;
+    *" logs "*)
+        # k8s_capture_failed_agent_log's own read, on a Failed pod/job --
+        # never reached under --probe. K8S_STUB_LOGS_RC simulates the read
+        # itself failing (a live-cluster kubectl error).
+        if [[ -n "${K8S_STUB_LOGS_RC:-}" ]]; then
+            exit "$K8S_STUB_LOGS_RC"
+        fi
+        printf 'stub pod log: entrypoint narration\n'; exit 0 ;;
     *" delete pod/"*)
         # k8s_teardown_claude_proxy's one call -- the only "delete pod/..."
         # (TYPE/NAME) invocation in the whole script. K8S_STUB_PROXY_DELETE_RC
@@ -7227,21 +7235,46 @@ fi
 
 # 2. A Failed pod: the wait itself fails with the TERMINAL code 2 (the
 # run can never complete through this wait again -- a probe loop must
-# give the seat up, not re-probe it), naming the pod.
+# give the seat up, not re-probe it), naming the pod. Given --run-dir, it
+# also captures the agent container's log: a tail on stderr, and the full
+# log saved to <run-dir>/evidence/pod-log-agent.log -- the path a cluster
+# postmaster's pm_wake_exit_record reads for a k8s wake's own failure tail.
 wait_log2="$(newdir)/kubectl.log"; wait_out2="$(newdir)/out2.txt"; wait_err2="$(newdir)/err2.txt"
 tmpdirs+=("$(dirname "$wait_log2")")
+wait2_rd="$(newdir)"; tmpdirs+=("$wait2_rd")
 rc=0
 K8S_STUB_POD_PHASE=Failed \
     waitstub_wait "$wait_log2" "$wait_out2" "$wait_err2" \
-    --branch fs-k8s-test-wait-podfailed --timeout 5 || rc=$?
+    --branch fs-k8s-test-wait-podfailed --timeout 5 --run-dir "$wait2_rd" || rc=$?
 if (( rc == 2 )) && grep -q 'pod stub-pod is Failed -- it died before writing' "$wait_err2"; then
     ok "a Failed pod fails the wait with the terminal code 2"
 else
     no "a Failed pod fails the wait with the terminal code 2" "rc=$rc: $(cat "$wait_err2")"
 fi
+contains_log2=$(grep -c 'stub pod log: entrypoint narration' "$wait_err2")
+check "a Failed pod's agent log tail is printed to stderr" "1" "$contains_log2"
+check "a Failed pod's agent log is saved to <run-dir>/evidence/pod-log-agent.log" \
+    "stub pod log: entrypoint narration" "$(cat "$wait2_rd/evidence/pod-log-agent.log" 2>/dev/null)"
+
+# 2b. A Failed pod whose log read itself fails still gives the terminal
+# code 2 -- the capture is best effort and never changes the outcome.
+wait_log2b="$(newdir)/kubectl.log"; wait_out2b="$(newdir)/out2b.txt"; wait_err2b="$(newdir)/err2b.txt"
+tmpdirs+=("$(dirname "$wait_log2b")")
+rc=0
+K8S_STUB_POD_PHASE=Failed K8S_STUB_LOGS_RC=1 \
+    waitstub_wait "$wait_log2b" "$wait_out2b" "$wait_err2b" \
+    --branch fs-k8s-test-wait-podfailed-logfail --timeout 5 || rc=$?
+if (( rc == 2 )) && grep -q 'pod stub-pod is Failed -- it died before writing' "$wait_err2b"; then
+    ok "a Failed pod whose log capture fails still exits the terminal code 2"
+else
+    no "a Failed pod whose log capture fails still exits the terminal code 2" \
+        "rc=$rc: $(cat "$wait_err2b")"
+fi
 
 # 3. A Failed job condition: the wait itself fails with the terminal
-# code 2, naming the job.
+# code 2, naming the job. Under --probe, no log capture runs at all: a
+# probe loop calls this every few seconds and must never shell out to
+# `kubectl logs` for what may still just be a transient result elsewhere.
 wait_log3="$(newdir)/kubectl.log"; wait_out3="$(newdir)/out3.txt"; wait_err3="$(newdir)/err3.txt"
 tmpdirs+=("$(dirname "$wait_log3")")
 rc=0
@@ -7252,6 +7285,27 @@ if (( rc == 2 )) && grep -q 'reports a Failed condition' "$wait_err3"; then
     ok "a Failed job condition fails the wait with the terminal code 2"
 else
     no "a Failed job condition fails the wait with the terminal code 2" "rc=$rc: $(cat "$wait_err3")"
+fi
+if grep -q ' logs ' "$wait_log3"; then
+    no "--probe never calls kubectl logs, even on a Failed job condition" \
+        "$(cat "$wait_log3")"
+else
+    ok "--probe never calls kubectl logs, even on a Failed job condition"
+fi
+
+# 3b. A Failed job condition WITHOUT --probe does capture the log, the
+# same as the Failed-pod case above.
+wait_log3b="$(newdir)/kubectl.log"; wait_out3b="$(newdir)/out3b.txt"; wait_err3b="$(newdir)/err3b.txt"
+tmpdirs+=("$(dirname "$wait_log3b")")
+rc=0
+K8S_STUB_JOB_FAILED=True \
+    waitstub_wait "$wait_log3b" "$wait_out3b" "$wait_err3b" \
+    --branch fs-k8s-test-wait-jobfailed-nop --timeout 5 || rc=$?
+if (( rc == 2 )) && grep -q 'stub pod log: entrypoint narration' "$wait_err3b"; then
+    ok "a Failed job condition without --probe also captures the agent log"
+else
+    no "a Failed job condition without --probe also captures the agent log" \
+        "rc=$rc: $(cat "$wait_err3b")"
 fi
 
 # 4. No sentinel by the deadline: the wait itself fails with code 1 --
