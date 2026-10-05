@@ -467,18 +467,20 @@ What to expect while it is on:
   in-session. The session reports each sandboxed round in a few lines —
   branch, what landed, whether the suites pass on the host, any caveat —
   and quotes the cost every round.
-- The composition is yours, not the session's: runs launch at the mode's
-  defaults (a light model implements, a stronger one reviews, up to two
-  review loops), overridable per machine in
-  `~/.config/fork-sandbox/coder-mode.env`. The session never lowers the
-  review on its own; a deviation is announced in one line.
+- The session picks each round's pipeline. Leg composition follows the
+  task's shape and an estimate of how long the round will take: a
+  mechanical, fully specified change gets one or two legs, while a large,
+  subtle or widely-depended-on one gets the deepest composition. Harness
+  and model follow whatever quota information the environment exposes.
+  The standard composition for ordinary work (a light model implements, a
+  stronger one reviews, up to two review loops) is overridable per machine
+  in `~/.config/fork-sandbox/coder-mode.env`. Every routing decision is
+  announced in one line, with its time estimate and reason.
 - To pin one composition for a whole session, name it on the invocation:
-  `/sandbox-coder-mode --preset <name>` runs every round on that preset
-  from `~/.config/fork-sandbox/presets/`, whatever the machine file says.
-  It is the flag for a standing constraint the machine default does not
-  know about — a nearly exhausted subscription, a provider to stay off.
-  `--auto-preset-router` is the opposite choice: let the session pick a
-  preset per round from that directory. A pin wins over the router.
+  `/sandbox-coder-mode --preset <name>` (a file in
+  `~/.config/fork-sandbox/presets/`) or `--pipeline <spec>` runs every
+  round on it and turns routing off. A composition you name for a single
+  round always wins.
 - Steer a round in flight by just saying so — the session relays the
   correction into the running sandbox as an operator addendum, without
   restarting it.

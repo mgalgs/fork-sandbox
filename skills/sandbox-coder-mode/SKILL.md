@@ -1,7 +1,7 @@
 ---
 name: sandbox-coder-mode
 description: Enter a standing mode where this session stops writing code and delegates every coding and editing task to an unattended fork-sandbox run, acting as orchestrator, reviewer and integrator. Use when the user wants an expensive model to plan and review while cheap or self-hosted models do the typing, or wants unattended editing to happen somewhere that is not their own checkout. Stays on until the user ends it.
-argument-hint: [off|--preset <name>|--auto-preset-router] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. "--preset <name>" pins every round of this session to that machine preset — see "Pinning one preset for the session". "--auto-preset-router" instead lets the orchestrator route each round to the machine preset that fits the task — see "The auto-preset router". "--long" is accepted and changes nothing: the long-horizon discipline is the default — see "Running long".
+argument-hint: [off|--preset <name>|--pipeline <spec>] — no argument turns the mode on, and the orchestrator then picks each round's pipeline from the task and the quota left — see "Routing a round". Pass "off" (or say so in plain words) to end it. "--preset <name>" or "--pipeline <spec>" pins every round of this session to that composition instead — see "Pinning one composition for the session". "--auto-preset-router" and "--long" are accepted and change nothing.
 user-invocable: true
 ---
 
@@ -87,28 +87,28 @@ When the file sets `CODER_MODE_PRESET`, the composition lives in
 read that file too, and word the announcement from what it says — see
 **The machine's composition can be a preset** for the key's rules.
 
-When the mode is invoked with `--preset <name>`, that preset is the
-composition for every round instead of whatever the machine file says —
-read it and word the announcement from it, saying which preset is pinned
-and that it overrides the machine default. See **Pinning one preset for
-the session**.
+When the mode is invoked with `--preset <name>` or `--pipeline <spec>`,
+that composition is pinned for every round and this session does no
+routing of its own — read it and word the announcement from it, saying
+what is pinned and that it overrides the machine default. See **Pinning
+one composition for the session**.
 
-When the mode is invoked with `--auto-preset-router` (or the machine sets
-`CODER_MODE_AUTO_PRESET_ROUTER=1`), also list
-`~/.config/fork-sandbox/presets/` and read every preset there — the header
-comment is its author's statement of intent, the `agents`/`pipeline` body
-is what it actually runs — and name the roster in the announcement, so the
-user hears which presets rounds will be routed among. See **The
-auto-preset router** for the routing rules.
+Otherwise this session routes each round itself (see **Routing a round**).
+Also list `~/.config/fork-sandbox/presets/` if it exists and read every
+preset there — the header comment is its author's statement of intent,
+the `agents`/`pipeline` body is what it actually runs — since a preset
+that fits a task's shape is a ready-made answer. And note whether the
+environment exposes quota or usage information at all; routing reads it
+per round.
 
 Tell the user, in one or two lines, stating plainly that this session will
 stay high level:
 
 > Sandbox coder mode is on. I'll read, plan, review and integrate; the actual
-> editing goes to sandboxed runs on their own branches — sonnet implements,
-> opus reviews, up to two review rounds. I'll report each round with its
-> cost and flag anything unpushed. Say "exit sandbox coder mode" when you
-> want me writing code here again.
+> editing goes to sandboxed runs on their own branches. I'll pick each
+> round's pipeline from the task and the quota left, say which and why when
+> I launch, and report each round with its time and cost. Say "exit
+> sandbox coder mode" when you want me writing code here again.
 
 Then carry on with whatever they asked for. Do not re-announce the mode on
 every turn.
@@ -135,9 +135,10 @@ describes the mode; this section describes what running long demands.
   default `--harness claude --model sonnet` — or a `pi` / sealed-`pi` harness
   when a per-round reason calls for one — per **Choosing a harness and a
   model**.
-- **Tier 3 — in-sandbox reviewer.** On by default, via `--review-model opus
-  --review-loop 2`. A fresh opus session reviews tier 2's work before it
-  ever leaves the sandbox; drop below the default only for a stated reason.
+- **Tier 3 — in-sandbox reviewer.** Part of the standard composition, via
+  `--review-model opus --review-loop 2`. A fresh session reviews tier 2's
+  work before it ever leaves the sandbox. Routing leaves it out only for a
+  mechanical, fully specified round, and says so (**Routing a round**).
 
 **Tier 1's review is never skipped because tier 3 ran.** This is the
 load-bearing rule of the whole arrangement:
@@ -782,15 +783,15 @@ override rules are `docs/presets.md`), and every launch passes `--preset
 be set — a file carrying both is a config error to surface to the user,
 never to resolve silently, because two sources for one composition is
 exactly what this key exists to remove. `coder-mode.env` then holds only
-the pointer, plus any mode keys that are not composition (the router key,
-for one).
+the pointer, plus any mode keys that are not composition.
 
-Everything else in this section applies unchanged. A per-round deviation
-is flags stacked on top of `--preset` — a flag beats its preset
-counterpart key by key, and a harness override drops that seat's preset
-model, arguments and repeat ("Flags override, key by key" in
-`docs/presets.md`) — announced with its reason exactly as before, and the
-review composition is still never lowered: see the next sections.
+Everything else in this section applies unchanged. The preset is the
+standard composition that **Routing a round** starts from. A per-round
+deviation is either another composition entirely (`--pipeline`, or
+another preset) or flags stacked on top of `--preset`: a flag beats its
+preset counterpart key by key, and a harness override drops that seat's
+preset model, arguments and repeat ("Flags override, key by key" in
+`docs/presets.md`). Either way it is announced with its reason.
 
 ### Reasons to deviate for one round
 
@@ -806,111 +807,101 @@ Pick per task, and say why in one line when you launch:
 The review flags travel with `--harness`, not with this table: a round
 that deviates from the machine's harness restates `--review-model` (and
 `--review-harness`, if the reviewer should run elsewhere) in names that
-harness understands. Deviating on the harness never drops the review leg:
-the only round that runs without one is the medium-model one-shot in the
-next section, and that is an upward deviation on the implementer, not a
-review omission.
+harness understands. Which legs a round gets at all is the next section's
+question, not this table's.
 
-### The review loop is the user's setting, not the orchestrator's
+### Routing a round
 
-The composition the user launched the mode with — or the machine file
-above — has two tiers in it: `--model` is the *light* model that types,
-`--review-model` is the *medium* model that reads, and `--review-loop` is
-how many times. A machine file that sets the maintainer keys adds a third:
-the model that judges the branch the way a maintainer judging a pull
-request would, after the inner loop has finished arguing. That composition
-is the default for **every** round, and the orchestrator does not lower
-it: not the loop count, not the review model, not the maintainer tier, not
-for a round that "looks small". An implementer cannot judge its own work,
-and the orchestrator cannot judge its own spec; neither decides whether a
-review — inner or maintainer — runs.
+Unless the user has pinned a composition (see **Pinning one composition
+for the session**), this session picks each round's pipeline itself: the
+legs (which stages, how many passes) from the task, and the harness and
+model for each leg from the quota left. The machine's composition from
+`coder-mode.env` is the **standard composition** — what an ordinary
+implement round gets — not a floor every round must clear.
 
-The one permitted deviation is **upward on the implementer, never downward
-on the review**: a change small enough that a loop is plainly overkill goes
-to the *medium* model one-shot, and the orchestrator reads the diff itself.
-"Light model, no review" is not a composition the orchestrator may choose.
-The bar for even that is very high confidence about the *spec*, not the
-task: the files are named, the change is written out line by line, no
-security property is touched, and the implementer is left no choice to
-make. Any latitude at all, and the default stands. Doubt resolves toward
-the user's settings.
+Who decides, highest first:
 
-**Say what you are using whenever it is not the default.** One line at
-launch, every flag spelled out, and the reason — extremely verbose, zero
-ceremony:
+1. An explicit pipeline or preset the user names for this round.
+2. A composition pinned for the session.
+3. This session's routing, below.
 
-> Launching `sbx-review-cleared-fp` with `--harness claude --model opus`
-> and no review loop, not the session's `--model sonnet --review-loop 1
-> --review-model opus`: the handoff names both files and gives the regex,
-> the three lines, and all ten test cases, so the implementer has nothing
-> to decide; I read the diff.
+**Legs follow the task's shape.** Judge the shape from the compiled spec,
+the thing the handoff says, not from how small the request sounded:
 
-A launch at the default needs no such line. A launch that deviates and
-does not carry one is a launch the user cannot audit.
+| Shape | Composition | Wall-clock target |
+|---|---|---|
+| Mechanical and fully specified — a rename, a fixture fix, a pattern applied across files; the handoff leaves the implementer nothing to decide | one code leg, or a code leg and one light review | about one leg |
+| Ordinary implementation with a clear plan | the standard composition | the standard composition's usual time |
+| Large or subtle, or it modifies code other things already run through (a shared helper, an engine, a hot path) | the deepest composition available: a plan stage when the design spans files, the review loop, and a maintain step on the strongest model | whatever it takes |
+| High-volume or exploratory — a sweep, an investigation | the cheapest capable harness, sealed where one exists | short legs, many of them |
 
-### Pinning one preset for the session
+**Estimate the completion time before launching**, and let it decide
+between compositions that would all do the job. A round takes roughly the
+sum over its legs of the leg's work plus the project's test suite, for
+every leg that runs the suite. A long suite multiplies across legs: a
+mechanical change on a project with a fifteen-minute suite should be one
+or two legs, not six. Review legs that look at a commit an earlier leg
+already tested reuse that recorded result rather than paying for the
+suite again, but every fix leg's new commit is tested afresh. Compare
+the estimate with the round's actual elapsed time when it lands, and
+correct the next estimate.
 
-`--preset <name>` on the mode's invocation pins that preset as the
-composition for **every** round, in place of whatever
-`~/.config/fork-sandbox/presets/` composition the machine file names. It
-is the flag for a session with a standing constraint the machine default
-does not know about — a nearly exhausted subscription, a provider to stay
-off, an endpoint to exercise — where the answer is the same for every
-round and the user has already decided it.
+**Harness and model follow the quota.** When the environment exposes
+quota or usage information — a status command, a usage file, a provider's
+reported limits, or quota plans the user has recorded — read it before
+each launch. Seat legs on a provider with headroom. Never start a long
+composition on a window that is projected to run out before it resets:
+a leg that dies mid-run costs more than a slower model would have. Follow
+any spending preference the user has stated. When no quota information
+exists, use the standard composition's harnesses and models, and use
+`fork-sandbox status --json` costs from recent rounds as the guide.
 
-The preset must exist in `~/.config/fork-sandbox/presets/`. The flag
-selects among the user's own presets; it never composes one, and a name
-with no file behind it is an error to surface, not to approximate with
-the nearest match.
+`--pipeline <spec>` (see `docs/presets.md`, "Inline pipelines") expresses
+any composition the routing arrives at without a preset file; a preset
+file whose shape fits is an equally good answer.
 
-Read the pinned file on entering the mode and announce it — which preset,
-and that it overrides the machine default — since the whole point is that
-this session composes rounds differently from every other session on the
-machine.
+What routing never changes:
 
-**A pin turns the router off for the session.** A pinned composition and
-a router that chooses compositions are two answers to one question, so
-`--preset` wins over `CODER_MODE_AUTO_PRESET_ROUTER=1` and over
-`--auto-preset-router` typed alongside it; say so in the announcement
-rather than leaving the user to wonder which one is in force. Everything
-else stands unchanged: a pin is still not a licence to lower the review
-composition, and a per-round deviation is still flags stacked on top of
-`--preset` with its reason announced (**The review loop is the user's
-setting, not the orchestrator's**).
+- **Tier 1 review is never skipped.** A round with no in-sandbox review
+  means this session reads the whole diff itself, not just the diffstat.
+- **Light composition is for mechanical shape only.** A change that touches
+  a security property, authentication, data that can be lost, or anything
+  that runs on the host with privileges gets a review leg, however small
+  it is.
+- **Doubt resolves upward.** When the shape is unclear, or the handoff
+  leaves the implementer a real choice, use the standard composition, or
+  deeper.
+- **Every leg names its model**, as **Pin `--model` on every claude run**
+  below requires; a spec or preset does that for each seat.
 
-### The auto-preset router
+**Announce every routing decision.** One line at launch: the composition,
+the time estimate, and the reason, including what the quota reading said
+when there was one. Silence would leave the user unable to tell a
+decision from a habit:
 
-`--auto-preset-router` on the mode's invocation — or
-`CODER_MODE_AUTO_PRESET_ROUTER=1` in `coder-mode.env` as the machine
-default — moves one decision, *which preset*, from the user to the
-orchestrator. On entering the mode, read every preset in
-`~/.config/fork-sandbox/presets/` (see **Entering the mode**). Then route
-each round to the preset whose shape fits the task's — the same judgement
-`--task-meta` already records: a mechanical sweep or rename to the
-cheapest single-leg preset, an ordinary implement to the machine's
-default, a change that modifies code other things already run through to
-the deepest composition available (one with a maintain step, when one
-exists).
+> Launching `sbx-fixture-hermetic` on `--pipeline csonnet`: a fixture fix
+> the handoff spells out file by file, the suite is ~15 min, so one leg
+> (~25 min) and I read the diff; the subscription has headroom.
 
-This does not repeal the previous section; it relocates it. Every preset
-in the roster was authored by the user for this machine — that authorship
-is the consent the previous section demands — and the router picks whole
-presets, never composes flags of its own and never edits a preset
-downward. Two rules keep it auditable:
+### Pinning one composition for the session
 
-- **Announce every routing decision.** One line at launch: the preset
-  chosen and the task-shape reason. A routed launch always gets the line,
-  even to the default preset — with the router on, silence would leave
-  the user unable to tell a decision from a habit.
-- **Doubt resolves upward.** When the task's shape is ambiguous, or no
-  preset fits it, launch on the machine's default composition — never on
-  a cheaper preset because the task "looks small". The one permitted
-  deviation above (upward on the implementer, never downward on the
-  review) binds the router exactly as it binds a flag deviation.
+`--preset <name>` or `--pipeline <spec>` on the mode's invocation pins that
+composition for **every** round, and turns routing off for the session.
+That suits a session with a standing constraint the routing does not know
+about: an endpoint to exercise, a provider to stay off, a comparison that
+needs every round on the same composition.
 
-Without the flag or the env key, nothing changes: the machine's one
-composition is the default for every round, and preset choice is not the
-orchestrator's to make.
+A `--preset` name must exist in `~/.config/fork-sandbox/presets/` or parse
+as a pipeline spec. A name that is neither is an error to surface, not to
+approximate with the nearest match.
+
+Read the pinned composition on entering the mode and announce it. The
+pin is still not a licence to skip tier 1 review, and a per-round
+deviation from it is still flags stacked on top, with the reason
+announced.
+
+`--auto-preset-router` and `CODER_MODE_AUTO_PRESET_ROUTER=1` are still
+accepted and change nothing, since routing is now the default.
 
 **Pin `--model` on every claude run.** Without it the run takes the host's
 default, which is the expensive model this session is likely running on —
