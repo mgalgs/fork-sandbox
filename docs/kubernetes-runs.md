@@ -2184,13 +2184,19 @@ in its environment holds the clone's absolute path; `HOME` and `PATH` are
 the pod's own. It inherits the rest of the entrypoint's environment, but
 only those three are a promised contract. Its combined output is captured
 to the pod's `/work/provision.log`, bounded by a timeout (300 seconds by
-default).
+default) that is a hard bound: a provisioner that ignores the TERM sent
+at that mark is forcibly killed 10 seconds later.
 
 A non-zero exit or a timeout fails the run before any leg — no
 `.run-complete`, no harness call — with the last 40 lines of its output
-printed to the pod log, prefixed `provision:` (a timeout is named as one).
-When no provisioning executable is present, nothing changes: no log, no
-exclude-file edit, no output, the same pod as before this existed.
+printed to the pod log first, followed by the verdict line naming the exit
+code or the timeout, prefixed `provision:`. Printing the verdict after the
+tail, not before, keeps it inside the last-40-lines window that `wait` and
+a cluster postmaster's wake record each read back. When no provisioning
+executable is present, nothing changes: no log, no exclude-file edit, no
+output, the same pod as before this existed. A path that exists but is not
+executable, or a dangling symlink, is treated as a build mistake, not as
+absent: the run fails before any leg, naming the path.
 
 On success, every path the provisioner CREATED (a symlink, a directory —
 whatever `git status --porcelain --untracked-files=normal` reports as `??`
@@ -2201,6 +2207,11 @@ provisioner instead modified or deleted a TRACKED file, the run fails
 naming the path — exclusion cannot hide that, and silently committing an
 image's edits into the agent's own branch, with no author, is the worse
 outcome.
+
+A new directory is excluded whole (`/media/`, not each file in it), so
+anything the agent later adds under it is never committed either. Link
+image-held trees into the clone as symlinks, and create only paths the
+agent has no reason to commit into.
 
 The base image (`images/sandbox/Dockerfile`) ships no such executable at
 all. A worked example for a derived image:

@@ -177,8 +177,12 @@
 #   PROVISION_TIMEOUT
 #                   seconds to let an image-supplied provisioning
 #                   executable (PROVISION_EXE) run before the whole run
-#                   fails. Default 300. Not rendered by submit, so this is
-#                   a fixed default this round, not a k8s.env key.
+#                   fails. Default 300. A provisioner that ignores the
+#                   TERM sent at that bound gets a further 10s grace
+#                   period (timeout -k) before a KILL finishes the job --
+#                   so PROVISION_TIMEOUT is a hard bound either way, not
+#                   just a request. Not rendered by submit, so this is a
+#                   fixed default this round, not a k8s.env key.
 #   PROVISION_EXE   test seam: overrides the fixed, documented path a
 #                   derived image may carry provisioning at
 #                   (/opt/fork-sandbox/provision -- see "Provisioning the
@@ -818,15 +822,29 @@ run_image_provisioning_exclude() {
 # docs/kubernetes-runs.md for the full contract. Absent (the base image's
 # own state, and PROVISION_EXE's default never exists there): returns 0
 # with no log, no exclude edit and no output at all, so an unmodified
-# install sees no change here whatsoever. Present and executable: narrates,
-# runs it once with cwd set to the clone and FORK_SANDBOX_CLONE_DIR naming
-# it, captures its combined output to $work_dir/provision.log, and on a
-# non-zero exit (timeout included -- `timeout` itself exits 124) prints the
-# last 40 lines of that log, prefixed, and fails the run before any leg --
-# no .run-complete, no harness call. On success, hands off to
+# install sees no change here whatsoever. Present but not executable
+# (including a dangling symlink) is an operator build mistake, not "no
+# provisioner" -- failing loudly here beats
+# a silent no-op that only surfaces later as a confusing failure deep in the
+# agent's own leg, with no `.venv` or seed links and nothing in the pod log
+# saying why. Present and executable: narrates, runs it once with cwd set to
+# the clone and FORK_SANDBOX_CLONE_DIR naming it, captures its combined
+# output to $work_dir/provision.log, and on a non-zero exit (timeout
+# included -- 124 or 137, see below) prints the last 40 lines of that
+# log, prefixed, followed by the verdict, and fails the run before any leg --
+# no .run-complete, no harness call. The verdict is printed AFTER the tail,
+# not before: `wait` and the postmaster's wake record each keep only the
+# last 40 lines of this same stream, and a provisioner that itself logs 40+
+# lines would otherwise push the one line saying why the run failed out of
+# every window that later reads it. On success, hands off to
 # run_image_provisioning_exclude above.
 run_image_provisioning() {
-    [[ -x "$PROVISION_EXE" ]] || return 0
+    [[ -e "$PROVISION_EXE" || -L "$PROVISION_EXE" ]] || return 0
+    if [[ ! -x "$PROVISION_EXE" ]]; then
+        echo "Error: fork-sandbox-k8s-entrypoint: provisioning executable" >&2
+        echo "$PROVISION_EXE exists but is not executable (or is a dangling symlink)." >&2
+        exit 1
+    fi
     echo "fork-sandbox-k8s-entrypoint: provisioning with $PROVISION_EXE" >&2
     local provision_log="$work_dir/provision.log" provision_rc=0
     # Not `if ! cmd; then rc=$?`: under the negation, $? inside the then
@@ -835,18 +853,29 @@ run_image_provisioning() {
     # timeout back as "exited 1". `cmd && rc=0 || rc=$?` keeps the real
     # code, and the whole line still exits 0 so `set -e` never fires on a
     # failing provisioner.
+    # -k/--kill-after: plain `timeout N cmd` only sends TERM at N and then
+    # waits however long the command keeps running -- a provisioner that
+    # traps or ignores TERM would never actually be bounded by
+    # PROVISION_TIMEOUT. The extra 10s grace period gives a well-behaved
+    # provisioner a chance to clean up on TERM before KILL lands.
     (cd "$clone_dir" \
-        && FORK_SANDBOX_CLONE_DIR="$clone_dir" timeout "$PROVISION_TIMEOUT" "$PROVISION_EXE") \
+        && FORK_SANDBOX_CLONE_DIR="$clone_dir" \
+        timeout -k 10 "$PROVISION_TIMEOUT" "$PROVISION_EXE") \
         > "$provision_log" 2>&1 && provision_rc=0 || provision_rc=$?
     if (( provision_rc != 0 )); then
-        if (( provision_rc == 124 )); then
+        echo "fork-sandbox-k8s-entrypoint: provision: last 40 lines of its output:" >&2
+        tail -n 40 -- "$provision_log" | sed 's/^/fork-sandbox-k8s-entrypoint: provision: /' >&2
+        if (( provision_rc == 124 || provision_rc == 137 )); then
+            # 124: timeout's own TERM killed it within the grace period.
+            # 137 (128+SIGKILL): the provisioner ignored TERM and the -k
+            # grace period's KILL finished the job instead -- still a
+            # timeout, not an ordinary exit code.
             echo "Error: fork-sandbox-k8s-entrypoint: provision timed out after" >&2
-            echo "${PROVISION_TIMEOUT}s." >&2
+            echo "${PROVISION_TIMEOUT}s (exit $provision_rc; a provisioner that itself" >&2
+            echo "exits 124 or 137 reads the same way)." >&2
         else
             echo "Error: fork-sandbox-k8s-entrypoint: provision exited $provision_rc." >&2
         fi
-        echo "fork-sandbox-k8s-entrypoint: provision: last 40 lines of its output:" >&2
-        tail -n 40 -- "$provision_log" | sed 's/^/fork-sandbox-k8s-entrypoint: provision: /' >&2
         exit 1
     fi
     run_image_provisioning_exclude

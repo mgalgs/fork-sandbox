@@ -183,6 +183,11 @@ recognized store or build the venv on the system python.
 Entries cannot escape the repo — absolute paths, `..` and symlinks that
 resolve outside are refused.
 
+A `--k8s` run has no host to bind from, so `provision-ro` does not apply
+there; the cluster analogue is an image-supplied provisioning executable
+that links its own baked-in paths (a venv, seed data) into the clone — see
+"Provisioning the clone from the image" in `docs/kubernetes-runs.md`.
+
 ### Level 2: databases and services — `sandbox-services`
 
 For suites that need postgres, redis, object storage. The repo commits

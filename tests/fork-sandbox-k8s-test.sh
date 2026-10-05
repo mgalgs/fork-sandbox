@@ -333,6 +333,48 @@
 #     refuses --task-meta: it forwards the raw value, byte-for-byte
 #     identical to a direct `run --dry-run` render, and an invalid value
 #     is still refused (now by cmd_submit, forwarded through).
+#   - the per-run and per-project pod image: with neither --image nor a
+#     matching K8S_PROJECT_IMAGES entry, both the egress-gate and agent
+#     containers render K8S_IMAGE exactly as before (byte-identical to a
+#     render naming a different project), --image wins over a project
+#     entry and K8S_IMAGE together and announces its source, a project
+#     entry matching the origin repo's basename wins over K8S_IMAGE and
+#     announces its own source, a project entry lets K8S_IMAGE stay unset,
+#     a malformed --image/K8S_PROJECT_IMAGES value is refused by name
+#     before anything is created, run.env/summary.json/sandbox-run-log.py
+#     carry image and image_source, and fork-sandbox.sh --k8s --image
+#     renders byte-for-byte what a direct run --dry-run --image does (and
+#     is refused by name without --k8s).
+#   - `wait` on a Failed pod or a Failed job condition (non-probe) prints
+#     the agent container's log tail to stderr and, given --run-dir, saves
+#     it to <run-dir>/evidence/pod-log-agent.log, without changing the
+#     exit code; --probe makes no `kubectl logs` call at all.
+#   - image-supplied clone provisioning (run_image_provisioning, extracted
+#     from the entrypoint): a missing PROVISION_EXE runs nothing; a
+#     present-but-non-executable one fails the run naming the path; a
+#     present one runs once from the clone's own directory with
+#     FORK_SANDBOX_CLONE_DIR naming it, after git identity is set and
+#     before the harness branch; a non-zero exit or a PROVISION_TIMEOUT
+#     timeout -- including one that ignores TERM, which `timeout -k`
+#     still bounds with a KILL -- fails the run before any leg with the
+#     last 40 lines of its output on stderr, prefixed, the verdict line
+#     AFTER the tail; a symlink, a directory and a path the repo's own
+#     .gitignore already covers are each exclude-handled on success
+#     (twice, with no duplicate line) while a tracked-file edit or an
+#     unsafe path name fails the run naming it; and the base Dockerfile
+#     ships no such executable.
+#   - the per-run services spec's registry resolution
+#     (fork-sandbox-k8s-services-parse.py): with neither
+#     K8S_SERVICE_REGISTRY nor K8S_SERVICE_REGISTRIES set, a spec with
+#     Docker Hub short names and several fully qualified registries
+#     renders and validates exactly as today; with only the prefix set, a
+#     `./name:tag` ref resolves against it and every other ref renders
+#     byte-identically; with the allowlist set, a ref on a listed host, on
+#     the prefix's own host, or `./`-relative is accepted, while a ref on
+#     an unlisted host or an unqualified short name is refused naming the
+#     field and the key; a malformed key value is refused naming k8s.env,
+#     not the spec; and `validate-services` applies the same resolution
+#     and prints which rule it used.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -15711,6 +15753,37 @@ check "a missing PROVISION_EXE leaves .git/info/exclude unchanged" \
 check "a missing PROVISION_EXE writes no provision.log" \
     "false" "$([[ -f "$provision_t9_clone/../provision.log" ]] && echo true || echo false)"
 
+# T9b (R9): a PROVISION_EXE that exists but lost its +x bit is a build
+# mistake, not "no provisioner" -- the run fails before any leg, naming
+# the path, instead of silently skipping provisioning like T9's missing
+# file does.
+provision_t9b_clone="$(provision_make_clone)"
+provision_t9b_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t9b_stub")")
+cat > "$provision_t9b_stub" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod -x "$provision_t9b_stub"
+provision_run "$provision_t9b_clone" "$provision_t9b_stub"
+if (( PROVISION_RC == 1 )) && grep -qF "$provision_t9b_stub" "$PROVISION_ERR" \
+    && grep -qi 'not executable' "$PROVISION_ERR"; then
+    ok "a present but non-executable PROVISION_EXE fails the run, naming the path"
+else
+    no "a present but non-executable PROVISION_EXE fails the run, naming the path" \
+        "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+# A dangling symlink at the path is the same build mistake, not "absent".
+provision_t9c_clone="$(provision_make_clone)"
+provision_t9c_link="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t9c_link")")
+ln -s "$(dirname "$provision_t9c_link")/no-such-target" "$provision_t9c_link"
+provision_run "$provision_t9c_clone" "$provision_t9c_link"
+if (( PROVISION_RC == 1 )) && grep -qF "$provision_t9c_link" "$PROVISION_ERR"; then
+    ok "a dangling-symlink PROVISION_EXE fails the run, naming the path"
+else
+    no "a dangling-symlink PROVISION_EXE fails the run, naming the path" \
+        "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+
 # T10 (R10): a present, executable PROVISION_EXE runs from the clone's own
 # directory, with FORK_SANDBOX_CLONE_DIR naming it, as this process's own
 # uid (there is no other uid to switch to outside a real pod).
@@ -15807,6 +15880,19 @@ else
     no "a non-zero exit fails the run with the last 40 lines on stderr, prefixed" \
         "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
 fi
+# The verdict must sit AFTER the tail, not before it: a provisioner that
+# logs 40+ lines would otherwise push the "exited 3" line out of the
+# last-40-lines window that `wait` and a postmaster's wake record each
+# keep, leaving the operator staring at raw output with no reason why.
+provision_t12_tail_lineno="$(grep -n 'provision: line 50' "$PROVISION_ERR" | head -1 | cut -d: -f1)"
+provision_t12_verdict_lineno="$(grep -n 'exited 3' "$PROVISION_ERR" | head -1 | cut -d: -f1)"
+if [[ -n "$provision_t12_tail_lineno" && -n "$provision_t12_verdict_lineno" ]] \
+    && (( provision_t12_verdict_lineno > provision_t12_tail_lineno )); then
+    ok "the exit-code verdict is printed after the output tail, inside its window"
+else
+    no "the exit-code verdict is printed after the output tail, inside its window" \
+        "tail_line=$provision_t12_tail_lineno verdict_line=$provision_t12_verdict_lineno"
+fi
 provision_t12b_timeout_clone="$(provision_make_clone)"
 provision_t12_sleep_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t12_sleep_stub")")
 cat > "$provision_t12_sleep_stub" <<'STUB'
@@ -15820,6 +15906,34 @@ if (( PROVISION_RC == 1 )) && grep -qi 'timed out' "$PROVISION_ERR"; then
 else
     no "a provisioner exceeding PROVISION_TIMEOUT fails the run, naming it a timeout" \
         "rc=$PROVISION_RC err=$(cat "$PROVISION_ERR")"
+fi
+
+# T12c (R12): a provisioner that traps/ignores TERM is still bounded --
+# plain `timeout N cmd` only sends TERM at N and then waits however long
+# the command keeps running, so without a kill-after grace period this
+# provisioner would run past PROVISION_TIMEOUT (here, forever: it outlives
+# the test's own patience). `timeout -k` forces it with KILL after a grace
+# period, and the run is still reported as a timeout, not as whatever
+# ordinary exit code a killed process happens to carry.
+provision_t12c_timeout_clone="$(provision_make_clone)"
+provision_t12c_stub="$(newdir)/provision"; tmpdirs+=("$(dirname "$provision_t12c_stub")")
+cat > "$provision_t12c_stub" <<'STUB'
+#!/usr/bin/env bash
+trap '' TERM
+sleep 30
+STUB
+chmod +x "$provision_t12c_stub"
+# The elapsed bound is the real check: timeout exits 124 after TERM even
+# when it then waits out the full sleep, so rc alone cannot see a lost -k.
+provision_t12c_start=$SECONDS
+provision_run "$provision_t12c_timeout_clone" "$provision_t12c_stub" 1
+provision_t12c_elapsed=$((SECONDS - provision_t12c_start))
+if (( PROVISION_RC != 0 && provision_t12c_elapsed < 20 )) \
+    && grep -qi 'timed out' "$PROVISION_ERR"; then
+    ok "a provisioner that ignores TERM is still killed and reported as a timeout"
+else
+    no "a provisioner that ignores TERM is still killed and reported as a timeout" \
+        "rc=$PROVISION_RC elapsed=${provision_t12c_elapsed}s err=$(cat "$PROVISION_ERR")"
 fi
 
 # T13 (R13): a provisioner that edits a tracked file, or creates a path
