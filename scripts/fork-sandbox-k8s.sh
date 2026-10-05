@@ -459,6 +459,15 @@
 # credential. See docs/kubernetes-runs.md's "Model access" section for the
 # full design.
 #
+# --image REF (submit, run): the pod image for THIS run only, overriding both
+# K8S_PROJECT_IMAGES's entry for this project and K8S_IMAGE in k8s.env --
+# the same precedence --endpoint applies over K8S_DEFAULT_ENDPOINT. REF must
+# be a fully qualified image reference (never defaulted, same rule K8S_IMAGE
+# documents below); unlike K8S_IMAGE, that rule IS enforced here, since this
+# is a new flag with no installed base to stay compatible with. Renders on
+# both the egress-gate and agent containers. See "Per-project and per-run
+# images" in docs/kubernetes-runs.md.
+#
 # Cluster-specific settings are never taken from this repo -- a public repo
 # must not carry a private hostname, a real cluster name or a registry
 # address, and none of those belong hardcoded regardless. They are read at
@@ -479,6 +488,17 @@
 #                         scripts/build-sandbox-image.sh and push it to a
 #                         registry you control; see docs/kubernetes-runs.md
 #                         for concrete options.
+#   K8S_PROJECT_IMAGES=   <project>=<ref>[,<project>=<ref>...] -- a default
+#                         image for a project whose runs should use its own
+#                         image (built FROM the base one, see
+#                         docs/kubernetes-runs.md's provisioning section)
+#                         instead of K8S_IMAGE. <project> is the basename of
+#                         the origin repo's top level (two repos sharing a
+#                         basename share the default; use --image for the
+#                         exception). <ref> must be fully qualified, the
+#                         same rule --image enforces. Optional; an unlisted
+#                         project still falls back to K8S_IMAGE exactly as
+#                         before this key existed. Overridden by --image.
 #   K8S_PROXY_UPSTREAM=   https://<provider host>, e.g. https://openrouter.ai.
 #                         The legacy single, API-keyed upstream. install
 #                         requires this or K8S_PROXY_ENDPOINTS, never both.
@@ -847,6 +867,9 @@ fi
 K8S_NAMESPACE="$(read_env_value "$k8s_env" K8S_NAMESPACE || true)"
 K8S_NAMESPACE="${K8S_NAMESPACE:-fork-sandbox}"
 K8S_IMAGE="$(read_env_value "$k8s_env" K8S_IMAGE || true)"
+# Per-project default image ref -- see resolve_run_image below for how it
+# combines with --image and K8S_IMAGE.
+K8S_PROJECT_IMAGES="$(read_env_value "$k8s_env" K8S_PROJECT_IMAGES || true)"
 K8S_PROXY_UPSTREAM="$(read_env_value "$k8s_env" K8S_PROXY_UPSTREAM || true)"
 K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
 # Keys a K8S_PROXY_ENDPOINTS entry -- holds the VAR_NAME only, never the
@@ -996,6 +1019,7 @@ fi
 # too, same reasoning as the block above.
 if [[ "${1-}" != check-grant ]]; then
     fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
+        "$K8S_PROJECT_IMAGES" \
         "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ENDPOINT_KEYS" \
         "$K8S_PROXY_ENDPOINT_EMBEDDINGS" \
         "$K8S_PROXY_ALLOW" \
@@ -1525,6 +1549,118 @@ resolve_run_labels() {
             RUN_LABEL_VALUES+=("$PARSED_LABEL_VALUE")
         fi
     done
+    return 0
+}
+
+# An image reference's shape: no comma, equals sign, space, quote or
+# newline -- every legal OCI reference fits this, and it is what the
+# unquoted `image: $ref` YAML line below needs to stay a single scalar.
+# $what names the flag or key for the error (e.g. "--image", or
+# "K8S_PROJECT_IMAGES entry 'proj'"). When $require_qualified is 1, REF must
+# also be fully qualified by Docker's own rule: the part before the first
+# '/' contains a '.' or a ':', or is exactly 'localhost' -- a ref with no
+# '/' at all is unqualified. K8S_IMAGE is deliberately never passed through
+# this second check: that rule is documented for it but, unlike --image and
+# K8S_PROJECT_IMAGES (new flags with no installed base), never enforced,
+# per Compatibility.
+k8s_valid_image_ref() {
+    local ref="$1" what="$2" require_qualified="${3:-0}" first_segment
+    if [[ -z "$ref" || ! "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$ ]]; then
+        echo "Error: $what: '$ref' is not a valid image reference." >&2
+        return 1
+    fi
+    if [[ "$require_qualified" == 1 ]]; then
+        first_segment="${ref%%/*}"
+        if [[ "$ref" != */* ]] \
+            || { [[ "$first_segment" != *.* && "$first_segment" != *:* \
+                    && "$first_segment" != localhost ]]; }; then
+            echo "Error: $what: '$ref' is not a fully qualified image" >&2
+            echo "reference. It must include a registry host (e.g." >&2
+            echo "registry.example/you/image:tag) -- there is no default" >&2
+            echo "registry to resolve a bare name against." >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Parses K8S_PROJECT_IMAGES ("<project>=<ref>,<project>=<ref>,...") into the
+# PROJECT_IMAGE_NAMES / PROJECT_IMAGE_REFS arrays (module-global, same
+# convention as PROXY_ENDPOINT_NAMES/_URLS). <project> is a basename, so it
+# gets the same shape K8S_POSTMASTER_PROJECT already requires
+# (^[A-Za-z0-9][A-Za-z0-9._-]*$, so it can never be "." or ".."). An empty
+# spec is not an error.
+parse_project_images() {
+    local spec="$1" entry name ref seen=","
+    PROJECT_IMAGE_NAMES=()
+    PROJECT_IMAGE_REFS=()
+    [[ -z "$spec" ]] && return 0
+
+    local -a entries
+    IFS=',' read -ra entries <<< "$spec"
+    for entry in "${entries[@]}"; do
+        if [[ "$entry" != *=* ]]; then
+            echo "Error: K8S_PROJECT_IMAGES entry '$entry' is not" >&2
+            echo "<project>=<ref>." >&2
+            return 1
+        fi
+        name="${entry%%=*}"
+        ref="${entry#*=}"
+        if [[ -z "$name" || ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "Error: K8S_PROJECT_IMAGES entry '$entry' has an invalid" >&2
+            echo "project name -- it must match ^[A-Za-z0-9][A-Za-z0-9._-]*\$" >&2
+            echo "(the basename of the project's repo top level)." >&2
+            return 1
+        fi
+        if [[ "$seen" == *",$name,"* ]]; then
+            echo "Error: K8S_PROJECT_IMAGES entry '$entry' repeats project" >&2
+            echo "'$name', already set earlier in K8S_PROJECT_IMAGES." >&2
+            return 1
+        fi
+        k8s_valid_image_ref "$ref" "K8S_PROJECT_IMAGES entry '$name'" 1 || return 1
+        seen+="$name,"
+        PROJECT_IMAGE_NAMES+=("$name")
+        PROJECT_IMAGE_REFS+=("$ref")
+    done
+    return 0
+}
+
+# Resolves the pod image for this run: --image (REF_FLAG) wins over
+# K8S_PROJECT_IMAGES's entry for PROJECT_BASENAME, which wins over K8S_IMAGE
+# -- the precedence acceptance 2 requires. Sets the module-global RUN_IMAGE
+# and RUN_IMAGE_SOURCE ("flag"|"project"|"k8s-env"). Announces the source on
+# stderr for "flag"/"project" only -- an unconfigured run (the "k8s-env"
+# case, meaning nothing new applies) must stay silent, same as the
+# --endpoint/--label precedence resolvers above announcing only a
+# non-default choice. Returns 1 (not exit) on a bad ref, matching every
+# other resolver in this file, so cmd_submit can `|| exit 1` it.
+resolve_run_image() {
+    local ref_flag="$1" project_basename="$2" i
+    RUN_IMAGE=""
+    RUN_IMAGE_SOURCE="k8s-env"
+
+    if [[ -n "$ref_flag" ]]; then
+        k8s_valid_image_ref "$ref_flag" "--image" 1 || return 1
+        RUN_IMAGE="$ref_flag"
+        RUN_IMAGE_SOURCE="flag"
+        echo "fork-sandbox-k8s: --image '$ref_flag' overrides any" >&2
+        echo "K8S_PROJECT_IMAGES entry and K8S_IMAGE." >&2
+        return 0
+    fi
+
+    parse_project_images "$K8S_PROJECT_IMAGES" || return 1
+    for i in "${!PROJECT_IMAGE_NAMES[@]}"; do
+        if [[ "${PROJECT_IMAGE_NAMES[$i]}" == "$project_basename" ]]; then
+            RUN_IMAGE="${PROJECT_IMAGE_REFS[$i]}"
+            RUN_IMAGE_SOURCE="project"
+            echo "fork-sandbox-k8s: using K8S_PROJECT_IMAGES entry" >&2
+            echo "'$project_basename=$RUN_IMAGE' ($k8s_env)." >&2
+            return 0
+        fi
+    done
+
+    RUN_IMAGE="$K8S_IMAGE"
+    RUN_IMAGE_SOURCE="k8s-env"
     return 0
 }
 
@@ -4291,7 +4427,7 @@ cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
-    local thread_dir="" attach_dir=""
+    local thread_dir="" attach_dir="" image_flag=""
     # Recorded in run.env for `resume` only; submit itself acts on none.
     local outbox_dir="" keep=false run_timeout=3600
     local session_state="" resume_session="" session_id_arg=""
@@ -4310,6 +4446,7 @@ cmd_submit() {
             --extra-ref) extra_refs_raw+=("${2:?--extra-ref requires NAME=SHA}"); shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
+            --image) image_flag="${2:?--image requires an image reference}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --pi-args) pi_args="${2:?--pi-args requires a value}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
@@ -4903,6 +5040,14 @@ cmd_submit() {
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
     fs_check_branch_free "$origin_repo" "$branch" || exit 1
 
+    # The pod image for this run: --image, then K8S_PROJECT_IMAGES's entry
+    # for this project's basename, then K8S_IMAGE -- see resolve_run_image's
+    # own header. Resolved here, right after origin_repo is known, and before
+    # the K8S_IMAGE requirement below, which this resolution makes
+    # conditional: a project with its own image needs no K8S_IMAGE at all.
+    local RUN_IMAGE="" RUN_IMAGE_SOURCE=""
+    resolve_run_image "$image_flag" "$(basename "$origin_repo")" || exit 1
+
     # --checkout names the commit the branch starts from instead of the
     # repo's HEAD. Resolved to a sha here, before the Job, the Secret and
     # the proxy Pod exist, for the same reason every other pre-creation
@@ -5107,7 +5252,10 @@ cmd_submit() {
         [[ -n "$brief_warning" ]] && printf '%s\n' "$brief_warning" >&2
     fi
 
-    if [[ -z "$K8S_IMAGE" ]]; then
+    # Skipped when the image came from --image or K8S_PROJECT_IMAGES: a
+    # project with its own image needs no K8S_IMAGE in k8s.env at all. A
+    # plain run (RUN_IMAGE_SOURCE == k8s-env) still requires it, unchanged.
+    if [[ "$RUN_IMAGE_SOURCE" == k8s-env && -z "$K8S_IMAGE" ]]; then
         echo "Error: K8S_IMAGE is not set in $k8s_env. This project ships a" >&2
         echo "Dockerfile and a build script, and never ships an image or a" >&2
         echo "registry -- you build it and push it to a registry you control." >&2
@@ -5657,7 +5805,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: egress-gate
-          image: $K8S_IMAGE
+          image: $RUN_IMAGE
           command: ["bash", "/mnt/fork-sandbox/egress-gate.sh"]
           env:
             - name: DENIED_PROBE
@@ -5681,7 +5829,7 @@ spec:
               readOnly: true${services_containers}
       containers:
         - name: agent
-          image: $K8S_IMAGE
+          image: $RUN_IMAGE
           command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]
           env:
             - name: HOME
@@ -5875,6 +6023,8 @@ EOF
         printf 'harness=%s\n' "$harness"
         printf 'network=cluster\n'
         printf 'model=%s\n' "$model"
+        printf 'image=%s\n' "$RUN_IMAGE"
+        printf 'image_source=%s\n' "$RUN_IMAGE_SOURCE"
         printf 'branch=%s\n' "$branch"
         printf 'origin_repo=%s\n' "$origin_repo"
         printf 'base_sha=%s\n' "$run_log_base_sha"
@@ -7559,8 +7709,11 @@ cmd_collect() {
     if [[ -n "$run_dir" ]]; then
         local run_log_harness run_log_model run_log_commits=""
         local run_log_claude_source="" run_log_claude_via=""
+        local run_log_image="" run_log_image_source=""
         run_log_harness="$(read_env_value "$run_dir/run.env" harness || true)"
         run_log_model="$(read_env_value "$run_dir/run.env" model || true)"
+        run_log_image="$(read_env_value "$run_dir/run.env" image || true)"
+        run_log_image_source="$(read_env_value "$run_dir/run.env" image_source || true)"
         run_log_claude_source="$(read_env_value "$run_dir/run.env" claude_credentials_source || true)"
         run_log_claude_via="$(read_env_value "$run_dir/run.env" claude_credentials_via || true)"
         if [[ -n "$base_sha" && -n "$after_sha" ]]; then
@@ -7601,6 +7754,8 @@ cmd_collect() {
             --arg harness "$run_log_harness" \
             --arg network "cluster" \
             --arg model "$run_log_model" \
+            --arg image "$run_log_image" \
+            --arg image_source "$run_log_image_source" \
             --arg branch "$branch" \
             --arg origin_repo "$origin_repo" \
             --arg base_sha "$base_sha" \
@@ -7616,6 +7771,8 @@ cmd_collect() {
                 harness: $harness,
                 network: $network,
                 model: (if $model == "" then null else $model end),
+                image: $image,
+                image_source: $image_source,
                 branch: $branch,
                 origin_repo: $origin_repo,
                 base_sha: (if $base_sha == "" then null else $base_sha end),
@@ -7824,7 +7981,7 @@ cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" context_secret="" harness="" review_model="" endpoint=""
     local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
-    local thread_dir="" attach_dir=""
+    local thread_dir="" attach_dir="" image_flag=""
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
@@ -7839,6 +7996,7 @@ cmd_run() {
             --extra-ref) extra_refs_raw+=("${2:?--extra-ref requires NAME=SHA}"); shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
+            --image) image_flag="${2:?--image requires an image reference}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --pi-args) pi_args="${2:?--pi-args requires a value}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
@@ -7916,6 +8074,7 @@ cmd_run() {
     # --review-loop below.
     [[ -n "$model" ]] && submit_argv+=(--model "$model")
     [[ -n "$endpoint" ]] && submit_argv+=(--endpoint "$endpoint")
+    [[ -n "$image_flag" ]] && submit_argv+=(--image "$image_flag")
     [[ -n "$harness" ]] && submit_argv+=(--harness "$harness")
     # Same pass-through-when-given rule as --harness above: the value is
     # forwarded UNCHANGED, and cmd_submit re-runs its own refusal (the

@@ -57,7 +57,7 @@ Do these in order.
    |---|---|---|
    | `K8S_POSTMASTER_IMAGE` | yes | the image ref step 1 built and you pushed |
    | `K8S_POSTMASTER_REPO_URL` | yes | ssh URL of the project repo: `ssh://[user@]host[:port]/path` or the scp-like `user@host:path` form. Anything else (`https://`, a bare hostname) is refused. |
-   | `K8S_POSTMASTER_PROJECT` | no | directory name under `$HOME/src` in the pod; defaults to the URL's last path component with a trailing `.git` stripped. Must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, so it can never be `.` or `..`. |
+   | `K8S_POSTMASTER_PROJECT` | no | directory name under `$HOME/src` in the pod; defaults to the URL's last path component with a trailing `.git` stripped. Must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, so it can never be `.` or `..`. A `K8S_PROJECT_IMAGES` entry (see "Per-project and per-run images" in [docs/kubernetes-runs.md](kubernetes-runs.md)) keys on this same name, since a run the postmaster spawns resolves its default image from the project path it was handed, the same as any other run. |
    | `K8S_POSTMASTER_GIT_KEY_FILE` | yes | laptop path to the deploy private key from step 2 |
    | `K8S_POSTMASTER_KNOWN_HOSTS_FILE` | yes | laptop path to the known_hosts file from step 2 |
    | `K8S_POSTMASTER_STORAGE_CLASS` | no | `storageClassName` of both PVCs; empty (the default) omits the field, so the cluster's default StorageClass applies |

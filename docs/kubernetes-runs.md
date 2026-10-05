@@ -466,7 +466,8 @@ takes: `mktemp -d` under the same
 `record`'s own path gate requires. Into it, at submit time, go:
 
 - `run.env` -- the fallback shape `record` reads when `summary.json` is
-  missing, carrying `mode`, `harness`, `network`, `model`, `branch`,
+  missing, carrying `mode`, `harness`, `network`, `model`, `image`,
+  `image_source` (see "Per-project and per-run images" above), `branch`,
   `origin_repo` and `base_sha` (the revision the branch is about to start
   from -- `--checkout`'s resolved sha, or this repo's HEAD), plus
   `claude_credentials_source` and `claude_credentials_via` for a
@@ -2080,6 +2081,109 @@ debugging a stuck pod.
 whatever your setup names it. This document names no real registry, on
 purpose: which one to use is a decision for the operator's own cluster, not
 this project's to make for them.
+
+### Per-project and per-run images
+
+`K8S_IMAGE` is one value for every run. A project that wants its own image —
+built `FROM` the base one, with its own toolchain, browser, prebuilt
+virtualenv or seed data baked in (see "Provisioning the clone from the
+image" below) — needs its runs on that image while other projects keep the
+default. Two more ways to choose the pod image, both operator-controlled,
+never read from the repo being run:
+
+- **`--image REF`**, on `submit` and `run` (and forwarded through
+  `fork-sandbox.sh --k8s --image REF`): the image for THIS run only.
+- **`K8S_PROJECT_IMAGES=<project>=<ref>[,<project>=<ref>...]`** in
+  `k8s.env`: a default image for a project, keyed by the basename of that
+  project's repo top level (the same identity `fork-sandbox.sh` already
+  uses for a local clone). Two repos that happen to share a basename share
+  the default; use `--image` for the exception.
+
+Precedence: `--image` wins over a matching `K8S_PROJECT_IMAGES` entry, which
+wins over `K8S_IMAGE`. With neither set, every run behaves exactly as
+before this existed — same image, same pod, same validation. A project
+covered by `K8S_PROJECT_IMAGES` needs no `K8S_IMAGE` in `k8s.env` at all; a
+plain run still requires it, unchanged.
+
+Both `--image` and a `K8S_PROJECT_IMAGES` ref must be fully qualified —
+the same rule `K8S_IMAGE` documents above, but, unlike `K8S_IMAGE`,
+actually enforced for these two: they are new inputs with no installed
+base to stay compatible with. The resolved image renders on both the
+egress-gate and agent containers (the gate needs only bash, `timeout`,
+`ping` and `/dev/tcp`, which a derived image keeps since it is `FROM` the
+base), is recorded in the run's `run.env` and `summary.json` as `image`/
+`image_source` (`flag`, `project` or `k8s-env`), and appears in
+`--dry-run` output. A non-default choice is announced on stderr; an
+unconfigured run stays silent.
+
+## Provisioning the clone from the image
+
+**The trust anchor is the image, never the repo.** The repo a run clones is
+agent-editable; the image is something the operator built and chose. So an
+image may carry provisioning logic that runs before the agent starts, while
+nothing in the checkout may choose the image or supply code that runs
+outside the agent — the same line "Per-run services" draws for
+`.agents/sandbox-services/services.yaml` (declarative data from the repo,
+never an executable hook).
+
+Locally, a project gets host directories bound read-only into its clone (see
+`sandbox-quickstart.md`'s `provision-ro`). A pod has no host: the project's
+own image already holds files like a prebuilt virtualenv or seed media at
+absolute paths (`/opt/venv`, say), but nothing links them into the clone,
+and the project's own instructions expect them at clone-relative paths such
+as `.venv/bin/python`. An image may carry an executable at the fixed,
+documented path:
+
+    /opt/fork-sandbox/provision
+
+When present and executable, the pod entrypoint runs it once, after the
+clone is checked out (including any `--extra-ref` branches) and before the
+agent's first leg, as the agent's own user (every container in the pod runs
+as uid 1000). Its working directory is the clone; `FORK_SANDBOX_CLONE_DIR`
+in its environment holds the clone's absolute path; `HOME` and `PATH` are
+the pod's own. It inherits the rest of the entrypoint's environment, but
+only those three are a promised contract. Its combined output is captured
+to the pod's `/work/provision.log`, bounded by a timeout (300 seconds by
+default).
+
+A non-zero exit or a timeout fails the run before any leg — no
+`.run-complete`, no harness call — with the last 40 lines of its output
+printed to the pod log, prefixed `provision:` (a timeout is named as one).
+When no provisioning executable is present, nothing changes: no log, no
+exclude-file edit, no output, the same pod as before this existed.
+
+On success, every path the provisioner CREATED (a symlink, a directory —
+whatever `git status --porcelain --untracked-files=normal` reports as `??`
+right after it runs) is appended to `.git/info/exclude`, the same exclusion
+mechanism `.env.sandbox` already uses: a link or file provisioning puts in
+the clone never gets committed and never counts as uncommitted work. If the
+provisioner instead modified or deleted a TRACKED file, the run fails
+naming the path — exclusion cannot hide that, and silently committing an
+image's edits into the agent's own branch, with no author, is the worse
+outcome.
+
+The base image (`images/sandbox/Dockerfile`) ships no such executable at
+all. A worked example for a derived image:
+
+```dockerfile
+FROM registry.example/you/fork-sandbox:latest
+COPY --chown=1000:1000 venv /opt/venv
+COPY --chown=1000:1000 provision /opt/fork-sandbox/provision
+```
+
+```bash
+#!/usr/bin/env bash
+# /opt/fork-sandbox/provision -- links the image's prebuilt virtualenv into
+# the clone at the path this project's own instructions expect.
+set -euo pipefail
+ln -s /opt/venv "$FORK_SANDBOX_CLONE_DIR/.venv"
+```
+
+This project's own scripts never choose which image a run uses, and never
+supply or run a provisioning executable of their own — that is for a
+project's own derived image to carry, entirely outside this repo. See
+"Per-project and per-run images" above for how an operator points a run at
+such an image.
 
 ## The Kubernetes platform interface
 

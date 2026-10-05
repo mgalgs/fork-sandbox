@@ -263,6 +263,8 @@ SUMMARY_FIELDS = [
     "harness_version",
     "network",
     "model",
+    "image",
+    "image_source",
     "usage_source",
     "branch",
     "origin_repo",
@@ -687,7 +689,8 @@ def cmd_record(args):
         # is still worth a record. run.env and exit-code carry the basics.
         rec["summary_missing"] = True
         env = load_run_env(os.path.join(rd, "run.env"))
-        for k in ("harness", "harness_version", "network", "model", "branch",
+        for k in ("harness", "harness_version", "network", "model", "image",
+                  "image_source", "branch",
                   "origin_repo", "base_sha", "claude_credentials_source",
                   "claude_credentials_via"):
             if env.get(k):

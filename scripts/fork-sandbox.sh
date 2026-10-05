@@ -533,6 +533,12 @@
 #                        the combination on a legacy install); --harness
 #                        claude keeps the --model requirement either way.
 #                        Refused without --k8s.
+# --image <ref>:         with --k8s, the pod image for THIS run only,
+#                        overriding both K8S_PROJECT_IMAGES's entry for this
+#                        project and K8S_IMAGE in k8s.env (passed to fork-
+#                        sandbox-k8s.sh run, which resolves the precedence
+#                        and enforces the fully-qualified-ref rule). Refused
+#                        without --k8s.
 # --allow-namespace <ns[:port]>:
 #                        with --k8s, widen this run's own agent egress to
 #                        an extra namespace, on top of (never instead of)
@@ -1696,6 +1702,7 @@ k8s_keep=false
 k8s_outbox_dir=""
 k8s_endpoint=""
 k8s_endpoint_given=false
+k8s_image=""
 k8s_allow_ns_raw=()
 k8s_reach_probe_raw=()
 k8s_extra_refs_raw=()
@@ -1903,6 +1910,10 @@ while [[ "${1:-}" == -* ]]; do
                 echo "match that shape (it becomes a /e/<name>/v1 path segment)." >&2
                 exit 1
             fi
+            shift 2
+            ;;
+        --image)
+            k8s_image="${2:?--image requires an image reference}"
             shift 2
             ;;
         --allow-namespace)
@@ -3489,6 +3500,7 @@ if [[ "$k8s_mode" == true ]]; then
     [[ -n "$review_loop_arg" ]] && k8s_argv+=(--review-loop "$review_loop_arg")
     [[ -n "$review_model" ]] && k8s_argv+=(--review-model "$review_model")
     [[ -n "$k8s_endpoint" ]] && k8s_argv+=(--endpoint "$k8s_endpoint")
+    [[ -n "$k8s_image" ]] && k8s_argv+=(--image "$k8s_image")
     [[ -n "$k8s_outbox_dir" ]] && k8s_argv+=(--outbox-dir "$k8s_outbox_dir")
     # Forwarded as the raw ref, like --endpoint: fork-sandbox-k8s.sh's
     # cmd_submit resolves it (and refuses it by name if it does not name a
@@ -3581,9 +3593,9 @@ if [[ "$k8s_mode" == true ]]; then
 fi
 
 if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
-    || -n "$k8s_endpoint" || ${#k8s_allow_ns_raw[@]} -gt 0 \
+    || -n "$k8s_endpoint" || -n "$k8s_image" || ${#k8s_allow_ns_raw[@]} -gt 0 \
     || ${#k8s_reach_probe_raw[@]} -gt 0 || -n "$context_secret" ]]; then
-    echo "Error: --timeout, --keep, --outbox-dir, --endpoint," >&2
+    echo "Error: --timeout, --keep, --outbox-dir, --endpoint, --image," >&2
     echo "--allow-namespace, --reach-probe and --context-secret" >&2
     echo "only apply with --k8s," >&2
     echo "which passes them on to fork-sandbox-k8s.sh run. Add --k8s, or drop" >&2

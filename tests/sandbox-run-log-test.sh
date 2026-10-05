@@ -245,6 +245,37 @@ out="$(query show "$(basename "$rd_env")")"
 contains "run.env fallback still carries network" '"network": "sealed"' "$out"
 contains "run.env fallback marks summary_missing" '"summary_missing": true' "$out"
 
+printf '\n== record: image/image_source are lifted from summary.json ==\n'
+rd_image="$(mk_run_dir image)"
+tmpdirs+=("$rd_image")
+cat > "$rd_image/summary.json" <<'EOF'
+{"harness":"pi","network":"cluster","model":null,"image":"registry.example/proj:2","image_source":"flag","branch":"fixture-branch","origin_repo":"/var/tmp/claude-scratch/forks/fixture-origin","base_sha":"0123456789abcdef0123456789abcdef01234567","exit_code":0,"commits":0,"cost_usd":0.0,"usage":{"input_tokens":10,"output_tokens":1},"duration_seconds":0}
+EOF
+printf '0\n' > "$rd_image/exit-code"
+record "$rd_image" >/dev/null 2>"$tmp/err"
+out="$(query show "$(basename "$rd_image")")"
+contains "a run's image is recorded" '"image": "registry.example/proj:2"' "$out"
+contains "a run's image_source is recorded" '"image_source": "flag"' "$out"
+
+printf '\n== record: image/image_source from a summary-missing run.env fallback ==\n'
+rd_image_env="$(mk_run_dir image-env)"
+tmpdirs+=("$rd_image_env")
+cat > "$rd_image_env/run.env" <<'EOF'
+harness=pi
+network=cluster
+model=
+image=registry.example/you/fork-sandbox:latest
+image_source=k8s-env
+branch=fixture-branch
+origin_repo=/var/tmp/claude-scratch/forks/fixture-origin
+base_sha=0123456789abcdef0123456789abcdef01234567
+EOF
+printf '0\n' > "$rd_image_env/exit-code"
+record "$rd_image_env" >/dev/null 2>"$tmp/err"
+out="$(query show "$(basename "$rd_image_env")")"
+contains "run.env fallback carries image" '"image": "registry.example/you/fork-sandbox:latest"' "$out"
+contains "run.env fallback carries image_source" '"image_source": "k8s-env"' "$out"
+
 printf '\n== record: agent_kit is lifted from summary.json ==\n'
 rd_kit="$(mk_run_dir kit)"
 tmpdirs+=("$rd_kit")

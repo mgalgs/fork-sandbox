@@ -10727,6 +10727,10 @@ refuses "--endpoint without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
     --endpoint llm unused-project unused-handoff
+refuses "--image without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --image registry.example/you/fork-sandbox:latest unused-project unused-handoff
 refuses "--endpoint with a bad name shape is refused" \
     "takes a name matching" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
@@ -13115,6 +13119,187 @@ else
 fi
 rm -f /tmp/fs-k8s-test-combined.err
 
+printf '\n== fork-sandbox-k8s.sh: per-project and per-run images ==\n'
+# mk_image_config mirrors mk_label_config above: the same fixture k8s.env
+# base, plus whatever extra lines a case needs.
+mk_image_config() {
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    {
+        cat <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+CONF
+        printf '%s\n' "$@"
+    } > "$d/k8s.env"
+    install -m 600 /dev/null "$d/pi.env"
+    printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$d/pi.env"
+    chmod 600 "$d/pi.env"
+    printf '%s' "$d"
+}
+proj_basename="$(basename "$proj_dir")"
+
+# T1 (R1): with neither --image nor a matching K8S_PROJECT_IMAGES entry,
+# both image: lines render K8S_IMAGE, with silent stderr. Re-rendered fresh
+# here (rather than reusing $submit_out) because its own stderr capture was
+# already removed earlier in this suite.
+plain_image_out="$(newdir)/plain-image.yaml"; tmpdirs+=("$(dirname "$plain_image_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$plain_image_out" 2>/tmp/fs-k8s-test-plain-image.err
+check "no --image, no K8S_PROJECT_IMAGES: both image: lines are K8S_IMAGE" \
+    "2" "$(grep -cF 'image: registry.example/you/fork-sandbox:latest' "$plain_image_out")"
+check "no --image, no K8S_PROJECT_IMAGES: stderr is silent" \
+    "" "$(cat /tmp/fs-k8s-test-plain-image.err)"
+check "no --image, no K8S_PROJECT_IMAGES: renders byte-identically to the earlier baseline" \
+    "same" "$(cmp -s "$submit_out" "$plain_image_out" && echo same || echo different)"
+rm -f /tmp/fs-k8s-test-plain-image.err
+other_project_dir="$(mk_image_config 'K8S_PROJECT_IMAGES=other-project=registry.example/other:1')"
+other_project_out="$(newdir)/other-project.yaml"; tmpdirs+=("$(dirname "$other_project_out")")
+FORK_SANDBOX_CONFIG_DIR="$other_project_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$other_project_out" 2>/dev/null
+check "a K8S_PROJECT_IMAGES entry for a different project renders byte-identically" \
+    "same" "$(cmp -s "$submit_out" "$other_project_out" && echo same || echo different)"
+
+# T2 (R2): --image wins over a matching K8S_PROJECT_IMAGES entry and over
+# K8S_IMAGE, and announces the source on stderr.
+project_image_dir="$(mk_image_config "K8S_PROJECT_IMAGES=$proj_basename=registry.example/project-default:1")"
+flag_image_out="$(newdir)/flag-image.yaml"; tmpdirs+=("$(dirname "$flag_image_out")")
+FORK_SANDBOX_CONFIG_DIR="$project_image_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image registry.example/proj:2 \
+    "$proj_dir" "$handoff_file" > "$flag_image_out" 2>/tmp/fs-k8s-test-image-flag.err
+check "--image wins over K8S_PROJECT_IMAGES and K8S_IMAGE: both image: lines" \
+    "2" "$(grep -cF 'image: registry.example/proj:2' "$flag_image_out")"
+if grep -qF -- "--image 'registry.example/proj:2'" /tmp/fs-k8s-test-image-flag.err; then
+    ok "--image's source is announced on stderr"
+else
+    no "--image's source is announced on stderr" "$(cat /tmp/fs-k8s-test-image-flag.err)"
+fi
+rm -f /tmp/fs-k8s-test-image-flag.err
+
+# T3 (R3): no --image, K8S_PROJECT_IMAGES names this project's basename --
+# that entry wins over K8S_IMAGE, and announces the source on stderr.
+project_image_out="$(newdir)/project-image.yaml"; tmpdirs+=("$(dirname "$project_image_out")")
+FORK_SANDBOX_CONFIG_DIR="$project_image_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$project_image_out" 2>/tmp/fs-k8s-test-image-project.err
+check "K8S_PROJECT_IMAGES entry for this project wins over K8S_IMAGE: both image: lines" \
+    "2" "$(grep -cF 'image: registry.example/project-default:1' "$project_image_out")"
+if grep -qF "K8S_PROJECT_IMAGES entry" /tmp/fs-k8s-test-image-project.err; then
+    ok "the K8S_PROJECT_IMAGES source is announced on stderr (key)"
+else
+    no "the K8S_PROJECT_IMAGES source is announced on stderr (key)" "$(cat /tmp/fs-k8s-test-image-project.err)"
+fi
+if grep -qF "$proj_basename=registry.example/project-default:1" /tmp/fs-k8s-test-image-project.err; then
+    ok "the K8S_PROJECT_IMAGES source is announced on stderr (project)"
+else
+    no "the K8S_PROJECT_IMAGES source is announced on stderr (project)" "$(cat /tmp/fs-k8s-test-image-project.err)"
+fi
+rm -f /tmp/fs-k8s-test-image-project.err
+
+# T4 (R4): K8S_IMAGE becomes optional once a project entry covers this
+# project, but stays required (unchanged message) for a plain run.
+no_k8s_image_with_project_dir="$(newdir)"; tmpdirs+=("$no_k8s_image_with_project_dir")
+cat > "$no_k8s_image_with_project_dir/k8s.env" <<CONF
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+K8S_PROJECT_IMAGES=$proj_basename=registry.example/project-only:1
+CONF
+install -m 600 /dev/null "$no_k8s_image_with_project_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$no_k8s_image_with_project_dir/pi.env"
+chmod 600 "$no_k8s_image_with_project_dir/pi.env"
+if FORK_SANDBOX_CONFIG_DIR="$no_k8s_image_with_project_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-no-k8s-image.err; then
+    ok "no K8S_IMAGE is fine when a K8S_PROJECT_IMAGES entry covers this project"
+else
+    no "no K8S_IMAGE is fine when a K8S_PROJECT_IMAGES entry covers this project" \
+        "$(cat /tmp/fs-k8s-test-no-k8s-image.err)"
+fi
+rm -f /tmp/fs-k8s-test-no-k8s-image.err
+no_k8s_image_dir="$(newdir)"; tmpdirs+=("$no_k8s_image_dir")
+cat > "$no_k8s_image_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+CONF
+install -m 600 /dev/null "$no_k8s_image_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$no_k8s_image_dir/pi.env"
+chmod 600 "$no_k8s_image_dir/pi.env"
+refuses "a plain run (no project entry) still requires K8S_IMAGE, unchanged" \
+    "K8S_IMAGE is not set in" \
+    env FORK_SANDBOX_CONFIG_DIR="$no_k8s_image_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+
+# T5 (R5): refusals, each naming the flag or key and the bad value, nothing
+# created (the stubbed-kubectl log stays empty, same proof style the label
+# refusals above use via --dry-run touching no kubectl at all).
+refuses "--image with an unqualified ref is refused" \
+    "is not a fully qualified image" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image sandbox:1 \
+    "$proj_dir" "$handoff_file"
+refuses "--image with an invalid shape is refused" \
+    "is not a valid image reference" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image 'a b' \
+    "$proj_dir" "$handoff_file"
+refuses "K8S_PROJECT_IMAGES entry with no '=' is refused" \
+    "entry 'proj' is not" \
+    env FORK_SANDBOX_CONFIG_DIR="$(mk_image_config 'K8S_PROJECT_IMAGES=proj')" \
+    "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+refuses "K8S_PROJECT_IMAGES entry with an empty project name is refused" \
+    "has an invalid" \
+    env FORK_SANDBOX_CONFIG_DIR="$(mk_image_config 'K8S_PROJECT_IMAGES==ref')" \
+    "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+refuses "K8S_PROJECT_IMAGES entry with an unqualified ref is refused" \
+    "is not a fully qualified image" \
+    env FORK_SANDBOX_CONFIG_DIR="$(mk_image_config 'K8S_PROJECT_IMAGES=proj=sandbox:1')" \
+    "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+refuses "a duplicate project name within K8S_PROJECT_IMAGES is refused" \
+    "repeats project" \
+    env FORK_SANDBOX_CONFIG_DIR="$(mk_image_config 'K8S_PROJECT_IMAGES=proj=registry.example/a:1,proj=registry.example/b:1')" \
+    "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+# A digest ref and a localhost:PORT ref are both accepted as fully
+# qualified.
+digest_ref="registry.example/you/fork-sandbox@sha256:$(printf 'a%.0s' {1..64})"
+digest_image_out="$(newdir)/digest-image.yaml"; tmpdirs+=("$(dirname "$digest_image_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image "$digest_ref" \
+    "$proj_dir" "$handoff_file" > "$digest_image_out" 2>/tmp/fs-k8s-test-digest-image.err; then
+    ok "--image accepts a digest ref"
+else
+    no "--image accepts a digest ref" "$(cat /tmp/fs-k8s-test-digest-image.err)"
+fi
+rm -f /tmp/fs-k8s-test-digest-image.err
+localhost_image_out="$(newdir)/localhost-image.yaml"; tmpdirs+=("$(dirname "$localhost_image_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image localhost:5000/you/fork-sandbox:1 \
+    "$proj_dir" "$handoff_file" > "$localhost_image_out" 2>/tmp/fs-k8s-test-localhost-image.err; then
+    ok "--image accepts a localhost:PORT ref"
+else
+    no "--image accepts a localhost:PORT ref" "$(cat /tmp/fs-k8s-test-localhost-image.err)"
+fi
+rm -f /tmp/fs-k8s-test-localhost-image.err
+
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # Guards the public-repo leak rule (see the fork-sandbox-k8s.sh header): no
 # real hostname, cluster name or LAN address may be committed, only
@@ -14125,6 +14310,10 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
         "network=cluster" "$(grep '^network=' "$rundir_rd/run.env")"
     check "run.env carries the model" \
         "model=moonshotai/kimi-k3" "$(grep '^model=' "$rundir_rd/run.env")"
+    check "run.env carries the resolved image" \
+        "image=registry.example/you/fork-sandbox:latest" "$(grep '^image=' "$rundir_rd/run.env")"
+    check "run.env carries the image source (plain K8S_IMAGE, no --image/K8S_PROJECT_IMAGES)" \
+        "image_source=k8s-env" "$(grep '^image_source=' "$rundir_rd/run.env")"
     check "run.env carries the branch" \
         "branch=fs-k8s-test-rundir-submit" "$(grep '^branch=' "$rundir_rd/run.env")"
     check "run.env carries the origin repo" \
@@ -14511,6 +14700,10 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
             "pi" "$(jq -r '.harness' "$rundir_rd/summary.json")"
         check "summary.json: model (read back from submit's own run.env)" \
             "moonshotai/kimi-k3" "$(jq -r '.model' "$rundir_rd/summary.json")"
+        check "summary.json: image (read back from submit's own run.env)" \
+            "registry.example/you/fork-sandbox:latest" "$(jq -r '.image' "$rundir_rd/summary.json")"
+        check "summary.json: image_source (read back from submit's own run.env)" \
+            "k8s-env" "$(jq -r '.image_source' "$rundir_rd/summary.json")"
         check "summary.json: branch" \
             "fs-k8s-test-rundir-submit" "$(jq -r '.branch' "$rundir_rd/summary.json")"
         check "summary.json: origin_repo" \
@@ -14737,6 +14930,27 @@ refuses "--k8s --harness claude --pi-args is still refused (by cmd_submit's harn
     --harness claude --branch fs-k8s-flag-test-piargs-bad --model claude-sonnet-5 \
     --pi-args '--thinking high' \
     "$k8s_flag_proj" "$k8s_flag_handoff"
+
+printf '\n== fork-sandbox.sh --k8s: --image is forwarded ==\n'
+image_dispatch_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$image_dispatch_out")")
+image_dispatch_err="$(dirname "$image_dispatch_out")/image.err"
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --branch fs-k8s-flag-test-image --model moonshotai/kimi-k3 \
+    --image registry.example/proj:2 \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$image_dispatch_out" 2>"$image_dispatch_err"; then
+    ok "fork-sandbox.sh --k8s --image exits 0"
+else
+    no "fork-sandbox.sh --k8s --image exits 0" "$(cat "$image_dispatch_err")"
+fi
+rm -f "$image_dispatch_err"
+
+image_direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$image_direct_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-flag-test-image --model moonshotai/kimi-k3 \
+    --harness pi --image registry.example/proj:2 \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$image_direct_out" 2>/dev/null
+check "--k8s --image renders byte-for-byte the same as a direct run --dry-run" \
+    "$(cat "$image_direct_out")" "$(cat "$image_dispatch_out")"
 
 printf '\n== the fixture run log: every row this suite appends carries source=test ==\n'
 # This suite's header (above) states that source: "test" is deliberate and
