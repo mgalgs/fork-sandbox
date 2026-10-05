@@ -14305,6 +14305,243 @@ svc_val_usage_rc=0
 python3 "$svc_parse_py" a b c d > /dev/null 2>&1 || svc_val_usage_rc=$?
 check "render form: a wrong argument count is refused" 1 "$svc_val_usage_rc"
 
+printf '\n== per-run services: registry-relative refs and the registry allowlist ==\n'
+# K8S_SERVICE_REGISTRY resolves a './name:tag' ref; K8S_SERVICE_REGISTRIES
+# restricts fully qualified refs to a listed registry. Both keys are read
+# straight from k8s.env by the parser itself (mk_image_config, defined
+# above for the image-choice tests, writes the same base fixture file plus
+# whatever extra lines a case needs -- reused here for the identical
+# reason).
+svc_digest="registry.example/z@sha256:$(printf 'a%.0s' {1..64})"
+svc_mixed_spec="version: 1
+services:
+  - name: short
+    image: redis:7
+    port: 6379
+  - name: direct
+    image: registry.example/a:1
+    port: 7000
+  - name: ghcr
+    image: ghcr.io/x/y:1
+    port: 7001
+  - name: digest
+    image: $svc_digest
+    port: 7002
+"
+
+# T15 (R15): with neither key set, Docker Hub short names, fully
+# qualified refs on several registries and a digest ref all validate and
+# render exactly as today; validate-only says both keys are unset.
+svc_t15_dir="$(svc_mk_repo "$svc_mixed_spec")"
+svc_t15_out="$(newdir)/svc-t15.yaml"; tmpdirs+=("$(dirname "$svc_t15_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-reg-t15 --model moonshotai/kimi-k3 \
+    "$svc_t15_dir" "$handoff_file" > "$svc_t15_out" 2>/tmp/fs-k8s-test-svc-reg-t15.err; then
+    ok "neither registry key set: a mixed-registry spec still renders"
+else
+    no "neither registry key set: a mixed-registry spec still renders" \
+        "$(cat /tmp/fs-k8s-test-svc-reg-t15.err)"
+fi
+for needle in 'image: "redis:7"' 'image: "registry.example/a:1"' \
+    'image: "ghcr.io/x/y:1"' "image: \"$svc_digest\""; do
+    if grep -qF -- "$needle" "$svc_t15_out"; then
+        ok "neither registry key set: renders $needle unchanged"
+    else
+        no "neither registry key set: renders $needle unchanged" \
+            "not found in $svc_t15_out"
+    fi
+done
+cp "$svc_t15_dir/.agents/sandbox-services/services.yaml" "$svc_validate_dir/mixed.yaml"
+svc_t15_val_out="$(env FORK_SANDBOX_CONFIG_DIR="$config_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/mixed.yaml")"
+check "validate-only: both registry keys say unset" \
+    "image refs: K8S_SERVICE_REGISTRY unset (no relative refs), K8S_SERVICE_REGISTRIES unset (fully qualified refs unrestricted)" \
+    "$(grep '^image refs: ' <<< "$svc_t15_val_out")"
+
+# T16 (R16, R20): setting only K8S_SERVICE_REGISTRY renders the T15 spec
+# byte-identically (no './' ref in it), and a './cache:7' ref resolves
+# against the prefix -- with or without a trailing slash on the prefix.
+svc_prefix_dir="$(mk_image_config 'K8S_SERVICE_REGISTRY=registry.example/mirror')"
+svc_t16_out="$(newdir)/svc-t16.yaml"; tmpdirs+=("$(dirname "$svc_t16_out")")
+FORK_SANDBOX_CONFIG_DIR="$svc_prefix_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-reg-t15 --model moonshotai/kimi-k3 \
+    "$svc_t15_dir" "$handoff_file" > "$svc_t16_out" 2>/dev/null
+check "K8S_SERVICE_REGISTRY alone: a './'-free spec renders byte-identically" \
+    "same" "$(cmp -s "$svc_t15_out" "$svc_t16_out" && echo same || echo different)"
+svc_rel_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: cache
+    image: ./cache:7
+    port: 6379
+')"
+svc_t16_rel_out="$(newdir)/svc-t16-rel.yaml"; tmpdirs+=("$(dirname "$svc_t16_rel_out")")
+FORK_SANDBOX_CONFIG_DIR="$svc_prefix_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-reg-rel --model moonshotai/kimi-k3 \
+    "$svc_rel_dir" "$handoff_file" > "$svc_t16_rel_out" 2>/dev/null
+check "a './name:tag' ref resolves against K8S_SERVICE_REGISTRY" \
+    "yes" "$(grep -qF 'image: "registry.example/mirror/cache:7"' "$svc_t16_rel_out" && echo yes || echo no)"
+svc_prefix_slash_dir="$(mk_image_config 'K8S_SERVICE_REGISTRY=registry.example/mirror/')"
+svc_t16_slash_out="$(newdir)/svc-t16-slash.yaml"; tmpdirs+=("$(dirname "$svc_t16_slash_out")")
+FORK_SANDBOX_CONFIG_DIR="$svc_prefix_slash_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-reg-rel --model moonshotai/kimi-k3 \
+    "$svc_rel_dir" "$handoff_file" > "$svc_t16_slash_out" 2>/dev/null
+check "a trailing slash on K8S_SERVICE_REGISTRY resolves identically" \
+    "same" "$(cmp -s "$svc_t16_rel_out" "$svc_t16_slash_out" && echo same || echo different)"
+svc_t16_noservice_out="$(newdir)/svc-t16-none.yaml"; tmpdirs+=("$(dirname "$svc_t16_noservice_out")")
+FORK_SANDBOX_CONFIG_DIR="$svc_prefix_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-reg-none --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$svc_t16_noservice_out" 2>/tmp/fs-k8s-test-svc-reg-t16-none.err
+check "K8S_SERVICE_REGISTRY set, no spec: still silent on stderr" \
+    "" "$(cat /tmp/fs-k8s-test-svc-reg-t16-none.err)"
+
+# T17 (R17): a './' ref with K8S_SERVICE_REGISTRY unset is refused, naming
+# the field and the key, in submit --dry-run and in validate-only alike.
+svc_refuses "a './' ref with K8S_SERVICE_REGISTRY unset is refused" \
+    "is registry-relative but K8S_SERVICE_REGISTRY is not set" \
+    'version: 1
+services:
+  - name: cache
+    image: ./cache:7
+    port: 6379
+'
+cp "$svc_rel_dir/.agents/sandbox-services/services.yaml" "$svc_validate_dir/rel.yaml"
+svc_t17_val_out=""; svc_t17_val_rc=0
+svc_t17_val_out="$(env FORK_SANDBOX_CONFIG_DIR="$config_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/rel.yaml" 2>&1)" || svc_t17_val_rc=$?
+if (( svc_t17_val_rc != 0 )) \
+    && [[ "$svc_t17_val_out" == *"is registry-relative but K8S_SERVICE_REGISTRY is not set"* ]]; then
+    ok "validate-only: the same './' refusal, with no --k8s involved at all"
+else
+    no "validate-only: the same './' refusal, with no --k8s involved at all" \
+        "rc=$svc_t17_val_rc: $svc_t17_val_out"
+fi
+
+# T18 (R18): with the prefix set AND an allowlist, a ref on a listed
+# host, on the prefix's own host (not listed), and a relative ref are all
+# accepted; an unlisted host and an unqualified ref are both refused.
+svc_allow_dir="$(mk_image_config 'K8S_SERVICE_REGISTRY=registry.example' \
+    'K8S_SERVICE_REGISTRIES=docker.io,ghcr.io')"
+svc_allow_spec="version: 1
+services:
+  - name: hub
+    image: docker.io/library/redis:7
+    port: 6379
+  - name: ghcr
+    image: ghcr.io/x/y:1
+    port: 7001
+  - name: direct
+    image: registry.example/direct:1
+    port: 7002
+  - name: rel
+    image: ./rel:1
+    port: 7003
+"
+svc_allow_repo_dir="$(svc_mk_repo "$svc_allow_spec")"
+svc_t18_out="$(newdir)/svc-t18.yaml"; tmpdirs+=("$(dirname "$svc_t18_out")")
+if FORK_SANDBOX_CONFIG_DIR="$svc_allow_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-allow --model moonshotai/kimi-k3 \
+    "$svc_allow_repo_dir" "$handoff_file" > "$svc_t18_out" 2>/tmp/fs-k8s-test-svc-allow.err; then
+    ok "an allowlisted host, the prefix's own host, and a relative ref all accept"
+else
+    no "an allowlisted host, the prefix's own host, and a relative ref all accept" \
+        "$(cat /tmp/fs-k8s-test-svc-allow.err)"
+fi
+check "the relative ref resolved against the prefix's own host" \
+    "yes" "$(grep -qF 'image: "registry.example/rel:1"' "$svc_t18_out" && echo yes || echo no)"
+svc_refuses_allow() {
+    local label="$1" needle="$2" spec="$3" d
+    d="$(svc_mk_repo "$spec")"
+    refuses "$label" "$needle" \
+        env FORK_SANDBOX_CONFIG_DIR="$svc_allow_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-svc-allow-rej --model moonshotai/kimi-k3 "$d" "$handoff_file"
+}
+svc_refuses_allow "an unlisted registry is refused, naming the field and the key" \
+    "is not in K8S_SERVICE_REGISTRIES" \
+    'version: 1
+services:
+  - name: bad
+    image: quay.example/z:1
+    port: 6379
+'
+svc_refuses_allow "an unqualified ref is refused under an allowlist (no implied default)" \
+    "is not fully qualified and K8S_SERVICE_REGISTRIES is set" \
+    'version: 1
+services:
+  - name: bad
+    image: redis:7
+    port: 6379
+'
+cp "$svc_allow_repo_dir/.agents/sandbox-services/services.yaml" "$svc_validate_dir/allow.yaml"
+svc_t18_val_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_allow_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/allow.yaml")"
+check "validate-only: the allowed spec passes under the same config" \
+    "valid services spec" "$(sed -n 's/^.*: //p' <<< "$svc_t18_val_out" | head -1)"
+if grep -qF 'image refs: K8S_SERVICE_REGISTRY=registry.example' <<< "$svc_t18_val_out" \
+    && grep -qF 'K8S_SERVICE_REGISTRIES=' <<< "$svc_t18_val_out"; then
+    ok "validate-only: the image refs line names the resolved prefix and allowlist"
+else
+    no "validate-only: the image refs line names the resolved prefix and allowlist" \
+        "$svc_t18_val_out"
+fi
+printf 'version: 1\nservices:\n  - name: bad\n    image: quay.example/z:1\n    port: 6379\n' \
+    > "$svc_validate_dir/disallowed.yaml"
+svc_t18_val_bad_out=""; svc_t18_val_bad_rc=0
+svc_t18_val_bad_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_allow_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/disallowed.yaml" 2>&1)" || svc_t18_val_bad_rc=$?
+if (( svc_t18_val_bad_rc != 0 )) \
+    && [[ "$svc_t18_val_bad_out" == *"is not in K8S_SERVICE_REGISTRIES"* ]]; then
+    ok "validate-only: the same disallowed-registry verdict as the cluster path"
+else
+    no "validate-only: the same disallowed-registry verdict as the cluster path" \
+        "rc=$svc_t18_val_bad_rc: $svc_t18_val_bad_out"
+fi
+
+# T19 (R19): a malformed K8S_SERVICE_REGISTRY (unqualified) or
+# K8S_SERVICE_REGISTRIES (an entry with a '/') is a k8s.env error, naming
+# the config file, in both modes -- never the spec.
+svc_badprefix_dir="$(mk_image_config 'K8S_SERVICE_REGISTRY=mirror')"
+svc_refuses_badprefix() {
+    local label="$1" needle="$2" spec="$3" d
+    d="$(svc_mk_repo "$spec")"
+    refuses "$label" "$needle" \
+        env FORK_SANDBOX_CONFIG_DIR="$svc_badprefix_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-svc-badprefix --model moonshotai/kimi-k3 "$d" "$handoff_file"
+}
+svc_refuses_badprefix "an unqualified K8S_SERVICE_REGISTRY is a k8s.env error" \
+    "$svc_badprefix_dir/k8s.env: K8S_SERVICE_REGISTRY" \
+    'version: 1
+services:
+  - name: ok
+    image: registry.example/ok:1
+    port: 6379
+'
+svc_t19_val_out=""; svc_t19_val_rc=0
+svc_t19_val_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_badprefix_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_t19_val_rc=$?
+if (( svc_t19_val_rc != 0 )) \
+    && [[ "$svc_t19_val_out" == *"$svc_badprefix_dir/k8s.env"*"K8S_SERVICE_REGISTRY"* ]]; then
+    ok "validate-only: the same K8S_SERVICE_REGISTRY shape error, naming k8s.env"
+else
+    no "validate-only: the same K8S_SERVICE_REGISTRY shape error, naming k8s.env" \
+        "rc=$svc_t19_val_rc: $svc_t19_val_out"
+fi
+svc_badlist_dir="$(mk_image_config 'K8S_SERVICE_REGISTRIES=registry.example/path')"
+svc_refuses_badlist() {
+    local label="$1" needle="$2" spec="$3" d
+    d="$(svc_mk_repo "$spec")"
+    refuses "$label" "$needle" \
+        env FORK_SANDBOX_CONFIG_DIR="$svc_badlist_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-svc-badlist --model moonshotai/kimi-k3 "$d" "$handoff_file"
+}
+svc_refuses_badlist "a K8S_SERVICE_REGISTRIES entry with a '/' is a k8s.env error" \
+    "$svc_badlist_dir/k8s.env: K8S_SERVICE_REGISTRIES" \
+    'version: 1
+services:
+  - name: ok
+    image: registry.example/ok:1
+    port: 6379
+'
+
 printf '\n== the durable run log: cmd_submit creates and populates the run directory ==\n'
 # --dry-run contacts nothing, and that includes the host filesystem outside
 # rendering: no run directory may appear under the forks root.

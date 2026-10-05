@@ -179,9 +179,26 @@ sandboxEnv:
 - `services[].name` — required, at most **40 characters**, matching
   `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, unique, and not one of the harness's own
   pod container names. Becomes the sidecar's container name.
-- `services[].image` — required, an image ref. An unqualified image resolves
-  wherever the cluster's container runtime points (commonly Docker Hub);
-  fully qualify the ref to pin the registry.
+- `services[].image` — required, an image ref, in one of three forms:
+    - a fully qualified ref (`registry.example/postgres:16`): unchanged,
+      the way it always worked, unless the operator's `k8s.env` sets
+      `K8S_SERVICE_REGISTRIES` (an allowlist — see below), in which case
+      its registry host must be on that list.
+    - a Docker Hub short name (`redis:7`): unqualified, resolving
+      wherever the cluster's container runtime points (commonly Docker
+      Hub) — unchanged by `K8S_SERVICE_REGISTRY` alone, and refused when
+      `K8S_SERVICE_REGISTRIES` is set, since there is then no implied
+      default registry to resolve it against.
+    - a registry-relative ref (`./postgres:16`, a leading `./`): resolves
+      against `K8S_SERVICE_REGISTRY` in the operator's `k8s.env`
+      (`<prefix>/postgres:16`), or is refused when that key is unset. A
+      leading `.` can never appear in a real image reference, so this
+      form is unambiguous and never collides with a ref that already
+      pulls something today.
+  See `docs/kubernetes-runs.md`'s "Per-run services" section for the two
+  `k8s.env` keys (`K8S_SERVICE_REGISTRY`, `K8S_SERVICE_REGISTRIES`) and how
+  they compose. Neither set: every form above behaves exactly as before
+  these keys existed.
 - `services[].port` — required, an integer **1025-65535**. Every service
   container runs non-root (below), and a non-root process cannot bind a port
   under 1024. Must not collide with another service's port.
@@ -242,13 +259,16 @@ The same parser the cluster path runs can check a spec on its own:
 
     .agents/sandbox-services/services.yaml: valid services spec
     limits applied: K8S_SERVICES_MAX=8 (built-in default), K8S_SERVICE_MAX_CPU=1000m (built-in default), K8S_SERVICE_MAX_MEMORY=1Gi (built-in default)
+    image refs: K8S_SERVICE_REGISTRY unset (no relative refs), K8S_SERVICE_REGISTRIES unset (fully qualified refs unrestricted)
 
 It applies the per-run caps the cluster path would — `K8S_SERVICES_MAX` /
 `K8S_SERVICE_MAX_CPU` / `K8S_SERVICE_MAX_MEMORY` from this machine's
 `k8s.env` when set, otherwise the same built-in defaults — and prints which
 limits it applied with their source, so a pass is only a guarantee under the
-limits it names. On failure it exits non-zero with the same field-naming
-messages the cluster path gives.
+limits it names. The same applies to `K8S_SERVICE_REGISTRY` /
+`K8S_SERVICE_REGISTRIES`: the second line says which rule resolved every
+`services[].image` in the spec. On failure it exits non-zero with the same
+field-naming messages the cluster path gives.
 
 ### What the harness guarantees on every sidecar, never from the spec
 

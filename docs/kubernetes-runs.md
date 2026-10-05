@@ -1944,6 +1944,29 @@ Three `k8s.env` keys cap what a spec can claim, since a repo — the thing
 A spec over any of these is refused before the Job is even assembled, naming
 the offending field and which `k8s.env` key raises it.
 
+Two more keys resolve a `services[].image` ref — see
+[docs/sandbox-services.md](sandbox-services.md)'s own `services[].image`
+section for the full syntax and the resolution rule, repeated only in
+summary here:
+
+- `K8S_SERVICE_REGISTRY` — a registry prefix (e.g.
+  `registry.example/mirror`). Unset: a `./name:tag` relative ref is
+  refused; a plain `redis:7` or any fully qualified ref is unchanged.
+  With it set, `./name:tag` resolves to `<prefix>/name:tag`, and every
+  OTHER ref (short name, fully qualified, digest) is still unchanged --
+  setting this key alone never repoints an existing spec.
+- `K8S_SERVICE_REGISTRIES` — a comma-separated allowlist of registry
+  hosts a fully qualified `services[].image` may name (the
+  `K8S_SERVICE_REGISTRY` host, when set, is always implicitly included).
+  Unset: no restriction, today's behavior. Set: an unqualified ref
+  (`redis:7`) is refused too -- under an allowlist there is no implied
+  default registry, so the author must write the qualified spelling
+  (`docker.io/library/redis:7`) and the operator must list its host.
+
+`fork-sandbox validate-services <file>` applies the same two keys the
+same way, and prints which rule it applied (unset, or the resolved
+prefix/allowlist) alongside the limits line.
+
 ## Attribution: fork-sandbox/owner and free-form labels
 
 `kubectl get pods -n fork-sandbox` otherwise shows a pile of

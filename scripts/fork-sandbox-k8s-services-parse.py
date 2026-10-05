@@ -28,6 +28,19 @@ account -- not rejected, just not expressible).
 K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU / K8S_SERVICE_MAX_MEMORY in
 k8s.env (fork-sandbox-k8s.sh resolves their defaults before calling this).
 
+Every services[].image is also resolved against two more k8s.env keys,
+read directly from the site's config by both call forms (never passed as
+an argument, so validate-only applies the identical rule): a leading
+"./" is registry-relative, resolving against K8S_SERVICE_REGISTRY (and
+refused when that key is unset); anything else is unchanged unless
+K8S_SERVICE_REGISTRIES (an allowlist of registry hosts, the
+K8S_SERVICE_REGISTRY host always implicitly included) is set, in which
+case a fully qualified ref's host must be listed and an unqualified ref
+is refused outright (there is no implied default registry under an
+allowlist). With neither key set, every ref resolves exactly as before
+either existed. See registry_host/resolve_registry_rules/resolve_image
+below, and "Per-run services" in docs/kubernetes-runs.md.
+
 On success, writes into <out-dir> the already-rendered YAML/text fragments
 fork-sandbox-k8s.sh splices into the Job it builds, so no further parsing
 of this script's output is needed on the bash side:
@@ -71,6 +84,21 @@ except ImportError:
 SPEC_PATH = ".agents/sandbox-services/services.yaml"
 SUPPORTED_VERSIONS = (1,)
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+# A services[].image spelled "./name:tag" resolves against
+# K8S_SERVICE_REGISTRY -- see resolve_image's own header for why this sigil
+# and not a boolean field. REGISTRY_PREFIX_RE is K8S_SERVICE_REGISTRY's own
+# shape (a ref prefix, no space); REGISTRY_HOST_RE is one
+# K8S_SERVICE_REGISTRIES entry (a bare registry host, optionally
+# host:port -- no '/', which would make it a path prefix instead of a
+# host).
+RELATIVE_PREFIX = "./"
+REGISTRY_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+REGISTRY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$")
+# Set by main()/validate_only() from resolve_registry_rules() before
+# parse_doc() runs -- read there as module globals, the same convention
+# MAX_CPU/MAX_MEMORY/MAX_SERVICES already use.
+PREFIX = None
+ALLOWED_REGISTRIES = None
 # Two deliberately different patterns for two different call sites -- one
 # pattern serving both was exactly the defect this split removes:
 #
@@ -241,6 +269,7 @@ def parse_doc(doc):
         # for --branch and --model, plus the stronger yaml_safe check this
         # script applies everywhere it double-quotes a value instead.
         image = text_field(item["image"], f"{path}.image")
+        image = resolve_image(image, f"{path}.image", PREFIX, ALLOWED_REGISTRIES)
 
         if "port" not in item:
             fail(f"{path}.port: needs a port")
@@ -407,6 +436,9 @@ def write_if(path, content):
 def main():
     doc = load_doc(FILE)
 
+    global PREFIX, ALLOWED_REGISTRIES
+    PREFIX, ALLOWED_REGISTRIES, _ = resolve_registry_rules()
+
     services, sandbox_env = parse_doc(doc)
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -460,6 +492,118 @@ def k8s_env_path():
                   os.path.join(os.path.expanduser("~"),
                                ".config", "fork-sandbox"))
     return os.path.join(config_dir, "k8s.env")
+
+
+def looks_like_registry_host(segment):
+    """Docker's own qualification rule, applied to one path segment: a
+    '.' or a ':' in it, or exactly 'localhost'."""
+    return "." in segment or ":" in segment or segment == "localhost"
+
+
+def registry_host(ref):
+    """The registry host a fully qualified IMAGE REF names, by Docker's
+    own rule: the part before the first '/' looks like a host (see
+    looks_like_registry_host). A ref with no '/' at all is unqualified --
+    'redis:7' has a ':' but no '/', so it is not mistaken for a ref on a
+    registry named 'redis'. (K8S_SERVICE_REGISTRY itself is checked by a
+    sibling rule in resolve_registry_rules, since a bare prefix with no
+    '/' at all, e.g. 'registry.example', is legitimately a host alone.)
+    Returns None for an unqualified ref."""
+    if "/" not in ref:
+        return None
+    first = ref.split("/", 1)[0]
+    return first if looks_like_registry_host(first) else None
+
+
+def resolve_registry_rules():
+    """Reads K8S_SERVICE_REGISTRY and K8S_SERVICE_REGISTRIES from the
+    site's k8s.env -- called by both main() (the cluster path) and
+    validate_only(), so acceptance 8's "validate-services applies the same
+    resolution" holds from one function rather than two copies of the
+    rule. Returns (prefix, allowed, rule_line):
+      prefix  -- the registry a './' relative ref resolves against, or
+                 None when K8S_SERVICE_REGISTRY is unset (a './' ref is
+                 then refused, not resolved against a runtime default).
+      allowed -- the set of registry hosts a fully qualified ref may name,
+                 always including the prefix's own host when one is set,
+                 or None when K8S_SERVICE_REGISTRIES is unset (no
+                 restriction -- today's behavior).
+      rule_line -- describes what was applied, for validate_only's output.
+    Shape errors here name k8s.env, not the spec: a bad key is a config
+    mistake, not something the spec's own author can fix.
+    """
+    k8s_env = k8s_env_path()
+    prefix = read_env_key(k8s_env, "K8S_SERVICE_REGISTRY")
+    if prefix:
+        if not REGISTRY_PREFIX_RE.fullmatch(prefix):
+            fail(f"K8S_SERVICE_REGISTRY: '{prefix}' is not a valid image "
+                 f"ref prefix", spec_path=k8s_env)
+        prefix = prefix.rstrip("/")
+        if not looks_like_registry_host(prefix.split("/", 1)[0]):
+            fail(f"K8S_SERVICE_REGISTRY: '{prefix}' must itself be fully "
+                 f"qualified -- it needs a registry host (a '.' or ':' in "
+                 f"its first path segment, or 'localhost') for a relative "
+                 f"ref to resolve against", spec_path=k8s_env)
+        prefix_line = f"K8S_SERVICE_REGISTRY={prefix} (from {k8s_env})"
+    else:
+        prefix = None
+        prefix_line = "K8S_SERVICE_REGISTRY unset (no relative refs)"
+
+    registries_raw = read_env_key(k8s_env, "K8S_SERVICE_REGISTRIES")
+    allowed = None
+    if registries_raw:
+        allowed = set()
+        for entry in registries_raw.split(","):
+            entry = entry.strip()
+            if not entry or not REGISTRY_HOST_RE.fullmatch(entry):
+                fail(f"K8S_SERVICE_REGISTRIES: '{entry}' is not a valid "
+                     f"registry host", spec_path=k8s_env)
+            allowed.add(entry)
+        if prefix is not None:
+            allowed.add(prefix.split("/", 1)[0])
+        registries_line = (f"K8S_SERVICE_REGISTRIES="
+                            f"{','.join(sorted(allowed))} (from {k8s_env})")
+    else:
+        registries_line = ("K8S_SERVICE_REGISTRIES unset (fully qualified "
+                            "refs unrestricted)")
+
+    return prefix, allowed, f"{prefix_line}, {registries_line}"
+
+
+def resolve_image(raw, path, prefix, allowed):
+    """Resolves one services[].image value against the registry rules
+    resolve_registry_rules() returned. A './name:tag' ref resolves to
+    '<prefix>/name:tag'; anything else is unchanged unless an allowlist is
+    active and refuses it. With neither key configured (prefix and allowed
+    both None/None), every ref -- Docker Hub short name, fully qualified,
+    digest -- returns unchanged: this is the identity resolution that
+    keeps an unconfigured install's render byte-identical."""
+    if raw.startswith(RELATIVE_PREFIX):
+        rest = raw[len(RELATIVE_PREFIX):]
+        if not rest:
+            fail(f"{path}: '{raw}' has nothing after './'")
+        if prefix is None:
+            fail(f"{path}: '{raw}' is registry-relative but "
+                 f"K8S_SERVICE_REGISTRY is not set in {k8s_env_path()}")
+        return f"{prefix}/{rest}"
+
+    if allowed is None:
+        return raw
+
+    host = registry_host(raw)
+    if host is None:
+        if "/" in raw:
+            suggested = f"docker.io/{raw}"
+        else:
+            suggested = f"docker.io/library/{raw}"
+        fail(f"{path}: '{raw}' is not fully qualified and "
+             f"K8S_SERVICE_REGISTRIES is set in {k8s_env_path()}; write "
+             f"{suggested} (and list docker.io in K8S_SERVICE_REGISTRIES), "
+             f"or a ./ relative ref")
+    if host not in allowed:
+        fail(f"{path}: registry '{host}' is not in K8S_SERVICE_REGISTRIES "
+             f"({', '.join(sorted(allowed))})")
+    return raw
 
 
 def resolve_limits():
@@ -517,9 +661,12 @@ def validate_only():
         parse_memory(MAX_MEMORY, "K8S_SERVICE_MAX_MEMORY",
                      spec_path=k8s_env_path())
     doc = load_doc(FILE)
+    global PREFIX, ALLOWED_REGISTRIES
+    PREFIX, ALLOWED_REGISTRIES, registry_line = resolve_registry_rules()
     parse_doc(doc)
     sys.stdout.write(f"{FILE}: valid services spec\n")
     sys.stdout.write(f"limits applied: {limits_line}\n")
+    sys.stdout.write(f"image refs: {registry_line}\n")
 
 
 if __name__ == "__main__":
