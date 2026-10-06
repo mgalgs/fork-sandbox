@@ -308,6 +308,9 @@ check "the server wrote nothing outside its root" \
 check "no scratch files are left in the root" "" \
     "$(find "$scratch/beta/root" -maxdepth 1 -name '.*' ! -name . | grep -E 'ingest|body|xhost' | head -2)"
 
+check "lane-mail.sh works with no scripts dir on PATH (non-interactive ssh)" "$id1" \
+    "$(env PATH=/usr/bin:/bin FORK_SANDBOX_CONFIG_DIR="$scratch/beta/cfg" "$scratch/beta/bin/lane-mail.sh" inbox x --all | cut -f1 | grep -Fx "$id1")"
+
 help_out="$(PATH="$scratch/beta/bin:$PATH" "$scratch/beta/bin/lane-mail-serve" --help)"
 contains "--help documents the authorized_keys line" "$help_out" 'command="lane-mail-serve --peer <name>",restrict'
 contains "--help states the trust model" "$help_out" "ONLY source of"

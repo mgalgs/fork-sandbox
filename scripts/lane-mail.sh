@@ -68,6 +68,8 @@ set -euo pipefail
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
 source "$script_dir/lane-mail-lib.sh"
+# By path, not PATH: a non-interactive ssh login's PATH lacks the scripts dir.
+mail_bin="$script_dir/fork-sandbox-mail.sh"
 
 LANES_DIR="/tmp/claude-$(id -u)/lane-mail-lanes"
 work=""    # scratch dir of an in-flight cross-host send; removed on exit
@@ -115,7 +117,7 @@ find_remote_hosts() {
                     recips+=("${parts[@]:-}")
                     ;;
             esac
-        done < <(FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT" fork-sandbox-mail.sh show "$reply_to" 2>/dev/null || true)
+        done < <(FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT" "$mail_bin" show "$reply_to" 2>/dev/null || true)
     fi
     self="$(lane_mail_self_name || true)"
     for addr in "${recips[@]:-}"; do
@@ -169,7 +171,7 @@ cross_host() {
     done
 
     local msg="$work/msg" rc=0
-    fork-sandbox-mail.sh "$verb" --emit "${args[@]}" > "$msg" || rc=$?
+    "$mail_bin" "$verb" --emit "${args[@]}" > "$msg" || rc=$?
     (( rc == 0 )) || exit "$rc"
 
     local mid from from_host
@@ -215,7 +217,7 @@ cross_host() {
     done
 
     export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
-    if ! fork-sandbox-mail.sh ingest < "$msg" >/dev/null; then
+    if ! "$mail_bin" ingest < "$msg" >/dev/null; then
         die "delivered to$delivered but the local store write failed; $mid exists only on the remote side"
     fi
     echo "lane-mail: delivered $mid to$delivered and stored it here" >&2
@@ -270,12 +272,12 @@ case "$cmd" in
         if (( ${#remote_hosts[@]} > 0 )); then
             cross_host "$cmd" "${@:2}"
         else
-            exec fork-sandbox-mail.sh "$@"
+            exec "$mail_bin" "$@"
         fi
         ;;
     show|tree|list|inbox|seen)
         export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
-        exec fork-sandbox-mail.sh "$@"
+        exec "$mail_bin" "$@"
         ;;
     -h|--help|"")
         usage
