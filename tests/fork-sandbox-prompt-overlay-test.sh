@@ -516,6 +516,12 @@ the change: if building the evidence is taking longer than the change
 itself did, stop refining it, report what you did measure, name what you
 did not run and why, and finish.
 
+Commit at natural points, as soon as that commit's tests pass, and leave the
+history as you made it: do not re-split, squash, amend or rebase your own
+commits to make it read well. History cleanup is not this leg's job.
+Whoever integrates this branch squashes or reshapes it then; no leg of
+this run will.
+
 ---
 
 do the task
@@ -1100,6 +1106,12 @@ verification or evidence-gathering. Keep that verification proportional to
 the change: if building the evidence is taking longer than the change
 itself did, stop refining it, report what you did measure, name what you
 did not run and why, and finish.
+
+Commit at natural points, as soon as that commit's tests pass, and leave the
+history as you made it: do not re-split, squash, amend or rebase your own
+commits to make it read well. History cleanup is not this leg's job.
+Whoever integrates this branch squashes or reshapes it then; no leg of
+this run will.
 
 Some of what follows may be wrong: the reviewer read the same code you are
 about to read and could have misread it. **Do not change code to satisfy a

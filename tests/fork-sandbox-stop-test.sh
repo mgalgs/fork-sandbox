@@ -259,6 +259,68 @@ else
     no "signaled mid-leg: the fetched, commit-free branch was removed" "no run dir"
 fi
 
+# -- a TERM landing before the tidy leg ever starts means no tidy
+# leg runs at all -- stop_requested is the FIRST thing the tidy
+# eligibility check in fork-sandbox.sh reads (ahead of whether a maintain
+# step even ran), so signaling during leg 1 of a maintainer-loop pipeline
+# already proves this: by the time that check runs, stop_requested is set
+# regardless of which leg was in flight when it was, and nothing resets
+# it. The maintain leg itself never runs either, so this is also coverage
+# for "no leg of this run ever reaches the tidy block after a stop".
+count_file_tidy="$(mktemp)"; tmpdirs+=("$count_file_tidy")
+out_file_tidy="$(mktemp)"; tmpdirs+=("$out_file_tidy")
+HOME="$launcher_home" PATH="$stub_bin:$PATH" \
+    FAKE_CLAUDE_COUNT_FILE="$count_file_tidy" \
+    FAKE_SLEEP_SECONDS=3 \
+    FAKE_HANDOFF_LEGS="" \
+    "$launcher" --foreground --harness claude --maintainer-loop 1 \
+    --maintainer-model sonnet \
+    "$proj" "$handoff" > "$out_file_tidy" 2>&1 &
+runner_pid_tidy=$!
+rd_tidy_stop=""
+for _ in $(seq 1 100); do
+    rd_tidy_stop="$(sed -n 's/^  run dir:  *//p' "$out_file_tidy" 2>/dev/null | head -1)"
+    [[ -n "$rd_tidy_stop" ]] && break
+    sleep 0.1
+done
+if [[ -n "$rd_tidy_stop" ]]; then
+    tmpdirs+=("$rd_tidy_stop")
+    sleep 0.5
+    kill -TERM "$runner_pid_tidy" 2>/dev/null
+    wait "$runner_pid_tidy" 2>/dev/null
+    rc_seen_tidy=0
+    for _ in $(seq 1 100); do
+        [[ -f "$rd_tidy_stop/exit-code" ]] && { rc_seen_tidy=1; break; }
+        sleep 0.1
+    done
+    if (( rc_seen_tidy )); then
+        check "stop-before-tidy: only leg 1 ran, the maintain leg never started" \
+            "1" "$(cat "$count_file_tidy" 2>/dev/null)"
+        check "stop-before-tidy: no tidy leg ran either (no events-tidy-1.jsonl)" \
+            "0" "$([[ -e "$rd_tidy_stop/events-tidy-1.jsonl" ]] && echo 1 || echo 0)"
+        check "stop-before-tidy: tidy.json still exists (this pipeline HAS a maintain step)" \
+            "skipped" "$(jq -r '.ended // empty' "$rd_tidy_stop/tidy.json" 2>/dev/null)"
+        contains "stop-before-tidy: the skip detail cites the stop request" \
+            "stop requested" "$(jq -r '.detail // empty' "$rd_tidy_stop/tidy.json" 2>/dev/null)"
+        check "stop-before-tidy: summary.json's tidy key is present, ended skipped" \
+            "skipped" "$(jq -r '.tidy.ended // empty' "$rd_tidy_stop/summary.json" 2>/dev/null)"
+    else
+        no "stop-before-tidy: only leg 1 ran, the maintain leg never started" "no exit-code ever appeared"
+        no "stop-before-tidy: no tidy leg ran either (no events-tidy-1.jsonl)" "no exit-code ever appeared"
+        no "stop-before-tidy: tidy.json still exists (this pipeline HAS a maintain step)" "no exit-code ever appeared"
+        no "stop-before-tidy: the skip detail cites the stop request" "no exit-code ever appeared"
+        no "stop-before-tidy: summary.json's tidy key is present, ended skipped" "no exit-code ever appeared"
+    fi
+    branch_tidy_stop="$(sed -n 's/^branch=//p' "$rd_tidy_stop/run.env" 2>/dev/null | head -1)"
+    [[ -n "$branch_tidy_stop" ]] && (cd "$proj" && git branch -q -D "$branch_tidy_stop" >/dev/null 2>&1) || true
+else
+    no "stop-before-tidy: only leg 1 ran, the maintain leg never started" "no run dir ever appeared: $(cat "$out_file_tidy")"
+    no "stop-before-tidy: no tidy leg ran either (no events-tidy-1.jsonl)" "no run dir"
+    no "stop-before-tidy: tidy.json still exists (this pipeline HAS a maintain step)" "no run dir"
+    no "stop-before-tidy: the skip detail cites the stop request" "no run dir"
+    no "stop-before-tidy: summary.json's tidy key is present, ended skipped" "no run dir"
+fi
+
 # -- a normal, unsignaled run's summary.json has no end_reason key at all.
 count_file2="$(mktemp)"; tmpdirs+=("$count_file2")
 out2="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" \
@@ -1068,6 +1130,87 @@ else
 fi
 wait "$leader_job" 2>/dev/null || true
 
+# -- forced stop of the same foreground shape: the runner ignores TERM
+# (forcing the violent fallback) and, like a --foreground leg's own
+# direct child, backgrounds a sleep without ever getting a process group
+# of its own -- it shares the wrapper's group, same as the runner itself.
+# kill_other_groups will not touch that shared group (it would also take
+# down the sibling, standing in for the launching shell), so the forced
+# path has to reach the child individually by pid.
+fake_runner_ignores_term_with_child="$(mktemp /var/tmp/claude-scratch/fs-stop-fake-runner.XXXXXX)"
+tmpdirs+=("$fake_runner_ignores_term_with_child")
+cat > "$fake_runner_ignores_term_with_child" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$$" > "$RUN_DIR/pid"
+trap '' TERM
+sleep 300 &
+printf '%s\n' "$!" > "$RUN_DIR/runner-child-pid"
+while :; do sleep 0.2; done
+EOF
+chmod +x "$fake_runner_ignores_term_with_child"
+
+leaderforced_origin="$(new_project)"; tmpdirs+=("$leaderforced_origin")
+leaderforced_base_sha="$(cd "$leaderforced_origin" && git rev-parse HEAD)"
+leaderforced_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-leaderforced-clone.XXXXXX)"
+tmpdirs+=("$leaderforced_clone")
+(
+    cd "$leaderforced_origin" && git clone -q . "$leaderforced_clone" \
+        && cd "$leaderforced_clone" && git checkout -q -b fs-stop-leaderforced
+) >/dev/null 2>&1
+
+rd_leaderforced="$(new_run_dir)"
+cat > "$rd_leaderforced/run.env" <<EOF
+version=1
+branch=fs-stop-leaderforced
+origin_repo=$leaderforced_origin
+clone_dir=$leaderforced_clone
+base_sha=$leaderforced_base_sha
+session=cc-sbx-fs-stop-leaderforced-does-not-exist
+EOF
+leaderforced_sibling_pid_file="$(mktemp)"; tmpdirs+=("$leaderforced_sibling_pid_file")
+RUN_DIR="$rd_leaderforced" SIBLING_PID_FILE="$leaderforced_sibling_pid_file" \
+    FAKE_RUNNER_SCRIPT="$fake_runner_ignores_term_with_child" \
+    setsid --fork "$leader_wrapper" \
+    < /dev/null > "$rd_leaderforced/fake-runner.log" 2>&1 &
+leaderforced_job=$!
+if wait_for_file "$rd_leaderforced/pid" && wait_for_file "$leaderforced_sibling_pid_file" \
+    && wait_for_file "$rd_leaderforced/runner-child-pid"; then
+    leaderforced_sibling_pid="$(cat "$leaderforced_sibling_pid_file")"
+    leaderforced_runner_pid="$(cat "$rd_leaderforced/pid")"
+    leaderforced_child_pid="$(cat "$rd_leaderforced/runner-child-pid")"
+    leaderforced_pgid_seen="$(ps -o pgid= -p "$leaderforced_runner_pid" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$leaderforced_pgid_seen" && "$leaderforced_pgid_seen" != "$leaderforced_runner_pid" ]]; then
+        out_leaderforced="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 2 "$rd_leaderforced" 2>&1)"; rc_leaderforced=$?
+        check "forced leadership: stop exits 0" "0" "$rc_leaderforced"
+        contains "forced leadership: reports stop-timeout" "stop-timeout" "$out_leaderforced"
+        if kill -0 "$leaderforced_sibling_pid" 2>/dev/null; then
+            ok "forced leadership: the group's other member survives"
+        else
+            no "forced leadership: the group's other member survives" \
+                "sibling pid $leaderforced_sibling_pid is dead; the forced path signaled the whole shared group"
+        fi
+        if kill -0 "$leaderforced_child_pid" 2>/dev/null; then
+            no "forced leadership: the runner's own child in the shared group is also dead" \
+                "child pid $leaderforced_child_pid is still alive after a forced stop"
+        else
+            ok "forced leadership: the runner's own child in the shared group is also dead"
+        fi
+    else
+        no "forced leadership: stop exits 0" "runner's pgid ($leaderforced_pgid_seen) equalled its pid ($leaderforced_runner_pid); fixture did not set up pgid != pid"
+        no "forced leadership: reports stop-timeout" "fixture setup failed"
+        no "forced leadership: the group's other member survives" "fixture setup failed"
+        no "forced leadership: the runner's own child in the shared group is also dead" "fixture setup failed"
+    fi
+    kill -9 "$leaderforced_sibling_pid" "$leaderforced_child_pid" 2>/dev/null || true
+else
+    no "forced leadership: stop exits 0" "fake runner/sibling/child never wrote their pid files"
+    no "forced leadership: reports stop-timeout" "fake runner/sibling/child never wrote their pid files"
+    no "forced leadership: the group's other member survives" "fake runner/sibling/child never wrote their pid files"
+    no "forced leadership: the runner's own child in the shared group is also dead" "fake runner/sibling/child never wrote their pid files"
+fi
+wait "$leaderforced_job" 2>/dev/null || true
+
 # -- exact-match tmux kill-session: run.env names a session that is a
 # strict PREFIX of the only session actually alive, and does not itself
 # exist. With two sessions both alive under their real, distinct names
@@ -1244,6 +1387,296 @@ contains "checkout-base: reports 0 new commits from return_base_sha" "0 new comm
 check "checkout-base: branch removed (zero commits past return_base_sha)" \
     "0" "$(cd "$checkout_origin" && git show-ref --quiet refs/heads/fs-stop-checkout-base && echo 1 || echo 0)"
 
+# -- forced stop while the tidy leg is still mid-flight (stub harness).
+# The runner snapshots the approved head into a holding ref BEFORE
+# launching the leg (fork-sandbox.sh's own fetch into
+# refs/fork-sandbox/tidy/<run-id>/approved, keyed by this run's own run
+# dir, read back here the same way); dying before the leg ever finishes,
+# the same dead-pid salvage shape "failed fetch"/"zero commits" below
+# use, leaves no tidy.json behind at all. The clone's branch holds
+# whatever the still-running leg had committed so far -- unverified, never
+# approved -- which must never reach the origin; only the snapshot may.
+midflight_origin="$(new_project)"; tmpdirs+=("$midflight_origin")
+midflight_base_sha="$(cd "$midflight_origin" && git rev-parse HEAD)"
+midflight_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-midflight-clone.XXXXXX)"
+tmpdirs+=("$midflight_clone")
+(
+    cd "$midflight_origin" && git clone -q . "$midflight_clone" \
+        && cd "$midflight_clone" && git checkout -q -b fs-stop-midflight \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'approved work\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'approved work'
+) >/dev/null 2>&1
+midflight_approved_sha="$(cd "$midflight_clone" && git rev-parse fs-stop-midflight)"
+rd_midflight="$(new_run_dir)"
+midflight_run_id="$(basename "$rd_midflight")"
+(cd "$midflight_origin" && git fetch -q "$midflight_clone" \
+    "+refs/heads/fs-stop-midflight:refs/fork-sandbox/tidy/$midflight_run_id/approved")
+(
+    cd "$midflight_clone" \
+        && git commit -q --allow-empty -m 'unverified work-in-progress from a still-running tidy leg'
+) >/dev/null 2>&1
+cat > "$rd_midflight/run.env" <<EOF
+version=1
+branch=fs-stop-midflight
+origin_repo=$midflight_origin
+clone_dir=$midflight_clone
+base_sha=$midflight_base_sha
+session=cc-sbx-fs-stop-midflight-does-not-exist
+EOF
+( : ) & dead_pid_midflight=$!
+wait "$dead_pid_midflight" 2>/dev/null || true
+printf '%s\n' "$dead_pid_midflight" > "$rd_midflight/pid"
+out_midflight="$(HOME="$launcher_home" "$stop" "$rd_midflight" 2>&1)"; rc_midflight=$?
+check "mid-flight tidy leg: stop exits 0" "0" "$rc_midflight"
+check "mid-flight tidy leg: the published branch is the approved head, not the clone's WIP" \
+    "$midflight_approved_sha" "$(cd "$midflight_origin" && git rev-parse fs-stop-midflight 2>/dev/null)"
+contains "mid-flight tidy leg: says it published the approved history, not the clone" \
+    "published the maintainer-approved history" "$out_midflight"
+check "mid-flight tidy leg: the holding ref is cleaned up after a successful publish" \
+    "" "$(cd "$midflight_origin" && git for-each-ref "refs/fork-sandbox/tidy/$midflight_run_id")"
+
+# -- the same mid-flight scenario, but the publish itself loses a
+# collision -- the ONE case that still has a live holding ref to name
+# (tidy.json never got written), so this is the one path that can prove
+# the recovery message names the ref, not just the sha.
+midflight2_origin="$(new_project)"; tmpdirs+=("$midflight2_origin")
+midflight2_base_sha="$(cd "$midflight2_origin" && git rev-parse HEAD)"
+midflight2_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-midflight2-clone.XXXXXX)"
+tmpdirs+=("$midflight2_clone")
+(
+    cd "$midflight2_origin" && git clone -q . "$midflight2_clone" \
+        && cd "$midflight2_clone" && git checkout -q -b fs-stop-midflight2 \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'approved work\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'approved work'
+) >/dev/null 2>&1
+midflight2_approved_sha="$(cd "$midflight2_clone" && git rev-parse fs-stop-midflight2)"
+rd_midflight2="$(new_run_dir)"
+midflight2_run_id="$(basename "$rd_midflight2")"
+(cd "$midflight2_origin" && git fetch -q "$midflight2_clone" \
+    "+refs/heads/fs-stop-midflight2:refs/fork-sandbox/tidy/$midflight2_run_id/approved")
+(
+    cd "$midflight2_origin" && git checkout -q -b fs-stop-midflight2 \
+        && printf "someone else's work\n" > other.txt \
+        && git add other.txt && git commit -q -m 'an unrelated commit' \
+        && git checkout -q -
+) >/dev/null 2>&1
+cat > "$rd_midflight2/run.env" <<EOF
+version=1
+branch=fs-stop-midflight2
+origin_repo=$midflight2_origin
+clone_dir=$midflight2_clone
+base_sha=$midflight2_base_sha
+session=cc-sbx-fs-stop-midflight2-does-not-exist
+EOF
+( : ) & dead_pid_midflight2=$!
+wait "$dead_pid_midflight2" 2>/dev/null || true
+printf '%s\n' "$dead_pid_midflight2" > "$rd_midflight2/pid"
+out_midflight2="$(HOME="$launcher_home" "$stop" "$rd_midflight2" 2>&1)"; rc_midflight2=$?
+if (( rc_midflight2 != 0 )); then
+    ok "mid-flight collision: stop reports non-zero exit"
+else
+    no "mid-flight collision: stop reports non-zero exit" "exited 0: $out_midflight2"
+fi
+not_contains "mid-flight collision: never suggests fetching the clone" \
+    "git fetch $midflight2_clone" "$out_midflight2"
+contains "mid-flight collision: names the still-live holding ref" \
+    "refs/fork-sandbox/tidy/$midflight2_run_id/approved" "$out_midflight2"
+contains "mid-flight collision: names the by-hand recovery command against the approved sha" \
+    "git update-ref refs/heads/fs-stop-midflight2 $midflight2_approved_sha" "$out_midflight2"
+check "mid-flight collision: the holding ref survives, not deleted" \
+    "$midflight2_approved_sha" \
+    "$(cd "$midflight2_origin" && git rev-parse -q --verify "refs/fork-sandbox/tidy/$midflight2_run_id/approved" 2>/dev/null)"
+
+# -- a live holding ref belonging to a DIFFERENT run (its own run id, not
+# this run's) that happens to share this run's branch name must never be
+# trusted as this run's own in-flight snapshot: refs are keyed by run id
+# precisely so two runs can share a branch name without either reading
+# or clearing the other's refs, and nothing here needs a gate on whether
+# THIS run's own pipeline could ever have made one -- no other run could
+# ever create a ref under this exact id. This run has no maintain step
+# at all and no tidy.json, the exact tidy.json-less shape
+# resolve_tidy_safe_sha's live-ref lookup reads -- reproduced with a dead
+# pid and no exit-code, same as the real report.
+otherrun_origin="$(new_project)"; tmpdirs+=("$otherrun_origin")
+otherrun_base_sha="$(cd "$otherrun_origin" && git rev-parse HEAD)"
+otherrun_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-otherrun-clone.XXXXXX)"
+tmpdirs+=("$otherrun_clone")
+(
+    cd "$otherrun_origin" && git clone -q . "$otherrun_clone" \
+        && cd "$otherrun_clone" && git checkout -q -b fs-stop-otherrun \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'other run work\n' > other.txt \
+        && git add other.txt \
+        && git commit -q -m 'other run: approved work'
+) >/dev/null 2>&1
+otherrun_prior_sha="$(cd "$otherrun_clone" && git rev-parse fs-stop-otherrun)"
+# A DIFFERENT run's own holding ref, under ITS OWN run id -- modeling a
+# run that lost a publish collision and left this ref behind for later
+# recovery (nothing here or in the real runner deletes it on its own).
+rd_otherrun_prior="$(new_run_dir)"; tmpdirs+=("$rd_otherrun_prior")
+otherrun_prior_run_id="$(basename "$rd_otherrun_prior")"
+(cd "$otherrun_origin" && git fetch -q "$otherrun_clone" \
+    "+refs/heads/fs-stop-otherrun:refs/fork-sandbox/tidy/$otherrun_prior_run_id/approved")
+(cd "$otherrun_origin" && git branch -q -D fs-stop-otherrun 2>/dev/null) || true
+# THIS run reuses the now-free branch name, commits its own work in the
+# clone, and (no maintain step) never touches any holding ref at all.
+(
+    cd "$otherrun_clone" \
+        && git commit -q --allow-empty -m 'this run: new work, no maintain step'
+) >/dev/null 2>&1
+otherrun_new_sha="$(cd "$otherrun_clone" && git rev-parse fs-stop-otherrun)"
+rd_otherrun="$(new_run_dir)"
+cat > "$rd_otherrun/run.env" <<EOF
+version=1
+branch=fs-stop-otherrun
+origin_repo=$otherrun_origin
+clone_dir=$otherrun_clone
+base_sha=$otherrun_base_sha
+session=cc-sbx-fs-stop-otherrun-does-not-exist
+EOF
+( : ) & dead_pid_otherrun=$!
+wait "$dead_pid_otherrun" 2>/dev/null || true
+printf '%s\n' "$dead_pid_otherrun" > "$rd_otherrun/pid"
+out_otherrun="$(HOME="$launcher_home" "$stop" "$rd_otherrun" 2>&1)"; rc_otherrun=$?
+check "other run's holding ref, no maintain step: stop exits 0" "0" "$rc_otherrun"
+check "other run's holding ref, no maintain step: publishes the clone's own work, not the other run's sha" \
+    "$otherrun_new_sha" "$(cd "$otherrun_origin" && git rev-parse fs-stop-otherrun 2>/dev/null)"
+if [[ "$(cd "$otherrun_origin" && git rev-parse fs-stop-otherrun 2>/dev/null)" != "$otherrun_prior_sha" ]]; then
+    ok "other run's holding ref, no maintain step: the other run's sha is not what landed"
+else
+    no "other run's holding ref, no maintain step: the other run's sha is not what landed" \
+        "the origin branch is at the OTHER run's sha"
+fi
+not_contains "other run's holding ref, no maintain step: never claims to have published the maintainer-approved history" \
+    "published the maintainer-approved history" "$out_otherrun"
+check "other run's holding ref, no maintain step: the other run's ref survives untouched" \
+    "$otherrun_prior_sha" \
+    "$(cd "$otherrun_origin" && git rev-parse -q --verify "refs/fork-sandbox/tidy/$otherrun_prior_run_id/approved" 2>/dev/null)"
+
+# -- forced stop after a discard whose own clone reset failed (stub
+# harness). The runner recorded the discard in tidy.json (head_approved,
+# clone_restored: false) before dying -- its own fetch-back into the
+# origin never ran. The clone's branch still holds the REJECTED rewrite;
+# only head_approved may ever reach the origin.
+discard_origin="$(new_project)"; tmpdirs+=("$discard_origin")
+discard_base_sha="$(cd "$discard_origin" && git rev-parse HEAD)"
+discard_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-discard-clone.XXXXXX)"
+tmpdirs+=("$discard_clone")
+(
+    cd "$discard_origin" && git clone -q . "$discard_clone" \
+        && cd "$discard_clone" && git checkout -q -b fs-stop-discard \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'approved work\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'approved work'
+) >/dev/null 2>&1
+discard_approved_sha="$(cd "$discard_clone" && git rev-parse fs-stop-discard)"
+rd_discard="$(new_run_dir)"
+discard_run_id="$(basename "$rd_discard")"
+# The runner's own pre-leg snapshot: the approved object has to actually
+# be in the origin repo's ODB for a by-sha publish to work at all, same as
+# the mid-flight fixture's explicit fetch above.
+(cd "$discard_origin" && git fetch -q "$discard_clone" \
+    "+refs/heads/fs-stop-discard:refs/fork-sandbox/tidy/$discard_run_id/approved")
+(
+    cd "$discard_clone" && git reset -q --soft "$discard_base_sha" \
+        && printf 'an edit the tidy leg should never have made\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'rejected rewrite, still sitting in the clone'
+) >/dev/null 2>&1
+cat > "$rd_discard/run.env" <<EOF
+version=1
+branch=fs-stop-discard
+origin_repo=$discard_origin
+clone_dir=$discard_clone
+base_sha=$discard_base_sha
+session=cc-sbx-fs-stop-discard-does-not-exist
+EOF
+jq -n --arg head_approved "$discard_approved_sha" '{
+    ended: "discarded", detail: "the tree differs; the approved history was restored",
+    head_approved: $head_approved, head_after: null, exit: 1, cost_usd: null,
+    usage: null, retries: [], clone_restored: false
+}' > "$rd_discard/tidy.json"
+( : ) & dead_pid_discard=$!
+wait "$dead_pid_discard" 2>/dev/null || true
+printf '%s\n' "$dead_pid_discard" > "$rd_discard/pid"
+out_discard="$(HOME="$launcher_home" "$stop" "$rd_discard" 2>&1)"; rc_discard=$?
+check "discard with failed clone reset: stop exits 0" "0" "$rc_discard"
+check "discard with failed clone reset: the published branch is head_approved, not the clone's rejected rewrite" \
+    "$discard_approved_sha" "$(cd "$discard_origin" && git rev-parse fs-stop-discard 2>/dev/null)"
+contains "discard with failed clone reset: says it published the approved history, not the clone" \
+    "published the maintainer-approved history" "$out_discard"
+
+# -- the tidy-safe publish can itself lose a collision (an operator or
+# another run claimed the branch name while this one was down) -- the
+# recovery command printed must still never suggest fetching the clone,
+# which here holds the SAME rejected rewrite as the fixture above.
+collide_origin="$(new_project)"; tmpdirs+=("$collide_origin")
+collide_base_sha="$(cd "$collide_origin" && git rev-parse HEAD)"
+collide_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-collide-clone.XXXXXX)"
+tmpdirs+=("$collide_clone")
+(
+    cd "$collide_origin" && git clone -q . "$collide_clone" \
+        && cd "$collide_clone" && git checkout -q -b fs-stop-collide \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'approved work\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'approved work'
+) >/dev/null 2>&1
+collide_approved_sha="$(cd "$collide_clone" && git rev-parse fs-stop-collide)"
+rd_collide="$(new_run_dir)"
+collide_run_id="$(basename "$rd_collide")"
+(cd "$collide_origin" && git fetch -q "$collide_clone" \
+    "+refs/heads/fs-stop-collide:refs/fork-sandbox/tidy/$collide_run_id/approved")
+(
+    cd "$collide_clone" && git reset -q --soft "$collide_base_sha" \
+        && printf 'rejected\n' > work.txt && git add work.txt \
+        && git commit -q -m 'rejected rewrite'
+) >/dev/null 2>&1
+(
+    cd "$collide_origin" && git checkout -q -b fs-stop-collide \
+        && printf "someone else's work\n" > other.txt \
+        && git add other.txt && git commit -q -m 'an unrelated commit' \
+        && git checkout -q -
+) >/dev/null 2>&1
+cat > "$rd_collide/run.env" <<EOF
+version=1
+branch=fs-stop-collide
+origin_repo=$collide_origin
+clone_dir=$collide_clone
+base_sha=$collide_base_sha
+session=cc-sbx-fs-stop-collide-does-not-exist
+EOF
+jq -n --arg head_approved "$collide_approved_sha" '{
+    ended: "discarded", detail: "the tree differs; the approved history was restored",
+    head_approved: $head_approved, head_after: null, exit: 1, cost_usd: null,
+    usage: null, retries: [], clone_restored: false
+}' > "$rd_collide/tidy.json"
+( : ) & dead_pid_collide=$!
+wait "$dead_pid_collide" 2>/dev/null || true
+printf '%s\n' "$dead_pid_collide" > "$rd_collide/pid"
+out_collide="$(HOME="$launcher_home" "$stop" "$rd_collide" 2>&1)"; rc_collide=$?
+if (( rc_collide != 0 )); then
+    ok "tidy-safe collision: stop reports non-zero exit"
+else
+    no "tidy-safe collision: stop reports non-zero exit" "exited 0: $out_collide"
+fi
+not_contains "tidy-safe collision: never suggests fetching the clone" \
+    "git fetch $collide_clone" "$out_collide"
+contains "tidy-safe collision: names the by-hand recovery command against the approved sha" \
+    "git update-ref refs/heads/fs-stop-collide $collide_approved_sha" "$out_collide"
+check "tidy-safe collision: the colliding commit in the origin is untouched" \
+    "an unrelated commit" "$(cd "$collide_origin" && git log -1 --format=%s fs-stop-collide)"
+
 # -- failed fetch is reported as a failure, not a clean "0 new commits"
 # (proves 3.5). clone_dir is a plain empty directory, not a git repo at
 # all, so the fetch fails cleanly without needing to fabricate corruption.
@@ -1271,6 +1704,705 @@ else
 fi
 not_contains "failed fetch: does not claim 0 new commits" "0 new commit" "$out_fail"
 contains "failed fetch: names the clone as the rescue path" "$fail_clone" "$out_fail"
+
+# -- exit-code already exists, but the runner never reached its own
+# publish: fork-sandbox.sh writes exit-code (its teardown) strictly before
+# its tidy-aware fetch-back runs, and strictly before summary.json, which
+# it writes only after that fetch-back lands. A fixture with exit-code but
+# no summary.json is exactly the window a kill -9/OOM/host-reboot between
+# those two writes would leave behind. Entry state 1 used to trust
+# exit-code alone and declare "nothing to stop" here, silently leaving the
+# tidy leg's verified rewrite unpublished with no recovery hint -- this
+# proves the fix confirms (and if needed completes) the publish instead.
+unconfirmed_origin="$(new_project)"; tmpdirs+=("$unconfirmed_origin")
+unconfirmed_base_sha="$(cd "$unconfirmed_origin" && git rev-parse HEAD)"
+unconfirmed_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-unconfirmed-clone.XXXXXX)"
+tmpdirs+=("$unconfirmed_clone")
+(
+    cd "$unconfirmed_origin" && git clone -q . "$unconfirmed_clone" \
+        && cd "$unconfirmed_clone" && git checkout -q -b fs-stop-unconfirmed \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'approved work\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'approved work'
+) >/dev/null 2>&1
+unconfirmed_approved_sha="$(cd "$unconfirmed_clone" && git rev-parse fs-stop-unconfirmed)"
+unconfirmed_candidate_sha="$(
+    cd "$unconfirmed_clone" && git commit-tree "fs-stop-unconfirmed^{tree}" \
+        -p "$unconfirmed_approved_sha" -m 'tidied: approved work'
+)"
+# refs/heads/fs-stop-unconfirmed is never created in the origin repo at
+# all -- fs_check_branch_free only proves it free at launch, and nothing
+# creates it in the real flow until the runner's own create-only publish
+# (fork-sandbox.sh's tidy block uses the same empty-old-value update-ref
+# fetch_branch_back does), so this fixture's whole point is that publish
+# never happened. Both holding refs, though, are already in the origin
+# repo under this run's own id -- fetched in by the runner's own pre-leg
+# and post-leg snapshots, same as the real tidy block creates both before
+# fs_tidy_verify ever runs, well before exit-code is written.
+rd_unconfirmed="$(new_run_dir)"
+unconfirmed_run_id="$(basename "$rd_unconfirmed")"
+(cd "$unconfirmed_origin" && git fetch -q "$unconfirmed_clone" \
+    "+refs/heads/fs-stop-unconfirmed:refs/fork-sandbox/tidy/$unconfirmed_run_id/approved")
+(
+    cd "$unconfirmed_clone" \
+        && git update-ref refs/fs-stop-unconfirmed-candidate-scratch "$unconfirmed_candidate_sha"
+)
+(cd "$unconfirmed_origin" && git fetch -q "$unconfirmed_clone" \
+    "+refs/fs-stop-unconfirmed-candidate-scratch:refs/fork-sandbox/tidy/$unconfirmed_run_id/candidate")
+(cd "$unconfirmed_clone" && git update-ref -d refs/fs-stop-unconfirmed-candidate-scratch) >/dev/null 2>&1
+cat > "$rd_unconfirmed/run.env" <<EOF
+version=1
+branch=fs-stop-unconfirmed
+origin_repo=$unconfirmed_origin
+clone_dir=$unconfirmed_clone
+base_sha=$unconfirmed_base_sha
+session=cc-sbx-fs-stop-unconfirmed-does-not-exist
+EOF
+printf '0\n' > "$rd_unconfirmed/exit-code"
+jq -n --arg head_approved "$unconfirmed_approved_sha" \
+    --arg head_after "$unconfirmed_candidate_sha" '{
+    ended: "accepted", detail: null,
+    head_approved: $head_approved, head_after: $head_after, exit: 0, cost_usd: null,
+    usage: null, retries: [], clone_restored: null
+}' > "$rd_unconfirmed/tidy.json"
+out_unconfirmed="$(HOME="$launcher_home" "$stop" "$rd_unconfirmed" 2>&1)"; rc_unconfirmed=$?
+check "unconfirmed publish: stop exits 0" "0" "$rc_unconfirmed"
+check "unconfirmed publish: the branch is moved to the verified candidate, not left at approved" \
+    "$unconfirmed_candidate_sha" "$(cd "$unconfirmed_origin" && git rev-parse fs-stop-unconfirmed 2>/dev/null)"
+contains "unconfirmed publish: says it published, not that there was nothing to stop" \
+    "published" "$out_unconfirmed"
+check "unconfirmed publish: the holding refs are cleaned up after the publish lands" \
+    "" "$(cd "$unconfirmed_origin" && git for-each-ref "refs/fork-sandbox/tidy/$unconfirmed_run_id")"
+
+# -- the same unconfirmed-publish window, but the publish itself loses a
+# collision: something else already moved the branch, so stop must report
+# failure and a by-hand recovery command rather than silently exit 0.
+collide2_origin="$(new_project)"; tmpdirs+=("$collide2_origin")
+collide2_base_sha="$(cd "$collide2_origin" && git rev-parse HEAD)"
+collide2_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-unconfirmed-collide-clone.XXXXXX)"
+tmpdirs+=("$collide2_clone")
+(
+    cd "$collide2_origin" && git clone -q . "$collide2_clone" \
+        && cd "$collide2_clone" && git checkout -q -b fs-stop-unconfirmed-collide \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'approved work\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'approved work'
+) >/dev/null 2>&1
+collide2_approved_sha="$(cd "$collide2_clone" && git rev-parse fs-stop-unconfirmed-collide)"
+collide2_candidate_sha="$(
+    cd "$collide2_clone" && git commit-tree "fs-stop-unconfirmed-collide^{tree}" \
+        -p "$collide2_approved_sha" -m 'tidied: approved work'
+)"
+(
+    cd "$collide2_origin" && git fetch -q "$collide2_clone" \
+        "+refs/heads/fs-stop-unconfirmed-collide:refs/heads/fs-stop-unconfirmed-collide" \
+        && git checkout -q fs-stop-unconfirmed-collide \
+        && git commit -q --allow-empty -m 'an unrelated commit' \
+        && git checkout -q -
+) >/dev/null 2>&1
+# Both holding refs, keyed by this run's own id -- same reasoning as the
+# unconfirmed-publish fixture above -- so the collision below is the one
+# and only reason the publish fails, not a missing object or a missing ref.
+rd_collide2="$(new_run_dir)"
+collide2_run_id="$(basename "$rd_collide2")"
+(cd "$collide2_origin" && git fetch -q "$collide2_clone" \
+    "+refs/heads/fs-stop-unconfirmed-collide:refs/fork-sandbox/tidy/$collide2_run_id/approved")
+(
+    cd "$collide2_clone" \
+        && git update-ref refs/fs-stop-unconfirmed-collide-candidate-scratch "$collide2_candidate_sha"
+)
+(cd "$collide2_origin" && git fetch -q "$collide2_clone" \
+    "+refs/fs-stop-unconfirmed-collide-candidate-scratch:refs/fork-sandbox/tidy/$collide2_run_id/candidate")
+(cd "$collide2_clone" && git update-ref -d refs/fs-stop-unconfirmed-collide-candidate-scratch) >/dev/null 2>&1
+collide2_unrelated_sha="$(cd "$collide2_origin" && git rev-parse fs-stop-unconfirmed-collide)"
+cat > "$rd_collide2/run.env" <<EOF
+version=1
+branch=fs-stop-unconfirmed-collide
+origin_repo=$collide2_origin
+clone_dir=$collide2_clone
+base_sha=$collide2_base_sha
+session=cc-sbx-fs-stop-unconfirmed-collide-does-not-exist
+EOF
+printf '0\n' > "$rd_collide2/exit-code"
+jq -n --arg head_approved "$collide2_approved_sha" \
+    --arg head_after "$collide2_candidate_sha" '{
+    ended: "accepted", detail: null,
+    head_approved: $head_approved, head_after: $head_after, exit: 0, cost_usd: null,
+    usage: null, retries: [], clone_restored: null
+}' > "$rd_collide2/tidy.json"
+out_collide2="$(HOME="$launcher_home" "$stop" "$rd_collide2" 2>&1)"; rc_collide2=$?
+if (( rc_collide2 != 0 )); then
+    ok "unconfirmed publish, collision: stop reports non-zero exit"
+else
+    no "unconfirmed publish, collision: stop reports non-zero exit" "exited 0: $out_collide2"
+fi
+not_contains "unconfirmed publish, collision: never suggests fetching the clone" \
+    "git fetch" "$out_collide2"
+contains "unconfirmed publish, collision: names the by-hand recovery command against the candidate sha" \
+    "git update-ref refs/heads/fs-stop-unconfirmed-collide $collide2_candidate_sha" "$out_collide2"
+check "unconfirmed publish, collision: the colliding commit in the origin is untouched" \
+    "$collide2_unrelated_sha" "$(cd "$collide2_origin" && git rev-parse fs-stop-unconfirmed-collide)"
+check "unconfirmed publish, collision: the candidate holding ref survives, not deleted" \
+    "$collide2_candidate_sha" \
+    "$(cd "$collide2_origin" && git rev-parse -q --verify "refs/fork-sandbox/tidy/$collide2_run_id/candidate" 2>/dev/null)"
+
+# -- once this run's own tidy publish has already landed (both holding
+# refs gone, the one signal that means so -- see resolve_tidy_safe_sha's
+# own header), stop must treat the "already ended" check as a pure no-op,
+# never re-create a branch the integrator deleted on purpose and never
+# report a collision because they moved it. tidy.json still carries
+# head_approved/head_after (that never changes once written), and
+# exit-code exists with no summary.json -- the same crash/jq-failure
+# window the unconfirmed-publish fixtures above model -- but here the
+# publish already succeeded before that window opened.
+published_origin="$(new_project)"; tmpdirs+=("$published_origin")
+published_base_sha="$(cd "$published_origin" && git rev-parse HEAD)"
+published_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-published-clone.XXXXXX)"
+tmpdirs+=("$published_clone")
+(
+    cd "$published_origin" && git clone -q . "$published_clone" \
+        && cd "$published_clone" && git checkout -q -b fs-stop-published \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'approved work\n' > work.txt \
+        && git add work.txt \
+        && git commit -q -m 'approved work'
+) >/dev/null 2>&1
+published_approved_sha="$(cd "$published_clone" && git rev-parse fs-stop-published)"
+published_candidate_sha="$(
+    cd "$published_clone" && git commit-tree "fs-stop-published^{tree}" \
+        -p "$published_approved_sha" -m 'tidied: approved work'
+)"
+# commit-tree leaves the candidate dangling in the clone (no ref points at
+# it) -- fetching refs/heads/fs-stop-published would only bring over the
+# approved commit it names, not the candidate. Name it with a scratch ref
+# in the clone first, same as the unconfirmed-publish fixtures above, then
+# fetch that.
+(cd "$published_clone" \
+    && git update-ref refs/fs-stop-published-candidate-scratch "$published_candidate_sha")
+(cd "$published_origin" && git fetch -q "$published_clone" \
+    "+refs/fs-stop-published-candidate-scratch:refs/fs-stop-published-candidate-scratch")
+(cd "$published_clone" && git update-ref -d refs/fs-stop-published-candidate-scratch) >/dev/null 2>&1
+# The runner's own successful publish, already landed -- create-only,
+# same as fs_tidy_publish -- with NO run-id holding refs left behind
+# (the runner deletes both only once fetched=1, which this models).
+published_setup_ok=0
+if (cd "$published_origin" \
+    && git update-ref refs/heads/fs-stop-published "$published_candidate_sha" "" \
+    && git update-ref -d refs/fs-stop-published-candidate-scratch); then
+    published_setup_ok=1
+fi
+rd_published="$(new_run_dir)"
+cat > "$rd_published/run.env" <<EOF
+version=1
+branch=fs-stop-published
+origin_repo=$published_origin
+clone_dir=$published_clone
+base_sha=$published_base_sha
+session=cc-sbx-fs-stop-published-does-not-exist
+EOF
+printf '0\n' > "$rd_published/exit-code"
+jq -n --arg head_approved "$published_approved_sha" \
+    --arg head_after "$published_candidate_sha" '{
+    ended: "accepted", detail: null,
+    head_approved: $head_approved, head_after: $head_after, exit: 0, cost_usd: null,
+    usage: null, retries: [], clone_restored: null
+}' > "$rd_published/tidy.json"
+# The integrator deleted the branch after the publish landed -- ordinary
+# post-run cleanup, not this verb's business to undo.
+(cd "$published_origin" && git branch -q -D fs-stop-published) >/dev/null 2>&1
+if (( published_setup_ok )); then
+    out_published="$(HOME="$launcher_home" "$stop" "$rd_published" 2>&1)"; rc_published=$?
+    check "already published, integrator deleted it: stop exits 0" "0" "$rc_published"
+    contains "already published, integrator deleted it: reports nothing to stop" \
+        "nothing to stop" "$out_published"
+    check "already published, integrator deleted it: branch stays deleted, not recreated" \
+        "0" "$(cd "$published_origin" && git show-ref --quiet refs/heads/fs-stop-published && echo 1 || echo 0)"
+else
+    no "already published, integrator deleted it: stop exits 0" "fixture setup failed"
+    no "already published, integrator deleted it: reports nothing to stop" "fixture setup failed"
+    no "already published, integrator deleted it: branch stays deleted, not recreated" "fixture setup failed"
+fi
+
+# -- the same already-published run, but the integrator MOVED the branch
+# instead of deleting it: stop must not report a collision, and must
+# leave the integrator's own commit alone.
+rd_published2="$(new_run_dir)"
+cat > "$rd_published2/run.env" <<EOF
+version=1
+branch=fs-stop-published
+origin_repo=$published_origin
+clone_dir=$published_clone
+base_sha=$published_base_sha
+session=cc-sbx-fs-stop-published2-does-not-exist
+EOF
+printf '0\n' > "$rd_published2/exit-code"
+jq -n --arg head_approved "$published_approved_sha" \
+    --arg head_after "$published_candidate_sha" '{
+    ended: "accepted", detail: null,
+    head_approved: $head_approved, head_after: $head_after, exit: 0, cost_usd: null,
+    usage: null, retries: [], clone_restored: null
+}' > "$rd_published2/tidy.json"
+published2_setup_ok=0
+if (
+    cd "$published_origin" && git update-ref refs/heads/fs-stop-published "$published_candidate_sha" "" \
+        && git checkout -q fs-stop-published \
+        && git commit -q --allow-empty -m 'the integrator amended this after the publish' \
+        && git checkout -q -
+) >/dev/null 2>&1; then
+    published2_setup_ok=1
+fi
+if (( published2_setup_ok )); then
+    published_moved_sha="$(cd "$published_origin" && git rev-parse fs-stop-published)"
+    out_published2="$(HOME="$launcher_home" "$stop" "$rd_published2" 2>&1)"; rc_published2=$?
+    check "already published, integrator moved it: stop exits 0" "0" "$rc_published2"
+    contains "already published, integrator moved it: reports nothing to stop" \
+        "nothing to stop" "$out_published2"
+    not_contains "already published, integrator moved it: never claims a collision" \
+        "different history" "$out_published2"
+    check "already published, integrator moved it: the integrator's own commit is untouched" \
+        "$published_moved_sha" "$(cd "$published_origin" && git rev-parse fs-stop-published)"
+else
+    no "already published, integrator moved it: stop exits 0" "fixture setup failed"
+    no "already published, integrator moved it: reports nothing to stop" "fixture setup failed"
+    no "already published, integrator moved it: never claims a collision" "fixture setup failed"
+    no "already published, integrator moved it: the integrator's own commit is untouched" "fixture setup failed"
+fi
+
+# -- the real launcher, the real fork-sandbox-stop.sh, a run.env and
+# run.sh fork-sandbox.sh itself generated (not hand-built), stopped while
+# the tidy leg is actually running. Every other fixture in this file
+# hand-builds run.env/run.sh, which cannot exercise anything the launcher
+# itself writes into them. The maintain leg commits once and approves;
+# the tidy leg's own stub rewrites the clone once more -- its own
+# "approved" snapshot, taken just before, is what a correct stop must
+# publish instead -- then sleeps far longer than this test waits, tagged
+# with a sleep duration unique to this process tree so it can be told
+# apart from any other sleep on the machine.
+midtidy_stub_bin="$(mktemp -d /var/tmp/claude-scratch/fs-stop-midtidy-stub.XXXXXX)"
+tmpdirs+=("$midtidy_stub_bin")
+midtidy_hang_seconds=619
+cat > "$midtidy_stub_bin/claude-sandboxed" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir="" prev=""
+for a in "\$@"; do
+    [[ "\$a" == "--dangerously-skip-permissions" ]] && clone_dir="\$prev"
+    prev="\$a"
+done
+prompt="\$(cat)"
+n=0
+[[ -f "\$FAKE_MIDTIDY_COUNT_FILE" ]] && n="\$(cat "\$FAKE_MIDTIDY_COUNT_FILE")"
+n=\$(( n + 1 ))
+printf '%s' "\$n" > "\$FAKE_MIDTIDY_COUNT_FILE"
+if (( n == 1 )); then
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \\
+        -C "\$clone_dir" commit --allow-empty -q -m "stub leg \$n"
+elif (( n == 2 )); then
+    verdict_name="\$(printf '%s\\n' "\$prompt" \\
+        | sed -nE 's#.*\\.git/(maintainer-verdict\\.md)#\\1#p' | head -1)"
+    [[ -n "\$verdict_name" ]] || verdict_name=maintainer-verdict.md
+    printf 'APPROVED\\n\\nChecked: everything.\\n' > "\$clone_dir/.git/\$verdict_name"
+else
+    # Snapshot the approved head before rewriting it, so the test can
+    # tell "stop published the approved history" apart from "stop
+    # published whatever this leg left in the clone" -- a plain clone
+    # fetch and the tidy-safe publish would otherwise land on the exact
+    # same sha, since nothing used to change the clone here at all.
+    git -C "\$clone_dir" rev-parse HEAD > "\$FAKE_MIDTIDY_APPROVED_FILE"
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \\
+        -C "\$clone_dir" commit --allow-empty -q -m "tidy leg's in-progress rewrite"
+    sleep $midtidy_hang_seconds
+fi
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$midtidy_stub_bin/claude-sandboxed"
+
+midtidy_count_file="$(mktemp)"; tmpdirs+=("$midtidy_count_file")
+midtidy_approved_file="$(mktemp)"; tmpdirs+=("$midtidy_approved_file")
+midtidy_out="$(mktemp)"; tmpdirs+=("$midtidy_out")
+midtidy_branch="sandbox-test-stop-midtidy-$$"
+HOME="$launcher_home" PATH="$midtidy_stub_bin:$PATH" \
+    FAKE_MIDTIDY_COUNT_FILE="$midtidy_count_file" \
+    FAKE_MIDTIDY_APPROVED_FILE="$midtidy_approved_file" \
+    "$launcher" --foreground --harness claude --maintainer-loop 1 \
+    --maintainer-model sonnet --tidy-timeout 1800 --branch "$midtidy_branch" \
+    "$proj" "$handoff" > "$midtidy_out" 2>&1 &
+midtidy_runner_pid=$!
+
+midtidy_rd=""
+for _ in $(seq 1 100); do
+    midtidy_rd="$(sed -n 's/^  run dir:  *//p' "$midtidy_out" 2>/dev/null | head -1)"
+    [[ -n "$midtidy_rd" ]] && break
+    sleep 0.1
+done
+if [[ -n "$midtidy_rd" ]]; then
+    tmpdirs+=("$midtidy_rd")
+    midtidy_leg_seen=0
+    for _ in $(seq 1 150); do
+        [[ -e "$midtidy_rd/events-tidy-1.jsonl" ]] && { midtidy_leg_seen=1; break; }
+        sleep 0.1
+    done
+    # The stub's own sleep, tagged with its unique duration, confirms the
+    # tidy leg's agent is actually alive before this proves anything about
+    # killing it.
+    midtidy_hang_alive=0
+    for _ in $(seq 1 50); do
+        pgrep -f "sleep $midtidy_hang_seconds" >/dev/null 2>&1 && { midtidy_hang_alive=1; break; }
+        sleep 0.1
+    done
+    if (( midtidy_leg_seen )) && (( midtidy_hang_alive )); then
+        ok "mid-tidy-leg real stop: the tidy leg's agent is actually running"
+        midtidy_clone_dir="$(sed -n 's/^clone_dir=//p' "$midtidy_rd/run.env" | head -1)"
+        # Read off the stub's own snapshot, taken before it rewrote the
+        # clone -- not the clone's current head, which by now is the
+        # leg's in-progress rewrite, exactly the thing a correct stop
+        # must never publish.
+        midtidy_approved_sha="$(cat "$midtidy_approved_file" 2>/dev/null)"
+        midtidy_wip_sha="$(git -C "$midtidy_clone_dir" rev-parse "$midtidy_branch" 2>/dev/null)"
+        check "mid-tidy-leg real stop: the clone's own head is the leg's WIP, not the approved sha" \
+            "1" "$( [[ -n "$midtidy_approved_sha" && "$midtidy_wip_sha" != "$midtidy_approved_sha" ]] && echo 1 || echo 0 )"
+        out_midtidy="$(HOME="$launcher_home" "$stop" --timeout 5 "$midtidy_rd" 2>&1)"
+        rc_midtidy=$?
+        check "mid-tidy-leg real stop: stop exits 0" "0" "$rc_midtidy"
+        # Whether this reads "published the maintainer-approved history,
+        # not the clone" (stop itself completed the publish) or a plain
+        # "stopped gracefully"/"end_reason: ..." (the runner's own
+        # teardown, now that the group signal actually reaches the tidy
+        # leg, won the race and published it first) depends on timing, not
+        # correctness -- either way this must never report the one
+        # outcome that would mean the fetch-back failed.
+        not_contains "mid-tidy-leg real stop: never reports a failed fetch-back" \
+            "NOT fetched back" "$out_midtidy"
+        midtidy_hang_gone=1
+        for _ in $(seq 1 50); do
+            pgrep -f "sleep $midtidy_hang_seconds" >/dev/null 2>&1 || { midtidy_hang_gone=1; break; }
+            midtidy_hang_gone=0
+            sleep 0.1
+        done
+        check "mid-tidy-leg real stop: no process from the run survives" "1" "$midtidy_hang_gone"
+        check "mid-tidy-leg real stop: the published branch is the approved head, not a WIP" \
+            "$midtidy_approved_sha" "$(git -C "$proj" rev-parse "$midtidy_branch" 2>/dev/null)"
+        check "mid-tidy-leg real stop: the tidy leg's own holding refs are gone once published" \
+            "" "$(git -C "$proj" for-each-ref "refs/fork-sandbox/tidy/$(basename "$midtidy_rd")")"
+    else
+        no "mid-tidy-leg real stop: the tidy leg's agent is actually running" \
+            "events-tidy-1.jsonl seen: $midtidy_leg_seen, hang stub alive: $midtidy_hang_alive"
+        no "mid-tidy-leg real stop: the clone's own head is the leg's WIP, not the approved sha" \
+            "tidy leg never started"
+        no "mid-tidy-leg real stop: stop exits 0" "tidy leg never started"
+        no "mid-tidy-leg real stop: never reports a failed fetch-back" \
+            "tidy leg never started"
+        no "mid-tidy-leg real stop: no process from the run survives" "tidy leg never started"
+        no "mid-tidy-leg real stop: the published branch is the approved head, not a WIP" \
+            "tidy leg never started"
+        no "mid-tidy-leg real stop: the tidy leg's own holding refs are gone once published" \
+            "tidy leg never started"
+    fi
+    kill -KILL "$midtidy_runner_pid" 2>/dev/null || true
+    wait "$midtidy_runner_pid" 2>/dev/null || true
+    pkill -9 -f "sleep $midtidy_hang_seconds" >/dev/null 2>&1 || true
+    (cd "$proj" && git branch -q -D "$midtidy_branch" >/dev/null 2>&1) || true
+else
+    no "mid-tidy-leg real stop: the tidy leg's agent is actually running" \
+        "no run dir ever appeared: $(cat "$midtidy_out")"
+    no "mid-tidy-leg real stop: the clone's own head is the leg's WIP, not the approved sha" \
+        "no run dir"
+    no "mid-tidy-leg real stop: stop exits 0" "no run dir"
+    no "mid-tidy-leg real stop: never reports a failed fetch-back" "no run dir"
+    no "mid-tidy-leg real stop: no process from the run survives" "no run dir"
+    no "mid-tidy-leg real stop: the published branch is the approved head, not a WIP" "no run dir"
+    no "mid-tidy-leg real stop: the tidy leg's own holding refs are gone once published" "no run dir"
+fi
+
+# -- same shape as the mid-tidy-leg test above, but the runner is killed
+# outright (SIGKILL on its own pid, never the tidy leg's own group) before
+# stop is ever called, the way a crash or an external kill -9 would leave
+# things -- stop can only take the salvage path here, with no runner left
+# alive to walk descendants down from. The tidy leg's own GNU-timeout group
+# is a separate group from the runner's, so killing the runner alone leaves
+# it a live orphan, exactly the case the recorded pgid file exists for.
+deadrunner_stub_bin="$(mktemp -d /var/tmp/claude-scratch/fs-stop-deadrunner-stub.XXXXXX)"
+tmpdirs+=("$deadrunner_stub_bin")
+deadrunner_hang_seconds=631
+cat > "$deadrunner_stub_bin/claude-sandboxed" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir="" prev=""
+for a in "\$@"; do
+    [[ "\$a" == "--dangerously-skip-permissions" ]] && clone_dir="\$prev"
+    prev="\$a"
+done
+prompt="\$(cat)"
+n=0
+[[ -f "\$FAKE_DEADRUNNER_COUNT_FILE" ]] && n="\$(cat "\$FAKE_DEADRUNNER_COUNT_FILE")"
+n=\$(( n + 1 ))
+printf '%s' "\$n" > "\$FAKE_DEADRUNNER_COUNT_FILE"
+if (( n == 1 )); then
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \\
+        -C "\$clone_dir" commit --allow-empty -q -m "stub leg \$n"
+elif (( n == 2 )); then
+    verdict_name="\$(printf '%s\\n' "\$prompt" \\
+        | sed -nE 's#.*\\.git/(maintainer-verdict\\.md)#\\1#p' | head -1)"
+    [[ -n "\$verdict_name" ]] || verdict_name=maintainer-verdict.md
+    printf 'APPROVED\\n\\nChecked: everything.\\n' > "\$clone_dir/.git/\$verdict_name"
+else
+    git -C "\$clone_dir" rev-parse HEAD > "\$FAKE_DEADRUNNER_APPROVED_FILE"
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \\
+        -C "\$clone_dir" commit --allow-empty -q -m "tidy leg's in-progress rewrite"
+    sleep $deadrunner_hang_seconds
+fi
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$deadrunner_stub_bin/claude-sandboxed"
+
+deadrunner_count_file="$(mktemp)"; tmpdirs+=("$deadrunner_count_file")
+deadrunner_approved_file="$(mktemp)"; tmpdirs+=("$deadrunner_approved_file")
+deadrunner_out="$(mktemp)"; tmpdirs+=("$deadrunner_out")
+deadrunner_branch="sandbox-test-stop-deadrunner-$$"
+HOME="$launcher_home" PATH="$deadrunner_stub_bin:$PATH" \
+    FAKE_DEADRUNNER_COUNT_FILE="$deadrunner_count_file" \
+    FAKE_DEADRUNNER_APPROVED_FILE="$deadrunner_approved_file" \
+    "$launcher" --foreground --harness claude --maintainer-loop 1 \
+    --maintainer-model sonnet --tidy-timeout 1800 --branch "$deadrunner_branch" \
+    "$proj" "$handoff" > "$deadrunner_out" 2>&1 &
+deadrunner_launcher_pid=$!
+
+deadrunner_rd=""
+for _ in $(seq 1 100); do
+    deadrunner_rd="$(sed -n 's/^  run dir:  *//p' "$deadrunner_out" 2>/dev/null | head -1)"
+    [[ -n "$deadrunner_rd" ]] && break
+    sleep 0.1
+done
+if [[ -n "$deadrunner_rd" ]]; then
+    tmpdirs+=("$deadrunner_rd")
+    deadrunner_leg_seen=0
+    for _ in $(seq 1 150); do
+        [[ -e "$deadrunner_rd/events-tidy-1.jsonl" ]] && { deadrunner_leg_seen=1; break; }
+        sleep 0.1
+    done
+    deadrunner_hang_alive=0
+    for _ in $(seq 1 50); do
+        pgrep -f "sleep $deadrunner_hang_seconds" >/dev/null 2>&1 && { deadrunner_hang_alive=1; break; }
+        sleep 0.1
+    done
+    if (( deadrunner_leg_seen )) && (( deadrunner_hang_alive )); then
+        ok "dead-runner real stop: the tidy leg's agent is actually running"
+        deadrunner_pid="$(tr -dc '0-9' < "$deadrunner_rd/pid")"
+        # SIGKILL the runner's own pid alone -- never a group, never the
+        # tidy leg's own separate group -- so the leg's agent is left a
+        # live orphan, same as a crash or a bare 'kill -9' would.
+        kill -KILL "$deadrunner_pid" 2>/dev/null || true
+        deadrunner_runner_dead=0
+        for _ in $(seq 1 50); do
+            kill -0 "$deadrunner_pid" 2>/dev/null || { deadrunner_runner_dead=1; break; }
+            sleep 0.1
+        done
+        check "dead-runner real stop: the runner is actually dead before stop is called" \
+            "1" "$deadrunner_runner_dead"
+        deadrunner_approved_sha="$(cat "$deadrunner_approved_file" 2>/dev/null)"
+        out_deadrunner="$(HOME="$launcher_home" "$stop" "$deadrunner_rd" 2>&1)"
+        rc_deadrunner=$?
+        check "dead-runner real stop: stop exits 0" "0" "$rc_deadrunner"
+        contains "dead-runner real stop: reports a salvage, not a graceful stop" \
+            "end_reason: salvaged" "$out_deadrunner"
+        not_contains "dead-runner real stop: never reports a failed fetch-back" \
+            "NOT fetched back" "$out_deadrunner"
+        deadrunner_hang_gone=1
+        for _ in $(seq 1 50); do
+            pgrep -f "sleep $deadrunner_hang_seconds" >/dev/null 2>&1 || { deadrunner_hang_gone=1; break; }
+            deadrunner_hang_gone=0
+            sleep 0.1
+        done
+        check "dead-runner real stop: no process from the run survives" "1" "$deadrunner_hang_gone"
+        check "dead-runner real stop: the published branch is the approved head, not the orphaned WIP" \
+            "$deadrunner_approved_sha" "$(git -C "$proj" rev-parse "$deadrunner_branch" 2>/dev/null)"
+        check "dead-runner real stop: the tidy leg's own holding refs are gone once published" \
+            "" "$(git -C "$proj" for-each-ref "refs/fork-sandbox/tidy/$(basename "$deadrunner_rd")")"
+    else
+        no "dead-runner real stop: the tidy leg's agent is actually running" \
+            "events-tidy-1.jsonl seen: $deadrunner_leg_seen, hang stub alive: $deadrunner_hang_alive"
+        no "dead-runner real stop: the runner is actually dead before stop is called" "tidy leg never started"
+        no "dead-runner real stop: stop exits 0" "tidy leg never started"
+        no "dead-runner real stop: reports a salvage, not a graceful stop" "tidy leg never started"
+        no "dead-runner real stop: never reports a failed fetch-back" "tidy leg never started"
+        no "dead-runner real stop: no process from the run survives" "tidy leg never started"
+        no "dead-runner real stop: the published branch is the approved head, not the orphaned WIP" \
+            "tidy leg never started"
+        no "dead-runner real stop: the tidy leg's own holding refs are gone once published" \
+            "tidy leg never started"
+    fi
+    kill -KILL "$deadrunner_launcher_pid" 2>/dev/null || true
+    wait "$deadrunner_launcher_pid" 2>/dev/null || true
+    pkill -9 -f "sleep $deadrunner_hang_seconds" >/dev/null 2>&1 || true
+    (cd "$proj" && git branch -q -D "$deadrunner_branch" >/dev/null 2>&1) || true
+else
+    no "dead-runner real stop: the tidy leg's agent is actually running" \
+        "no run dir ever appeared: $(cat "$deadrunner_out")"
+    no "dead-runner real stop: the runner is actually dead before stop is called" "no run dir"
+    no "dead-runner real stop: stop exits 0" "no run dir"
+    no "dead-runner real stop: reports a salvage, not a graceful stop" "no run dir"
+    no "dead-runner real stop: never reports a failed fetch-back" "no run dir"
+    no "dead-runner real stop: no process from the run survives" "no run dir"
+    no "dead-runner real stop: the published branch is the approved head, not the orphaned WIP" "no run dir"
+    no "dead-runner real stop: the tidy leg's own holding refs are gone once published" "no run dir"
+fi
+
+# -- stale tidy.pgid: the recorded start time does not match the pid's
+# CURRENT one, because its number was reused by an unrelated process after
+# the leg that originally held it ended. A hand-built fixture, not a real
+# launcher run: the bystander here is a genuine GNU `timeout` (so its comm
+# really is "timeout", isolating the start-time check from the comm check)
+# started independently of this run, with a deliberately wrong recorded
+# start time standing in for "pid reused". fork-sandbox-stop.sh must never
+# signal it.
+staletidy_origin="$(new_project)"; tmpdirs+=("$staletidy_origin")
+staletidy_base_sha="$(cd "$staletidy_origin" && git rev-parse HEAD)"
+staletidy_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-staletidy-clone.XXXXXX)"
+tmpdirs+=("$staletidy_clone")
+(
+    cd "$staletidy_origin" && git clone -q . "$staletidy_clone" \
+        && cd "$staletidy_clone" \
+        && git checkout -q -b fs-stop-staletidy \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'work\n' > staletidy.txt \
+        && git add staletidy.txt \
+        && git commit -q -m 'salvaged work'
+) >/dev/null 2>&1
+rd_staletidy="$(new_run_dir)"
+cat > "$rd_staletidy/run.env" <<EOF
+version=1
+branch=fs-stop-staletidy
+origin_repo=$staletidy_origin
+clone_dir=$staletidy_clone
+base_sha=$staletidy_base_sha
+session=cc-sbx-fs-stop-staletidy-does-not-exist
+EOF
+( : ) & staletidy_dead_pid=$!
+wait "$staletidy_dead_pid" 2>/dev/null || true
+printf '%s\n' "$staletidy_dead_pid" > "$rd_staletidy/pid"
+
+staletidy_hang_seconds=653
+timeout "$staletidy_hang_seconds" sleep "$staletidy_hang_seconds" &
+staletidy_bystander_pid=$!
+staletidy_bystander_alive=0
+for _ in $(seq 1 50); do
+    kill -0 "$staletidy_bystander_pid" 2>/dev/null && { staletidy_bystander_alive=1; break; }
+    sleep 0.1
+done
+# The recorded pid is real and its comm really is "timeout" -- only the
+# start time (decades in the past) cannot match, isolating exactly that
+# check.
+printf '%s\n%s\n' "$staletidy_bystander_pid" "Thu Jan  1 00:00:00 1970" \
+    > "$rd_staletidy/tidy.pgid"
+
+if (( staletidy_bystander_alive )); then
+    ok "stale tidy.pgid: the bystander process is actually running"
+    out_staletidy="$(HOME="$launcher_home" "$stop" "$rd_staletidy" 2>&1)"
+    rc_staletidy=$?
+    check "stale tidy.pgid: stop exits 0" "0" "$rc_staletidy"
+    contains "stale tidy.pgid: reports end_reason salvaged" "salvaged" "$out_staletidy"
+    check "stale tidy.pgid: the bystander process is never signaled" \
+        "1" "$(kill -0 "$staletidy_bystander_pid" 2>/dev/null && echo 1 || echo 0)"
+    check "stale tidy.pgid: the branch is still fetched back normally" \
+        "$(cd "$staletidy_clone" && git rev-parse fs-stop-staletidy)" \
+        "$(cd "$staletidy_origin" && git rev-parse fs-stop-staletidy 2>/dev/null)"
+else
+    no "stale tidy.pgid: the bystander process is actually running" "timeout never started"
+    no "stale tidy.pgid: stop exits 0" "bystander never started"
+    no "stale tidy.pgid: reports end_reason salvaged" "bystander never started"
+    no "stale tidy.pgid: the bystander process is never signaled" "bystander never started"
+    no "stale tidy.pgid: the branch is still fetched back normally" "bystander never started"
+fi
+kill -KILL "$staletidy_bystander_pid" 2>/dev/null || true
+wait "$staletidy_bystander_pid" 2>/dev/null || true
+pkill -9 -f "sleep $staletidy_hang_seconds" >/dev/null 2>&1 || true
+
+# -- macOS-named tidy leg: FS_TIMEOUT resolves to "gtimeout" (the name
+# Homebrew's coreutils gives GNU timeout on macOS), not "timeout". A real
+# leg started under that name, with its real pid and start time recorded
+# in tidy.pgid exactly as fs_record_tidy_leg_pgid would, must still be
+# recognized and signaled: the comm check has to follow $FS_TIMEOUT's own
+# resolved name rather than a hardcoded "timeout". The shim is a bare
+# symlink to the real `timeout`, not a wrapper script that execs it --
+# a wrapper's own exec would replace its image with the real binary's,
+# whose comm is "timeout" again, defeating the point.
+gtimeout_shim_bin="$(mktemp -d /var/tmp/claude-scratch/fs-stop-gtimeout-shim.XXXXXX)"
+tmpdirs+=("$gtimeout_shim_bin")
+ln -s "$(command -v timeout)" "$gtimeout_shim_bin/gtimeout"
+
+gtimeout_origin="$(new_project)"; tmpdirs+=("$gtimeout_origin")
+gtimeout_base_sha="$(cd "$gtimeout_origin" && git rev-parse HEAD)"
+gtimeout_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-gtimeout-clone.XXXXXX)"
+tmpdirs+=("$gtimeout_clone")
+(
+    cd "$gtimeout_origin" && git clone -q . "$gtimeout_clone" \
+        && cd "$gtimeout_clone" \
+        && git checkout -q -b fs-stop-gtimeout \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'work\n' > gtimeout.txt \
+        && git add gtimeout.txt \
+        && git commit -q -m 'salvaged work'
+) >/dev/null 2>&1
+rd_gtimeout="$(new_run_dir)"
+cat > "$rd_gtimeout/run.env" <<EOF
+version=1
+branch=fs-stop-gtimeout
+origin_repo=$gtimeout_origin
+clone_dir=$gtimeout_clone
+base_sha=$gtimeout_base_sha
+session=cc-sbx-fs-stop-gtimeout-does-not-exist
+EOF
+( : ) & gtimeout_dead_pid=$!
+wait "$gtimeout_dead_pid" 2>/dev/null || true
+printf '%s\n' "$gtimeout_dead_pid" > "$rd_gtimeout/pid"
+
+gtimeout_hang_seconds=653
+PATH="$gtimeout_shim_bin:$PATH" gtimeout "$gtimeout_hang_seconds" sleep "$gtimeout_hang_seconds" &
+gtimeout_leg_pid=$!
+gtimeout_leg_alive=0
+for _ in $(seq 1 50); do
+    kill -0 "$gtimeout_leg_pid" 2>/dev/null && { gtimeout_leg_alive=1; break; }
+    sleep 0.1
+done
+
+if (( gtimeout_leg_alive )); then
+    ok "gtimeout tidy leg: the leg process is actually running"
+    # Recorded the same way fs_record_tidy_leg_pgid does, through the real
+    # lib function, so this exercises the actual identity check rather
+    # than a hand-guessed start time.
+    gtimeout_start="$(bash -c 'source "$1"; fs_proc_start_time "$2"' _ \
+        "$repo_dir/scripts/fork-sandbox-lib.sh" "$gtimeout_leg_pid")"
+    printf '%s\n%s\n' "$gtimeout_leg_pid" "$gtimeout_start" > "$rd_gtimeout/tidy.pgid"
+
+    out_gtimeout="$(HOME="$launcher_home" PATH="$gtimeout_shim_bin:$PATH" "$stop" "$rd_gtimeout" 2>&1)"
+    rc_gtimeout=$?
+    check "gtimeout tidy leg: stop exits 0" "0" "$rc_gtimeout"
+    contains "gtimeout tidy leg: reports end_reason salvaged" "salvaged" "$out_gtimeout"
+    gtimeout_leg_gone=0
+    for _ in $(seq 1 50); do
+        kill -0 "$gtimeout_leg_pid" 2>/dev/null || { gtimeout_leg_gone=1; break; }
+        sleep 0.1
+    done
+    check "gtimeout tidy leg: the leg is signaled and gone, not left as a bystander" \
+        "1" "$gtimeout_leg_gone"
+else
+    no "gtimeout tidy leg: the leg process is actually running" "gtimeout never started"
+    no "gtimeout tidy leg: stop exits 0" "leg never started"
+    no "gtimeout tidy leg: reports end_reason salvaged" "leg never started"
+    no "gtimeout tidy leg: the leg is signaled and gone, not left as a bystander" "leg never started"
+fi
+kill -KILL "$gtimeout_leg_pid" 2>/dev/null || true
+wait "$gtimeout_leg_pid" 2>/dev/null || true
+pkill -9 -f "sleep $gtimeout_hang_seconds" >/dev/null 2>&1 || true
 
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Same guard as fork-sandbox-k8s-test.sh's: archives carry no source

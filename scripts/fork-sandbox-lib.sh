@@ -105,6 +105,17 @@ fs_verdict_has_usable_report() {
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_OUTBOX_MAX_BYTES=$((64 * 1024 * 1024))   # 64 MiB
 
+# The tidy-history leg's own wall-clock limit: a hung leg must not
+# hold an already-approved branch back indefinitely, since nothing watches
+# it the way the review/maintainer loops watch their own legs (see the
+# tidy block's own comment in fork-sandbox.sh). 30 minutes is generous for
+# a leg that reshapes commits already written and tested, never the
+# project's own test suite. fork-sandbox.sh's --tidy-timeout overrides this
+# per run; there is no --k8s equivalent, since the cluster path has no
+# tidy leg yet.
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_TIDY_TIMEOUT_SECS=1800   # 30 minutes
+
 # Parses a --outbox-max argument into a byte count on stdout: bare digits
 # mean bytes, and a K/M/G suffix means that many KiB/MiB/GiB, consistent
 # with the 1024-based arithmetic FS_OUTBOX_MAX_BYTES above already uses.
@@ -3239,14 +3250,17 @@ EOF
 #                   at launch, so any failure here is a bug that must be
 #                   visible at prompt-build time (before any model runs),
 #                   not a silently missing section.
-# $2  flavor        "spec" (default), "review-only" or "plan" -- see
+# $2  flavor        "spec" (default), "review-only", "plan" or "tidy" -- see
 #                   fs_emit_handoff_spec_section. The heading above the
 #                   embedded text and the wording of the fail-on-missing/
 #                   empty/unreadable checks below both change with it: the
 #                   review-only file is a review brief, not the branch's
 #                   spec, and the failure text should not call it one; the
 #                   plan flavor is embedded before any branch exists to
-#                   call "built", so it is a brief, not a handoff.
+#                   call "built", so it is a brief, not a handoff; the tidy
+#                   flavor keeps the handoff's own heading-less wording but
+#                   titles the section as context for commit messages, not
+#                   a to-do list -- there is no more work to do against it.
 fs_append_handoff_brief() {
     local handoff_file="$1" flavor="${2:-spec}"
     local doc_desc build_desc
@@ -3256,6 +3270,9 @@ fs_append_handoff_brief() {
     elif [[ "$flavor" == "plan" ]]; then
         doc_desc="brief"
         build_desc="the brief this plan is written against"
+    elif [[ "$flavor" == "tidy" ]]; then
+        doc_desc="handoff"
+        build_desc="the handoff the branch was built against"
     else
         doc_desc="handoff"
         build_desc="the handoff the branch was built against"
@@ -3283,6 +3300,8 @@ fs_append_handoff_brief() {
         printf '\n## The review brief\n\n'
     elif [[ "$flavor" == "plan" ]]; then
         printf '\n## The original brief\n\n'
+    elif [[ "$flavor" == "tidy" ]]; then
+        printf '\n## What the branch was built for\n\n'
     else
         printf '\n## The handoff this branch was built against\n\n'
     fi
@@ -3641,7 +3660,24 @@ EOF
 # bare, mid-paragraph, where a prompt already has a natural place for it
 # (fs_emit_fix_prompt_body); fs_emit_headless_turn_section wraps it with its
 # own heading for a prompt that does not.
+#
+# $1  history_owner  "maintainer" when this run's last pipeline step is a
+#                    maintain step that, on approval, runs a tidy-history
+#                    leg on its own seat; "integrator" (the default)
+#                    otherwise, when nothing in the run rewrites history and
+#                    whoever integrates the branch reshapes it by hand. Only
+#                    changes the closing sentence below: coding and fix legs
+#                    never curate their own history either way.
 fs_emit_headless_turn_para() {
+    local history_owner="${1:-integrator}"
+    local history_para
+    if [[ "$history_owner" == maintainer ]]; then
+        history_para="After the maintainer step approves the branch, a tidy-history leg on
+that step's seat rewrites the commits into logical ones."
+    else
+        history_para="Whoever integrates this branch squashes or reshapes it then; no leg of
+this run will."
+    fi
     cat <<'EOF'
 This session is headless: when your turn ends, the run ends, and nothing
 wakes you later to deliver a background command's result. Run tests and
@@ -3656,11 +3692,18 @@ the change: if building the evidence is taking longer than the change
 itself did, stop refining it, report what you did measure, name what you
 did not run and why, and finish.
 EOF
+    cat <<EOF
+
+Commit at natural points, as soon as that commit's tests pass, and leave the
+history as you made it: do not re-split, squash, amend or rebase your own
+commits to make it read well. History cleanup is not this leg's job.
+$history_para
+EOF
 }
 
 fs_emit_headless_turn_section() {
     printf '\n## Before you end your turn\n\n'
-    fs_emit_headless_turn_para
+    fs_emit_headless_turn_para "${1:-integrator}"
 }
 
 # inner_review is "yes" when a --review-loop ran before this one and "no"
@@ -3880,8 +3923,10 @@ EOF
 # $3  handoff_file  the caller's ORIGINAL handoff path (never the rendered
 #                   copy: a fix prompt must not carry the implement
 #                   preamble a second time).
+# $4  history_owner  passed straight through to fs_emit_headless_turn_para;
+#                    see its own doc comment.
 fs_emit_fix_prompt_body() {
-    local branch="$1" base_sha="$2" handoff_file="$3"
+    local branch="$1" base_sha="$2" handoff_file="$3" history_owner="${4:-integrator}"
     cat <<EOF
 
 ---
@@ -3895,7 +3940,7 @@ reported the problems repeated below.
 Fix the real ones, and commit. Uncommitted work is lost with the clone, so a
 fix you do not commit is a fix nobody gets.
 
-$(fs_emit_headless_turn_para)
+$(fs_emit_headless_turn_para "$history_owner")
 
 Some of what follows may be wrong: the reviewer read the same code you are
 about to read and could have misread it. **Do not change code to satisfy a
@@ -4058,6 +4103,101 @@ EOF
     fs_emit_handoff_spec_section "$handoff_file" plan
 }
 
+# The tidy-history leg's static task text: rewrite base_sha..HEAD into
+# logical commits, run only after the maintain step approves (see
+# fork-sandbox.sh's tidy block). Static because the launcher builds it once,
+# at the same point it builds the maintainer prompt; the per-leg file the
+# runner actually hands this leg is this body plus a "## The approved head"
+# section the runner appends at run time -- the approved head is not known
+# until the maintain step ends, long after this static text is built -- and,
+# when the run has a plan, fs_emit_plan_section's "tidy" flavor.
+#
+# $1  branch        the branch being tidied.
+# $2  base_sha      the commit the tidied range starts from.
+# $3  handoff_file  the caller's original handoff, embedded at the end; see
+#                    fs_append_handoff_brief.
+fs_emit_tidy_prompt_body() {
+    local branch="$1" base_sha="$2" handoff_file="$3"
+    cat <<EOF
+
+---
+
+# Your task: rewrite this branch's history, not its content
+
+The maintainer approved the branch \`$branch\` -- the commit range
+\`$base_sha..HEAD\` -- so there is no more code to write or fix here. Your
+job is to rewrite how that same content is split into commits: one logical
+change per commit, with a message that describes the code, not the run
+that produced it.
+
+## What "logical" means here
+
+- **One change per commit.** Group the range's diff by what it does, not by
+  when it happened. Two commits that both belong to the same change become
+  one; a commit that bundles two unrelated changes becomes two.
+- **No commit adds code nothing calls yet.** Order commits so each one
+  leaves the tree in a sensible state on its own -- a helper lands with (or
+  after) its first caller, never dangling ahead of it.
+- **Tests land with the behavior they cover.** A commit that adds a
+  behavior and the commit that tests it are the same commit, not two.
+- **Messages describe the code, never the run's process.** No "fix review finding",
+  no "per operator", no "address feedback" -- say what changed and, where
+  it is not obvious, why. A reader with no memory of this run should be
+  able to tell what each commit does from its message alone.
+
+## What is frozen
+
+The content is not yours to change -- only its commit boundaries, order and
+messages. Before you end your turn, confirm:
+
+- \`git diff --stat\` against the approved head named at the end of this
+  prompt prints nothing, and the two commits' \`^{tree}\` ids match. Any
+  difference at all, including a file's mode, is content you changed, not
+  history you reshaped.
+- The branch still starts from \`$base_sha\`: \`git merge-base --is-ancestor
+  $base_sha HEAD\` succeeds, and the range is linear -- no merge commits.
+- Every trailer line (\`Co-Authored-By\` and the like) on every commit you
+  are replacing still appears, byte-for-byte, on some commit in your
+  rewritten range. Move a trailer to the commit its change landed on; add
+  none that was not already there.
+
+The runner checks the tree, the base and linearity, and that you added no
+trailer line that was not already there, once you finish, against the
+exact head this prompt names below; it does not check that you kept every
+existing trailer, so treat that one as a rule you hold yourself to, not a
+safety net. If any of the runner's own checks fails, or this leg exits
+non-zero, or times out, the whole rewrite is discarded and the approved
+history stands unchanged -- so there is no retry loop watching this leg the
+way there is for a reviewer's findings; get it right the first time.
+
+## If the history already reads well
+
+Leave it alone. A branch that already reads as one logical change per
+commit, with messages that already describe the code, needs no rewrite --
+ending your turn with the branch exactly as you found it is a valid
+outcome here, not a failure to find work.
+
+## How to get there
+
+\`git rebase -i\`, squash-and-recommit, or \`git reset --soft\` plus fresh
+commits are all fine -- whatever reaches the shape above.
+
+Do not run the project's test suite per commit: the content is already
+tested and approved, this leg only reshapes how it is split, and
+re-running a full suite once per commit is exactly the cost this leg
+exists to remove from the legs before it. End this leg on \`$branch\`,
+checked out, with a clean working tree and no rebase in progress -- a leg
+that stops mid-rebase
+leaves nothing for the runner to read.
+
+The handoff below is the brief the branch was built against -- context for
+writing commit messages that describe what the code does and why, not a
+to-do list: there is no more work to do against it, only history to
+reshape.
+EOF
+    fs_append_handoff_brief "$handoff_file" tidy
+}
+
 # Appended after the brief to every later leg's prompt in a run with a plan
 # step; a no-op when $1 is empty. A missing plan file fails loudly: the plan
 # step runs first, so by the time any later prompt is built it is a bug.
@@ -4065,6 +4205,11 @@ EOF
 # $1  plan_file  the run-dir copy of the plan, or "" for no plan step.
 # $2  flavor     "review" (default): deviations are findings. "code": for
 #                code and fix legs, which are told to explain a deviation.
+#                "tidy": for the tidy-history leg, which changes no
+#                content -- the plan's commit split is the target shape,
+#                and a difference between the approved code and the plan is
+#                resolved by following the code, not by treating it as a
+#                deviation to explain or a finding to raise.
 fs_emit_plan_section() {
     local plan_file="$1" flavor="${2:-review}"
     [[ -n "$plan_file" ]] || return 0
@@ -4085,6 +4230,19 @@ it; where it and the brief above disagree, the brief wins. If you deviate
 from it, say why -- in a commit message or your final report -- a reviewer
 is told to treat an unexplained deviation as a finding, and cannot tell a
 deliberate change from an oversight on its own.
+
+EOF
+    elif [[ "$flavor" == "tidy" ]]; then
+        cat <<'EOF'
+
+## The plan
+
+A planning leg worked out the approach below before any code was written.
+Its own commit split (the section mapping requirements to tests and
+commits, if it has one) is the target shape for this rewrite -- aim for
+that grouping. Where the approved code differs from what the plan
+describes, follow the code: the plan describes intent, and the commits in
+front of you are what actually has to end up tidy.
 
 EOF
     else
@@ -4261,6 +4419,278 @@ fs_normalize_authorship() {
     (cd "$repo" && git update-ref "refs/heads/$branch" "$parent") || return 1
     printf '%s' "$n"
     return 0
+}
+
+# Checks a tidy-history leg's rewrite against the three invariants the
+# runner enforces before trusting it (see fork-sandbox.sh's tidy block):
+# the content is byte-identical to what was approved, the rewritten range
+# still descends from $base with no merge commits, and it invents no
+# trailer line. A pure read: it writes nothing, to no ref in $repo or
+# anywhere else. Prints one reason on stdout and returns non-zero on the
+# first check that fails; prints nothing and returns 0 when every check
+# passes.
+#
+# Checks run in this order, each cheaper (and each a precondition the next
+# relies on to mean what it says) than the last: tree identity first, since
+# a candidate with the wrong tree fails regardless of how its history is
+# shaped; then that $base is still an ancestor and the range holds no merge
+# commit -- fs_normalize_authorship's own precondition for a range it
+# rewrites, for the same reason: a non-linear or non-descending range has
+# no single "the trailers of base..candidate" to even read; then that the
+# range is not empty (a tidy leg that left the branch at $base would
+# otherwise pass every check above vacuously); and only then the trailers
+# themselves, read with `git log --format='%(trailers:only,unfold)'`, which
+# prints one `Key: value` per trailer line with blank lines between commits
+# -- blank lines are dropped before comparing. A trailer line is compared
+# exactly, case included: a leg that re-cases a key (`Co-authored-by` for
+# `Co-Authored-By`) has written a different line, and failing it is cheap
+# insurance against exactly the invented-trailer failure this check exists
+# to catch.
+#
+# That trailer read has a gap: git only treats a commit message's LAST
+# paragraph as a trailer block, and only when every line in it looks like
+# one -- a last paragraph of `Some prose.` followed by
+# `Co-Authored-By: Invented <x@y>` is skipped by `%(trailers:only)`
+# entirely, prose and invented identity alike, so the check above never
+# sees that line at all. The last check closes that gap by scanning every
+# line of every commit's full body in the candidate range (`git log
+# --format=%B`, independent of git's own trailer-block detection) for
+# anything trailer-SHAPED: a key of ASCII letters and hyphens only,
+# optionally indented, followed by a colon, optional spaces or tabs, and a
+# non-empty value -- the space after the colon is not required, so a key
+# packed straight up against its value still counts. A merely
+# colon-bearing prose line (`Note: see above.`) is not enough to flag on
+# its own -- plenty of ordinary sentences have one -- so a shaped line is
+# only treated as naming an identity, and so checked, when its key either
+# ends in `-by`, case-insensitively (the convention every BY-style trailer
+# in use here follows: `Co-Authored-By`, `Signed-off-by`, `Reviewed-by`,
+# `Acked-by`, and the like; `Fixes:`/`See-also:`-style trailers, which are
+# not about identity, correctly do not), or is `Author`, `Committer`, or
+# `Co-Author`, case-insensitively (git's own non-`-by` identity
+# pseudo-headers, plus the one co-author spelling in common use that drops
+# `-by` -- a line like `Author: Invented <x@y>` or `Co-Author: Invented
+# <x@y>` names an identity just as surely as a `-by` trailer does, even
+# though git itself never parses either as a trailer). Each such line found
+# in the candidate range must appear,
+# byte-for-byte, somewhere in the approved range's full message text --
+# not necessarily inside its own trailer block, and not necessarily on
+# the same commit, the same "moved is fine, invented is not" rule the
+# block above applies to a real trailer.
+#
+# Returns 2, with a reason, when a git command itself fails (a ref that
+# does not resolve, most likely) rather than 0 -- a caller must never read
+# a failed lookup as "nothing to report".
+#
+# $1  repo           the host-side repo the refs below live in
+#                      (origin_repo, never the clone -- same rule as
+#                      fs_normalize_authorship above).
+# $2  base            the commit the approved and candidate ranges both
+#                      start from.
+# $3  approved_ref    the ref (or sha) naming the head the maintainer
+#                      approved.
+# $4  candidate_ref   the ref (or sha) naming the tidy leg's rewritten head.
+fs_tidy_verify() {
+    local repo="$1" base="$2" approved_ref="$3" candidate_ref="$4"
+    local approved_tree candidate_tree merges commits
+    local approved_trailers candidate_trailers missing
+    local approved_trailers_raw candidate_trailers_raw
+    local shaped_pattern='^[[:blank:]]*[A-Za-z][A-Za-z-]*-[Bb][Yy]:[[:blank:]]*.+$|^[[:blank:]]*([Aa]uthor|[Cc]ommitter|[Cc]o-[Aa]uthor):[[:blank:]]*.+$'
+    local approved_shaped candidate_shaped missing_shaped
+    local approved_shaped_raw candidate_shaped_raw
+
+    approved_tree="$(cd "$repo" && git rev-parse "${approved_ref}^{tree}" 2>/dev/null)" \
+        && [[ -n "$approved_tree" ]] \
+        || { printf 'could not resolve %s' "$approved_ref"; return 2; }
+    candidate_tree="$(cd "$repo" && git rev-parse "${candidate_ref}^{tree}" 2>/dev/null)" \
+        && [[ -n "$candidate_tree" ]] \
+        || { printf 'could not resolve %s' "$candidate_ref"; return 2; }
+
+    if [[ "$approved_tree" != "$candidate_tree" ]]; then
+        printf 'tree differs'
+        return 1
+    fi
+
+    if ! (cd "$repo" && git merge-base --is-ancestor "$base" "$candidate_ref") 2>/dev/null; then
+        printf 'base is not an ancestor'
+        return 1
+    fi
+
+    merges="$(cd "$repo" && git rev-list --min-parents=2 --count "${base}..${candidate_ref}" 2>/dev/null)" \
+        || { printf 'could not list the candidate range'; return 2; }
+    if [[ "$merges" != "0" ]]; then
+        printf 'history contains a merge commit'
+        return 1
+    fi
+
+    commits="$(cd "$repo" && git rev-list --count "${base}..${candidate_ref}" 2>/dev/null)" \
+        || { printf 'could not list the candidate range'; return 2; }
+    if [[ "$commits" == "0" ]]; then
+        printf 'range is empty'
+        return 1
+    fi
+
+    if ! candidate_trailers_raw="$(cd "$repo" \
+        && git log --format='%(trailers:only,unfold)' "${base}..${candidate_ref}" 2>/dev/null)"; then
+        printf 'could not read the trailers of %s' "$candidate_ref"
+        return 2
+    fi
+    candidate_trailers="$(sed '/^$/d' <<<"$candidate_trailers_raw" | sort -u)"
+    if [[ -n "$candidate_trailers" ]]; then
+        if ! approved_trailers_raw="$(cd "$repo" \
+            && git log --format='%(trailers:only,unfold)' "${base}..${approved_ref}" 2>/dev/null)"; then
+            printf 'could not read the trailers of %s' "$approved_ref"
+            return 2
+        fi
+        approved_trailers="$(sed '/^$/d' <<<"$approved_trailers_raw" | sort -u)"
+        missing="$(comm -23 <(printf '%s\n' "$candidate_trailers") \
+            <(printf '%s\n' "$approved_trailers") | head -1)"
+        if [[ -n "$missing" ]]; then
+            printf 'invented trailer: %s' "$missing"
+            return 1
+        fi
+    fi
+
+    if ! candidate_shaped_raw="$(cd "$repo" \
+        && git log --format='%B' "${base}..${candidate_ref}" 2>/dev/null)"; then
+        printf 'could not read the commit bodies of %s' "$candidate_ref"
+        return 2
+    fi
+    candidate_shaped="$(grep -E "$shaped_pattern" <<<"$candidate_shaped_raw" | sort -u)"
+    if [[ -n "$candidate_shaped" ]]; then
+        if ! approved_shaped_raw="$(cd "$repo" \
+            && git log --format='%B' "${base}..${approved_ref}" 2>/dev/null)"; then
+            printf 'could not read the commit bodies of %s' "$approved_ref"
+            return 2
+        fi
+        approved_shaped="$(grep -E "$shaped_pattern" <<<"$approved_shaped_raw" | sort -u)"
+        missing_shaped="$(comm -23 <(printf '%s\n' "$candidate_shaped") \
+            <(printf '%s\n' "$approved_shaped") | head -1)"
+        if [[ -n "$missing_shaped" ]]; then
+            printf 'invented trailer-shaped line: %s' "$missing_shaped"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Create-only publish of $3 onto refs/heads/$2 in $1, the one way the tidy
+# leg's verified or approved history ever reaches a branch (see
+# fork-sandbox.sh's tidy block and fork-sandbox-stop.sh's fetch_branch_back,
+# its only two callers): never a ref update that could move a branch that
+# already names something else, so a branch that sprang up (or moved)
+# during the run is a collision, not an overwrite. Treats the branch
+# already sitting at exactly $3 as success rather than a collision --
+# `fork-sandbox stop` and the runner's own publish can both reach this
+# call for the same sha in the same window, and whichever loses that race
+# must see its own work already done, not a false collision. The same
+# race can also land the branch at $3 BETWEEN the check above and the
+# create-only update-ref, which then fails for having lost its "must not
+# exist" precondition -- recheck on that failure too, rather than report
+# a collision over a create that only lost a race it did not need to win.
+# Returns 1 on a genuine collision.
+fs_tidy_publish() {
+    local repo="$1" branch="$2" sha="$3" have
+    have="$( (cd "$repo" && git rev-parse --verify -q "refs/heads/$branch") 2>/dev/null )" || true
+    [[ "$have" == "$sha" ]] && return 0
+    (cd "$repo" && git update-ref "refs/heads/$branch" "$sha" "") && return 0
+    have="$( (cd "$repo" && git rev-parse --verify -q "refs/heads/$branch") 2>/dev/null )" || true
+    [[ "$have" == "$sha" ]]
+}
+
+# The descendant pids of $1 (excluding $1 itself) whose process group is
+# exactly $2, one per line -- found by walking ppid links through one `ps`
+# snapshot, read before signaling anything (once a process in the middle
+# of the tree dies, any descendant of its own that is not yet reached gets
+# reparented and drops out of $1's ppid chain). For a caller whose own
+# group is shared with something it must never signal as a group -- a
+# --foreground run's runner, which inherits its CALLER's group instead of
+# leading its own, so a group signal would also hit the launching shell --
+# this is how it reaches any of its own descendants still sitting in that
+# shared group (a foreground leg's direct child that never got a group of
+# its own) individually instead. Best-effort: a `ps` that cannot see the
+# whole tree (a container's own pid namespace, say) just yields fewer
+# pids, never an error.
+fs_descendant_pids_in_pgid() {
+    local root="$1" target_pgid="$2"
+    ps -eo pid=,ppid=,pgid= 2>/dev/null | awk -v root="$root" -v target="$target_pgid" '
+        { ppid[$1] = $2; pgid[$1] = $3; known[$1] = 1 }
+        END {
+            if (!(root in known)) { exit }
+            queue[0] = root; seen[root] = 1; n = 1
+            for (i = 0; i < n; i++) {
+                p = queue[i]
+                if (p != root && pgid[p] == target) print p
+                for (c in known) {
+                    if (ppid[c] == p && !(c in seen)) {
+                        seen[c] = 1
+                        queue[n++] = c
+                    }
+                }
+            }
+        }' | sort -un
+}
+
+# $1's start time, to tell whether a pid still names the same process it
+# did earlier, since pids get reused. On Linux, /proc/<pid>/stat field 22
+# (starttime, in clock ticks since boot) gives this at process-start
+# granularity; comm is parenthesized and can itself contain ") ", so the
+# split is anchored on the LAST ") " rather than the first. Elsewhere,
+# falls back to `ps -o lstart` (GNU and BSD both support it), whose
+# one-second resolution is the best any portable `ps` offers. Empty if $1
+# is not running or neither source can see it.
+fs_proc_start_time() {
+    local pid="$1" line rest fields
+    local stat_file="/proc/$pid/stat"
+    if [[ -r "$stat_file" ]] && line="$(cat "$stat_file" 2>/dev/null)" && [[ -n "$line" ]]; then
+        rest="${line##*) }"
+        read -r -a fields <<< "$rest"
+        [[ -n "${fields[19]-}" ]] && { printf '%s\n' "${fields[19]}"; return 0; }
+    fi
+    ps -o lstart= -p "$pid" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# Records this subshell's own pid and start time into $1, atomically
+# (build beside the destination and rename, so a reader never sees a
+# partial line). Call this from inside the subshell that is about to
+# `exec` GNU timeout for the tidy leg (see run_leg's tidy wrap in
+# fork-sandbox.sh): the fork already gave the subshell its own pid, and
+# because timeout runs without --foreground it becomes that pid's own
+# process group leader the moment it execs, so the pid recorded here,
+# before the leg it names even exists, IS the group fork-sandbox-stop.sh
+# must later signal. $BASHPID is read into a local first, not inlined into
+# the command substitution below: inside `$(...)` it would name THAT
+# subshell's own pid, not this function's caller. Best effort: a failed
+# write leaves stop with nothing to signal, never a wrong signal.
+fs_record_tidy_leg_pgid() {
+    local pgid_file="$1" pid="$BASHPID" start
+    start="$(fs_proc_start_time "$pid")"
+    [[ -n "$start" ]] || return 0
+    printf '%s\n%s\n' "$pid" "$start" > "$pgid_file.part" 2>/dev/null \
+        && mv -f "$pgid_file.part" "$pgid_file" 2>/dev/null
+}
+
+# Echoes the pid recorded in $1 (fs_record_tidy_leg_pgid's own file) ONLY
+# if it still names a live process whose start time matches what was
+# recorded and whose comm is the resolved timeout binary ($FS_TIMEOUT's
+# basename -- "gtimeout" under Homebrew on macOS, "timeout" elsewhere) --
+# never a bare number. Pids wrap, so a recorded number can land on a
+# different, unrelated process by the time anything reads it back (an
+# orphaned leg that ended on its own within --tidy-timeout, then its
+# number reused); this is what keeps fork-sandbox-stop.sh from signaling
+# that bystander. Empty when the file is missing or malformed, the pid is
+# gone, its start time moved, or its comm does not match -- any of which
+# means the file is stale, and the caller must signal nothing.
+fs_tidy_leg_live_pgid() {
+    local pgid_file="$1" pid="" recorded_start="" now_start="" comm=""
+    [[ -f "$pgid_file" && ! -L "$pgid_file" ]] || return 0
+    { IFS= read -r pid; IFS= read -r recorded_start; } < "$pgid_file" 2>/dev/null
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    now_start="$(fs_proc_start_time "$pid")"
+    [[ -n "$now_start" && "$now_start" == "$recorded_start" ]] || return 0
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$comm" == "$(basename -- "$FS_TIMEOUT")" ]] || return 0
+    printf '%s\n' "$pid"
 }
 
 # --refresh-at / --refresh-max resolution, shared by fork-sandbox.sh (local)

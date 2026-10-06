@@ -126,7 +126,11 @@
 #                        harness addresses its findings, up to N times. N must be a
 #                        positive integer. Fix legs never re-enter the
 #                        review loop. Requires a named model -- see
-#                        --maintainer-model. See "The maintainer loop"
+#                        --maintainer-model. When this is the pipeline's
+#                        last tier and it approves, a tidy-history leg
+#                        runs right after it, on this same seat, and
+#                        rewrites the branch's commits into logical ones.
+#                        See "The maintainer loop" and "The tidy leg"
 #                        below.
 # --maintainer-model <model>:
 #                        the model the maintainer legs run on. Required by
@@ -479,6 +483,18 @@
 #                        loop anyway. Default 6. Requires --refresh-at (which
 #                        is on by default), so it inherits the same harness
 #                        restriction. Forwarded as given with --k8s.
+# --tidy-timeout <secs>: the tidy-history leg's own wall-clock limit, PER
+#                        ATTEMPT (see "The tidy leg" below) -- an attempt
+#                        still running when this elapses is killed and the
+#                        rewrite discarded, the approved history published
+#                        unchanged, same as any other tidy failure; a
+#                        retried attempt gets this same limit again, fresh.
+#                        Default FS_TIDY_TIMEOUT_SECS (30 minutes). A run
+#                        with no maintain step, or whose maintain step
+#                        never becomes eligible for a tidy leg, ignores
+#                        this harmlessly -- which is also what --k8s does
+#                        with it, since the cluster path has no maintainer
+#                        tier (and so no tidy leg) to attach to at all.
 # --kit-skill <name>:    bind one more skill from $HOME/.claude/skills/<name>
 #                        into every seat of this run, read-only, on top of
 #                        the machine's agent kit (AGENT_KIT_SKILLS in
@@ -725,6 +741,79 @@
 # cost folds into total_cost_usd the same way. Refused with --k8s (the
 # cluster path has no maintainer tier yet) and with --review-only (there is
 # no coding leg whose branch a maintainer would review).
+#
+# The tidy leg. Coding and fix legs commit at natural points and never
+# curate their own history (see history_owner and fs_emit_headless_turn_para
+# in the lib) -- cleanup is this leg's job, not theirs, and it runs at most
+# once per run, as the very last leg. Eligible only when this run's LAST
+# pipeline step (legacy or composed) is a maintain step and that step's
+# final iteration ended "approved": not a maintain step that ran earlier in
+# a composed pipeline (a later step could commit on top of a rewrite), not a
+# read-only run, not after a stop request, and not after findings/cap/
+# harness-error. The eligible leg runs on the maintain SEAT's own harness
+# and model, with the editing settings file swapped in (fs_use_editing_
+# settings, the inverse of the read-only swap every review/maintain leg
+# gets) -- it rewrites the branch, so it needs the commit guard. Its prompt
+# (fs_emit_tidy_prompt_body) asks for one logical commit per change, no
+# commit that adds code nothing calls yet, tests landing with the behavior
+# they cover, and messages that describe the code, never the run's process.
+# Wrapped in `timeout --kill-after=60 --tidy-timeout` seconds (default
+# FS_TIDY_TIMEOUT_SECS, 30 minutes): nothing else watches this leg the way
+# the review/maintainer loops watch theirs, so a leg that hangs could
+# otherwise hold an already-approved branch back indefinitely. timeout's
+# own new process group is what lets its TERM/KILL reach every descendant
+# a sandboxed backend forks, so it keeps its default grouping rather than
+# --foreground; fork-sandbox-stop.sh does not depend on this leg sharing
+# the runner's own group either -- see its own comment on signaling every
+# process group among the run's descendants. The bound is per attempt: a
+# leg retried by fs_run_claude_leg_with_retry gets a fresh one on each
+# attempt, so the worst case is this many seconds times one plus the
+# retry count, not this many seconds total. Timing out is a discard, same
+# as any other tidy failure below -- not a run failure.
+#
+# The runner, not the prompt, enforces the result: before trusting the
+# rewrite, it fetches the pre-leg ("approved") and post-leg ("candidate")
+# heads into host-side holding refs keyed by this run's own id
+# (refs/fork-sandbox/tidy/<run-id>/...), never by branch name -- two runs
+# that share a branch name, or one run relaunched after an earlier one left
+# its own ref behind on a publish collision, can never read or clear each
+# other's snapshots. Deleted only once this run's own publish has actually
+# landed, never on a mere discard or collision, so a run whose publish lost
+# a race still has its approved or verified history recoverable from the
+# ref fork-sandbox-stop.sh's own summary names. It calls fs_tidy_verify (in
+# the lib) against them, host-side, never inside the clone. It checks: the
+# two heads' trees are byte-identical (content, modes
+# included -- this leg reshapes commits, not code); the base is still an
+# ancestor and the range is linear, no merge commits; and every trailer
+# line (Co-Authored-By and the like) on the candidate side already appeared,
+# verbatim, somewhere in the approved range -- moved to a different commit
+# is fine, invented is not. (A trailer dropped from the approved range is
+# not caught here.) The same rule also covers an identity-naming line (a
+# key ending in "-by", or "Author"/"Committer"/"Co-Author") that LOOKS
+# like a trailer but that git's own parser does not treat as one -- see
+# fs_tidy_verify's own header comment for exactly when that gap opens. A
+# leg that left the branch exactly as approved
+# (same head) is recorded "unchanged", not "accepted": the escape hatch for
+# history that already reads well. Any check that fails, a non-zero exit,
+# or a leg that never produced a usable head gets the rewrite discarded:
+# the clone is reset back to the approved head, best-effort, through the
+# sandbox backend, but the ORIGIN branch — never the clone's own state — comes
+# from publishing the approved head's holding ref by sha instead, so a backend
+# that could not reset the clone never costs the approved work. Every publish
+# (accepted, unchanged, or a discard's restore) is create-only against the
+# origin branch, never a move of an existing ref, and treats the branch
+# already sitting at exactly that sha as success rather than a collision --
+# the one case fork-sandbox-stop.sh's own publish can race this one into. The
+# run's own exit code is unaffected either way: a discarded or skipped
+# tidy leg is not a failed run. Every outcome (accepted/unchanged/
+# discarded/skipped, with why) is
+# recorded in <run-dir>/tidy.json, and mirrored into summary.json's own
+# "tidy" key, on every run whose pipeline has a maintain step anywhere --
+# not just when one ran last, so a reader can always tell whether the LEG
+# itself ran from "skipped" alone. A pipeline with no maintain step at all
+# gets no tidy.json, no "tidy" key in summary.json and no tidy: line
+# anywhere in its output, leaving it exactly as it read before this
+# feature existed.
 #
 # A run that refreshes itself. An interactive session that fills its context
 # writes a hand-off and forks a fresh session rather than degrade into
@@ -1695,6 +1784,7 @@ prompts_dir_arg=""
 refresh_at_arg=""
 refresh_at_given=false
 refresh_max_arg=""
+tidy_timeout_secs="$FS_TIDY_TIMEOUT_SECS"
 kit_skill_flags=()
 k8s_mode=false
 k8s_timeout=""
@@ -1874,6 +1964,15 @@ while [[ "${1:-}" == -* ]]; do
         --refresh-max)
             refresh_max_arg="${2:?--refresh-max requires a non-negative integer}"
             shift 2
+            ;;
+        --tidy-timeout)
+            tidy_timeout_secs="${2:?--tidy-timeout requires a number of seconds}"
+            shift 2
+            if [[ ! "$tidy_timeout_secs" =~ ^[0-9]+$ ]] || (( 10#$tidy_timeout_secs == 0 )); then
+                echo "Error: --tidy-timeout takes a positive integer number of" >&2
+                echo "seconds, not '$tidy_timeout_secs'." >&2
+                exit 1
+            fi
             ;;
         --kit-skill)
             kit_skill_flags+=("${2:?--kit-skill requires a skill name}")
@@ -5309,6 +5408,20 @@ else
     run_step_count=$(( run_step_k - 1 ))
 fi
 
+# Who cleans up this run's history, for the coding/continuation/fix prompts
+# below: "maintainer" when the pipeline's LAST step is a maintain step, so a
+# tidy-history leg on that step's seat runs after it approves; "integrator"
+# (every other shape, including a maintain step that is not last) when
+# nothing in the run rewrites history and whoever integrates the branch
+# reshapes it by hand. A read-only run has no coding or fix prompt to tell
+# either way, but the value is still well-defined for it.
+history_owner=integrator
+if [[ "$mode" != review-only ]] \
+    && (( run_step_count > 0 )) \
+    && [[ "${run_step_kind[run_step_count]}" == maintainer ]]; then
+    history_owner=maintainer
+fi
+
 # A composed preset's own per-step model/harness values (resolved by the
 # seat-resolution loop above into "s<K>_*"/"s<K>fix_*") reach this same
 # generated run.sh via the %q-quoted serialization loop further down, just
@@ -6596,7 +6709,7 @@ EOF
     fi
     fs_emit_browser_section
     fs_emit_prompt_overlay implement
-    fs_emit_headless_turn_section
+    fs_emit_headless_turn_section "$history_owner"
     printf '\n---\n\n'
     cat -- "$handoff_file"
 } > "$handoff_copy.part"
@@ -6682,7 +6795,7 @@ if [[ "$review_only" != true ]] \
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
     } > "$fix_prompt_header.part"
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
 fi
@@ -6694,7 +6807,7 @@ if [[ -n "$fix_harness" ]] && (( review_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$fix_harness" \
             "$fxr_preamble_network" "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
     } > "$fxr_fix_prompt_header.part"
     mv -- "$fxr_fix_prompt_header.part" "$fxr_fix_prompt_header"
 fi
@@ -6706,7 +6819,7 @@ if [[ -n "$mntfix_harness" ]] && (( maintainer_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$mntfix_harness" \
             "$fxm_preamble_network" "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
     } > "$fxm_fix_prompt_header.part"
     mv -- "$fxm_fix_prompt_header.part" "$fxm_fix_prompt_header"
 fi
@@ -6734,6 +6847,26 @@ if (( maintainer_loop_cap > 0 )); then
             "$handoff_file" "$review_prompt_flavor"
     } > "$maintainer_prompt.part"
     mv -- "$maintainer_prompt.part" "$maintainer_prompt"
+fi
+
+# The tidy leg's static prompt base, built beside the maintainer prompt for
+# the same reason: everything it names (the clone, the inbox) is known now.
+# Built only when this run's last pipeline step is a maintain step
+# (history_owner) -- the runner appends the approved head and, when the run
+# has a plan, the plan section, once the maintain step actually approves
+# (see the runner's tidy block); this static base never changes per run.
+tidy_prompt=""
+if [[ "$history_owner" == maintainer ]]; then
+    tidy_prompt="$run_dir/tidy-prompt.md"
+    fs_reject_unsafe_chars "$tidy_prompt"
+    {
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+            "$maintainer_preamble_harness" "$maintainer_preamble_network" \
+            "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
+        fs_emit_prompt_overlay maintainer
+        fs_emit_tidy_prompt_body "$branch" "$base_sha" "$handoff_file"
+    } > "$tidy_prompt.part"
+    mv -- "$tidy_prompt.part" "$tidy_prompt"
 fi
 
 # run_step_prompt (declared empty at the run_step_* compile point above,
@@ -6828,7 +6961,7 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
@@ -6887,10 +7020,26 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
+                fi
+                # The composed counterpart of the legacy tidy_prompt built
+                # above: only the one step history_owner already named (this
+                # run's last step) gets one.
+                if [[ "$history_owner" == maintainer ]] && (( preset_k == preset_step_count )); then
+                    step_k_tidy_prompt="$run_dir/step-${preset_k}-tidy-prompt.md"
+                    fs_reject_unsafe_chars "$step_k_tidy_prompt"
+                    {
+                        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                            "$preset_k_preamble_harness" "$preset_k_preamble_network" \
+                            "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
+                        fs_emit_step_prompt_overlay maintainer "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
+                        fs_emit_tidy_prompt_body "$branch" "$base_sha" "$handoff_file"
+                    } > "$step_k_tidy_prompt.part"
+                    mv -- "$step_k_tidy_prompt.part" "$step_k_tidy_prompt"
+                    printf -v "s${preset_k}_tidy_prompt" '%s' "$step_k_tidy_prompt"
                 fi
                 ;;
             plan)
@@ -6927,7 +7076,7 @@ if (( refresh_enabled )); then
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "" "$outbox_max_bytes" "${plan_file:-}"
-        fs_emit_headless_turn_section
+        fs_emit_headless_turn_section "$history_owner"
     } > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
@@ -6982,6 +7131,25 @@ fs_use_readonly_settings() {
     for i in "${!settings_arr[@]}"; do
         if [[ "${settings_arr[$i]}" == "$inbox_settings" ]]; then
             settings_arr[i]="$inbox_settings_ro"
+        fi
+    done
+    return 0
+}
+
+# The inverse: walks a sandbox_cmd array built for a read-only leg (a
+# review/maintainer seat, fixed or composed) and swaps $inbox_settings_ro
+# back to $inbox_settings -- used to build the tidy leg's own command from
+# a copy of the maintain seat's command, below. The tidy leg rewrites the
+# branch's own history, so it needs the commit guard the editing settings
+# file installs, same as every other leg that commits. A no-op under the
+# same condition as fs_use_readonly_settings.
+fs_use_editing_settings() {
+    local -n editing_settings_arr="$1"
+    [[ -n "$inbox_settings" ]] || return 0
+    local i
+    for i in "${!editing_settings_arr[@]}"; do
+        if [[ "${editing_settings_arr[$i]}" == "$inbox_settings_ro" ]]; then
+            editing_settings_arr[i]="$inbox_settings"
         fi
     done
     return 0
@@ -7571,6 +7739,19 @@ if (( maintainer_loop_cap > 0 )); then
     fi
 fi
 
+# The tidy leg's own command: a copy of the maintain seat's own command,
+# finalized just above, with its read-only settings file swapped for the
+# editing one (fs_use_editing_settings). Built only when this run's last
+# pipeline step is a maintain step (history_owner, decided once right after
+# the run_step_kind/run_step_count compile) -- never otherwise, so a run
+# with no maintain step, or whose maintain step is not last, emits no tidy
+# state into run.sh at all, the same "nothing emitted unless built" rule
+# maintainer_sandbox_cmd itself follows just above.
+if [[ "$history_owner" == maintainer ]]; then
+    tidy_sandbox_cmd=("${maintainer_sandbox_cmd[@]}")
+    fs_use_editing_settings tidy_sandbox_cmd
+fi
+
 # The preset fix seats, when set: each is a full independent build from the
 # "fxr_"/"fxm_" state fs_resolve_harness resolved above, exactly as a named
 # --review-harness or --maintainer-harness builds fresh. Without a seat, fix
@@ -7643,6 +7824,18 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
             && "${preset_step_action[$preset_k]}" != plan \
             && "$preset_ro_multi" != true ]]; then
             fs_build_sandbox_cmd "s${preset_k}fix" "s${preset_k}fix_sandbox_cmd"
+        fi
+        # The composed counterpart of the legacy tidy_sandbox_cmd build
+        # above: only the one step history_owner already named (this run's
+        # last step, a maintain step, not read-only) gets one, built from
+        # that same step's own "s<K>_sandbox_cmd" rather than its fix seat's.
+        if [[ "$history_owner" == maintainer ]] && (( preset_k == preset_step_count )); then
+            declare -n preset_k_tidy_src="s${preset_k}_sandbox_cmd"
+            declare -n preset_k_tidy_dst="s${preset_k}tidy_sandbox_cmd"
+            # shellcheck disable=SC2034  # written-through only, via the nameref
+            preset_k_tidy_dst=("${preset_k_tidy_src[@]}")
+            unset -n preset_k_tidy_src preset_k_tidy_dst
+            fs_use_editing_settings "s${preset_k}tidy_sandbox_cmd"
         fi
     done
 fi
@@ -8026,6 +8219,11 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
         printf 'maintainer_prompt=%q\n' "$maintainer_prompt"
         printf 'maintainer_verdict_file=%q\n' "$maintainer_verdict_file"
     fi
+    # Mirrors the build above: emitted only when this run's last pipeline
+    # step is a maintain step.
+    if [[ "$history_owner" == maintainer ]]; then
+        printf 'tidy_prompt=%q\n' "$tidy_prompt"
+    fi
     # The preset-only pipeline knobs, emitted only when set so a run without
     # them stays byte-identical to one built before they existed. run_leg and
     # the walker below guard every read with ${...:-} defaults to match.
@@ -8114,6 +8312,10 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
                 preset_k_var="s${preset_k}_prompt_inner_review"
                 printf 's%d_prompt_inner_review=%q\n' "$preset_k" "${!preset_k_var}"
             fi
+            if [[ "$history_owner" == maintainer ]] && (( preset_k == preset_step_count )); then
+                preset_k_var="s${preset_k}_tidy_prompt"
+                printf 's%d_tidy_prompt=%q\n' "$preset_k" "${!preset_k_var}"
+            fi
         done
     fi
     # Per-account attribution, for summary.json's own claude_credentials_*
@@ -8161,6 +8363,15 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     # a bare call would fail into the `|| true` and leak the compose stack
     # silently, which is the one outcome the trap exists to prevent.
     printf 'FS_TIMEOUT=%q\n' "$FS_TIMEOUT"
+    # The tidy-history leg's own wall-clock limit (--tidy-timeout, default
+    # FS_TIDY_TIMEOUT_SECS) -- emitted only when this run's last pipeline
+    # step is a maintain step (history_owner, the same gate tidy_sandbox_cmd
+    # itself is built under above): a pipeline that can never reach a tidy
+    # leg must leave no tidy trace in run.sh, same as it leaves none in
+    # tidy.json/summary.json.
+    if [[ "$history_owner" == maintainer ]]; then
+        printf 'tidy_timeout_secs=%q\n' "$tidy_timeout_secs"
+    fi
     # A claude leg that fails on an auth or transient provider error (a
     # revoked OAuth token, an overloaded model) is retried fresh, at most
     # once per delay listed here -- see fs_run_claude_leg_with_retry in the
@@ -8197,6 +8408,13 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
         printf '%q ' "${maintainer_sandbox_cmd[@]}"
         printf ')\n'
     fi
+    # Mirrors the build above: emitted only when this run's last pipeline
+    # step is a maintain step, same single source of truth (history_owner).
+    if [[ "$history_owner" == maintainer ]]; then
+        printf 'tidy_sandbox_cmd=('
+        printf '%q ' "${tidy_sandbox_cmd[@]}"
+        printf ')\n'
+    fi
     # Both arrays were populated by fs_build_sandbox_cmd's out-nameref --
     # the same false positive as sandbox_cmd's own emission above.
     # shellcheck disable=SC2154
@@ -8230,6 +8448,12 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
                 && "$preset_ro_multi" != true ]]; then
                 declare -n preset_k_cmd_ref="s${preset_k}fix_sandbox_cmd"
                 printf 's%dfix_sandbox_cmd=(' "$preset_k"
+                printf '%q ' "${preset_k_cmd_ref[@]}"
+                printf ')\n'
+            fi
+            if [[ "$history_owner" == maintainer ]] && (( preset_k == preset_step_count )); then
+                declare -n preset_k_cmd_ref="s${preset_k}tidy_sandbox_cmd"
+                printf 's%dtidy_sandbox_cmd=(' "$preset_k"
                 printf '%q ' "${preset_k_cmd_ref[@]}"
                 printf ')\n'
             fi
@@ -8272,6 +8496,36 @@ source "$script_dir/fork-sandbox-lib.sh"
 # The --refresh-at loop's pure logic, shared with the pod (ConfigMap key refresh.sh).
 source "$script_dir/fork-sandbox-refresh.sh"
 
+# This run's own id for its tidy holding refs (refs/fork-sandbox/tidy/
+# <run_id>/approved|candidate) -- fork-sandbox-stop.sh derives the same id
+# the same way, from the same run_dir, so the two agree on where this
+# run's snapshots live without either reading the other's state. Resolved
+# here, before anything else, so the guard right below can use it.
+run_id="$(basename -- "$run_dir")"
+
+# A manual re-run in this same run dir must not pick up the previous
+# invocation's tidy.json/tidy.pgid, nor race a 'fork-sandbox stop' that is
+# still confirming the previous invocation's own publish against these
+# same refs (resolve_tidy_safe_sha, fetch_branch_back) -- refuse outright
+# instead, rather than silently delete a ref stop still needs or publish
+# by a run_id that is no longer this invocation's own.
+tidy_stale_refs=()
+for tidy_stale_ref in "refs/fork-sandbox/tidy/$run_id/approved" "refs/fork-sandbox/tidy/$run_id/candidate"; do
+    if (cd "$origin_repo" && git rev-parse --verify -q "$tidy_stale_ref") >/dev/null 2>&1; then
+        tidy_stale_refs+=("$tidy_stale_ref")
+    fi
+done
+if (( ${#tidy_stale_refs[@]} )); then
+    printf 'fork-sandbox: refusing to start: %s still exist in %s, left by an earlier run in this directory.\n' \
+        "$(IFS=', '; echo "${tidy_stale_refs[*]}")" "$origin_repo" >&2
+    printf 'Confirm the earlier run is really over (fork-sandbox stop on its run dir), or delete them by hand once you are sure they are not needed:\n' >&2
+    for tidy_stale_ref in "${tidy_stale_refs[@]}"; do
+        printf '  (cd %q && git update-ref -d %q)\n' "$origin_repo" "$tidy_stale_ref" >&2
+    done
+    exit 1
+fi
+rm -f -- "$run_dir/tidy.json" "$run_dir/tidy.pgid"
+
 # fork-sandbox-stop.sh's graceful path signals this runner's whole process
 # GROUP with TERM (a bash trap does not fire while a foreground child is
 # running, so the leg's own child gets the signal directly and dies first).
@@ -8310,6 +8564,22 @@ fi
 # "$@" still runs.
 fs_run_lock_closed() {
     ( { exec {clone_lock_fd}>&-; } 2>/dev/null; "$@" )
+}
+
+# The tidy leg's own variant: same lock-fd close, but records this
+# subshell's pid and start time into $1 (fs_record_tidy_leg_pgid, in the
+# lib) and THEN `exec`s the rest of argv (GNU timeout, per the leg's own
+# wrap -- see run_leg's tidy block) rather than merely running it. `exec`
+# keeps the subshell's pid rather than forking a new one, and since
+# timeout runs without --foreground it becomes that pid's own process
+# group leader the moment it starts -- so the pid recorded here, before
+# the leg it names even exists, is exactly the group fork-sandbox-stop.sh
+# must later find and signal.
+fs_run_tidy_leg() {
+    local pgid_file="$1"; shift
+    ( { exec {clone_lock_fd}>&-; } 2>/dev/null
+      fs_record_tidy_leg_pgid "$pgid_file"
+      exec "$@" )
 }
 
 # --------------------------------------------------------- claude retry ----
@@ -9752,7 +10022,35 @@ run_leg() {
     # implement harness unconditionally. Not local, for the same reason:
     # fs_refresh_chain gates a leg's whole chain on this being "claude".
     leg_harness="$harness"
-    if [[ -n "$step_idx" ]]; then
+    if [[ "$kind" == "tidy" ]]; then
+        # The tidy leg runs on the maintain SEAT's accounting (pi session
+        # dir, usage source, formatter, harness) but its own command: the
+        # editing-settings swap of that seat's own sandbox_cmd (built
+        # beside it at launch, see tidy_sandbox_cmd/s<K>tidy_sandbox_cmd),
+        # never the seat's fix command. A composed step's maintain fields
+        # are its own "s<K>_*" (not "s<K>fix_*" -- there is no fix-seat
+        # accounting to borrow here); the legacy fields are "mnt_*", the
+        # same ones the "maintainer" arm below reads.
+        if [[ -n "$step_idx" ]]; then
+            local -n leg_cmd_ref="${step_idx}tidy_sandbox_cmd"
+            cmd=("${leg_cmd_ref[@]}")
+            local step_field
+            step_field="${step_idx}_pi_session_dir"
+            leg_pi_session_dir="${!step_field}"
+            step_field="${step_idx}_usage_source"
+            leg_usage_source="${!step_field}"
+            step_field="${step_idx}_formatter"
+            leg_formatter="${!step_field}"
+            step_field="${step_idx}_harness"
+            leg_harness="${!step_field}"
+        else
+            cmd=("${tidy_sandbox_cmd[@]}")
+            leg_pi_session_dir="$mnt_pi_session_dir"
+            leg_usage_source="$mnt_usage_source"
+            leg_formatter="$mnt_formatter"
+            leg_harness="$maintainer_preamble_harness"
+        fi
+    elif [[ -n "$step_idx" ]]; then
         # A composed step's own seat: resolved by the seat-resolution loop
         # into "s<K>_*"/"s<K>fix_*" and serialized into this same run.sh's
         # text by the loops beside the fixed rev_*/mnt_*/fxr_*/fxm_*
@@ -9802,6 +10100,27 @@ run_leg() {
         leg_usage_source="${fxm_usage_source:-}"
         leg_formatter="${fxm_formatter:-}"
         leg_harness="$mntfix_harness"
+    fi
+    # The tidy leg's own wall-clock limit: nothing else watches this leg the
+    # way the review/maintainer loops watch theirs, so a leg that hangs
+    # would otherwise hold an already-approved branch back indefinitely.
+    # GNU timeout's own 124 exit is read below (see tidy_detail's own
+    # "timed out" branch), distinct from whatever this harness's own exit
+    # codes mean, since this wrap is the only thing that can ever produce
+    # it for this leg. --kill-after backs the TERM with a SIGKILL: a
+    # harness that traps or ignores TERM would otherwise hang past
+    # $tidy_timeout_secs with timeout itself just waiting on it, which
+    # defeats the whole bound this wrap exists to enforce. No --foreground:
+    # timeout's own new process group is what lets ITS OWN TERM/KILL reach
+    # every descendant a sandboxed backend forks, not just its direct
+    # child -- a backend that waits on a foreground grandchild under its
+    # own EXIT trap (every bundled backend does) would otherwise defer
+    # that signal until the grandchild returns on its own, which can be
+    # indefinitely. fork-sandbox-stop.sh does not rely on this leg sharing
+    # the runner's own process group either; see its own comment on
+    # signaling every process group among the run's descendants.
+    if [[ "$kind" == "tidy" ]]; then
+        cmd=("$FS_TIMEOUT" "--kill-after=60" "$tidy_timeout_secs" "${cmd[@]}")
     fi
     # "fix" and "mntfix" without a preset fix seat, and "code" (a repeat
     # pass of the coding leg), all fall through to the implement defaults
@@ -9871,17 +10190,31 @@ run_leg() {
     # leg's redirect for why (MAX_ARG_STRLEN), and note that the fix prompt
     # carries verdict text of no fixed size.
     _fs_leg_attempt() {
+        # The tidy leg runs under GNU timeout in its own process group (see
+        # the leg's own wrap above); fs_run_tidy_leg records that group
+        # (pid and start time, in "$run_dir/tidy.pgid") from inside the
+        # subshell that becomes it, before the exec that starts it, so
+        # fork-sandbox-stop.sh can verify and signal it even once this
+        # runner is gone. Removed once this attempt returns, so a retry's
+        # fresh timeout wrap is never confused with the one before it, and
+        # stop never finds a leg that already ended.
+        local -a _fs_run=(fs_run_lock_closed)
+        if [[ "$kind" == "tidy" ]]; then
+            rm -f -- "$run_dir/tidy.pgid" 2>/dev/null
+            _fs_run=(fs_run_tidy_leg "$run_dir/tidy.pgid")
+        fi
         if [[ -n "$leg_formatter" ]]; then
-            fs_run_lock_closed "${cmd[@]}" < "$prompt" \
+            "${_fs_run[@]}" "${cmd[@]}" < "$prompt" \
                 2> >(tee -a "$sandbox_log" >&2) \
                 | tee -a "$leg_events" \
                 | "$leg_formatter"
         else
-            fs_run_lock_closed "${cmd[@]}" < "$prompt" \
+            "${_fs_run[@]}" "${cmd[@]}" < "$prompt" \
                 2> >(tee -a "$sandbox_log" >&2) \
                 | tee -a "$leg_events"
         fi
         _fs_leg_attempt_rc="${PIPESTATUS[0]:-1}"
+        [[ "$kind" == "tidy" ]] && rm -f -- "$run_dir/tidy.pgid" 2>/dev/null
     }
     fs_run_claude_leg_with_retry "$leg_harness" "$leg_events" "$sandbox_log" \
         "the $kind leg of iteration $n" _fs_leg_attempt "$leg_formatter"
@@ -11168,6 +11501,218 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     fi
 done
 
+# The tidy-history leg: when this run's last pipeline step is a maintain
+# step and it just approved, one more leg rewrites the branch's commits
+# into logical ones -- see "The tidy leg" in this script's own header
+# comment for the full contract (eligibility, the three invariants
+# enforced below, and the restore on discard). It runs here, after every
+# other leg but before $rc is published and before run_cleanup revokes
+# this run's credential, and it never changes $rc itself: accepted,
+# unchanged, discarded and skipped are all still a successful run of
+# whatever the maintainer approved.
+tidy_ended="skipped"
+tidy_detail="no maintain step"
+tidy_approved_sha=""
+tidy_head_after=""
+tidy_restore=0
+tidy_exit_json=null
+tidy_cost_json=null
+tidy_usage_json=null
+tidy_retries_json='[]'
+clone_restored_json=null
+
+# run_id (this run's own holding refs live under it, never under the
+# branch name) was resolved near the top of this file, before the
+# stale-tidy-state startup guard.
+
+tidy_step_idx="${run_step_idx[run_step_count]:-}"
+# Whether the pipeline has a maintain step ANYWHERE, not just last -- read
+# by the summary below to decide whether this run prints a tidy: line at
+# all (A run with no maintain step reads exactly as it did before this
+# feature existed; a run whose maintain step is not last still gets a
+# line, since it does have one, just not in the one position that runs a
+# tidy leg).
+tidy_has_maintain_step=0
+for (( _tk = 1; _tk <= run_step_count; _tk++ )); do
+    [[ "${run_step_kind[_tk]}" == "maintainer" ]] && tidy_has_maintain_step=1
+done
+tidy_eligible=0
+if [[ "${stop_requested:-0}" == 1 ]]; then
+    tidy_detail="stop requested"
+elif [[ "$mode" == "review-only" ]]; then
+    tidy_detail="read-only run"
+elif (( run_step_count == 0 )) || [[ "${run_step_kind[run_step_count]:-}" != "maintainer" ]]; then
+    if (( tidy_has_maintain_step )); then
+        tidy_detail="the maintain step is not the pipeline's last step"
+    else
+        tidy_detail="no maintain step"
+    fi
+elif [[ "${progress_ended[run_step_count]:-}" != "approved" ]]; then
+    tidy_detail="the maintainer did not approve (${progress_ended[run_step_count]:-unknown})"
+else
+    tidy_eligible=1
+fi
+
+if (( tidy_eligible )); then
+    # The approved head is snapshotted into a holding ref in the ORIGIN
+    # repo before this leg runs, host-side -- the one safe way across the
+    # sandbox boundary (see the fetch-back comment below for why nothing
+    # here ever runs git inside the clone). Everything this leg's
+    # verification reads is read from these refs, never from the clone
+    # directly. tidy_approved_sha is re-resolved from the ref actually
+    # fetched, below, not trusted from this ls-remote: the two are separate
+    # round trips to the clone, and only the ref's own sha is what every
+    # later check (fs_tidy_verify, the publish at the end of this run) is
+    # actually pinned to.
+    if [[ -n "$(clone_branch_head)" ]] \
+        && (cd "$origin_repo" && git fetch --quiet "$clone_dir" \
+            "+refs/heads/$branch:refs/fork-sandbox/tidy/$run_id/approved"); then
+        tidy_approved_sha="$(cd "$origin_repo" && git rev-parse --verify -q \
+            "refs/fork-sandbox/tidy/$run_id/approved" 2>/dev/null)"
+    fi
+    if [[ -z "$tidy_approved_sha" ]]; then
+        tidy_ended="skipped"
+        tidy_detail="could not snapshot the approved history"
+    else
+        if [[ -n "$tidy_step_idx" ]]; then
+            tidy_static_prompt_var="${tidy_step_idx}_tidy_prompt"
+            tidy_static_prompt="${!tidy_static_prompt_var}"
+            tidy_runtime_prompt="$run_dir/step-${run_step_count}-tidy-prompt-1.md"
+        else
+            tidy_static_prompt="$tidy_prompt"
+            tidy_runtime_prompt="$run_dir/tidy-prompt-1.md"
+        fi
+        if { cat -- "$tidy_static_prompt"
+             printf '\n## The approved head\n\n'
+             printf 'The approved head -- what your rewrite is checked against once you\n'
+             printf 'finish -- is:\n\n    %s\n\n' "$tidy_approved_sha"
+             printf 'The base this range starts from is:\n\n    %s\n' "$base_sha"
+             fs_emit_plan_section "$plan_file" tidy
+           } > "$tidy_runtime_prompt.part" 2>/dev/null; then
+            mv -- "$tidy_runtime_prompt.part" "$tidy_runtime_prompt"
+            # A tidy leg never refreshes -- like plan/review/maintain, it is
+            # not the long-running leg --refresh-at exists for.
+            fs_refresh_disarm
+            run_leg tidy 1 "$tidy_runtime_prompt" "$tidy_step_idx"
+            tidy_exit_json="$leg_rc"
+            tidy_cost_json="${leg_cost:-null}"
+            tidy_usage_json="${leg_usage:-null}"
+            tidy_retries_json="${leg_retries_json:-[]}"
+            tidy_head_after="$(clone_branch_head)"
+            if [[ "$leg_rc" != 0 ]]; then
+                tidy_ended="discarded"
+                if [[ "$leg_rc" == 124 ]]; then
+                    # The GNU timeout wrap above (never the harness itself,
+                    # which this leg's own cmd never ran without it) -- a
+                    # hung leg is a discard, same as any other tidy
+                    # failure, not left to hold the approved branch back.
+                    tidy_detail="the tidy leg timed out after ${tidy_timeout_secs}s; the approved history was restored"
+                else
+                    tidy_detail="the tidy leg exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}$(fs_leg_retry_suffix "${leg_retries_count:-0}"); the approved history was restored"
+                fi
+                tidy_restore=1
+            elif [[ -z "$tidy_head_after" ]]; then
+                tidy_ended="discarded"
+                tidy_detail="branch $branch could not be read from the clone after the tidy leg; the approved history was restored"
+                tidy_restore=1
+            elif [[ "$tidy_head_after" == "$tidy_approved_sha" ]]; then
+                tidy_ended="unchanged"
+                tidy_detail=""
+            elif ! (cd "$origin_repo" && git fetch --quiet "$clone_dir" \
+                "+refs/heads/$branch:refs/fork-sandbox/tidy/$run_id/candidate"); then
+                tidy_ended="discarded"
+                tidy_detail="the tidied branch could not be fetched; the approved history was restored"
+                tidy_restore=1
+            else
+                # Re-resolve from the candidate ref just fetched, not the
+                # earlier clone_branch_head() read above: that read and this
+                # fetch are two separate trips to the clone, and if its
+                # branch moved between them, head_after must still name
+                # exactly what fs_tidy_verify is about to check below --
+                # never an earlier, unverified commit -- since tidy.json's
+                # head_after is what fork-sandbox-stop.sh's salvage path
+                # trusts for an "accepted" outcome (see its
+                # resolve_tidy_safe_sha).
+                tidy_head_after="$(cd "$origin_repo" && git rev-parse --verify -q \
+                    "refs/fork-sandbox/tidy/$run_id/candidate" 2>/dev/null)"
+                tidy_verify_reason="$(fs_tidy_verify "$origin_repo" "$base_sha" \
+                    "refs/fork-sandbox/tidy/$run_id/approved" \
+                    "refs/fork-sandbox/tidy/$run_id/candidate")"
+                tidy_verify_rc=$?
+                if (( tidy_verify_rc == 0 )); then
+                    tidy_ended="accepted"
+                    tidy_detail=""
+                else
+                    tidy_ended="discarded"
+                    tidy_detail="$tidy_verify_reason; the approved history was restored"
+                    tidy_restore=1
+                fi
+            fi
+        else
+            rm -f -- "$tidy_runtime_prompt.part"
+            tidy_ended="skipped"
+            tidy_detail="could not build the tidy leg's prompt"
+        fi
+    fi
+fi
+
+# On a discard, the clone is reset back to the approved head, best-effort,
+# through the sandbox backend -- the same confinement every other git
+# command against the clone runs under in this runner (nothing runs git
+# INSIDE the clone directly: the sandbox could write its config, and a key
+# such as core.fsmonitor runs on the HOST). Whether it worked is read back
+# with clone_branch_head and recorded, not assumed: a --clone-dir reuse
+# continues from whatever the clone actually ends up holding.
+if [[ "$tidy_restore" == 1 ]]; then
+    tidy_restore_bind_flags=()
+    if [[ "${#fs_alternates[@]}" -gt 0 ]]; then
+        for tidy_alt in "${fs_alternates[@]}"; do
+            tidy_restore_bind_flags+=(--bind-ro "$tidy_alt")
+        done
+    fi
+    if fs_resolve_backend "$script_dir"; then
+        "$FS_TIMEOUT" 60 "$FS_BACKEND_BIN" --workdir "$clone_dir" \
+            "${tidy_restore_bind_flags[@]}" --net sealed \
+            --hostname fork-sandbox-tidy-restore -- \
+            sh -c 'git rebase --abort >/dev/null 2>&1
+git checkout -q -f "$1" && git reset -q --hard "$2"' \
+            sh "$branch" "$tidy_approved_sha" \
+            > "$run_dir/tidy-restore.log" 2>&1
+    else
+        printf 'fork-sandbox: could not resolve the sandbox backend for the ' \
+            > "$run_dir/tidy-restore.log"
+        printf 'tidy restore.\n' >> "$run_dir/tidy-restore.log"
+    fi
+    if [[ "$(clone_branch_head)" == "$tidy_approved_sha" ]]; then
+        clone_restored_json=true
+    else
+        clone_restored_json=false
+    fi
+fi
+
+# Both the artifact and this line are written only when the pipeline has a
+# maintain step at all -- same gate as the summary.txt line below -- so a
+# pipeline with none (the common case before this feature existed) leaves
+# no tidy trace anywhere in a run's output or artifacts, not even a
+# "skipped" one.
+if (( tidy_has_maintain_step )); then
+    jq -n \
+        --arg ended "$tidy_ended" --arg detail "$tidy_detail" \
+        --arg head_approved "$tidy_approved_sha" --arg head_after "$tidy_head_after" \
+        --argjson exit "$tidy_exit_json" --argjson cost_usd "$tidy_cost_json" \
+        --argjson usage "$tidy_usage_json" --argjson retries "$tidy_retries_json" \
+        --argjson clone_restored "$clone_restored_json" \
+        '{ended: $ended,
+          detail: (if $detail == "" then null else $detail end),
+          head_approved: (if $head_approved == "" then null else $head_approved end),
+          head_after: (if $head_after == "" then null else $head_after end),
+          exit: $exit, cost_usd: $cost_usd, usage: $usage, retries: $retries,
+          clone_restored: $clone_restored}' \
+        > "$run_dir/tidy.json.part" 2>/dev/null \
+        && mv -f "$run_dir/tidy.json.part" "$run_dir/tidy.json"
+    printf 'fork-sandbox: tidy: %s%s\n' "$tidy_ended" "${tidy_detail:+ ($tidy_detail)}"
+fi
+
 # The other half of the deferral above: for a --review-loop or --refresh-at
 # run the run is over here -- every loop ran, or was skipped and said why --
 # so this is where its exit code is published, which is what puts a
@@ -11307,7 +11852,58 @@ uncommitted_paths_capped=("${uncommitted_paths[@]:0:20}")
 # on the HOST. Every git command here runs in the origin repo, which is the
 # user's own.
 fetched=0
-if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch"); then
+# Named only when a create-only publish below loses its collision -- the
+# approved or candidate holding ref that still names the history this run
+# actually produced, for the cleanup block and the summary further down to
+# point at instead of either deleting it or claiming "the work is in the
+# clone only" (that clone-only framing is actively wrong for a discard,
+# where the clone may hold the REJECTED rewrite, not this run's approved
+# work).
+tidy_kept_ref=""
+tidy_kept_sha=""
+if [[ "$tidy_restore" == 1 ]]; then
+    # The tidy leg was discarded: the clone was reset best-effort above, but
+    # the origin branch comes from the approved-head holding ref, never from
+    # the clone -- if the sandboxed reset above failed, an unchanged fetch
+    # here would otherwise bring the REJECTED history home instead. The
+    # object is already in $origin_repo (fetched into that ref before the
+    # tidy leg ran), so fs_tidy_publish is a ref update, not a fetch, and
+    # create-only: the same refusal the plain fetch below gives a branch
+    # that sprang up in the origin while the run was in flight
+    # (fs_check_branch_free only proved it free at launch) -- except a
+    # branch already sitting at exactly this sha (fork-sandbox-stop.sh
+    # published it first) counts as success, not a collision.
+    if fs_tidy_publish "$origin_repo" "$branch" "$tidy_approved_sha"; then
+        fetched=1
+    else
+        tidy_kept_ref="refs/fork-sandbox/tidy/$run_id/approved"
+        tidy_kept_sha="$tidy_approved_sha"
+    fi
+elif [[ "$tidy_ended" == "accepted" ]]; then
+    # Publish exactly what fs_tidy_verify checked, not a fresh read of the
+    # clone's branch: re-fetching here would re-open the gap between
+    # verification and publication that the holding ref exists to close.
+    # Create-only for the same reason as the tidy_restore case above.
+    tidy_candidate_sha="$(cd "$origin_repo" && git rev-parse --verify -q \
+        "refs/fork-sandbox/tidy/$run_id/candidate" 2>/dev/null)"
+    if [[ -n "$tidy_candidate_sha" ]] \
+        && fs_tidy_publish "$origin_repo" "$branch" "$tidy_candidate_sha"; then
+        fetched=1
+    else
+        tidy_kept_ref="refs/fork-sandbox/tidy/$run_id/candidate"
+        tidy_kept_sha="$tidy_candidate_sha"
+    fi
+elif [[ "$tidy_ended" == "unchanged" ]]; then
+    # Nothing changed, so the already-fetched approved head is what gets
+    # published -- again, no new read of the clone's branch. Create-only
+    # for the same reason as the tidy_restore case above.
+    if fs_tidy_publish "$origin_repo" "$branch" "$tidy_approved_sha"; then
+        fetched=1
+    else
+        tidy_kept_ref="refs/fork-sandbox/tidy/$run_id/approved"
+        tidy_kept_sha="$tidy_approved_sha"
+    fi
+elif (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch"); then
     fetched=1
 fi
 
@@ -11332,6 +11928,21 @@ fi
 upstream_line=""
 if (( fetched )); then
     upstream_line="$(fs_apply_upstream "$origin_repo" "$branch" "$upstream" "$upstream_reason")"
+fi
+
+# The two holding refs the tidy block above may have used to snapshot the
+# approved and candidate heads host-side are cleaned up now -- but ONLY
+# once the branch they protect actually reached the origin (fetched=1):
+# $tidy_kept_ref above means the publish lost a collision, and deleting
+# its ref here would leave the approved history this run actually
+# produced unreachable from anything, with no way back short of the
+# object falling out of the ODB on a future gc. A repeat run (a
+# --clone-dir reuse, say) finding a stale ref from an earlier SUCCESSFUL
+# publish is the only case this cleanup exists to prevent, and that case
+# always has fetched=1.
+if (( fetched )); then
+    (cd "$origin_repo" && git update-ref -d "refs/fork-sandbox/tidy/$run_id/approved") 2>/dev/null || true
+    (cd "$origin_repo" && git update-ref -d "refs/fork-sandbox/tidy/$run_id/candidate") 2>/dev/null || true
 fi
 
 # Now that the origin repo holds the objects, each loop iteration's
@@ -11680,6 +12291,14 @@ loop_findings() {
             fi
         fi
     fi
+    # The tidy leg's own line, printed only when the pipeline has a
+    # maintain step at all (not just when one ran last and approved): a
+    # pipeline with none reads exactly as it did before this feature
+    # existed, matching maintainer:/review: above, each printed only when
+    # that tier exists in this run.
+    if (( tidy_has_maintain_step )); then
+        printf 'tidy:      %s%s\n' "$tidy_ended" "${tidy_detail:+ ($tidy_detail)}"
+    fi
     # A multi-step read-only run lists every leg and how it ended.
     if [[ "${ro_multi:-0}" == 1 ]]; then
         jq -r '.[] | "step \(.step):   \(.action) (\(.harness)\(if .model then "/" + .model else "" end)): \(.ended // "not run")\(if .findings then ", findings " + .findings else "" end)"' \
@@ -11707,14 +12326,29 @@ loop_findings() {
     # neither ever doing anything -- reads exactly as it did before either
     # feature existed.
     if [[ -n "$total_cost_fmt" && "$total_cost_fmt" != "$run_cost_fmt" ]]; then
-        printf 'total:     $%s  (the session and every review-, maintainer- or continuation leg)\n' \
+        printf 'total:     $%s  (the session and every review-, maintainer-, tidy- or continuation leg)\n' \
             "$total_cost_fmt"
     fi
     if [[ -d "$run_dir/pi-session" ]]; then
         printf 'session:   %s\n' "$run_dir/pi-session"
     fi
     if (( ! fetched )); then
-        printf 'fetched:   NO -- the work is in the clone only\n'
+        if [[ -n "$tidy_kept_ref" ]]; then
+            # The clone is NOT a safe fallback here -- for a discard
+            # it may hold the rejected rewrite, not this run's approved
+            # work -- so this names the holding ref fetch-back kept instead
+            # of claiming the usual "the work is in the clone only".
+            printf 'fetched:   NO -- branch %s already exists in %s with a\n' \
+                "$branch" "$origin_repo"
+            printf '           different history. This run'"'"'s own history is safe at\n'
+            printf '           %s (%s); recover it by hand once the\n' \
+                "$tidy_kept_ref" "$tidy_kept_sha"
+            printf '           collision is resolved:\n'
+            printf '             (cd %q && git update-ref refs/heads/%s %s "")\n' \
+                "$origin_repo" "$branch" "$tidy_kept_sha"
+        else
+            printf 'fetched:   NO -- the work is in the clone only\n'
+        fi
     elif (( removed )); then
         printf 'fetched:   nothing. The session made no commits, so branch %s\n' "$branch"
         printf '           was removed again and %s is unchanged.\n' "$origin_repo"
@@ -11849,6 +12483,15 @@ if [[ -n "$session_state" ]]; then
 fi
 ended_at="$(date +%s)"
 
+# Present whenever the pipeline has a maintain step anywhere (tidy.json
+# itself is only written then, by the tidy block above -- see its own
+# comment); absent, not null, on a run with no maintain step at all, the
+# same convention session_state/claude_credentials_via below use, so a
+# pipeline that never had this leg to begin with leaves no "tidy" key for
+# a reader to puzzle over.
+tidy_summary_json="$(cat "$run_dir/tidy.json" 2>/dev/null)"
+[[ -n "$tidy_summary_json" ]] || tidy_summary_json=null
+
 jq -n \
     --argjson version 1 \
     --arg mode "$mode" \
@@ -11894,6 +12537,8 @@ jq -n \
     --argjson implement_retries "${impl_leg_retries_json:-[]}" \
     --argjson uncommitted_files "$uncommitted_files_json" \
     --argjson uncommitted_files_list "$uncommitted_files_list_json" \
+    --argjson tidy "$tidy_summary_json" \
+    --argjson tidy_has_maintain_step "$( (( tidy_has_maintain_step )) && echo true || echo false )" \
     '{
         version: $version,
         mode: $mode,
@@ -11955,7 +12600,11 @@ jq -n \
     # run ended other than on its own.
     + (if $end_reason == "" then {} else {end_reason: $end_reason} end)
     # Present only on a multi-step read-only run, one record per leg.
-    + (if ($ro_steps | length) == 0 then {} else {steps: $ro_steps} end)' \
+    + (if ($ro_steps | length) == 0 then {} else {steps: $ro_steps} end)
+    # Absent, not null, on a pipeline with no maintain step anywhere -- the
+    # tidy leg never exists to have an outcome there, so there is nothing
+    # for this key to report (see the tidy block comment above).
+    + (if $tidy_has_maintain_step then {tidy: $tidy} else {} end)' \
     > "$run_dir/summary.json" 2>/dev/null \
     || rm -f "$run_dir/summary.json"
 

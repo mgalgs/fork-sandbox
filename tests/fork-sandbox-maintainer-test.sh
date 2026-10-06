@@ -623,7 +623,7 @@ rd2="$(printf '%s\n' "$out2" | sed -n 's/^  run dir:  *//p' | head -1)"
 if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
     tmpdirs+=("$rd2")
     ok "the four-leg maintainer run exits 0"
-    check "four legs ran: implement, maintainer, fix, maintainer" "4" \
+    check "five legs ran: implement, maintainer, fix, maintainer, tidy" "5" \
         "$(cat "$count2")"
     check "the loop ended approved" "approved" \
         "$(jq -r '.ended' "$rd2/maintainer-loop.json")"
@@ -703,7 +703,7 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
     # explains it names that tier, and the summary's value column stays
     # aligned even though 'maintainer:' is the longest label.
     contains "the summary's total names the tiers it includes" \
-        "(the session and every review-, maintainer- or continuation leg)" \
+        "(the session and every review-, maintainer-, tidy- or continuation leg)" \
         "$(cat "$rd2/summary.txt")"
     # Every label line of the summary header block puts its value at
     # column 12 -- including 'maintainer:', the longest label, which is
@@ -802,7 +802,7 @@ rd3="$(printf '%s\n' "$out3" | sed -n 's/^  run dir:  *//p' | head -1)"
 if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     tmpdirs+=("$rd3")
     ok "the seven-leg combined run exits 0"
-    check "seven legs ran: impl, review, fix, review, maintainer, mntfix, maintainer" "7" \
+    check "eight legs ran: impl, review, fix, review, maintainer, mntfix, maintainer, tidy" "8" \
         "$(cat "$count3")"
     contains "a review-looped prompt claims the inner review" \
         "an inner review loop has already read that diff line by line" \
@@ -861,7 +861,7 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     # family a migration is most likely to rename or drop, and a pin that
     # never exercises it would not catch that.
     check "the combined review+maintainer legacy run keeps its historical filename set" \
-        $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-maintainer-2.jsonl\nevents-mntfix-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\ngit-status.log\ngit-status.txt\nhandoff-original.md\nhandoff.md\nmaintainer-fix-prompt-1.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt-2.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\nmaintainer-verdict-2.md\npid\nprogress.json\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
+        $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-maintainer-2.jsonl\nevents-mntfix-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents-tidy-1.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\ngit-status.log\ngit-status.txt\nhandoff-original.md\nhandoff.md\nmaintainer-fix-prompt-1.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt-2.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\nmaintainer-verdict-2.md\npid\nprogress.json\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt\ntidy-prompt-1.md\ntidy-prompt.md\ntidy.json' \
         "$(find "$rd3" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
     # run.sh's run_step_* serialization used to fire only for composed
     # runs (preset_is_legacy_shaped != true); a legacy run's generated
@@ -1108,7 +1108,7 @@ rcA_mntnz=$?
 rdA_mntnz="$(printf '%s\n' "$outA_mntnz" | sed -n 's/^  run dir:  *//p' | head -1)"
 if [[ -n "$rdA_mntnz" ]]; then
     tmpdirs+=("$rdA_mntnz")
-    check "a failed coding leg that committed work still runs both legs" "2" \
+    check "a failed coding leg that committed work still runs both legs, plus tidy" "3" \
         "$(cat "$count_mntnzA")"
     check "the maintainer leg approves the branch despite the failed coding leg" \
         "approved" "$(jq -r '.ended' "$rdA_mntnz/maintainer-loop.json")"
@@ -1245,7 +1245,7 @@ ledger_count="$(mktemp)"; tmpdirs+=("$ledger_count")
 # A fix leg that records its own run.
 if rd_l1="$(run_ledger 1)"; then
     tmpdirs+=("$rd_l1")
-    check "the four-leg ledger run ran every leg" "4" "$(cat "$ledger_count")"
+    check "the four-leg ledger run ran every leg, plus tidy" "5" "$(cat "$ledger_count")"
     check "the ledger run ended approved" "approved" \
         "$(jq -r '.ended' "$rd_l1/maintainer-loop.json")"
     ledger_file="$rd_l1/outbox/test-runs.jsonl"
@@ -1288,7 +1288,7 @@ fi
 ledger_count="$(mktemp)"; tmpdirs+=("$ledger_count")
 if rd_l0="$(run_ledger 0)"; then
     tmpdirs+=("$rd_l0")
-    check "the no-fix-record run ran every leg" "4" "$(cat "$ledger_count")"
+    check "the no-fix-record run ran every leg, plus tidy" "5" "$(cat "$ledger_count")"
     mnt_p="$(cat "$rd_l0/maintainer-prompt-1.md")"
     contains "a HEAD with no record is told nothing was recorded for it" \
         "## No test run is recorded for this commit" "$mnt_p"

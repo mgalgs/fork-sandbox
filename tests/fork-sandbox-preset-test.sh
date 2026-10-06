@@ -2638,6 +2638,8 @@ if rd_a="$(run_stubbed --preset rep3 \
         "$(jq -r '.steps[0].fix' "$rd_a/pipeline.json")"
     check "pipeline.json's step 0 harness is claude" "claude" \
         "$(jq -r '.steps[0].harness' "$rd_a/pipeline.json")"
+    # fs-18b: no tidy.json -- this pipeline (code, repeat 3) has no
+    # maintain step at all, so the tidy leg leaves no trace whatsoever.
     check "legacy preset run keeps its historical filename set" \
         $'continuation-prompt-header.md\nevents-code-2.jsonl\nevents-code-3.jsonl\nevents.jsonl\nexit-code\ngit-status.log\ngit-status.txt\nhandoff-original.md\nhandoff.md\npid\npipeline.json\npreset.json\npreset.yaml\nprogress.json\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
         "$(find "$rd_a" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
@@ -3182,7 +3184,7 @@ EOF
 prep_stub $'commit\nfindings\ncommit\napproved\napproved'
 if rd_composed="$(run_stubbed --preset composed --branch "sandbox-test-composed-$$-$RANDOM")"; then
     tmpdirs+=("$rd_composed")
-    check "composed walk runs every step and its finding fix" "5" "$(cat "$count")"
+    check "composed walk runs every step and its finding fix, plus tidy" "6" "$(cat "$count")"
     contains "the first code leg runs its own seat's model, not the default seat's" \
         "$(sed -n 1p "$argv_log")" "--model sonnet"
     if [[ -s "$rd_composed/step-2-loop.json" && -s "$rd_composed/step-3-loop.json" \
@@ -3210,7 +3212,7 @@ fi
 prep_stub $'commit-record\nfindings\ncommit-record\napproved\napproved'
 if rd_led="$(run_stubbed --preset composed --branch "sandbox-test-composed-ledger-$$-$RANDOM")"; then
     tmpdirs+=("$rd_led")
-    check "the ledger composed walk runs every leg" "5" "$(cat "$count")"
+    check "the ledger composed walk runs every leg, plus tidy" "6" "$(cat "$count")"
     led_p2="$(cat "$rd_led/step-2-prompt-1.md")"
     contains "the first review step is shown the code leg's record" \
         "$led_p2" "- \`stub-suite-call-1\` -- pass, 11 ok / 0 fail"
@@ -3282,7 +3284,7 @@ EOF
 prep_stub $'plan\ncommit\nfindings\ncommit\napproved'
 if rd_plan="$(run_stubbed --preset plan-code-review --branch "sandbox-test-plan-$$-$RANDOM")"; then
     tmpdirs+=("$rd_plan")
-    check "plan: runs first and once, then code, review, fix, then maintain" "5" "$(cat "$count")"
+    check "plan: runs first and once, then code, review, fix, then maintain, then tidy" "6" "$(cat "$count")"
     check "plan: pipeline.json names the first step's action plan" \
         "plan" "$(jq -r '.steps[0].action' "$rd_plan/pipeline.json")"
     check "plan: progress.json's first step is done" \
@@ -3292,7 +3294,7 @@ if rd_plan="$(run_stubbed --preset plan-code-review --branch "sandbox-test-plan-
     check "plan: step-1-loop.json records the plan leg's own cost" \
         "0.01" "$(jq -r '.cost_usd' "$rd_plan/step-1-loop.json")"
     check "plan: summary.json's total_cost_usd counts the plan leg too" \
-        "0.050000" "$(jq -r '.total_cost_usd' "$rd_plan/summary.json")"
+        "0.060000" "$(jq -r '.total_cost_usd' "$rd_plan/summary.json")"
     contains "plan: its file survives in the run dir" \
         "$(cat "$rd_plan/plan.md")" "Stub plan body"
     contains "plan: its own prompt tells it to write plan.md" \
@@ -3422,7 +3424,7 @@ if rd_notblocked="$(run_stubbed --preset plan-code-review \
     tmpdirs+=("$rd_notblocked")
     check "plan starting with BLOCKEDNESS: the plan step is done" \
         "done" "$(jq -r '.steps[0].ended' "$rd_notblocked/progress.json")"
-    check "plan starting with BLOCKEDNESS: the code leg ran" "4" "$(cat "$count")"
+    check "plan starting with BLOCKEDNESS: the code leg ran, plus tidy" "5" "$(cat "$count")"
 else
     no "plan starting with BLOCKEDNESS: launch succeeds"
 fi

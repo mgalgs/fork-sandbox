@@ -403,7 +403,7 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|pipeline.json) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|tidy.json|pipeline.json) ;;
         step-[0-9]*-loop.json)
             [[ "$name" =~ ^step-[0-9]+-loop\.json$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         # One file per leg, named by the runner. The leg kinds are
@@ -418,11 +418,11 @@ resolve_run_file() {
         # name instead of getting the flat events-continuation-N.jsonl the
         # step-1 chain still uses -- see fs_refresh_chain's own naming
         # comment in fork-sandbox.sh.
-        events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl|events-code-[0-9]*.jsonl|events-continuation-[0-9]*.jsonl)
-            [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
+        events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl|events-code-[0-9]*.jsonl|events-continuation-[0-9]*.jsonl|events-tidy-[0-9]*.jsonl)
+            [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation|tidy)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
         events-s[0-9]*-*.jsonl)
-            [[ "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
+            [[ "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan|tidy)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
         review-verdict-[0-9]*.md)
             [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
@@ -703,7 +703,7 @@ all_event_files() {
     local path name
     resolve_run_file events.jsonl 2>/dev/null && EVENT_FILES+=("$RUN_FILE_PATH")
     local -a candidates=() step_files=()
-    candidates=("$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl)
+    candidates=("$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation,tidy}-*.jsonl)
     # Step files go in numeric step order (s2 before s10), which a plain glob
     # does not give and latest_event_file's tie rule relies on.
     step_files=("$run_dir"/events-s[0-9]*-*.jsonl)
@@ -714,8 +714,8 @@ all_event_files() {
     for path in "${candidates[@]}"; do
         [[ -e "$path" ]] || continue
         name="${path##*/}"
-        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ \
-            || "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
+        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation|tidy)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ \
+            || "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan|tidy)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] \
             || die "'$name' is not a valid event file name"
         resolve_run_file "$name" || die "'$name' is not a readable event file"
         EVENT_FILES+=("$RUN_FILE_PATH")
@@ -790,7 +790,7 @@ tmux_target="$(run_env_get session)"
 # Resolve every file this script may open, once, here at the top level, so a
 # tampered run directory is rejected before anything is printed. A file the
 # run has not written yet is fine and is checked again when it appears.
-for _name in events.jsonl sandbox.log exit-code summary.txt summary.json pid; do
+for _name in events.jsonl sandbox.log exit-code summary.txt summary.json pid tidy.json; do
     resolve_run_file "$_name" || true
 done
 # The same check for the leg event files, globbed instead of named: the
@@ -798,7 +798,7 @@ done
 # above, or events-s<K>-<kind>-<N>(-p<P>).jsonl for a composed step, so a
 # name in either shape that fails its pattern is not a run file, and any
 # symlink is refused before anything is printed.
-for _leg_events in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl \
+for _leg_events in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation,tidy}-*.jsonl \
         "$run_dir"/events-s[0-9]*-*.jsonl; do
     [[ -e "$_leg_events" ]] || continue
     resolve_run_file "${_leg_events##*/}" || die "'$_leg_events' is not a readable event file"
