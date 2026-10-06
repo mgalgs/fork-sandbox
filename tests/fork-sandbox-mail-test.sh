@@ -1260,6 +1260,15 @@ hx_try "ingest refuses a non-numeric X-Hops" alpha 's/^X-Hops: .*/X-Hops: lots/'
 hx_try "ingest refuses a malformed header line" alpha 's/^X-Hops: .*/&\nno colon here/'
 hx_try "ingest refuses a CR in a header" alpha 's/^Subject: .*/&\r/'
 hx_try "ingest refuses an empty body" alpha '/^ship it$/d'
+hx_try "ingest --peer refuses a To naming another host only" alpha 's/^To: .*/To: @x:gamma/'
+hx_try "ingest --peer refuses a To naming the sender's own host only" alpha 's/^To: .*/To: @x:alpha/'
+hx_try "ingest --peer refuses a To that is a different name for this host" alpha 's/^To: .*/To: @x:host-b/'
+hx_err="$(printf '%s\n' "$hx_portable" | sed 's/^To: .*/To: @x:gamma/;s/^Message-ID: .*/Message-ID: 22222222-2222-4222-8222-222222222222/;s/^Thread-ID: .*/Thread-ID: 22222222-2222-4222-8222-222222222222/' | mb ingest --peer alpha 2>&1)"
+contains "the no-local-recipient refusal names this host's peer name" "$hx_err" "peer name is 'beta'"
+printf '%s\n' "$hx_portable" | sed 's/^To: .*/To: @x:gamma/;s/^Message-ID: .*/Message-ID: 33333333-3333-4333-8333-333333333333/;s/^Thread-ID: .*/Thread-ID: 33333333-3333-4333-8333-333333333333/;s/^To: .*/&\nCc: @y:beta/' | mb ingest --peer alpha >/dev/null 2>&1; rc=$?
+check "ingest --peer accepts a message whose only local recipient is on Cc" "0" "$rc"
+check "ingest without --peer does not need a local recipient" "0" \
+    "$(printf '%s\n' "$hx_portable" | sed 's/^To: .*/To: @x:gamma/;s/^Message-ID: .*/Message-ID: 44444444-4444-4444-8444-444444444444/;s/^Thread-ID: .*/Thread-ID: 44444444-4444-4444-8444-444444444444/' | mb ingest >/dev/null 2>&1; echo $?)"
 check "ingest refuses a bad --peer name" "1" \
     "$(printf '%s\n' "$hx_portable" | mb ingest --peer 'Bad Peer' >/dev/null 2>&1; echo $?)"
 printf 'no headers here\n' | mb ingest --peer alpha >/dev/null 2>&1; rc=$?

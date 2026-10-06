@@ -56,8 +56,12 @@
 # With --peer the message is treated as received from that peer: From must
 # name that host (a bare From is qualified with it; any other host is
 # refused) and bare To/Cc addresses, which are in the sender's frame, are
-# qualified with it too. This is the receiving half of lane-mail-serve; the
-# peer name comes from its forced command, never from the message.
+# qualified with it too. --peer also refuses a message in which no To/Cc
+# address is a lane on this host after normalisation (the one-line error
+# names this host's peer name): the sender's name for this host did not match
+# ours, or the mail was not for us, and no inbox or watcher would ever see
+# it. This is the receiving half of lane-mail-serve; the peer name comes from
+# its forced command, never from the message.
 #
 # `export <thread-id> --json` prints one thread as a JSON object (every
 # header line, the verbatim body, attachment sizes, per-sender counts) for
@@ -1317,6 +1321,14 @@ mail_ingest_message() {
     to="$(mail_validate_addr_list "$to")" || return 1
     [[ -n "$to" ]] || { mail_ingest_fail "To is empty."; return 1; }
     [[ -z "$cc" ]] || { cc="$(mail_validate_addr_list "$cc")" || return 1; }
+    # A delivery from a peer must be for someone here: after normalisation at
+    # least one To/Cc address is a bare lane. Otherwise the sender's name for
+    # this host differs from ours, or the mail was never meant for us, and
+    # storing it would report success for mail no inbox or watcher can see.
+    if [[ -n "$peer" && ! ",$to,$cc," =~ ,\ *@[a-z0-9-]+\ *, ]]; then
+        mail_ingest_fail "no To/Cc address is a lane on this host (this host's peer name is '$(lane_mail_self_name || echo unknown)'); the sender's peers file must name this host exactly that."
+        return 1
+    fi
 
     if mail_find_by_id "$mid" >/dev/null; then
         mail_ingest_fail "message $mid is already in this store."

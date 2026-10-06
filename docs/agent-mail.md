@@ -387,6 +387,12 @@ path; everything else is unchanged.
    ```
 
    A host that is not listed is an error that names the file; nothing is sent.
+   The name you give a peer here must be exactly that host's own peer name
+   (its `LANE_MAIL_PEER_NAME`, or its short hostname if unset). The receiver
+   only accepts a message that has a recipient it recognises as itself, so a
+   differing name is refused as a failed delivery ("no To/Cc address is a lane
+   on this host") and leaves no local copy. Set `LANE_MAIL_PEER_NAME` on the
+   receiving host to match the name its peers use for it.
 2. The message is built once, in portable form (every bare address qualified
    with this host's name, so it means the same on the far side), and delivered
    to each remote host with
@@ -414,7 +420,8 @@ for it:
 command="lane-mail-serve --peer alpha",restrict ssh-ed25519 AAAA... lane-mail@alpha
 ```
 
-`alpha` is the sender's own peer name. Use the script's absolute path
+`alpha` is the sender's own peer name, and the entry for this host in
+`alpha`'s peers file must be this host's own peer name (see above). Use the script's absolute path
 (`~/.claude/scripts/lane-mail-serve` after `install.sh`) if it is not on the
 `PATH` a non-interactive ssh login gets. `install.sh` puts the script on `PATH`
 but never edits `authorized_keys` or any ssh config; that line is the

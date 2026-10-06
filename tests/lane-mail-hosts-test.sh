@@ -218,6 +218,18 @@ check "with no valid peer name a cross-host send fails" "1 $before_b" "$rc $(msg
 contains "it names the key to configure" "$err" "LANE_MAIL_PEER_NAME"
 mv "$scratch/alpha/cfg/lane-mail.env.save" "$scratch/alpha/cfg/lane-mail.env"
 
+# The sender's peers file calls the receiver "beta" but the receiver knows
+# itself as host-b: the mail could never reach an inbox, so it is a failed
+# delivery, not a silent success.
+cp "$scratch/beta/cfg/lane-mail.env" "$scratch/beta/cfg/lane-mail.env.save"
+printf 'LANE_MAIL_PEER_NAME=host-b\nLANE_MAIL_SSH=%s\n' "$scratch/ssh-stub" > "$scratch/beta/cfg/lane-mail.env"
+before_a="$(msgs alpha)"; before_b="$(msgs beta)"
+err="$(printf 'lost\n' | ha send --from @fe --to @x:beta --subject mismatch --body - 2>&1)"; rc=$?
+check "a peers-file name that is not the receiver's own name fails the send" "1" "$rc"
+contains "the refusal names the receiver's peer name" "$err" "peer name is 'host-b'"
+check "and nothing is stored on either side" "$before_a $before_b" "$(msgs alpha) $(msgs beta)"
+mv "$scratch/beta/cfg/lane-mail.env.save" "$scratch/beta/cfg/lane-mail.env"
+
 echo "== lane-mail-serve, through its forced-command interface =="
 serve() {
     # serve <ssh-original-command|-> <stdin file> [serve args...], as host beta.
