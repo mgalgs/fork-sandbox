@@ -137,6 +137,16 @@
 # (exit 1). Exit codes are run's own: the agent's, or the wait's nonzero
 # rc (2 for a dead pod, after writing the run-log row; 1 for a timeout).
 #
+# resume is also the adopt path, so it refuses a run whose submit never
+# finished pushing the run's inputs into the pod (the pod gives up on its
+# own, so there is nothing to adopt). submit writes INPUTS_PUSH_EXPECTED=true
+# at run.env's first write and INPUTS_PUSH_COMPLETE=true the moment the pod
+# is told its inputs are complete; a run.env with the first and not the
+# second is refused with exit 2 (the code a missing pod gets), after
+# deleting the run's cluster objects by branch label as submit's failure
+# trap does. A run.env with neither key (an older submit) is adopted as
+# before.
+#
 # fetch runs `git fetch` against the pod's clone, the same channel in
 # reverse, landing the branch in your real repo. It also signals the pod
 # that the run has been collected, so it does not idle out its full TTL.
@@ -6438,6 +6448,13 @@ EOF
         printf 'KEEP=%s\n' "$keep"
         printf 'TIMEOUT=%s\n' "$run_timeout"
         printf 'SUBMITTED_AT=%s\n' "$(date +%s)"
+        # Written at the FIRST write: a run.env carrying this key promises
+        # INPUTS_PUSH_COMPLETE=true follows once the pod has its inputs, and
+        # `resume` (which a restarted postmaster's adopt path runs) refuses
+        # a run that has the first without the second -- a submitter that
+        # died mid-push. A run.env with neither key predates the marker and
+        # is adopted as before.
+        printf 'INPUTS_PUSH_EXPECTED=true\n'
         # Read back by cmd_collect, before cmd_fetch, and handed to
         # cmd_fetch's own --upstream/--upstream-none: resolved once above,
         # at submit time, so a later collect or re-collect applies the same
@@ -6841,6 +6858,9 @@ EOF
     fi
 
     kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
+    # The pod has been told its inputs are complete: see
+    # INPUTS_PUSH_EXPECTED above and cmd_resume's check of the pair.
+    printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$run_dir/run.env"
 
     # Everything this run needs now exists and is up -- nothing left for
     # the cleanup trap above to protect, for either harness.
@@ -8411,6 +8431,20 @@ cmd_resume() {
     if [[ -z "$branch" || -z "$project" ]]; then
         echo "Error: resume: $env_file lacks BRANCH or PROJECT; cannot resume." >&2
         exit 1
+    fi
+    # A run whose submitter died before the pod got its inputs: the pod's
+    # entrypoint gives up on its own, so there is nothing to adopt. Only a
+    # run.env that says the marker is expected is held to it -- one with
+    # neither key (an older submit, possibly still live) is adopted as ever.
+    if [[ "$(read_env_value "$env_file" INPUTS_PUSH_EXPECTED || true)" == true \
+        && "$(read_env_value "$env_file" INPUTS_PUSH_COMPLETE || true)" != true ]]; then
+        echo "Error: resume: the submit for branch $branch never completed its push" >&2
+        echo "(INPUTS_PUSH_COMPLETE is missing from $env_file); the pod never got its" >&2
+        echo "inputs. Removing the run's cluster objects; submit it again." >&2
+        kubectl delete job,pod,service,secret,configmap,networkpolicy \
+            -l fork-sandbox/branch="$(k8s_safe_name fork-sandbox-agent "$branch")" \
+            --ignore-not-found >&2
+        exit 2
     fi
     outbox_dir="$(read_env_value "$env_file" OUTBOX_DIR || true)"
     outbox_max_bytes="$(read_env_value "$env_file" OUTBOX_MAX_BYTES || true)"

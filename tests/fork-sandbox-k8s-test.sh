@@ -7234,6 +7234,63 @@ else
     no "resume refuses a run dir without run.env" "rc=$rc out=$(cat "$resume_empty_dir/out")"
 fi
 
+# The push-complete marker. submit writes INPUTS_PUSH_EXPECTED at run.env's
+# first write and INPUTS_PUSH_COMPLETE once the pod has been told its inputs
+# are complete; resume (the adopt path) refuses a run with the first and not
+# the second -- deleting its cluster objects by branch label, exit 2, the
+# same code a missing pod gets -- and adopts a run with neither key (an older
+# submit) exactly as before.
+resume_rd_m="$(resume_submit fs-k8s-test-resume-marker)"
+if grep -qx 'INPUTS_PUSH_EXPECTED=true' "$resume_rd_m/run.env" \
+    && grep -qx 'INPUTS_PUSH_COMPLETE=true' "$resume_rd_m/run.env" \
+    && [[ "$(grep -n '^INPUTS_PUSH_' "$resume_rd_m/run.env" | head -1 | cut -d: -f2)" == INPUTS_PUSH_EXPECTED=true ]]; then
+    ok "a finished submit's run.env carries the expected key and then the complete key"
+else
+    no "a finished submit's run.env carries the expected key and then the complete key" "$(cat "$resume_rd_m/run.env")"
+fi
+resume_log_m="$(newdir)/kubectl.log"; resume_out_m="$(dirname "$resume_log_m")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_m")")
+rc=0
+RESUME_EXTRA_PATH="$resume_nosleep" \
+    runstub_verb "$resume_log_m" "$resume_out_m" resume --run-dir "$resume_rd_m" || rc=$?
+if (( rc == 0 )) && grep -q 'run complete. branch=fs-k8s-test-resume-marker' "$resume_out_m" \
+    && ! grep -q ' delete job,pod' "$resume_log_m"; then
+    ok "resume adopts a run whose run.env has the expected and the complete key"
+else
+    no "resume adopts a run whose run.env has the expected and the complete key" "rc=$rc out=$(cat "$resume_out_m")"
+fi
+
+resume_rd_h="$(resume_submit fs-k8s-test-resume-halfpush)"
+sed -i '/^INPUTS_PUSH_COMPLETE=/d' "$resume_rd_h/run.env"
+resume_log_h="$(newdir)/kubectl.log"; resume_out_h="$(dirname "$resume_log_h")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_h")")
+rc=0
+RESUME_EXTRA_PATH="$resume_nosleep" \
+    runstub_verb "$resume_log_h" "$resume_out_h" resume --run-dir "$resume_rd_h" || rc=$?
+if (( rc == 2 )) && grep -q 'never completed its push' "$resume_out_h" \
+    && grep -qF 'delete job,pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=fork-sandbox-agent-fs-k8s-test-resume-halfpush --ignore-not-found' "$resume_log_h" \
+    && ! grep -q ' wait \| exec ' "$resume_log_h" \
+    && ! grep -q 'run complete' "$resume_out_h"; then
+    ok "resume refuses a run with the expected key and no complete key: objects deleted, exit 2"
+else
+    no "resume refuses a run with the expected key and no complete key: objects deleted, exit 2" \
+        "rc=$rc out=$(cat "$resume_out_h") log=$(cat "$resume_log_h")"
+fi
+
+resume_rd_l="$(resume_submit fs-k8s-test-resume-legacy)"
+sed -i '/^INPUTS_PUSH_/d' "$resume_rd_l/run.env"
+resume_log_l="$(newdir)/kubectl.log"; resume_out_l="$(dirname "$resume_log_l")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_l")")
+rc=0
+RESUME_EXTRA_PATH="$resume_nosleep" \
+    runstub_verb "$resume_log_l" "$resume_out_l" resume --run-dir "$resume_rd_l" || rc=$?
+if (( rc == 0 )) && grep -q 'run complete. branch=fs-k8s-test-resume-legacy' "$resume_out_l" \
+    && ! grep -q ' delete job,pod' "$resume_log_l"; then
+    ok "resume adopts a legacy run.env (neither key) exactly as before"
+else
+    no "resume adopts a legacy run.env (neither key) exactly as before" "rc=$rc out=$(cat "$resume_out_l")"
+fi
+
 # resume's default --timeout (no --timeout given) is the recorded TIMEOUT
 # minus time elapsed since SUBMITTED_AT -- cmd_wait's own startup line
 # (printed to stderr only when --probe is not given, which resume's
