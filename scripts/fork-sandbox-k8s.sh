@@ -643,6 +643,15 @@
 #                         its per-run claude-proxy), so raise K8S_QUOTA_PODS
 #                         for concurrent claude runs. A malformed value is
 #                         refused by install before anything is applied.
+#   K8S_QUOTA_WAIT_SECONDS=
+#                         how long submit waits, in total, for room in
+#                         that quota when a create is refused ("exceeded
+#                         quota": the claude-proxy Pod, or the Job's agent
+#                         pod). Optional; defaults to 900; a positive
+#                         integer (refused otherwise, naming the key). A
+#                         budget of its own: time spent quota-blocked does
+#                         not count against the pod-ready budget. Other
+#                         create errors stay fatal.
 #   GIT_USER_NAME=, GIT_USER_EMAIL=
 #                         identity the pod's commits land under. Optional;
 #                         default to a fixed fork-sandbox identity.
@@ -940,6 +949,12 @@ K8S_SERVICE_MAX_MEMORY="${K8S_SERVICE_MAX_MEMORY:-1Gi}"
 # normal wait.
 K8S_SERVICE_MAX_STARTUP_SECONDS="$(read_env_value "$k8s_env" K8S_SERVICE_MAX_STARTUP_SECONDS || true)"
 K8S_SERVICE_MAX_STARTUP_SECONDS="${K8S_SERVICE_MAX_STARTUP_SECONDS:-600}"
+# How long submit waits, in total, for room in the namespace ResourceQuota
+# (the per-run proxy Pod's create or the Job's pod create refused with
+# "exceeded quota") before giving up. Its own budget, apart from submit's
+# pod-ready budget -- see k8s_quota_wait_step.
+K8S_QUOTA_WAIT_SECONDS="$(read_env_value "$k8s_env" K8S_QUOTA_WAIT_SECONDS || true)"
+K8S_QUOTA_WAIT_SECONDS="${K8S_QUOTA_WAIT_SECONDS:-900}"
 # The namespace ResourceQuota's five limits, substituted into
 # manifests/k8s/00-namespace.yaml by cmd_install, which also validates them
 # (only install renders the quota, so no other verb fails over a bad one).
@@ -1053,6 +1068,11 @@ fi
 if [[ "${1-}" != check-grant && ! "$K8S_SERVICE_MAX_STARTUP_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: K8S_SERVICE_MAX_STARTUP_SECONDS must be a positive integer, got" >&2
     echo "'$K8S_SERVICE_MAX_STARTUP_SECONDS'." >&2
+    exit 1
+fi
+if [[ "${1-}" != check-grant && ! "$K8S_QUOTA_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: K8S_QUOTA_WAIT_SECONDS must be a positive integer, got" >&2
+    echo "'$K8S_QUOTA_WAIT_SECONDS'." >&2
     exit 1
 fi
 
@@ -4637,6 +4657,116 @@ k8s_report_unready_pod() {
     done
 }
 
+# -- The namespace quota wait ---------------------------------------------
+#
+# The namespace ResourceQuota (00-namespace.yaml) can be full when submit
+# runs. Two refusals both mean "no room yet", not "this run is broken", and
+# submit waits on both instead of failing: the per-run claude-proxy Pod's
+# create ("forbidden: exceeded quota"), and the Job controller failing to
+# create the Job's agent pod (FailedCreate events carrying the same
+# message, while no pod for the Job exists). Every other create error stays
+# fatal. The wait has its own budget, K8S_QUOTA_WAIT_SECONDS, cumulative
+# over the whole submit and apart from the pod-ready budget: expiry is its
+# own failure, naming the quota. Quota is not transactional, so the
+# pre-check before the proxy Pod only narrows the window in which the proxy
+# holds a slot while its agent pod is blocked; it cannot close it.
+K8S_QUOTA_NAME=fork-sandbox-quota
+K8S_QUOTA_POLL_SECONDS=10
+K8S_QW_START=""      # epoch the current quota block began, empty when not blocked
+K8S_QW_TOTAL=0       # seconds spent quota-blocked in earlier blocks
+K8S_QW_LAST_MSG=""   # epoch of the last progress line
+
+# Prints "<used> <hard>" for the quota's pods, or nothing when the quota
+# cannot be read (no such quota, no RBAC to read it): callers treat that as
+# "no known limit", never as full.
+k8s_quota_pods_state() {
+    local out used hard
+    out="$(kubectl get resourcequota "$K8S_QUOTA_NAME" \
+        -o jsonpath='{.status.used.pods} {.status.hard.pods}' 2>/dev/null)" || return 0
+    read -r used hard <<< "$out"
+    [[ "$used" =~ ^[0-9]+$ && "$hard" =~ ^[0-9]+$ ]] || return 0
+    printf '%s %s\n' "$used" "$hard"
+}
+
+# One blocked iteration: fails submit once the budget is spent, prints a
+# progress line to stderr at most once a minute, then sleeps. $1 is the
+# progress text used when the quota's own numbers cannot be read.
+k8s_quota_wait_step() {
+    local fallback="$1" now state used hard
+    now="$(date +%s)"
+    [[ -n "$K8S_QW_START" ]] || K8S_QW_START="$now"
+    if (( K8S_QW_TOTAL + now - K8S_QW_START >= K8S_QUOTA_WAIT_SECONDS )); then
+        echo "Error: the namespace quota ($K8S_QUOTA_NAME) was full for ${K8S_QUOTA_WAIT_SECONDS}s;" >&2
+        echo "gave up waiting for room. Free a slot (remove finished runs), or raise" >&2
+        echo "the quota or K8S_QUOTA_WAIT_SECONDS." >&2
+        exit 1
+    fi
+    if [[ -z "$K8S_QW_LAST_MSG" ]] || (( now - K8S_QW_LAST_MSG >= 60 )); then
+        state="$(k8s_quota_pods_state)"
+        if [[ -n "$state" ]]; then
+            read -r used hard <<< "$state"
+            echo "fork-sandbox-k8s: waiting for namespace quota: pods $used/$hard" >&2
+        else
+            echo "fork-sandbox-k8s: waiting for namespace quota: $fallback" >&2
+        fi
+        K8S_QW_LAST_MSG="$now"
+    fi
+    sleep "$K8S_QUOTA_POLL_SECONDS"
+}
+
+# The block (if any) is over: bank its duration against the budget.
+k8s_quota_wait_end() {
+    [[ -n "$K8S_QW_START" ]] || return 0
+    K8S_QW_TOTAL=$(( K8S_QW_TOTAL + $(date +%s) - K8S_QW_START ))
+    K8S_QW_START=""
+}
+
+# Waits until the quota has room for $1 more pods (no-op when the quota is
+# unreadable).
+k8s_quota_wait_for_room() {
+    local need="$1" state used hard
+    while :; do
+        state="$(k8s_quota_pods_state)"
+        [[ -n "$state" ]] || break
+        read -r used hard <<< "$state"
+        (( hard - used >= need )) && break
+        k8s_quota_wait_step "pods $used/$hard"
+    done
+    k8s_quota_wait_end
+}
+
+# `kubectl apply` of $1 on stdin-equivalent, retried while the ONLY problem
+# is the quota refusal (apply is idempotent, so a retry after a partial
+# apply is safe). stdout passes through; any other failure returns kubectl's
+# own status after printing its stderr, exactly as a bare apply would.
+k8s_apply_waiting_for_quota() {
+    local manifest="$1" err rc
+    while :; do
+        rc=0
+        { err="$(printf '%s\n' "$manifest" | kubectl apply -f - 2>&1 1>&3)" || rc=$?; } 3>&1
+        [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+        if (( rc == 0 )); then
+            k8s_quota_wait_end
+            return 0
+        fi
+        if [[ "$err" == *"exceeded quota"* ]]; then
+            k8s_quota_wait_step "the run's proxy pod cannot be created"
+            continue
+        fi
+        k8s_quota_wait_end
+        return "$rc"
+    done
+}
+
+# True when Job $1's controller has been refused a pod create for quota.
+k8s_job_quota_blocked() {
+    local msgs
+    msgs="$(kubectl get events \
+        --field-selector "involvedObject.kind=Job,involvedObject.name=$1,reason=FailedCreate" \
+        -o jsonpath='{.items[*].message}' 2>/dev/null || true)"
+    [[ "$msgs" == *"exceeded quota"* ]]
+}
+
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
@@ -6551,7 +6681,10 @@ EOF
         # and if both went into one `kubectl apply` stream that start could
         # race the proxy's own image pull and readiness, failing the gate
         # closed on a cold node well within its default 60s GATE_TIMEOUT.
-        printf '%s\n' "$claude_proxy_rendered" | kubectl apply -f -
+        # Two pods per run (proxy + agent): wait for room for both first,
+        # and a create the quota still refuses is waited on, not fatal.
+        k8s_quota_wait_for_room 2
+        k8s_apply_waiting_for_quota "$claude_proxy_rendered"
         echo "fork-sandbox-k8s: waiting for proxy pod ($safe_name-claude-proxy) to be ready" >&2
         kubectl wait --for=condition=Ready "pod/$safe_name-claude-proxy" --timeout=120s
     fi
@@ -6576,6 +6709,15 @@ EOF
     local pod_budget=$(( 180 + services_ready_max )) pod_start pod_elapsed pod_remaining
     pod_start="$(date +%s)"
     while [[ -z "$(kubectl get pod -l "job-name=$safe_name" -o name 2>/dev/null || true)" ]]; do
+        # A Job controller refused a pod by the namespace quota is a wait on
+        # the quota's own budget; the pod-ready budget restarts each blocked
+        # iteration, so time spent here never eats it.
+        if k8s_job_quota_blocked "$safe_name"; then
+            k8s_quota_wait_step "job $safe_name cannot create its pod"
+            pod_start="$(date +%s)"
+            continue
+        fi
+        k8s_quota_wait_end
         if (( $(date +%s) - pod_start >= pod_budget )); then
             echo "Error: job $safe_name created no pod within ${pod_budget}s. The Job controller" >&2
             echo "may be blocked (quota, admission, or pod security). Inspect it with:" >&2
@@ -6584,6 +6726,7 @@ EOF
         fi
         sleep 2
     done
+    k8s_quota_wait_end
     pod_elapsed=$(( $(date +%s) - pod_start ))
     pod_remaining=$(( pod_budget - pod_elapsed ))
     (( pod_remaining >= 10 )) || pod_remaining=10

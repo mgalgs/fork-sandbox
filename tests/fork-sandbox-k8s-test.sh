@@ -1792,6 +1792,191 @@ else
 fi
 rm -f /tmp/fs-k8s-test-podwait-never.out
 
+# The namespace quota wait. A full ResourceQuota refuses the per-run
+# claude-proxy Pod's create outright, or lets the proxy take the last slot so
+# the Job controller cannot create the agent pod (FailedCreate events). Both
+# are waited on, under K8S_QUOTA_WAIT_SECONDS, outside the pod-ready budget;
+# every other create error stays fatal. The stub keeps a VIRTUAL clock: `date
+# +%s` reads it and `sleep N` advances it, so minutes of waiting cost nothing
+# and the budgets are exercised exactly.
+printf '\n== submit: a full namespace quota is waited on, not fatal ==\n'
+quota_stub_dir="$(newdir)"; tmpdirs+=("$quota_stub_dir")
+quota_real_date="$(type -P date)"
+cat > "$quota_stub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$quota_stub_dir/sleep" <<'STUB'
+#!/usr/bin/env bash
+echo $(( $(cat "$K8S_STUB_CLOCK") + ${1%%.*} )) > "$K8S_STUB_CLOCK"
+STUB
+cat > "$quota_stub_dir/date" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == "+%s" ]]; then cat "\$K8S_STUB_CLOCK"; else exec "$quota_real_date" "\$@"; fi
+STUB
+# Knobs (all virtual-clock times, 0 = never blocked): PROXY_OK_AT (proxy Pod
+# create refused for quota before it), PROXY_ERR (refuse it with a non-quota
+# error instead), EVENT_UNTIL (Job FailedCreate quota event until then),
+# POD_AT (agent pod exists from then), ROOM_AT (quota reports 9/10 before it).
+cat > "$quota_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+clock="$(cat "$K8S_STUB_CLOCK")"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get|delete) verb="$arg" ;; esac; done
+case "$verb" in
+    apply)
+        content="$(cat)"
+        if [[ "$content" == *"kind: Pod"* && "$content" != *"kind: Job"* ]]; then
+            if [[ -n "${K8S_STUB_PROXY_ERR:-}" ]]; then
+                echo 'Error from server: admission webhook "policy.example.invalid" denied the request: no' >&2
+                exit 1
+            fi
+            if (( clock < ${K8S_STUB_PROXY_OK_AT:-0} )); then
+                echo 'Error from server (Forbidden): pods "stub-claude-proxy" is forbidden: exceeded quota: fork-sandbox-quota, requested: pods=1, used: pods=10, limited: pods=10' >&2
+                echo "proxy-apply: refused" >> "$K8S_STUB_LOG"
+                exit 1
+            fi
+            echo "proxy-apply: ok" >> "$K8S_STUB_LOG"
+        fi
+        ;;
+    exec) cat >/dev/null ;;
+    get)
+        case "$*" in
+            *"get resourcequota"*)
+                if (( clock < ${K8S_STUB_ROOM_AT:-0} )); then printf '9 10'; else printf '0 10'; fi ;;
+            *"get events"*)
+                if (( clock < ${K8S_STUB_EVENT_UNTIL:-0} )); then
+                    printf 'Error creating: pods "stub-agent-x" is forbidden: exceeded quota: fork-sandbox-quota, requested: pods=1, used: pods=10, limited: pods=10'
+                fi ;;
+            *"pod -l job-name="*"-o name"*)
+                (( clock >= ${K8S_STUB_POD_AT:-0} )) && printf 'pod/stub-pod\n' ;;
+            *) printf 'stub-pod\n' ;;
+        esac
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$quota_stub_dir/git" "$quota_stub_dir/sleep" "$quota_stub_dir/date" "$quota_stub_dir/kubectl"
+quota_home="$(newdir)"; tmpdirs+=("$quota_home")
+mkdir -p "$quota_home/.claude"
+cat > "$quota_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-quota-token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $(( ($(date +%s) + 7200) * 1000 )), "scopes": ["user:inference"]}}
+JSON
+# $1 = case name, $2 = harness, $3 = config dir; knobs come from the environment.
+# Sets quota_rc, quota_log, quota_out, quota_clock (the clock's final value).
+quota_submit() {
+    local name="$1" harness="$2" cfg="$3" model=claude-sonnet-5
+    [[ "$harness" == pi ]] && model=moonshotai/kimi-k3
+    quota_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$quota_log")")
+    quota_out="$(dirname "$quota_log")/out"
+    printf '1000000' > "$(dirname "$quota_log")/clock"
+    PATH="$quota_stub_dir:$PATH" K8S_STUB_LOG="$quota_log" HOME="$quota_home" \
+        K8S_STUB_CLOCK="$(dirname "$quota_log")/clock" \
+        FORK_SANDBOX_CONFIG_DIR="$cfg" "$k8s_sh" submit \
+        --branch "fs-k8s-test-quota-$name" --model "$model" --harness "$harness" \
+        "$proj_dir" "$handoff_file" > "$quota_out" 2>&1 </dev/null
+    quota_rc=$?
+    quota_clock="$(( $(cat "$(dirname "$quota_log")/clock") - 1000000 ))"
+    local rd; rd="$(sed -n 's/^  run dir:  *//p' "$quota_out" | head -1)"
+    [[ -n "$rd" && -d "$rd" ]] && tmpdirs+=("$rd")
+    return 0
+}
+
+# Pre-check: room for one pod only (9/10) until +30s -- the proxy Pod is not
+# created until there is room for the agent pod as well.
+K8S_STUB_ROOM_AT=1000030 quota_submit precheck claude "$config_dir"
+if (( quota_rc == 0 )) && grep -q 'waiting for namespace quota: pods 9/10' "$quota_out" \
+    && [[ "$(grep -c '^proxy-apply:' "$quota_log")" == 1 ]] \
+    && grep -q '^proxy-apply: ok' "$quota_log" && (( quota_clock >= 30 )); then
+    ok "claude submit waits for room for both of the run's pods before creating the proxy"
+else
+    no "claude submit waits for room for both of the run's pods before creating the proxy" \
+        "rc=$quota_rc clock=$quota_clock out=$(cat "$quota_out") log=$(cat "$quota_log")"
+fi
+
+# The proxy create refused with the quota Forbidden message, then accepted.
+K8S_STUB_PROXY_OK_AT=1000120 quota_submit proxy claude "$config_dir"
+if (( quota_rc == 0 )) && [[ "$(grep -c '^proxy-apply: refused' "$quota_log")" -ge 2 ]] \
+    && grep -q '^proxy-apply: ok' "$quota_log" \
+    && grep -q 'waiting for namespace quota' "$quota_out" \
+    && ! grep -q ' delete ' "$quota_log"; then
+    ok "a proxy Pod create refused for quota is retried until it fits, and submit proceeds"
+else
+    no "a proxy Pod create refused for quota is retried until it fits, and submit proceeds" \
+        "rc=$quota_rc out=$(cat "$quota_out") log=$(cat "$quota_log")"
+fi
+# Progress is rate-limited: 300s of waiting prints one line per minute, not
+# one per 10s poll.
+K8S_STUB_PROXY_OK_AT=1000300 quota_submit progress claude "$config_dir"
+quota_lines="$(grep -c 'waiting for namespace quota' "$quota_out")"
+if (( quota_rc == 0 && quota_lines >= 4 && quota_lines <= 6 )); then
+    ok "the quota wait prints a progress line at most once a minute"
+else
+    no "the quota wait prints a progress line at most once a minute" \
+        "rc=$quota_rc lines=$quota_lines out=$(cat "$quota_out")"
+fi
+
+# The Job's pod create refused for quota (FailedCreate events), then the pod
+# appears. 600s blocked is far past the 180s pod-ready budget: the wait must
+# not spend it, and the Ready wait must still get the full remaining budget.
+K8S_STUB_EVENT_UNTIL=1000600 K8S_STUB_POD_AT=1000600 quota_submit job pi "$config_dir"
+quota_ready_timeout="$(sed -n 's/.* wait --for=condition=Ready pod -l job-name=.* --timeout=\([0-9]*\)s.*/\1/p' "$quota_log" | head -1)"
+if (( quota_rc == 0 )) && (( quota_clock >= 600 )) \
+    && grep -q 'waiting for namespace quota: pods 0/10' "$quota_out" \
+    && [[ "$quota_ready_timeout" =~ ^[0-9]+$ ]] && (( quota_ready_timeout >= 170 )); then
+    ok "a Job whose pod create is quota-refused waits, and the pod-ready budget is untouched"
+else
+    no "a Job whose pod create is quota-refused waits, and the pod-ready budget is untouched" \
+        "rc=$quota_rc clock=$quota_clock ready_timeout=$quota_ready_timeout out=$(cat "$quota_out")"
+fi
+
+# The wait has its own budget; expiry names the quota, not the pod-ready wait.
+quota_cfg="$(newdir)"; tmpdirs+=("$quota_cfg")
+cp -a "$config_dir/." "$quota_cfg/"
+printf 'K8S_QUOTA_WAIT_SECONDS=60\n' >> "$quota_cfg/k8s.env"
+K8S_STUB_PROXY_OK_AT=2000000 quota_submit expiry claude "$quota_cfg"
+if (( quota_rc != 0 )) && grep -q 'namespace quota (fork-sandbox-quota) was full for 60s' "$quota_out" \
+    && ! grep -q 'created no pod' "$quota_out" \
+    && grep -q ' delete job,pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=' "$quota_log"; then
+    ok "an expired quota wait fails with a quota-specific message, and the failure trap still cleans up"
+else
+    no "an expired quota wait fails with a quota-specific message, and the failure trap still cleans up" \
+        "rc=$quota_rc out=$(cat "$quota_out") log=$(cat "$quota_log")"
+fi
+K8S_STUB_EVENT_UNTIL=2000000 K8S_STUB_POD_AT=2000000 quota_submit jobexpiry pi "$quota_cfg"
+if (( quota_rc != 0 )) && grep -q 'namespace quota (fork-sandbox-quota) was full for 60s' "$quota_out"; then
+    ok "an expired Job-side quota wait fails with the same quota-specific message"
+else
+    no "an expired Job-side quota wait fails with the same quota-specific message" \
+        "rc=$quota_rc out=$(cat "$quota_out")"
+fi
+
+# Any other create error is still immediately fatal: no wait, no retry.
+K8S_STUB_PROXY_ERR=1 quota_submit other claude "$config_dir"
+if (( quota_rc != 0 )) && ! grep -q 'waiting for namespace quota' "$quota_out" \
+    && grep -q 'admission webhook' "$quota_out" && (( quota_clock == 0 )) \
+    && grep -q ' delete job,pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=' "$quota_log"; then
+    ok "a non-quota create error is still immediately fatal"
+else
+    no "a non-quota create error is still immediately fatal" \
+        "rc=$quota_rc clock=$quota_clock out=$(cat "$quota_out")"
+fi
+
+# A malformed K8S_QUOTA_WAIT_SECONDS is refused, naming the key.
+for quota_bad in soon 0 -5 1.5; do
+    printf 'K8S_QUOTA_WAIT_SECONDS=%s\n' "$quota_bad" > "$quota_cfg/k8s.env.bad"
+    cp -a "$config_dir/k8s.env" "$quota_cfg/k8s.env"
+    cat "$quota_cfg/k8s.env.bad" >> "$quota_cfg/k8s.env"
+    refuses "K8S_QUOTA_WAIT_SECONDS=$quota_bad is refused, naming the key" \
+        "K8S_QUOTA_WAIT_SECONDS must be a positive integer" \
+        env FORK_SANDBOX_CONFIG_DIR="$quota_cfg" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-quota-bad --model moonshotai/kimi-k3 --harness pi \
+        "$proj_dir" "$handoff_file"
+done
+
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh), shared with fork-sandbox.sh's
 # local path: the rendered handoff.md must carry the clone-path and
 # gated-egress blocks, must carry an "Operator inbox" section naming
