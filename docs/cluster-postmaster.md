@@ -148,7 +148,10 @@ Do these in order.
   store").
 - **In-flight seats survive a rollout.** A restarted postmaster adopts
   still-running Jobs instead of re-spawning them, so a rollout does not
-  lose a seat's work in progress.
+  lose a seat's work in progress. A Job whose submit never finished pushing
+  its inputs is the exception: it is refused and its objects deleted, not
+  adopted (see "The run directory is the join" in
+  [kubernetes-runs.md](kubernetes-runs.md)).
 
 ## The mail API
 
@@ -332,7 +335,9 @@ the always-on `fork-sandbox-proxy` Deployment, and `install --postmaster`
 adds the postmaster pod alongside it, so two of those ten are already
 spoken for. A panel gets at most eight seat pods running at once. A site
 that needs more sets `K8S_QUOTA_PODS` in `k8s.env` and re-runs `install`; see
-"The namespace quota" in [kubernetes-runs.md](kubernetes-runs.md).
+"The namespace quota" in [kubernetes-runs.md](kubernetes-runs.md). A seat
+submitted while the quota is full waits for room (`K8S_QUOTA_WAIT_SECONDS`)
+rather than failing.
 
 ## Storage
 

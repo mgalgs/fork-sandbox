@@ -489,6 +489,18 @@ takes: `mktemp -d` under the same
   `claude_credentials_source` and `claude_credentials_via` for a
   `--harness claude` run (see
   [docs/credential-balancing.md](credential-balancing.md)).
+- `run.env` also carries the **push marker** `resume` reads: submit writes
+  `INPUTS_PUSH_EXPECTED=true` at the file's first write, and
+  `INPUTS_PUSH_COMPLETE=true` the moment the run's inputs have been pushed into
+  the pod and the pod told they are complete. `resume` -- which a restarted
+  cluster postmaster's adopt path runs -- refuses a run that has the first key
+  and lacks the second: its submitter died mid-submit, so the pod never got
+  its input and gives up on its own. The refused run's cluster objects are
+  deleted by its branch label, as `submit`'s own failure cleanup does, and
+  `resume` exits 2, the code adopt already gets for a run with no pod to adopt.
+  A `run.env` with neither key (written by a `submit` that predates the marker,
+  possibly still live on a cluster) is adopted exactly as before, which is
+  what makes the change safe to roll out with seats in flight.
 - `task-meta.json` -- present only with `--task-meta`, the same flag and
   the same meaning as the local path's own (see "Recommended --task-meta
   fields" in `sandbox-run-log.py`'s header). `--task-meta` used to be
@@ -2320,6 +2332,34 @@ again; set the key instead. A malformed value is refused by `install` before
 anything is applied, with an error naming the key. Only the shape is checked,
 not whether the limit is big enough. The `LimitRange` beside it (per-container
 defaults) is not configurable.
+
+### A full quota is waited on
+
+When the quota has no room, `submit` waits instead of failing. Two refusals
+count, and only these: the per-run claude-proxy Pod's create being refused
+(`forbidden: exceeded quota`), and the Job controller being refused the Job's
+agent pod (`FailedCreate` events carrying the same message while no pod for
+the Job exists). Every other create error stays fatal, exactly as before.
+Before creating the proxy Pod, `submit` also checks that the quota has room for
+both of the run's pods (proxy and agent) and waits if it does not. Quota is not
+transactional, so that check narrows the case where the proxy holds a slot
+while its agent pod is blocked; it cannot close it, which is why the two
+refusals above are waited on as well.
+
+While it waits, `submit` prints `waiting for namespace quota: pods 10/10` to
+stderr at most once a minute, so a log reader can tell a quota wait from a hang.
+
+The wait has a budget of its own, the optional `k8s.env` key
+`K8S_QUOTA_WAIT_SECONDS` (a positive integer; default `900`, 15 minutes; a
+malformed value is refused naming the key). It is cumulative over the whole
+`submit`, and it is separate from the pod-ready budget (180 seconds plus any
+sidecar startup window): time spent quota-blocked never counts against that
+one, which starts counting once the agent pod can be created. When it runs
+out, `submit` fails saying the namespace quota (`fork-sandbox-quota`) was full
+for that many seconds, not with a pod-ready timeout, and the usual failure
+cleanup runs. The Job-side check reads the Job's events, so it does not wait on
+a pod that is merely slow to schedule; a stale quota event with no pod yet is
+still read as blocked, within the same budget.
 
 ## Limits
 
