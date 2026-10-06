@@ -311,7 +311,9 @@ moved" in [docs/agent-mail.md](agent-mail.md).
 `mail reply --upstream-state closed|open` takes the same `upstream` cap. A
 `closed` from any non-fleet sender stops the postmaster waking seats on that
 thread (CI sends it when the pull request closes, since that also tears the
-environment down); it resets nothing. See "Upstream closed" in
+environment down). It clears the thread's needs-operator flag (journaled like
+any unflag) but leaves the spawn budget alone. `open`, or a non-fleet
+`X-Upstream-Head`, reopens the thread. See "Upstream closed" in
 [docs/agent-mail.md](agent-mail.md).
 
 Install refuses when:
