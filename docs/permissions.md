@@ -134,6 +134,18 @@ from this root — but that is a weaker, different claim than "cannot pick a
 path outside what the script fixes," and it is the one you are actually
 approving.
 
+It also reaches the network when a recipient is `@lane:host`. `send` and
+`reply` then run `ssh` — to a destination taken only from the peers file
+(`~/.config/fork-sandbox/lane-mail-peers`), never from an argument — and ship
+the message, including a `--body <file>` the caller named, to that host's
+`lane-mail-serve`. So the blanket approval also covers "send any file the
+session can read to a peer you listed". That is the same trust you extend by
+listing the peer (and by the receiver adding your key); leave a peer out of
+the file if a session should not be able to reach it. Attachments, grants and
+review targets are refused on a cross-host message. The receiving side,
+`lane-mail-serve`, is an ssh forced command and is not something a session
+runs; do not add a rule for it (docs/agent-mail.md, "Lane mail between hosts").
+
 **`lane-mail-watch.sh` — read-only.** It only ever calls `lane-mail.sh inbox
 <lane>` in a loop and prints what comes back. It mutates nothing. Its
 `--wait` mode is the same read-only loop with a different exit condition —

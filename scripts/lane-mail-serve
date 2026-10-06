@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# lane-mail-serve -- Receive lane mail from a peer host: an ssh forced command
+#
+# Usage: lane-mail-serve --peer <name>     (as a forced command; see below)
+#        lane-mail-serve --help
+#
+# The receiving half of cross-host lane mail (`@lane:host`; docs/agent-mail.md,
+# "Lane mail between hosts"). git's ssh transport is the model: the sender
+# runs a fixed server command over ssh, and the receiver pins the key to it.
+# Enable a peer by adding ONE line to the receiving host's authorized_keys:
+#
+#   command="lane-mail-serve --peer <name>",restrict <the peer's public key>
+#
+# where <name> is the peer's own name for itself (what its LANE_MAIL_PEER_NAME
+# is, or its short hostname). Use an absolute path to this script if it is not
+# on the PATH a non-interactive login gets. Nothing here edits authorized_keys
+# or any ssh config; install never does either.
+#
+# What the key can do. sshd runs this script instead of whatever the client
+# asked for, and puts the client's request in SSH_ORIGINAL_COMMAND. The only
+# verb accepted is `deliver` (spelled `deliver` or `lane-mail-serve deliver`,
+# nothing after it), which reads ONE message on stdin and stores it in the
+# fixed lane-mail root (/var/tmp/claude-scratch/lane-mail, from
+# lane-mail-lib.sh -- never an argument, never from the environment of the
+# caller). There is no verb that reads an inbox, lists, shows, marks seen, or
+# runs anything else, and no shell: any other request, an empty one
+# (an interactive login), or extra arguments is refused with a one-line
+# error and exit 2. The key grants "drop mail here" and nothing more.
+#
+# Who the sender is. The forced command's --peer argument is the ONLY source of
+# the sender's host identity; nothing in the message or the request can
+# override it. The message's From must name that host (a bare From is
+# qualified with it, any other host is refused), and bare To/Cc addresses --
+# which are in the sender's frame -- are qualified with it too. A sender
+# picks its lane name freely and can never speak for another host. A missing
+# or malformed --peer is refused: without a forced command there is no
+# identity, so an unpinned key cannot deliver. All of that is
+# `fork-sandbox-mail.sh ingest --peer`, which also bounds the message to
+# 1 MiB, validates headers and ids, and refuses duplicates.
+#
+# On success it prints `ok <message-id>` on stdout and exits 0; on refusal or
+# failure it prints one line `lane-mail-serve: <reason>` on stderr and exits
+# non-zero (2: refused as a request, 1: the message itself was refused).
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/lane-mail-lib.sh"
+
+usage() {
+    sed -n '2,/^[^#]/{ /^#/s/^# \{0,1\}//p }' "$0"
+}
+
+# One printable line, whatever the caller sent: this goes back down an ssh
+# channel to the peer and into its logs.
+oneline() {
+    local s="${1:0:200}"
+    s="${s//[^[:print:]]/?}"
+    printf '%s' "$s"
+}
+
+refuse() {
+    printf 'lane-mail-serve: refused: %s\n' "$(oneline "$1")" >&2
+    exit 2
+}
+
+peer=""
+while (( $# )); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --peer)
+            (( $# >= 2 )) || refuse "--peer needs a name"
+            peer="$2"
+            shift 2
+            ;;
+        --peer=*) peer="${1#--peer=}"; shift ;;
+        *) refuse "unknown argument '$1'" ;;
+    esac
+done
+
+[[ -n "$peer" ]] || refuse "missing --peer (this must run as an authorized_keys forced command: command=\"lane-mail-serve --peer <name>\")"
+[[ "$peer" =~ $LANE_MAIL_HOST_RE ]] || refuse "--peer '$peer' is not a valid peer name"
+
+request="${SSH_ORIGINAL_COMMAND:-}"
+[[ -n "$request" ]] || refuse "no request; this key may only deliver mail, not open a shell"
+case "$request" in
+    "deliver"|"lane-mail-serve deliver") ;;
+    *) refuse "request '$request' is not allowed (the only verb is: deliver)" ;;
+esac
+
+export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
+if ! out="$("$script_dir/fork-sandbox-mail.sh" ingest --peer "$peer" 2>&1)"; then
+    msg="${out//$'\n'/ }"
+    msg="${msg#Error: }"
+    printf 'lane-mail-serve: %s\n' "$(oneline "$msg")" >&2
+    exit 1
+fi
+id="${out##*$'\n'}"
+if [[ ! "$id" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
+    printf 'lane-mail-serve: stored, but the store returned no message id\n' >&2
+    exit 1
+fi
+printf 'ok %s\n' "$id"

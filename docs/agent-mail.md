@@ -350,6 +350,102 @@ Handle the mail, mark it `lane-mail.sh seen <lane> <id>...`, then launch
 `--wait` again. Relaunching before marking fires again at once on the same
 messages.
 
+### Lane mail between hosts
+
+Sessions on different machines can mail each other's lanes, over the ssh
+access the machines already have and nothing else: no listener, no daemon,
+no synced directory. A session on host `alpha` runs
+
+```
+lane-mail.sh send --from @frontend --to @backend:beta --subject ... --body -
+```
+
+and `beta`'s `@backend` session is woken exactly as for a local send: `beta`'s
+own watcher and unread-mail hook see a new message in `beta`'s own store.
+It replies with `lane-mail.sh reply --from @backend --reply-to <id>` and the
+reply lands in `alpha`'s store, threaded under the original.
+
+**Addresses.** `@lane` is a lane on this host; `@lane:host` is a lane on the
+peer called `host` (lowercase alphanumeric, `-` and `.`). A host knows its
+own peer name — `LANE_MAIL_PEER_NAME` in `~/.config/fork-sandbox/lane-mail.env`,
+default the short hostname, lowercased. A store rewrites an address that
+names its own host to the bare form, so `@lane:alpha` on `alpha` *is*
+`@lane`; inboxes, `seen` and watchers only ever see bare names. `inbox` and
+`seen` are always this host's: there is no way to read a remote inbox.
+
+**What a send does.** Only `send`/`reply` with a recipient on another host
+(for a reply, including one inherited from the parent by reply-all) take this
+path; everything else is unchanged.
+
+1. Each remote host must be in the **peers file**,
+   `~/.config/fork-sandbox/lane-mail-peers`: one `<peer> <ssh destination>`
+   per line, `#` comments, nothing after the destination.
+
+   ```
+   # peer   ssh destination (anything `ssh` accepts: user@host or a Host alias)
+   beta     lane@beta.example.test
+   ```
+
+   A host that is not listed is an error that names the file; nothing is sent.
+2. The message is built once, in portable form (every bare address qualified
+   with this host's name, so it means the same on the far side), and delivered
+   to each remote host with
+   `ssh -o BatchMode=yes -o ConnectTimeout=10 <destination> lane-mail-serve deliver`,
+   the message on stdin. `LANE_MAIL_SSH` (the ssh command) and
+   `LANE_MAIL_SSH_TIMEOUT` (seconds) in `lane-mail.env` override the defaults.
+3. Only after every delivery succeeded is the same message — same message id,
+   thread id and headers — stored locally. Every message of a cross-host
+   thread therefore lands in both stores, so `show`, `tree` and
+   `reply --reply-to` work on either side. The two copies differ only in how
+   a host-qualified address reads from each side (the stored `To: @x` on the
+   receiving side is `To: @x:beta` in the sender's copy).
+
+A failure — an unreachable peer, an ssh error, the far side refusing —
+exits non-zero with the reason and writes nothing locally; with several
+hosts, hosts delivered before the failure are named. There is no retry queue:
+re-send. A cross-host message carries no attachments, grants or review target,
+and `--from` must be a lane on this host.
+
+**Enabling a peer: the receiving host.** Add one line to `~/.ssh/authorized_keys`
+on the host that will *receive* from `alpha`, using a key that `alpha` has
+for it:
+
+```
+command="lane-mail-serve --peer alpha",restrict ssh-ed25519 AAAA... lane-mail@alpha
+```
+
+`alpha` is the sender's own peer name. Use the script's absolute path
+(`~/.claude/scripts/lane-mail-serve` after `install.sh`) if it is not on the
+`PATH` a non-interactive ssh login gets. `install.sh` puts the script on `PATH`
+but never edits `authorized_keys` or any ssh config; that line is the
+operator's decision. The sender needs the mirror-image peers-file entry, and
+the receiving host needs one pointing back before it can reply.
+
+**Trust model.** The key grants "drop mail here" and never a shell:
+
+- `restrict` turns off forwarding, a pty and everything else; the forced
+  command replaces whatever the client asked to run.
+- `lane-mail-serve` takes its verb from `SSH_ORIGINAL_COMMAND` and accepts
+  exactly one, `deliver`. Nothing reads an inbox, lists, or runs anything;
+  any other request, an empty one (an interactive login) or trailing
+  arguments is refused with a one-line error.
+- It writes only to the fixed lane-mail root. The root is a constant, not an
+  argument or an environment variable, and the message is bounded to 1 MiB,
+  header- and id-validated, and refused if its id already exists.
+- **Sender identity is stamped, not trusted.** The forced command's `--peer`
+  argument is the only source of the sender's host. The message's `From` must
+  name that host (a bare `From` is qualified with it, anything else is
+  refused) and bare `To`/`Cc` addresses are qualified with it too. A sender
+  picks its lane name but can never speak for another host.
+- The reserved headers (`X-Attachment`, `X-Upstream-*`, `X-Review-Target*`,
+  `X-Version`) never cross.
+
+A peer holding a key can fill the receiver's lane-mail store with mail under
+its own host name; the forced command bounds that to the lane-mail root, and
+adding the key is the decision to trust that peer. The fleet store and its
+postmaster are untouched: they never route `@lane:host`, and a thread
+addressing one is treated like any name the postmaster cannot resolve.
+
 ## The fleet registry
 
 `fork-sandbox fleet` answers "who are the agents, and what seat does each
