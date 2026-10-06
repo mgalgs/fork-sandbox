@@ -433,9 +433,10 @@ the receiving host needs one pointing back before it can reply.
 - `restrict` turns off forwarding, a pty and everything else; the forced
   command replaces whatever the client asked to run.
 - `lane-mail-serve` takes its verb from `SSH_ORIGINAL_COMMAND` and accepts
-  exactly one, `deliver`. Nothing reads an inbox, lists, or runs anything;
-  any other request, an empty one (an interactive login) or trailing
-  arguments is refused with a one-line error.
+  exactly two: `deliver`, and `ping`, which reads and writes nothing and
+  answers `pong <this host's peer name>`. Nothing reads an inbox, lists, or
+  runs anything; any other request, an empty one (an interactive login) or
+  trailing arguments is refused with a one-line error.
 - It writes only to the fixed lane-mail root. The root is a constant, not an
   argument or an environment variable, and the message is bounded to 1 MiB,
   header- and id-validated, and refused if its id already exists.

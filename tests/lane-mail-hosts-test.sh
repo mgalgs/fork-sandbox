@@ -274,6 +274,26 @@ refused "an empty request is refused" "" 2 --peer alpha
 check "no refused request ran anything" "no" "$([[ -e "$scratch/pwned" ]] && echo yes || echo no)"
 check "refusals stored nothing" "$before_b" "$(msgs beta)"
 
+# ping: the allowlist grew by one read-only verb.
+ping_before="$(find "$scratch/home" "$scratch/tmp" "$scratch/emit-root" "$scratch/beta/root" 2>/dev/null | sort | md5sum)"
+out="$(serve ping /dev/null --peer alpha 2>"$scratch/serve.err")"; rc=$?
+check "ping answers with this host's peer name" "0 pong beta" "$rc $out"
+out="$(serve 'lane-mail-serve ping' /dev/null --peer alpha 2>/dev/null)"
+check "the git-style spelling 'lane-mail-serve ping' is accepted" "pong beta" "$out"
+out="$(serve ping "$portable" --peer alpha 2>/dev/null)"
+check "ping ignores stdin" "pong beta" "$out"
+check "ping writes nothing" "$ping_before" \
+    "$(find "$scratch/home" "$scratch/tmp" "$scratch/emit-root" "$scratch/beta/root" 2>/dev/null | sort | md5sum)"
+for verb in 'ping extra' 'ping; touch '"$scratch"'/pwned' 'PING' ' ping' 'ping ' 'lane-mail-serve ping extra'; do
+    refused "request '$verb' is refused" "$verb" 2 --peer alpha
+done
+refused "ping still needs a --peer" ping 2
+cp "$scratch/beta/cfg/lane-mail.env" "$scratch/beta/cfg/lane-mail.env.save"
+printf 'LANE_MAIL_PEER_NAME=Bad_Name\n' > "$scratch/beta/cfg/lane-mail.env"
+serve ping /dev/null --peer alpha >"$scratch/serve.out" 2>"$scratch/serve.err"; rc=$?
+check "ping with no valid peer name fails, one line, no pong" "1 1 0" "$rc $(wc -l < "$scratch/serve.err" | tr -d ' ') $(grep -c pong "$scratch/serve.out")"
+mv "$scratch/beta/cfg/lane-mail.env.save" "$scratch/beta/cfg/lane-mail.env"
+
 out="$(serve deliver "$portable" --peer alpha 2>"$scratch/serve.err")"; rc=$?
 check "deliver stores the message and acknowledges it" "0 ok $pid" "$rc $out"
 check "the delivered message is in the lane's inbox" "$pid" "$(hb inbox x | grep -F "$pid" | cut -f1)"
@@ -314,6 +334,7 @@ check "lane-mail.sh works with no scripts dir on PATH (non-interactive ssh)" "$i
 help_out="$(PATH="$scratch/beta/bin:$PATH" "$scratch/beta/bin/lane-mail-serve" --help)"
 contains "--help documents the authorized_keys line" "$help_out" 'command="lane-mail-serve --peer <name>",restrict'
 contains "--help states the trust model" "$help_out" "ONLY source of"
+contains "--help documents the ping verb" "$help_out" "pong <this host's"
 contains "lane-mail.sh --help documents the address form" "$(ha --help)" "@lane:host"
 check "the repo's lane-mail-serve is executable" "1" "$([[ -x "$scripts/lane-mail-serve" ]] && echo 1 || echo 0)"
 

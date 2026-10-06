@@ -17,15 +17,22 @@
 # or any ssh config; install never does either.
 #
 # What the key can do. sshd runs this script instead of whatever the client
-# asked for, and puts the client's request in SSH_ORIGINAL_COMMAND. The only
-# verb accepted is `deliver` (spelled `deliver` or `lane-mail-serve deliver`,
-# nothing after it), which reads ONE message on stdin and stores it in the
-# fixed lane-mail root (/var/tmp/claude-scratch/lane-mail, from
-# lane-mail-lib.sh -- never an argument, never from the environment of the
-# caller). There is no verb that reads an inbox, lists, shows, marks seen, or
-# runs anything else, and no shell: any other request, an empty one
-# (an interactive login), or extra arguments is refused with a one-line
-# error and exit 2. The key grants "drop mail here" and nothing more.
+# asked for, and puts the client's request in SSH_ORIGINAL_COMMAND. Two verbs
+# are accepted (each spelled bare or as `lane-mail-serve <verb>`, nothing
+# after it):
+#
+#   deliver   reads ONE message on stdin and stores it in the fixed lane-mail
+#             root (/var/tmp/claude-scratch/lane-mail, from lane-mail-lib.sh
+#             -- never an argument, never from the environment of the
+#             caller).
+#   ping      reads nothing, writes nothing, and prints `pong <this host's
+#             peer name>`. `lane-mail-peer add` uses it to prove a wired
+#             direction works end to end.
+#
+# There is no verb that reads an inbox, lists, shows, marks seen, or runs
+# anything else, and no shell: any other request, an empty one (an
+# interactive login), or extra arguments is refused with a one-line error and
+# exit 2. The key grants "drop mail here" and nothing more.
 #
 # Who the sender is. The forced command's --peer argument is the ONLY source of
 # the sender's host identity; nothing in the message or the request can
@@ -86,7 +93,15 @@ request="${SSH_ORIGINAL_COMMAND:-}"
 [[ -n "$request" ]] || refuse "no request; this key may only deliver mail, not open a shell"
 case "$request" in
     "deliver"|"lane-mail-serve deliver") ;;
-    *) refuse "request '$request' is not allowed (the only verb is: deliver)" ;;
+    "ping"|"lane-mail-serve ping")
+        name="$(lane_mail_self_name)" || {
+            printf 'lane-mail-serve: this host has no valid peer name (set LANE_MAIL_PEER_NAME)\n' >&2
+            exit 1
+        }
+        printf 'pong %s\n' "$name"
+        exit 0
+        ;;
+    *) refuse "request '$request' is not allowed (the verbs are: deliver, ping)" ;;
 esac
 
 export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
