@@ -168,6 +168,30 @@ verdict, which the engine forwards into its prompt (`--maintainer-loop`
 machinery). A `maintain` step without a `review` step is valid, and is
 then the branch's only review.
 
+When a pipeline's LAST step is a `maintain` step and it approves, one more
+leg runs right after it, on that same seat (same harness, same model) — a
+tidy-history leg that rewrites the branch's commits into logical ones,
+one change per commit, before the run ends. This is not a step of its
+own: it has no `action` keyword, no preset key, and no flag to turn it
+on or off — it is attached to whichever step, legacy or composed, ends up
+last and is a `maintain` step, the operator's reasoning being that a
+weaker model tidying history tends to hallucinate commit trailers, so
+the maintain seat's own model (presumably a strong one) does this job
+too. A pipeline whose `maintain` step is not last, or that has none at
+all, runs no tidy leg; whoever integrates the branch reshapes it by hand,
+and such a run leaves no tidy trace anywhere in its output or artifacts —
+no `tidy.json`, no `tidy` key in `summary.json`, not even a "skipped" one.
+The runner enforces that the rewrite changes no content (tree-identical
+to what was approved), stays on the same base with no merge commits, and
+invents no commit trailer, including one shaped like a trailer that
+git's own parser would not recognize as one — a rewrite that fails any
+of those, or that is still running past `--tidy-timeout` (default 30
+minutes, per attempt — a retried attempt gets this same limit again,
+fresh, not a shared budget across all of them), is discarded and the
+approved history is kept, so a run's outcome never depends on this leg
+succeeding. See `fork-sandbox.sh`'s own "The tidy leg" section for the
+full contract.
+
 A `plan` step is a one-shot leg that lets a strong model plan before a
 cheaper one codes, so an orchestrator can write a short, intent-level
 handoff and leave the mechanics — files and functions to touch, the test
@@ -619,7 +643,10 @@ at most one maintain step) writes the historical, unindexed names:
 `maintainer-prompt-<N>.md`, `events-review-<N>.jsonl`,
 `events-maintainer-<N>.jsonl`, `events-fix-<N>.jsonl`,
 `events-mntfix-<N>[-p<P>].jsonl`, `events-code-<N>.jsonl`,
-`events-continuation-<N>.jsonl`.
+`events-continuation-<N>.jsonl`. When the maintain step is last and
+approves, the tidy leg that follows it adds `tidy-prompt.md` (the static
+base), `tidy-prompt-1.md` (the per-run copy, naming the approved head)
+and `events-tidy-1.jsonl`.
 
 A **composed** run (anything else this grammar can express — free step
 order, more than one review or maintain step, review after maintain, and
@@ -627,7 +654,17 @@ so on) writes step-indexed names instead, where `<K>` is the 1-based step
 number in pipeline order: `step-<K>-loop.json`,
 `s<K>-review-verdict-<i>.md`, `s<K>-maintain-verdict-<i>.md`,
 `step-<K>-prompt-<i>.md`, and
-`events-s<K>-(code|review|maintain|fix)-<N>[-p<P>].jsonl`. A run launched
+`events-s<K>-(code|review|maintain|fix)-<N>[-p<P>].jsonl`. The same tidy
+leg, when the LAST step is maintain and approves, adds
+`step-<K>-tidy-prompt.md`, `step-<K>-tidy-prompt-1.md` and
+`events-s<K>-tidy-1.jsonl` for that step's `<K>`. `tidy.json` -- `ended`
+(`accepted`/`unchanged`/`discarded`/`skipped`), `detail`, the two heads
+compared, cost, usage and `clone_restored` -- is written in BOTH shapes,
+on every run whose pipeline has a maintain step ANYWHERE (not just last):
+`skipped` with a reason when that step is not last or did not approve.
+`summary.json`'s own `tidy` key mirrors it the same way. A pipeline with
+no maintain step at all writes neither -- no `tidy.json`, no `tidy` key.
+A run launched
 with `--preset` also writes `pipeline.json` (see "Provenance" above for
 `preset.json`/`preset.yaml`, which are separate files) — its `steps` array
 is the source of truth this section's canonical key is built from.
@@ -821,6 +858,11 @@ the syntax does not have, no engine — present or planned — has either:
   fixing.
 - **No action beyond `code`/`review`/`maintain`/`plan`**, and no branches
   or graphs — a pipeline is always a single linear chain, of any length.
+  The tidy-history leg is not a fifth action: it has no `action` keyword
+  and no preset key, and it is never a step of the pipeline a preset or
+  `--pipeline` spec describes — it is the runner's own addition, attached
+  to whichever step ends up last when that step is `maintain` and
+  approves (see "Composed runs" above).
 - **No per-seat `refresh-at`/`refresh-max`.** An agent's own key reaches
   only the first code step's agent, because there is no per-seat *refresh*
   plumbing — only the one run-level `--refresh-at`/`--refresh-max` pair a

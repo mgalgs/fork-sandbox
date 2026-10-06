@@ -349,6 +349,12 @@ the run's last word on the branch, reported ahead of the review's. Its
 `--maintainer-harness` takes the same `claude`/`pi`/`codex`
 choices as `--review-harness`, and a sealed implement leg with a
 networked maintainer harness warns by name, as `--review-harness` does.
+When the maintain step is the pipeline's last step and it approves, a
+tidy-history leg runs right after it, on that same seat, and rewrites the
+branch's commits into logical ones — see "The tidy leg" in `fork-sandbox.sh`
+for the contract it runs under. A pipeline whose maintain step runs
+earlier, or that has none, is left for whoever integrates the branch to
+reshape by hand.
 
 Use `--review-only --checkout <ref>` to review an existing branch after the
 fact. It runs one review leg and returns no coding or fix changes; use

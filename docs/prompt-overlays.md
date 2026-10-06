@@ -128,6 +128,9 @@ leg: `<leg>/all.md` for every model in this leg, `<leg>/model/<model>.md`
 for this model in this leg alone, general first within the leg-scoped pair
 too. A `maintainer/` directory is how you correct the maintainer leg's
 prompt specifically — the leg that runs only under `--maintainer-loop`.
+The tidy-history leg that may follow an approving, pipeline-last maintain
+step reads this same `maintainer` bucket, not a bucket of its own: it runs
+on that step's own seat, so the same overlay applies.
 
 `implement`, `review`, `fix`, `maintainer` and `plan` are reserved directory
 names at the root of a prompts directory — a model can never be called
