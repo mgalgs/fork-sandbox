@@ -28,11 +28,11 @@ metadata:
   namespace: __NAMESPACE__
 spec:
   hard:
-    pods: "10"
-    requests.cpu: "10"
-    requests.memory: 20Gi
-    limits.cpu: "20"
-    limits.memory: 40Gi
+    pods: "__QUOTA_PODS__"
+    requests.cpu: "__QUOTA_REQUESTS_CPU__"
+    requests.memory: __QUOTA_REQUESTS_MEMORY__
+    limits.cpu: "__QUOTA_LIMITS_CPU__"
+    limits.memory: __QUOTA_LIMITS_MEMORY__
 ---
 apiVersion: v1
 kind: LimitRange

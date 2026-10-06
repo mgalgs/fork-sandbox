@@ -629,6 +629,20 @@
 #                         Required for submit.
 #   K8S_RUN_TTL=          seconds the pod idles after the agent exits.
 #                         Defaults to 3600.
+#   K8S_QUOTA_PODS=, K8S_QUOTA_REQUESTS_CPU=, K8S_QUOTA_REQUESTS_MEMORY=,
+#   K8S_QUOTA_LIMITS_CPU=, K8S_QUOTA_LIMITS_MEMORY=
+#                         the five limits of the namespace's ResourceQuota,
+#                         rendered by `install` (and re-rendered on every
+#                         install, so a patch to the live object does not
+#                         survive one -- set the key instead). Optional;
+#                         default to 10, 10, 20Gi, 20 and 40Gi. pods must be
+#                         a positive integer, the cpu keys a Kubernetes
+#                         cpu quantity (4, 0.5, 500m), the memory keys an
+#                         integer with an optional suffix (512Mi, 20Gi,
+#                         20G). A claude seat is two pods (the agent and
+#                         its per-run claude-proxy), so raise K8S_QUOTA_PODS
+#                         for concurrent claude runs. A malformed value is
+#                         refused by install before anything is applied.
 #   GIT_USER_NAME=, GIT_USER_EMAIL=
 #                         identity the pod's commits land under. Optional;
 #                         default to a fixed fork-sandbox identity.
@@ -926,6 +940,20 @@ K8S_SERVICE_MAX_MEMORY="${K8S_SERVICE_MAX_MEMORY:-1Gi}"
 # normal wait.
 K8S_SERVICE_MAX_STARTUP_SECONDS="$(read_env_value "$k8s_env" K8S_SERVICE_MAX_STARTUP_SECONDS || true)"
 K8S_SERVICE_MAX_STARTUP_SECONDS="${K8S_SERVICE_MAX_STARTUP_SECONDS:-600}"
+# The namespace ResourceQuota's five limits, substituted into
+# manifests/k8s/00-namespace.yaml by cmd_install, which also validates them
+# (only install renders the quota, so no other verb fails over a bad one).
+# The defaults are the quota the manifest used to hard-code.
+K8S_QUOTA_PODS="$(read_env_value "$k8s_env" K8S_QUOTA_PODS || true)"
+K8S_QUOTA_PODS="${K8S_QUOTA_PODS:-10}"
+K8S_QUOTA_REQUESTS_CPU="$(read_env_value "$k8s_env" K8S_QUOTA_REQUESTS_CPU || true)"
+K8S_QUOTA_REQUESTS_CPU="${K8S_QUOTA_REQUESTS_CPU:-10}"
+K8S_QUOTA_REQUESTS_MEMORY="$(read_env_value "$k8s_env" K8S_QUOTA_REQUESTS_MEMORY || true)"
+K8S_QUOTA_REQUESTS_MEMORY="${K8S_QUOTA_REQUESTS_MEMORY:-20Gi}"
+K8S_QUOTA_LIMITS_CPU="$(read_env_value "$k8s_env" K8S_QUOTA_LIMITS_CPU || true)"
+K8S_QUOTA_LIMITS_CPU="${K8S_QUOTA_LIMITS_CPU:-20}"
+K8S_QUOTA_LIMITS_MEMORY="$(read_env_value "$k8s_env" K8S_QUOTA_LIMITS_MEMORY || true)"
+K8S_QUOTA_LIMITS_MEMORY="${K8S_QUOTA_LIMITS_MEMORY:-40Gi}"
 GIT_USER_NAME="$(read_env_value "$k8s_env" GIT_USER_NAME || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-fork-sandbox agent}"
 GIT_USER_EMAIL="$(read_env_value "$k8s_env" GIT_USER_EMAIL || true)"
@@ -3067,6 +3095,38 @@ cmd_install() {
         esac
     done
 
+    # The quota keys are substituted into a YAML manifest with no quoting
+    # of their own, so these anchored shape checks are what keep a value
+    # from injecting YAML (a newline, `: `, a quote or a `|` matches none
+    # of them). Run first, before anything is rendered or applied. Shape
+    # only: whether a limit is big enough is the operator's call.
+    local quota_pair quota_key quota_val quota_re quota_what
+    for quota_pair in \
+        "K8S_QUOTA_PODS|$K8S_QUOTA_PODS" \
+        "K8S_QUOTA_REQUESTS_CPU|$K8S_QUOTA_REQUESTS_CPU" \
+        "K8S_QUOTA_LIMITS_CPU|$K8S_QUOTA_LIMITS_CPU" \
+        "K8S_QUOTA_REQUESTS_MEMORY|$K8S_QUOTA_REQUESTS_MEMORY" \
+        "K8S_QUOTA_LIMITS_MEMORY|$K8S_QUOTA_LIMITS_MEMORY"; do
+        quota_key="${quota_pair%%|*}"
+        quota_val="${quota_pair#*|}"
+        case "$quota_key" in
+            K8S_QUOTA_PODS)
+                quota_re='^[1-9][0-9]*$'
+                quota_what="a positive integer" ;;
+            *_CPU)
+                quota_re='^([0-9]+(\.[0-9]+)?|[0-9]+m)$'
+                quota_what="a Kubernetes cpu quantity (4, 0.5 or 500m)" ;;
+            *)
+                quota_re='^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$'
+                quota_what="an integer with an optional binary or decimal suffix (512Mi, 20Gi, 20G)" ;;
+        esac
+        if [[ ! "$quota_val" =~ $quota_re ]]; then
+            echo "Error: $quota_key in $k8s_env must be $quota_what," >&2
+            echo "got '$quota_val'." >&2
+            exit 1
+        fi
+    done
+
     # --postmaster's own validation, kept visually separate from the
     # proxy's checks below and run first, so "validate before rendering or
     # applying anything" holds for both halves of this command
@@ -3786,6 +3846,11 @@ cmd_install() {
             -e "s|__PROXY_UPSTREAM_HOST__|$upstream_host|g" \
             -e "s|__PROXY_UPSTREAM__|$K8S_PROXY_UPSTREAM|g" \
             -e "s|__CLUSTER_DOMAIN__|$K8S_CLUSTER_DOMAIN|g" \
+            -e "s|__QUOTA_PODS__|$K8S_QUOTA_PODS|g" \
+            -e "s|__QUOTA_REQUESTS_CPU__|$K8S_QUOTA_REQUESTS_CPU|g" \
+            -e "s|__QUOTA_REQUESTS_MEMORY__|$K8S_QUOTA_REQUESTS_MEMORY|g" \
+            -e "s|__QUOTA_LIMITS_CPU__|$K8S_QUOTA_LIMITS_CPU|g" \
+            -e "s|__QUOTA_LIMITS_MEMORY__|$K8S_QUOTA_LIMITS_MEMORY|g" \
             "$f")"
         if [[ "$(basename "$f")" == 30-proxy.yaml ]]; then
             # The nginx location block(s) for whichever upstream mode is

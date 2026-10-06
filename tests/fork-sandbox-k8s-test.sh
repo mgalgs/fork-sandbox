@@ -824,6 +824,130 @@ if command -v yamllint >/dev/null 2>&1; then
     if [[ -z "$out" ]]; then ok "yamllint: install --dry-run piped through stdin"; else no "yamllint: install --dry-run piped through stdin" "$out"; fi
 fi
 
+printf '\n== K8S_QUOTA_* keys: the namespace ResourceQuota is configurable per site ==\n'
+# The quota lives inline in manifests/k8s/00-namespace.yaml behind
+# __QUOTA_*__ placeholders. These checks read the RENDERED quota out of
+# `install --dry-run`, never the manifest source: unset keys must render
+# exactly the limits the manifest hard-coded before the keys existed.
+quota_of() { awk '/^kind: ResourceQuota$/ {on=1} on && /^---$/ {exit} on'; }
+quota_default_expected='kind: ResourceQuota
+metadata:
+  name: fork-sandbox-quota
+  namespace: fork-sandbox-test
+spec:
+  hard:
+    pods: "10"
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi'
+check "no K8S_QUOTA_* keys set renders today's quota exactly" \
+    "$quota_default_expected" "$(quota_of < "$install_out")"
+
+quota_config_dir="$(newdir)"; tmpdirs+=("$quota_config_dir")
+{
+    cat "$config_dir/k8s.env"
+    printf '%s\n' K8S_QUOTA_PODS=24 K8S_QUOTA_REQUESTS_CPU=500m \
+        K8S_QUOTA_REQUESTS_MEMORY=64Gi K8S_QUOTA_LIMITS_CPU=1.5 \
+        K8S_QUOTA_LIMITS_MEMORY=128G
+} > "$quota_config_dir/k8s.env"
+install -m 600 "$config_dir/pi.env" "$quota_config_dir/pi.env"
+quota_set_out="$(newdir)/quota-set.yaml"; tmpdirs+=("$(dirname "$quota_set_out")")
+FORK_SANDBOX_CONFIG_DIR="$quota_config_dir" "$k8s_sh" install --dry-run > "$quota_set_out" 2>/dev/null
+check "all five K8S_QUOTA_* keys set render exactly those limits" \
+    'kind: ResourceQuota
+metadata:
+  name: fork-sandbox-quota
+  namespace: fork-sandbox-test
+spec:
+  hard:
+    pods: "24"
+    requests.cpu: "500m"
+    requests.memory: 64Gi
+    limits.cpu: "1.5"
+    limits.memory: 128G' "$(quota_of < "$quota_set_out")"
+if grep -q '__QUOTA_' "$quota_set_out" "$install_out"; then
+    no "no __QUOTA_*__ placeholder survives a render" "$(grep -n '__QUOTA_' "$quota_set_out" "$install_out")"
+else
+    ok "no __QUOTA_*__ placeholder survives a render"
+fi
+check "the LimitRange renders unchanged when the quota keys are set" \
+    "$(awk '/^kind: LimitRange$/ {on=1} on' "$install_out")" \
+    "$(awk '/^kind: LimitRange$/ {on=1} on' "$quota_set_out")"
+
+# One key set alone leaves the other four at their defaults.
+quota_one_config_dir="$(newdir)"; tmpdirs+=("$quota_one_config_dir")
+{ cat "$config_dir/k8s.env"; printf 'K8S_QUOTA_PODS=30\n'; } > "$quota_one_config_dir/k8s.env"
+install -m 600 "$config_dir/pi.env" "$quota_one_config_dir/pi.env"
+quota_one_out="$(FORK_SANDBOX_CONFIG_DIR="$quota_one_config_dir" "$k8s_sh" install --dry-run 2>/dev/null | quota_of)"
+check "K8S_QUOTA_PODS alone changes only pods" \
+    "${quota_default_expected/pods: \"10\"/pods: \"30\"}" "$quota_one_out"
+
+# A malformed value is refused before anything is applied, naming the key.
+# The stubbed kubectl logs every call; an empty log proves nothing was
+# applied. (read_env_value is line-based, so a real newline cannot reach a
+# value -- the closest a k8s.env can get is a CR, or a literal backslash-n,
+# both covered; the validator's anchors reject an embedded newline too.)
+quota_stub_bin="$(newdir)"; tmpdirs+=("$quota_stub_bin")
+quota_kubectl_log="$(newdir)/kubectl-quota.log"; tmpdirs+=("$(dirname "$quota_kubectl_log")")
+cat > "$quota_stub_bin/kubectl" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$quota_kubectl_log"
+cat >/dev/null
+exit 0
+STUB
+chmod +x "$quota_stub_bin/kubectl"
+quota_bad_cases=(
+    'K8S_QUOTA_PODS|0'
+    'K8S_QUOTA_PODS|ten'
+    'K8S_QUOTA_PODS|10.5'
+    'K8S_QUOTA_PODS|10: 11'
+    'K8S_QUOTA_PODS|10\n  limits.cpu: 1'
+    'K8S_QUOTA_PODS|10'$'\r'
+    'K8S_QUOTA_REQUESTS_CPU|four'
+    'K8S_QUOTA_REQUESTS_CPU|4: 5'
+    'K8S_QUOTA_REQUESTS_CPU|"4"'
+    'K8S_QUOTA_REQUESTS_CPU|4Gi'
+    'K8S_QUOTA_REQUESTS_CPU|4\nx'
+    'K8S_QUOTA_REQUESTS_MEMORY|lots'
+    'K8S_QUOTA_REQUESTS_MEMORY|20: Gi'
+    'K8S_QUOTA_REQUESTS_MEMORY|20Gi|x'
+    'K8S_QUOTA_REQUESTS_MEMORY|1.5Gi'
+    'K8S_QUOTA_REQUESTS_MEMORY|20m'
+    'K8S_QUOTA_REQUESTS_MEMORY|20Gi'$'\r'
+    'K8S_QUOTA_LIMITS_CPU|1m0'
+    'K8S_QUOTA_LIMITS_CPU|2: 3'
+    'K8S_QUOTA_LIMITS_CPU|2|3'
+    'K8S_QUOTA_LIMITS_CPU|'"'"'2'"'"
+    'K8S_QUOTA_LIMITS_CPU|-1'
+    'K8S_QUOTA_LIMITS_MEMORY|40GB'
+    'K8S_QUOTA_LIMITS_MEMORY|40: Gi'
+    'K8S_QUOTA_LIMITS_MEMORY|40Gi\nx: y'
+    'K8S_QUOTA_LIMITS_MEMORY|"40Gi"'
+)
+for quota_bad in "${quota_bad_cases[@]}"; do
+    quota_bad_key="${quota_bad%%|*}"; quota_bad_val="${quota_bad#*|}"
+    quota_bad_dir="$(newdir)"; tmpdirs+=("$quota_bad_dir")
+    { cat "$config_dir/k8s.env"; printf '%s=%s\n' "$quota_bad_key" "$quota_bad_val"; } > "$quota_bad_dir/k8s.env"
+    install -m 600 "$config_dir/pi.env" "$quota_bad_dir/pi.env"
+    : > "$quota_kubectl_log"
+    quota_bad_label="a malformed $quota_bad_key ($(printf '%q' "$quota_bad_val"))"
+    refuses "$quota_bad_label is refused, naming the key" \
+        "Error: $quota_bad_key in " \
+        env PATH="$quota_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$quota_bad_dir" "$k8s_sh" install
+    if [[ -s "$quota_kubectl_log" ]]; then
+        no "$quota_bad_label never reaches kubectl" "$(cat "$quota_kubectl_log")"
+    else
+        ok "$quota_bad_label never reaches kubectl"
+    fi
+done
+quota_bad_dir="$(newdir)"; tmpdirs+=("$quota_bad_dir")
+{ cat "$config_dir/k8s.env"; printf 'K8S_QUOTA_PODS=ten\n'; } > "$quota_bad_dir/k8s.env"
+install -m 600 "$config_dir/pi.env" "$quota_bad_dir/pi.env"
+refuses "install --dry-run also refuses a malformed K8S_QUOTA_PODS" \
+    "Error: K8S_QUOTA_PODS in " \
+    env FORK_SANDBOX_CONFIG_DIR="$quota_bad_dir" "$k8s_sh" install --dry-run
+
 printf '\n== shared proxy Service and static NetworkPolicy carry the role key ==\n'
 # fork-sandbox/role: model-proxy, alongside the pre-existing app:
 # fork-sandbox-proxy, on the Deployment's pod template, the Service
