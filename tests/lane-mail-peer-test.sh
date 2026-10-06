@@ -348,6 +348,31 @@ else
     ok "(skipped: hostname -f is not usable here)"
 fi
 
+echo "== a failed write is a failure, not a reported change =="
+if [[ "$(id -u)" != 0 ]]; then
+    mk_world
+    printf '# mine\n' > "$W/alpha/home/.config/fork-sandbox/lane-mail-peers"
+    chmod 444 "$W/alpha/home/.config/fork-sandbox/lane-mail-peers"
+    out="$(peer_tool alpha add beta beta-dest --back-dest alpha-dest 2>&1)"; rc=$?
+    check "an unwritable local peers file fails the add" "1" "$rc"
+    contains "it says which write failed" "$out" "could not write"
+    lacks "it does not report changes" "$out" "changed:"
+    lacks "it does not reach the probes" "$out" "probes:"
+    check "nothing was appended to the peers file" "# mine" "$(file_of alpha .config/fork-sandbox/lane-mail-peers)"
+
+    mk_world
+    mkdir -m 700 "$W/beta/home/.ssh"
+    : > "$W/beta/home/.ssh/authorized_keys"
+    chmod 400 "$W/beta/home/.ssh/authorized_keys"
+    out="$(peer_tool alpha add beta beta-dest --back-dest alpha-dest 2>&1)"; rc=$?
+    check "an unwritable authorized_keys on the peer fails the add" "1" "$rc"
+    contains "it names the peer and the failed write" "$out" "beta: could not write"
+    lacks "it does not claim the peer was changed" "$out" "changed:"
+    check "the peer's authorized_keys is still empty" "0" "$(wc -c < "$W/beta/home/.ssh/authorized_keys" | tr -d ' ')"
+else
+    ok "(running as root: unwritable-file tests skipped)"
+fi
+
 echo "== usage, help =="
 help_out="$(peer_tool alpha --help)"
 contains "--help documents the verb" "$help_out" "lane-mail-peer add <peer> <ssh-dest>"

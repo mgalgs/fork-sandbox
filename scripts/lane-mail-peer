@@ -245,23 +245,43 @@ side_run() {
         return 3
     fi
 
+    # Callers run this on the left of `||`, where bash ignores errexit, so every
+    # step checks its own status: a failed edit must stop here, not be reported.
     if [[ "$mode" == apply ]]; then
+        local fail_msg=""
         if (( do_key )); then
-            [[ -d "$HOME/.ssh" ]] || mkdir -m 700 "$HOME/.ssh"
-            ssh-keygen -q -t ed25519 -N '' -C "lane-mail@$name" -f "$key_path" </dev/null >/dev/null
-            read -r my_type my_b64 _ < "$key_path.pub"
+            if [[ ! -d "$HOME/.ssh" ]]; then
+                mkdir -m 700 "$HOME/.ssh" || fail_msg="create $HOME/.ssh"
+            fi
+            if [[ -z "$fail_msg" ]]; then
+                ssh-keygen -q -t ed25519 -N '' -C "lane-mail@$name" -f "$key_path" </dev/null >/dev/null \
+                    || fail_msg="create the mail key $key_path"
+            fi
+            if [[ -z "$fail_msg" ]]; then
+                read -r my_type my_b64 _ < "$key_path.pub" || fail_msg="read the new mail key $key_path.pub"
+            fi
         fi
-        if (( do_env )); then
-            mkdir -p "$(dirname "$env_file")"
-            append_line "$env_file" "LANE_MAIL_SSH=$want_ssh" 644
+        if [[ -z "$fail_msg" ]] && (( do_env )); then
+            { mkdir -p "$(dirname "$env_file")" \
+                && append_line "$env_file" "LANE_MAIL_SSH=$want_ssh" 644; } || fail_msg="write $env_file"
         fi
-        if (( do_peers )); then
-            mkdir -p "$(dirname "$peers_file")"
-            append_line "$peers_file" "$peer $send_dest" 644
+        if [[ -z "$fail_msg" ]] && (( do_peers )); then
+            { mkdir -p "$(dirname "$peers_file")" \
+                && append_line "$peers_file" "$peer $send_dest" 644; } || fail_msg="write $peers_file"
         fi
-        if (( do_auth )); then
-            [[ -d "$HOME/.ssh" ]] || mkdir -m 700 "$HOME/.ssh"
-            append_line "$authkeys" "command=\"$serve --peer $peer\",restrict $rtype $rb64 lane-mail@$peer" 600
+        if [[ -z "$fail_msg" ]] && (( do_auth )); then
+            if [[ ! -d "$HOME/.ssh" ]]; then
+                mkdir -m 700 "$HOME/.ssh" || fail_msg="create $HOME/.ssh"
+            fi
+            if [[ -z "$fail_msg" ]]; then
+                append_line "$authkeys" "command=\"$serve --peer $peer\",restrict $rtype $rb64 lane-mail@$peer" 600 \
+                    || fail_msg="write $authkeys"
+            fi
+        fi
+        if [[ -n "$fail_msg" ]]; then
+            emit refuse "could not $fail_msg; this host is only partly changed (re-run once fixed, it is idempotent)"
+            printf 'lane-mail-peer: could not %s\n' "$fail_msg" >&2
+            return 3
         fi
     fi
     [[ -n "$my_b64" ]] && emit pubkey "$my_type,$my_b64"
