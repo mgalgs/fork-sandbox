@@ -24,7 +24,9 @@
 
 set -uo pipefail
 
-repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR/../scripts
+# shellcheck source=../scripts/fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
 # shellcheck source=../scripts/fork-sandbox-lib.sh
 source "$repo_dir/scripts/fork-sandbox-lib.sh"
 
