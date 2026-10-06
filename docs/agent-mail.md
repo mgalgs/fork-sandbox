@@ -384,6 +384,15 @@ reaches `alpha` (default: `alpha`'s `hostname -f`, with `beta`'s own login
 name, so say `user@host` if that is not the account that should receive).
 `--one-way` wires `alpha` to `beta` only.
 
+The second argument is also the destination written to `alpha`'s peers file
+and used by the probes, which must log in with the mail key. If you set the
+peers file up by hand with a `Host` alias whose `IdentityFile` is the mail key,
+`beta`'s forced command answers that login and setup cannot run through it:
+`add` says so and changes nothing. Keep that alias as the second argument and
+pass `--setup-dest <dest>`, a login that uses your ordinary key, for the setup
+connections (`lane-mail-peer add beta beta-mail --setup-dest beta.example.test`).
+It combines with `--back-dest` and `--one-way`.
+
 Every check on both sides (names, that `beta` has fork-sandbox installed,
 existing entries, conflicts) runs before either side is changed; a refusal
 changes nothing. The edits are the manual steps listed under "What `add`
