@@ -151,10 +151,16 @@ Do these in order.
   and `postmaster --remote` retry through it on their own (a 5 minute budget
   by default, `K8S_MAIL_API_RETRY_SECONDS` in `k8s.env`), and the server
   records each state-changing call's idempotency key on the mail volume, so a
-  retried send is not delivered twice. A call is lost only if the rollout
-  outlasts the caller's budget, or if the server is an older version that
-  does not know the key (its retries are at-least-once). See "The `--remote`
-  client" and "Idempotency keys" in [mail-api.md](mail-api.md).
+  retried send is not delivered twice. This holds for callers that reach the
+  API through a stable endpoint, such as the in-cluster
+  `http://fork-sandbox-mail-api.<namespace>.svc` URL. A `kubectl
+  port-forward` to the Service is bound to the one pod it picked and never
+  reconnects to the replacement, so a caller behind one retries to no
+  effect: restart the forward after a rollout, or run it under a supervisor
+  that does. A call is also lost if the rollout outlasts the caller's
+  budget, or if the server is an older version that does not know the key
+  (its retries are at-least-once). See "The `--remote` client" and
+  "Idempotency keys" in [mail-api.md](mail-api.md).
 - **In-flight seats survive a rollout.** A restarted postmaster adopts
   still-running Jobs instead of re-spawning them, so a rollout does not
   lose a seat's work in progress. A Job whose submit never finished pushing
@@ -201,7 +207,10 @@ server reads its tokens once at startup; the Secret is part of the
 kubectl port-forward svc/fork-sandbox-mail-api 8765:80
 ```
 
-then set `K8S_MAIL_API_URL=http://127.0.0.1:8765` and
+A port-forward does not follow a rollout to the new pod: restart it
+afterward, or keep it under a supervisor that does (see the operations note
+"A rollout no longer loses mail API calls"). Then set
+`K8S_MAIL_API_URL=http://127.0.0.1:8765` and
 `K8S_MAIL_API_TOKEN_FILE=<file holding the raw token>` in `k8s.env` and use
 `fork-sandbox mail --remote <verb> ...` (and `fork-sandbox postmaster
 --remote <verb> ...`).

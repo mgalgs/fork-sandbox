@@ -296,6 +296,13 @@ and exit 2. Each retry prints one line to stderr (`fork-sandbox mail
 runs out the last error is printed as before, followed by `fork-sandbox mail
 --remote: gave up after N attempts`, and the exit code is 2.
 
+The retries cover callers that reach the server through a stable endpoint,
+such as the in-cluster Service URL. A `kubectl port-forward` to the Service
+stays bound to the pod it picked when it started and does not reconnect to
+the pod that replaces it after a rollout, so a client behind one retries
+until its budget is spent without getting through. Restart the forward after
+a rollout, or keep it under a supervisor that does.
+
 For each invocation of a verb that changes state the client makes one
 random `Idempotency-Key` and sends the same key on every attempt of that
 invocation (see "Idempotency keys"), so a retry after a lost reply returns
