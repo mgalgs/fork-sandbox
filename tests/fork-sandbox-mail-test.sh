@@ -1160,5 +1160,121 @@ check "a control character in a colon-less filter still gives a one-line error" 
 
 export FORK_SANDBOX_MAIL_ROOT="$saved_mail_root"
 
+
+echo "== host addresses: @lane:host, own-host normalisation, --emit, ingest =="
+
+hx_root_a="$(mktemp -d)"; hx_root_b="$(mktemp -d)"
+hx_cfg_a="$(mktemp -d)"; hx_cfg_b="$(mktemp -d)"
+tmpdirs+=("$hx_root_a" "$hx_root_b" "$hx_cfg_a" "$hx_cfg_b")
+printf 'LANE_MAIL_PEER_NAME=alpha\n' > "$hx_cfg_a/lane-mail.env"
+printf 'LANE_MAIL_PEER_NAME=beta\n' > "$hx_cfg_b/lane-mail.env"
+# ma/mb: this store as host alpha / host beta.
+ma() { FORK_SANDBOX_MAIL_ROOT="$hx_root_a" FORK_SANDBOX_CONFIG_DIR="$hx_cfg_a" "$mail" "$@"; }
+mb() { FORK_SANDBOX_MAIL_ROOT="$hx_root_b" FORK_SANDBOX_CONFIG_DIR="$hx_cfg_b" "$mail" "$@"; }
+
+hx_id="$(printf 'body\n' | ma send --from @fe:alpha --to @x:alpha,@y:beta --cc @z:gamma.example --subject hosts --body - 2>/dev/null)"
+hx_msg="$(ma show "$hx_id")"
+contains "a From naming this host is stored bare" "$hx_msg" $'\nFrom: @fe\n'
+contains "a To naming this host is stored bare; another host stays qualified" "$hx_msg" $'\nTo: @x, @y:beta\n'
+contains "a host with a dot is a valid host part" "$hx_msg" $'\nCc: @z:gamma.example\n'
+check "inbox sees the normalised bare address" "$hx_id" "$(ma inbox x | cut -f1)"
+check "a lane addressed on another host is not in this host's inbox" "" "$(ma inbox y)"
+refuses "inbox refuses a lane:host name" ma inbox y:beta
+refuses "seen refuses a lane:host name" ma seen y:beta "$hx_id"
+hx_send_to() { printf 'b\n' | ma send --from @fe --to "$1" --subject s --body -; }
+for bad in @x:Beta @x: @x:-b @x:b:c @x:b_c @:beta; do
+    refuses "address '$bad' is refused" hx_send_to "$bad"
+done
+
+hx_emit="$(printf 'body\n' | ma send --emit --from @fe --to @x:beta,@y --cc @w --subject portable --body - 2>/dev/null)"
+contains "--emit qualifies a bare From with this host" "$hx_emit" $'\nFrom: @fe:alpha\n'
+contains "--emit qualifies bare To addresses, keeps others" "$hx_emit" $'\nTo: @x:beta, @y:alpha\n'
+contains "--emit qualifies Cc" "$hx_emit" $'\nCc: @w:alpha\n'
+check "--emit stores nothing" "1" "$(find "$hx_root_a/threads" -name '*.msg' | wc -l | tr -d ' ')"
+hx_emit_attach() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --attach /etc/hostname; }
+refuses "--emit refuses an attachment" hx_emit_attach
+printf 'LANE_MAIL_PEER_NAME=Bad_Name\n' > "$hx_cfg_a/lane-mail.env"
+hx_err="$(printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - 2>&1)"; rc=$?
+check "--emit with no valid peer name fails" "1" "$rc"
+contains "--emit names the config key to set" "$hx_err" LANE_MAIL_PEER_NAME
+hx_id2="$(printf 'b\n' | ma send --from @fe --to @x:alpha --subject s --body - 2>/dev/null)"
+contains "with no valid peer name nothing is normalised" "$(ma show "$hx_id2")" $'\nTo: @x:alpha\n'
+printf 'LANE_MAIL_PEER_NAME=alpha\n' > "$hx_cfg_a/lane-mail.env"
+rm -f "$hx_cfg_a/lane-mail.env"
+hx_id3="$(printf 'b\n' | HOSTNAME=Gamma.example.test FORK_SANDBOX_MAIL_ROOT="$hx_root_a" \
+    FORK_SANDBOX_CONFIG_DIR="$hx_cfg_a" "$mail" send --from @fe --to @x:gamma --subject s --body - 2>/dev/null)"
+contains "the default peer name is the lowercased short hostname" \
+    "$(ma show "$hx_id3")" $'\nTo: @x\n'
+printf 'LANE_MAIL_PEER_NAME=alpha\n' > "$hx_cfg_a/lane-mail.env"
+
+# A reply's reply-all keeps host spellings coherent: the sender, written
+# with this host's name, is dropped from the recipient list.
+hx_rid="$(printf 'r\n' | ma reply --from @x:alpha --reply-to "$hx_id" --body - 2>/dev/null)"
+contains "reply-all drops the sender whichever way it is spelled" \
+    "$(ma show "$hx_rid")" $'\nTo: @fe, @y:beta, @z:gamma.example\n'
+
+# ---- ingest ----
+hx_portable="$(printf 'ship it\n' | ma send --emit --from @fe --to @x:beta --subject 'to beta' --body - 2>/dev/null)"
+hx_pid="$(sed -n 's/^Message-ID: //p' <<<"$hx_portable")"
+hx_got="$(printf '%s\n' "$hx_portable" | mb ingest --peer alpha 2>/dev/null)"; rc=$?
+check "ingest succeeds and prints the message id" "0 $hx_pid" "$rc $hx_got"
+hx_stored="$(mb show "$hx_pid")"
+contains "ingest keeps the Thread-ID" "$hx_stored" "Thread-ID: $hx_pid"
+contains "ingest keeps the sender's host" "$hx_stored" $'\nFrom: @fe:alpha\n'
+contains "ingest normalises this host's own name in To" "$hx_stored" $'\nTo: @x\n'
+check "the ingested message is in the lane's inbox" "$hx_pid" "$(mb inbox x | cut -f1)"
+check "a message ingested with no --peer stays as given (local copy)" \
+    "$hx_pid" "$(printf '%s\n' "$hx_portable" | ma ingest 2>/dev/null)"
+contains "a local ingest normalises own host to bare From" "$(ma show "$hx_pid")" $'\nFrom: @fe\n'
+hx_ingest_b() { printf '%s\n' "$hx_portable" | mb ingest --peer alpha; }
+refuses "ingest refuses a Message-ID already in the store" hx_ingest_b
+
+hx_try() {
+    # hx_try <label> <peer> <sed-expr> -- ingests the portable message after
+    # editing it, and expects a refusal that leaves the store unchanged.
+    local label="$1" peer="$2" expr="$3" before after out rc fresh
+    fresh="$(cat /proc/sys/kernel/random/uuid)"
+    before="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+    out="$(sed "s/^Message-ID: .*/Message-ID: $fresh/;s/^Thread-ID: .*/Thread-ID: $fresh/;$expr" <<<"$hx_portable" \
+        | mb ingest ${peer:+--peer "$peer"} 2>&1)"; rc=$?
+    after="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+    [[ -z "${HX_SHOW_REASONS:-}" ]] || printf '        %s: %s\n' "$label" "$out"
+    if (( rc != 0 )) && [[ "$before" == "$after" ]]; then
+        ok "$label"
+    else
+        no "$label" "rc=$rc before=$before after=$after out=$out"
+    fi
+}
+hx_try "ingest refuses a From host that differs from --peer" alpha 's/^From: .*/From: @fe:gamma/'
+hx_try "ingest --peer refuses a From naming this host" alpha 's/^From: .*/From: @fe:beta/'
+hx_try "ingest refuses an invalid address" alpha 's/^To: .*/To: @X:beta/'
+hx_try "ingest refuses a missing core header" alpha '/^Subject: /d'
+hx_try "ingest refuses a duplicated core header" alpha 's/^Subject: .*/&\nSubject: again/'
+hx_try "ingest refuses a core header in the wrong case" alpha 's/^Subject: /subject: /'
+hx_try "ingest refuses a path-shaped Thread-ID" alpha 's/^Thread-ID: .*/Thread-ID: ..\/..\/evil/'
+hx_try "ingest refuses a Thread-ID in a store-shaped id that is another message's thread with no In-Reply-To" alpha \
+    's/^Thread-ID: .*/Thread-ID: 00000000-0000-4000-8000-000000000099/'
+hx_try "ingest refuses X-Attachment" alpha 's/^X-Hops: .*/&\nX-Attachment: attachments\/..\/..\/etc\/passwd/'
+hx_try "ingest refuses X-Review-Target" alpha 's/^X-Hops: .*/&\nX-Review-Target: main aaaaaaaa/'
+hx_try "ingest refuses a non-numeric X-Hops" alpha 's/^X-Hops: .*/X-Hops: lots/'
+hx_try "ingest refuses a malformed header line" alpha 's/^X-Hops: .*/&\nno colon here/'
+hx_try "ingest refuses a CR in a header" alpha 's/^Subject: .*/&\r/'
+hx_try "ingest refuses an empty body" alpha '/^ship it$/d'
+check "ingest refuses a bad --peer name" "1" \
+    "$(printf '%s\n' "$hx_portable" | mb ingest --peer 'Bad Peer' >/dev/null 2>&1; echo $?)"
+printf 'no headers here\n' | mb ingest --peer alpha >/dev/null 2>&1; rc=$?
+check "ingest refuses input with no header block" "1" "$rc"
+hx_big="$( { printf '%s\n' "$hx_portable"; head -c 1100000 /dev/zero | tr '\0' x; printf '\n'; } | mb ingest --peer alpha 2>&1)"; rc=$?
+check "ingest refuses a message over the size cap" "1" "$rc"
+contains "the oversize refusal says why" "$hx_big" "byte cap"
+check "refusals wrote nothing outside the thread tree" "" \
+    "$(find "$hx_root_b" -mindepth 1 -maxdepth 1 ! -name threads ! -name agents | head -3)"
+
+# A bare From and bare To/Cc on the wire are the sending peer's own.
+sed 's/^From: .*/From: @fe/;s/^To: .*/To: @x:beta, @q/;s/^Message-ID: .*/Message-ID: 11111111-1111-4111-8111-111111111111/;s/^Thread-ID: .*/Thread-ID: 11111111-1111-4111-8111-111111111111/' <<<"$hx_portable" | mb ingest --peer alpha >/dev/null 2>&1
+hx_bare_msg="$(mb show 11111111-1111-4111-8111-111111111111)"
+contains "ingest --peer qualifies a bare From with the peer" "$hx_bare_msg" $'\nFrom: @fe:alpha\n'
+contains "ingest --peer qualifies a bare To with the peer" "$hx_bare_msg" $'\nTo: @x, @q:alpha\n'
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

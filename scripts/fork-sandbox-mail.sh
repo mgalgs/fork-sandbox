@@ -16,6 +16,8 @@
 #                              [--header 'X-Name: value']...
 #                              [--upstream-head <branch>:<sha>]
 #                              [--upstream-state closed|open]
+#        fork-sandbox-mail.sh send|reply --emit ...   (print, do not store)
+#        fork-sandbox-mail.sh ingest [--peer <name>] < message
 #        fork-sandbox-mail.sh show <message-id>
 #        fork-sandbox-mail.sh tree <thread-id>
 #        fork-sandbox-mail.sh export <thread-id> --json
@@ -34,6 +36,28 @@
 # arguments and the same exit code; it needs FORK_SANDBOX_MAIL_API_URL and
 # FORK_SANDBOX_MAIL_API_TOKEN_FILE (see docs/mail-api.md). Anywhere else in
 # the arguments it is not special.
+#
+# `send --emit` / `reply --emit` build the message exactly as without the flag
+# but print it (headers, blank line, body) on stdout instead of storing it,
+# and write nothing to the store. The printed form is PORTABLE: every bare
+# address is qualified with this host's peer name, so it means the same on
+# any host. --emit does not carry attachments, grants, --review-target or
+# the upstream flags (refused). It exists so lane-mail.sh can deliver a
+# message to another host before anything is written here.
+#
+# `ingest [--peer <name>]` reads one complete message from stdin (as --emit
+# prints it) and stores it keeping its Message-ID, Thread-ID and all other
+# headers, normalising addresses that name this host to the bare form. It
+# refuses (one-line error, exit 1): a message over 1 MiB, a malformed or
+# duplicated core header, a missing core header (Message-ID, Thread-ID, Date,
+# From, To, Subject, X-Hops), an id that is not a store-shaped id, the
+# reserved headers X-Attachment, X-Upstream-*, X-Review-Target* and X-Version,
+# an invalid address, an empty body, and a Message-ID already in the store.
+# With --peer the message is treated as received from that peer: From must
+# name that host (a bare From is qualified with it; any other host is
+# refused) and bare To/Cc addresses, which are in the sender's frame, are
+# qualified with it too. This is the receiving half of lane-mail-serve; the
+# peer name comes from its forced command, never from the message.
 #
 # `export <thread-id> --json` prints one thread as a JSON object (every
 # header line, the verbatim body, attachment sizes, per-sender counts) for
@@ -161,9 +185,17 @@
 # lkml-mailbox.sh used, ids here are bare uuids with no "<...>" wrapping and
 # no "@domain" suffix -- Message-ID and Thread-ID are literal uuid values.
 #
-# Addressing. Every @name (in --from/--to/--cc, and in an inbox lookup) must
-# match ^@[a-z0-9][a-z0-9-]*$ -- lowercase alnum, hyphens allowed, no leading
-# hyphen. Anything else is refused with a one-line error. There is no
+# Addressing. Every address (in --from/--to/--cc) is `@name` or
+# `@name:host`. The name must match [a-z0-9][a-z0-9-]* -- lowercase alnum,
+# hyphens allowed, no leading hyphen; a host (a lane-mail peer name) matches
+# [a-z0-9][a-z0-9.-]*. Anything else is refused with a one-line error. A
+# bare `@name` means this host. An address naming this host's own peer name
+# (LANE_MAIL_PEER_NAME in the config dir's lane-mail.env, default the short
+# hostname; see lane-mail-lib.sh) is stored in the bare form, so inboxes,
+# `seen` and watchers see one spelling. `inbox` and `seen` take a bare lane
+# name only. This store does not route: an `@name:host` address is just text
+# here (lane-mail.sh does the delivery), and the fleet postmaster treats one
+# like any name it cannot resolve. There is no
 # registry: this script does not know or care whether a name refers to a
 # live agent. --to and --cc each take a comma-separated list and may be
 # repeated; repeats accumulate, so `--to @a --to @b` is `--to @a,@b`.
@@ -210,7 +242,11 @@ set -euo pipefail
 
 MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
 MAIL_ATTACH_MAX_BYTES=$(( 4 * 1024 * 1024 ))
-MAIL_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
+# An address is `@lane` (this host) or `@lane:host` (a peer's lane; see
+# "Addressing" in the header). Same lane and host shapes as
+# LANE_MAIL_LANE_RE / LANE_MAIL_HOST_RE in lane-mail-lib.sh.
+MAIL_ADDR_RE='^@[a-z0-9][a-z0-9-]*(:[a-z0-9][a-z0-9.-]*)?$'
+MAIL_INGEST_MAX_BYTES=$(( 1024 * 1024 ))
 # Same hex-id shape as fork-sandbox.sh's own session-id check: no slashes,
 # no dots, no leading hyphen. mail_new_uuid never generates anything else,
 # so a caller-supplied id failing this shape is not a thread id this store
@@ -222,6 +258,8 @@ MAIL_SEQ_MAX_TRIES=10000
 # wrong; this matches how fork-sandbox.sh and fork-sandbox-fleet.sh locate
 # their own siblings.
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/lane-mail-lib.sh"
 
 usage() {
     # The header block is the documentation: print it from line 2 down to
@@ -240,10 +278,24 @@ mail_thread_dir() {
 mail_validate_addr() {
     if [[ ! "$1" =~ $MAIL_ADDR_RE ]]; then
         echo "Error: '$1' is not a valid address; addresses look like" >&2
-        echo "'@name', lowercase alphanumeric and '-' only, no leading '-'." >&2
+        echo "'@name' or '@name:host', lowercase alphanumeric and '-' only in" >&2
+        echo "the name (no leading '-'); a host may also contain '.'." >&2
         return 1
     fi
     return 0
+}
+
+# An inbox or seen-list belongs to a lane on THIS host: a bare name only.
+# `@lane:host` is a valid address but never a mailbox here -- a remote inbox
+# is read on the remote host.
+mail_validate_inbox_name() {
+    local name="$1" verb="$2"
+    if [[ "$name" == *:* ]]; then
+        echo "Error: $verb: '$name' names another host; $verb works on this host's" >&2
+        echo "lanes only (use the bare lane name)." >&2
+        return 1
+    fi
+    mail_validate_addr "@$name"
 }
 
 # Rejects a value containing a raw newline. Header values are joined into
@@ -297,6 +349,43 @@ mail_trim() {
     printf '%s' "$s"
 }
 
+# Prints a validated address in this store's own terms: an address naming
+# this host (`@lane:<self>`) becomes the bare `@lane`, so inboxes, `seen`
+# and watchers see one spelling. Anything else passes through. When this
+# host's peer name cannot be determined nothing can match it, so nothing
+# is rewritten.
+mail_norm_addr() {
+    local a="$1" self
+    if [[ "$a" == *:* ]] && self="$(lane_mail_self_name)" && [[ "${a#*:}" == "$self" ]]; then
+        a="${a%%:*}"
+    fi
+    printf '%s' "$a"
+}
+
+# Prints address $1 qualified with host $2 unless it already names a host.
+mail_qualify_addr() {
+    if [[ "$1" == *:* ]]; then
+        printf '%s' "$1"
+    else
+        printf '%s:%s' "$1" "$2"
+    fi
+}
+
+# Prints the comma-separated list $1 ", "-joined with every bare address
+# qualified with host $2. Empty elements are kept so that validation, which
+# runs afterwards, still refuses them.
+mail_qualify_list() {
+    local list="$1" host="$2" p out="" first=1
+    local -a parts
+    IFS=',' read -ra parts <<< "$list"
+    for p in "${parts[@]}"; do
+        p="$(mail_trim "$p")"
+        [[ -z "$p" ]] || p="$(mail_qualify_addr "$p" "$host")"
+        if (( first )); then out="$p"; first=0; else out="$out, $p"; fi
+    done
+    printf '%s' "$out"
+}
+
 # Validates a comma-separated list of addresses and prints it back
 # normalized as ", "-joined, or nothing for an empty list.
 mail_validate_addr_list() {
@@ -308,6 +397,7 @@ mail_validate_addr_list() {
     for p in "${parts[@]}"; do
         p="$(mail_trim "$p")"
         mail_validate_addr "$p" || return 1
+        p="$(mail_norm_addr "$p")"
         out="${out:+$out, }$p"
     done
     printf '%s' "$out"
@@ -710,13 +800,52 @@ mail_body_is_empty() {
     ! grep -q '[^[:space:]]' -- "$1"
 }
 
+# --emit builds a message exactly as send/reply would but prints it instead
+# of storing it, so a caller can ship it elsewhere before anything is
+# written here. It carries only what a plain message carries: attachments,
+# grants, a review target and the upstream flags stay in the local store.
+# Args: verb, attach count, grant-ns count, reach-probe count, and the
+# concatenation of the single-valued flags that --emit cannot carry.
+mail_emit_check() {
+    local verb="$1" n_attach="$2" n_ns="$3" n_probe="$4" other="$5"
+    if (( n_attach > 0 )) || (( n_ns > 0 )) || (( n_probe > 0 )) || [[ -n "$other" ]]; then
+        echo "Error: $verb: --emit does not carry attachments, grants, a review" >&2
+        echo "target or upstream flags." >&2
+        return 1
+    fi
+}
+
+# Rewrites the From/To/Cc values named by the three variables ($1 $2 $3)
+# into portable form: every bare address qualified with this host's peer
+# name, so the message means the same thing on any other host.
+mail_emit_addrs() {
+    local -n from_ref="$1" to_ref="$2" cc_ref="$3"
+    local self
+    self="$(lane_mail_self_name)" || {
+        echo "Error: --emit needs this host's peer name; set LANE_MAIL_PEER_NAME in" >&2
+        echo "$(lane_mail_config_dir)/lane-mail.env (lowercase alphanumeric, '-' and '.')." >&2
+        return 1
+    }
+    from_ref="$(mail_qualify_addr "$from_ref" "$self")"
+    to_ref="$(mail_qualify_list "$to_ref" "$self")"
+    [[ -z "$cc_ref" ]] || cc_ref="$(mail_qualify_list "$cc_ref" "$self")"
+}
+
+# Prints a finished message ($1 headers, $2 body file) and removes the body.
+mail_emit_message() {
+    printf '%s\n\n' "$1"
+    cat -- "$2"
+    rm -f -- "$2"
+}
+
 cmd_send() {
     local from="" to="" cc="" subject="" body_arg="" hops=8
     local -a attach_files=() extra_headers=()
     local -a grant_allow_ns=() grant_reach_probe=()
-    local grant_context_ro="" grant_context_secret="" review_target_arg=""
+    local grant_context_ro="" grant_context_secret="" review_target_arg="" emit=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --emit) emit=1; shift ;;
             --from) from="${2:?--from requires an address}"; shift 2 ;;
             --to) to="${to:+$to,}${2:?--to requires an address list}"; shift 2 ;;
             --cc) cc="${cc:+$cc,}${2:?--cc requires an address list}"; shift 2 ;;
@@ -759,10 +888,15 @@ cmd_send() {
     done
 
     mail_validate_addr "$from" || return 1
+    from="$(mail_norm_addr "$from")"
     local to_norm cc_norm
     to_norm="$(mail_validate_addr_list "$to")" || return 1
     cc_norm=""
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
+    if (( emit )); then
+        mail_emit_check send "${#attach_files[@]}" "${#grant_allow_ns[@]}" "${#grant_reach_probe[@]}" \
+            "$grant_context_ro$grant_context_secret$review_target_arg" || return 1
+    fi
 
     # A grant, if given, is checked before anything is written -- a
     # refused grant must leave no thread dir, no staged attachment, no
@@ -804,7 +938,7 @@ cmd_send() {
 
     local uuid; uuid="$(mail_new_uuid)"
     local thread_dir; thread_dir="$(mail_thread_dir "$uuid")"
-    mkdir -p -- "$thread_dir"
+    (( emit )) || mkdir -p -- "$thread_dir"
 
     if (( saw_grant )); then
         local write_rc=0
@@ -836,14 +970,18 @@ cmd_send() {
         }
     fi
 
+    local from_hdr="$from" to_hdr="$to_norm" cc_hdr="$cc_norm"
+    if (( emit )); then
+        mail_emit_addrs from_hdr to_hdr cc_hdr || { rm -f -- "$body_file"; return 1; }
+    fi
     local date_hdr; date_hdr="$(date -u +'%a, %d %b %Y %H:%M:%S +0000')"
     local -a hlines=()
     hlines+=("Message-ID: $uuid")
     hlines+=("Thread-ID: $uuid")
     hlines+=("Date: $date_hdr")
-    hlines+=("From: $from")
-    hlines+=("To: $to_norm")
-    [[ -n "$cc_norm" ]] && hlines+=("Cc: $cc_norm")
+    hlines+=("From: $from_hdr")
+    hlines+=("To: $to_hdr")
+    [[ -n "$cc_hdr" ]] && hlines+=("Cc: $cc_hdr")
     hlines+=("Subject: $subject")
     hlines+=("X-Hops: $hops")
     if (( saw_review_target )); then
@@ -867,6 +1005,11 @@ cmd_send() {
     fi
     local headers; headers="$(printf '%s\n' "${hlines[@]}")"
 
+    if (( emit )); then
+        mail_emit_message "$headers" "$body_file"
+        return 0
+    fi
+
     mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || {
         (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
         (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
@@ -881,9 +1024,10 @@ cmd_send() {
 cmd_reply() {
     local from="" reply_to="" body_arg="" to="" cc="" subject_override="" hops_override=""
     local -a attach_files=() extra_headers=()
-    local upstream_head_arg="" upstream_state_arg=""
+    local upstream_head_arg="" upstream_state_arg="" emit=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --emit) emit=1; shift ;;
             --from) from="${2:?--from requires an address}"; shift 2 ;;
             --reply-to) reply_to="${2:?--reply-to requires a message id}"; shift 2 ;;
             --body) body_arg="${2:?--body requires a file, or -}"; shift 2 ;;
@@ -935,9 +1079,13 @@ cmd_reply() {
     fi
 
     mail_validate_addr "$from" || return 1
+    from="$(mail_norm_addr "$from")"
     local to_norm="" cc_norm=""
     [[ -n "$to" ]] && { to_norm="$(mail_validate_addr_list "$to")" || return 1; }
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
+    if (( emit )); then
+        mail_emit_check reply "${#attach_files[@]}" 0 0 "$upstream_head_arg$upstream_state_arg" || return 1
+    fi
 
     local parent_file
     parent_file="$(mail_find_by_id "$reply_to")" || {
@@ -1016,14 +1164,18 @@ cmd_reply() {
     fi
 
     local uuid; uuid="$(mail_new_uuid)"
+    local from_hdr="$from" to_hdr="$to_norm" cc_hdr="$cc_norm"
+    if (( emit )); then
+        mail_emit_addrs from_hdr to_hdr cc_hdr || { rm -f -- "$body_file"; return 1; }
+    fi
     local date_hdr; date_hdr="$(date -u +'%a, %d %b %Y %H:%M:%S +0000')"
     local -a hlines=()
     hlines+=("Message-ID: $uuid")
     hlines+=("Thread-ID: $p_thread_id")
     hlines+=("Date: $date_hdr")
-    hlines+=("From: $from")
-    hlines+=("To: $to_norm")
-    [[ -n "$cc_norm" ]] && hlines+=("Cc: $cc_norm")
+    hlines+=("From: $from_hdr")
+    hlines+=("To: $to_hdr")
+    [[ -n "$cc_hdr" ]] && hlines+=("Cc: $cc_hdr")
     hlines+=("Subject: $subject")
     hlines+=("In-Reply-To: $p_id")
     hlines+=("References: $references")
@@ -1043,10 +1195,186 @@ cmd_reply() {
     fi
     local headers; headers="$(printf '%s\n' "${hlines[@]}")"
 
+    if (( emit )); then
+        mail_emit_message "$headers" "$body_file"
+        return 0
+    fi
+
     mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || { rm -f -- "$body_file"; return 1; }
     rm -f -- "$body_file"
     echo "fork-sandbox mail: replied ${uuid} to ${p_id}" >&2
     printf '%s\n' "$uuid"
+}
+
+# Single-valued headers: a second copy would make mail_header (first match)
+# and anything that reads the whole block disagree, so ingest refuses it.
+MAIL_INGEST_SINGLETONS=(Message-ID Thread-ID Date From To Cc Subject In-Reply-To References X-Hops)
+MAIL_INGEST_REQUIRED=(Message-ID Thread-ID Date From To Subject X-Hops)
+
+mail_ingest_fail() {
+    echo "Error: ingest: $*" >&2
+    return 1
+}
+
+# Validates the message in $2 (read bounded from stdin by cmd_ingest) and,
+# if it is sound, places it in the store keeping its ids and headers. $1 is
+# the peer name to stamp it as received from, or empty. $3 is a scratch file
+# for the body. Prints the message id.
+mail_ingest_message() {
+    local peer="$1" raw="$2" body_file="$3"
+    local -a hdrs=()
+    local line n=0 found_blank=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$(( n + 1 ))
+        if [[ -z "$line" ]]; then found_blank=1; break; fi
+        hdrs+=("$line")
+    done < "$raw"
+    (( found_blank )) || { mail_ingest_fail "no blank line ends the header block."; return 1; }
+    (( ${#hdrs[@]} > 0 )) || { mail_ingest_fail "the message has no headers."; return 1; }
+    [[ "$(head -n "$n" "$raw" | tr -d '\0' | wc -c)" == "$(head -n "$n" "$raw" | wc -c)" ]] ||
+        { mail_ingest_fail "the header block contains a NUL byte."; return 1; }
+    tail -n "+$(( n + 1 ))" "$raw" > "$body_file"
+    if mail_body_is_empty "$body_file"; then
+        mail_ingest_fail "message body is empty."
+        return 1
+    fi
+
+    local -A hv=() hcount=()
+    local name val k
+    for line in "${hdrs[@]}"; do
+        if [[ "$line" == *$'\r'* ]]; then
+            mail_ingest_fail "a header line contains a carriage return."
+            return 1
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z][A-Za-z0-9-]*):(\ (.*))?$ ]]; then
+            mail_ingest_fail "malformed header line '${line:0:60}'."
+            return 1
+        fi
+        name="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[3]}"
+        case "${name^^}" in
+            X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-REVIEW-TARGET|X-REVIEW-TARGET-SET|X-VERSION)
+                mail_ingest_fail "header '$name' is reserved and does not travel."
+                return 1
+                ;;
+        esac
+        for k in "${MAIL_INGEST_SINGLETONS[@]}"; do
+            [[ "${name^^}" == "${k^^}" ]] || continue
+            if [[ "$name" != "$k" ]]; then
+                mail_ingest_fail "header '$name' must be spelled '$k'."
+                return 1
+            fi
+            if (( ${hcount[$k]:-0} > 0 )); then
+                mail_ingest_fail "header '$k' appears more than once."
+                return 1
+            fi
+            hcount[$k]=1
+            hv[$k]="$val"
+        done
+    done
+    for k in "${MAIL_INGEST_REQUIRED[@]}"; do
+        if (( ${hcount[$k]:-0} == 0 )); then
+            mail_ingest_fail "header '$k' is missing."
+            return 1
+        fi
+    done
+
+    local mid="${hv[Message-ID]}" tid="${hv[Thread-ID]}"
+    for k in Message-ID Thread-ID In-Reply-To; do
+        [[ -z "${hcount[$k]:-}" || "${hv[$k]}" =~ $MAIL_ID_RE ]] ||
+            { mail_ingest_fail "$k '${hv[$k]:0:60}' is not a valid id."; return 1; }
+    done
+    if [[ -n "${hcount[References]:-}" ]]; then
+        local ref
+        for ref in ${hv[References]}; do
+            [[ "$ref" =~ $MAIL_ID_RE ]] || { mail_ingest_fail "References holds an invalid id."; return 1; }
+        done
+    fi
+    [[ "${hv[X-Hops]}" =~ ^[0-9]+$ ]] || { mail_ingest_fail "X-Hops must be a non-negative integer."; return 1; }
+    if [[ "$tid" != "$mid" && -z "${hcount[In-Reply-To]:-}" ]]; then
+        mail_ingest_fail "a message in another message's thread must carry In-Reply-To."
+        return 1
+    fi
+
+    # Addresses. With --peer, the message arrived from that peer: its From
+    # must name that host (a bare From is that host's lane), and bare To/Cc
+    # addresses are in the sender's frame, so they are that host's too.
+    local from="${hv[From]}" to="${hv[To]}" cc="${hv[Cc]:-}"
+    mail_validate_addr "$from" || return 1
+    if [[ -n "$peer" ]]; then
+        if [[ "$from" == *:* ]]; then
+            if [[ "${from#*:}" != "$peer" ]]; then
+                mail_ingest_fail "From host '${from#*:}' does not match the sending peer '$peer'."
+                return 1
+            fi
+        else
+            from="$(mail_qualify_addr "$from" "$peer")"
+        fi
+        to="$(mail_qualify_list "$to" "$peer")"
+        [[ -z "$cc" ]] || cc="$(mail_qualify_list "$cc" "$peer")"
+    fi
+    from="$(mail_norm_addr "$from")"
+    to="$(mail_validate_addr_list "$to")" || return 1
+    [[ -n "$to" ]] || { mail_ingest_fail "To is empty."; return 1; }
+    [[ -z "$cc" ]] || { cc="$(mail_validate_addr_list "$cc")" || return 1; }
+
+    if mail_find_by_id "$mid" >/dev/null; then
+        mail_ingest_fail "message $mid is already in this store."
+        return 1
+    fi
+
+    local -a out=()
+    for line in "${hdrs[@]}"; do
+        case "$line" in
+            "From:"*) out+=("From: $from") ;;
+            "To:"*) out+=("To: $to") ;;
+            "Cc:"*) out+=("Cc: $cc") ;;
+            *) out+=("$line") ;;
+        esac
+    done
+    local headers; headers="$(printf '%s\n' "${out[@]}")"
+
+    local thread_dir created=0
+    thread_dir="$(mail_thread_dir "$tid")"
+    [[ -d "$thread_dir" ]] || created=1
+    mkdir -p -- "$thread_dir"
+    if ! mail_place_message "$headers" "$body_file" "$thread_dir" "$mid" >/dev/null; then
+        (( created )) && rmdir -- "$thread_dir" 2>/dev/null
+        return 1
+    fi
+    printf '%s\n' "$mid"
+}
+
+# ingest --peer: the receiving end of a cross-host delivery. Writes one
+# complete message (as `send --emit` prints it) from stdin into this store,
+# keeping its Message-ID, Thread-ID and every other header, normalising
+# addresses that name this host to the bare form. Without --peer it is a
+# local write (the sender's own copy of a message it just delivered).
+cmd_ingest() {
+    local peer=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --peer) peer="${2:?--peer requires a peer name}"; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Error: ingest: unknown option '$1'." >&2; return 1 ;;
+        esac
+    done
+    if [[ -n "$peer" && ! "$peer" =~ $LANE_MAIL_HOST_RE ]]; then
+        mail_ingest_fail "--peer '$peer' is not a valid peer name."
+        return 1
+    fi
+    local raw body_file rc=0 size
+    raw="$(mktemp "$MAIL_ROOT/.mail.ingest.XXXXXX")"
+    body_file="$(mktemp "$MAIL_ROOT/.mail.body.XXXXXX")"
+    head -c $(( MAIL_INGEST_MAX_BYTES + 1 )) > "$raw" || true
+    size="$(wc -c < "$raw" | tr -d '[:space:]')"
+    if (( size > MAIL_INGEST_MAX_BYTES )); then
+        mail_ingest_fail "message is over the $MAIL_INGEST_MAX_BYTES byte cap." || rc=1
+    else
+        mail_ingest_message "$peer" "$raw" "$body_file" || rc=$?
+    fi
+    rm -f -- "$raw" "$body_file"
+    return "$rc"
 }
 
 cmd_show() {
@@ -1169,7 +1497,7 @@ cmd_inbox() {
         esac
     done
     local addr="@$name"
-    mail_validate_addr "$addr" || return 1
+    mail_validate_inbox_name "$name" inbox || return 1
 
     local seen_file="$MAIL_ROOT/agents/$name/seen"
     local -a seen_ids=()
@@ -1284,8 +1612,7 @@ cmd_seen() {
     local name="${1:?Usage: fork-sandbox-mail.sh seen <name> <message-id>...}"
     shift
     (( $# > 0 )) || { echo "Error: seen: at least one message id is required." >&2; return 1; }
-    local addr="@$name"
-    mail_validate_addr "$addr" || return 1
+    mail_validate_inbox_name "$name" seen || return 1
 
     local dir="$MAIL_ROOT/agents/$name"
     mkdir -p -- "$dir"
@@ -1324,6 +1651,7 @@ case "${1-}" in
     -h|--help) usage; exit 0 ;;
     send) shift; cmd_send "$@" ;;
     reply) shift; cmd_reply "$@" ;;
+    ingest) shift; cmd_ingest "$@" ;;
     show) shift; cmd_show "$@" ;;
     tree) shift; cmd_tree "$@" ;;
     export) shift; cmd_export "$@" ;;

@@ -343,6 +343,7 @@ PLUMBING=(
     fork-sandbox-preset-parse.py
     fork-sandbox-refresh.sh
     fork-sandbox-stop-guard.sh
+    lane-mail-lib.sh          # sourced by lane-mail.sh, lane-mail-serve and fork-sandbox-mail.sh
     sandbox-backend-bwrap
     sandbox-backend-container
 )
