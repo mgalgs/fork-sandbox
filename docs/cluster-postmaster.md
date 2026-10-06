@@ -384,7 +384,8 @@ generic even when the laptop runs something else.
 The postmaster's ServiceAccount is bound to a Role that can read every
 Secret in the namespace (`get`/`list`/`watch` on `secrets`, alongside
 `configmaps`, `services`, `jobs`, `pods`, `pods/exec`, `pods/log`, and
-`networkpolicies`). That is not a new exposure introduced by this Role:
+`networkpolicies`, plus read-only `list` on `events` and `get` on
+`resourcequotas` for submit's quota wait). That is not a new exposure introduced by this Role:
 anything that can create a Job can already mount any Secret in its own
 namespace by naming it in that Job's spec, regardless of what its own Role
 lists. What the Role does add is the ability to *list and delete* Secrets
