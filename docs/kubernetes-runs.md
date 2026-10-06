@@ -2361,6 +2361,14 @@ cleanup runs. The Job-side check reads the Job's events, so it does not wait on
 a pod that is merely slow to schedule; a stale quota event with no pod yet is
 still read as blocked, within the same budget.
 
+The Job-side check and the pre-check need two read-only grants beyond what
+earlier installs carry: `events` (`list`) and `resourcequotas` (`get`). Both
+the client Role (`10-rbac.yaml`) and the postmaster Role (`40-postmaster.yaml`)
+now grant them. Both reads swallow errors, so a Role without them does not fail
+loudly: the Job-side wait just never sees the refusal and the run falls back to
+the pod-ready timeout. Re-run `install` (and `install --postmaster`) to pick the
+grants up on an existing namespace.
+
 ## Limits
 
 Stated rather than solved, in the same spirit `docs/sandbox-backend.md` states

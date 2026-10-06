@@ -18054,5 +18054,17 @@ else
         "$(diff <(echo "$rbac_rules") <(echo "$pm_rules"))"
 fi
 
+# submit's quota wait reads Job FailedCreate events and the ResourceQuota;
+# both swallow errors, so a Role without these reads silently disables it.
+for rule in "/events/list" "/resourcequotas/get"; do
+    for who in "client:$rbac_rules" "postmaster:$pm_rules"; do
+        if grep -qxF -- "$rule" <<< "${who#*:}"; then
+            ok "${who%%:*} Role grants '$rule' (submit's quota wait needs it)"
+        else
+            no "${who%%:*} Role grants '$rule' (submit's quota wait needs it)" "missing"
+        fi
+    done
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

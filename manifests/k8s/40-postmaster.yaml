@@ -79,6 +79,15 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # Read-only: submit's quota wait reads the Job controller's FailedCreate
+  # events and the namespace ResourceQuota's pod usage. Without these reads a
+  # refused agent pod is invisible to it.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
