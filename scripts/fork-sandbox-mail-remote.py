@@ -11,11 +11,29 @@ stdout and stderr are written byte-exact and the exit code is the verb's.
 Other failures (no config, no route, HTTP 4xx/5xx) print one line to stderr
 and exit 2. `--remote --help` prints this text.
 
+Retries. A restart of the server is a window in which calls fail, so a call
+that could not reach the server, lost its connection, timed out waiting for
+the reply, or got HTTP 409, 502, 503 or 504 is tried again, after a
+wait that grows exponentially with jitter (from 1 s, at most 30 s), until the
+retry budget is spent. Each retry prints one line to stderr; when the budget
+runs out the last error is printed as before, then a line saying how many
+attempts were made. Any other status is a real answer and is never retried. A
+budget of 0 turns retries off.
+
+Every invocation of a verb that changes state (send, reply, seen, grant, flag,
+unflag) makes one random Idempotency-Key and sends it on every attempt, so
+a server that already ran the verb answers a retry with the first result
+instead of running it again. A server that predates the key ignores it, and
+then a retried call may run twice.
+
 Config, from the environment, else from ${FORK_SANDBOX_CONFIG_DIR:-
 $HOME/.config/fork-sandbox}/k8s.env (KEY=value lines, read, never sourced):
 
     FORK_SANDBOX_MAIL_API_URL         K8S_MAIL_API_URL          e.g. http://127.0.0.1:8080
     FORK_SANDBOX_MAIL_API_TOKEN_FILE  K8S_MAIL_API_TOKEN_FILE   a file holding the token
+    FORK_SANDBOX_MAIL_API_RETRY_SECONDS  K8S_MAIL_API_RETRY_SECONDS
+                                      the retry budget in seconds (default
+                                      300; 0 = no retries)
 
 The token file's trailing whitespace is stripped.
 
@@ -33,14 +51,24 @@ import base64
 import http.client
 import json
 import os
+import random
+import secrets
 import sys
+import time
 import urllib.error
 import urllib.request
 
 TIMEOUT = 90
+RETRY_DEFAULT = 300
+BACKOFF_START = 1.0
+BACKOFF_CAP = 30.0
+RETRY_STATUS = (409, 502, 503, 504)
+MUTATING = ("send", "reply", "seen", "grant", "flag", "unflag")
 TOOLS = ("mail", "postmaster")
 URL_KEYS = ("FORK_SANDBOX_MAIL_API_URL", "K8S_MAIL_API_URL")
 TOKEN_KEYS = ("FORK_SANDBOX_MAIL_API_TOKEN_FILE", "K8S_MAIL_API_TOKEN_FILE")
+RETRY_KEYS = ("FORK_SANDBOX_MAIL_API_RETRY_SECONDS",
+              "K8S_MAIL_API_RETRY_SECONDS")
 
 # The flags of send and reply that take a value, so a value that reads
 # "--body" is never taken for the flag.
@@ -55,6 +83,10 @@ class Fail(Exception):
     def __init__(self, message, rc=2):
         super().__init__(message)
         self.rc = rc
+
+
+class Retryable(Fail):
+    """A failure a restarting server explains: worth another attempt."""
 
 
 def read_env_key(path, key):
@@ -111,7 +143,17 @@ def config(tool):
     if not token:
         raise Fail("%sno token: the token file is empty (%s or %s)"
                    % (prefix, TOKEN_KEYS[0], TOKEN_KEYS[1]))
-    return url.rstrip("/") + "/v1/exec", token
+    return url.rstrip("/") + "/v1/exec", token, retry_budget(prefix)
+
+
+def retry_budget(prefix):
+    raw = setting(RETRY_KEYS)
+    if not raw:
+        return RETRY_DEFAULT
+    if not (raw.isascii() and raw.isdigit()):
+        raise Fail("%sthe retry budget (%s or %s) must be a whole number of "
+                   "seconds" % (prefix, RETRY_KEYS[0], RETRY_KEYS[1]))
+    return int(raw)
 
 
 def read_file(path, what):
@@ -166,13 +208,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def post(tool, url, token, request):
+def post(tool, url, token, request, key):
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), NoRedirect)
     req = urllib.request.Request(
         url, data=json.dumps(request).encode("ascii"), method="POST",
         headers={"Authorization": "Bearer " + token,
                  "Content-Type": "application/json"})
+    if key:
+        req.add_header("Idempotency-Key", key)
     prefix = "fork-sandbox %s --remote: " % tool
     try:
         with opener.open(req, timeout=TIMEOUT) as resp:
@@ -183,18 +227,46 @@ def post(tool, url, token, request):
         except (ValueError, KeyError, TypeError, OSError):
             message = e.reason or "no detail"
         message = " ".join(message.split()) or "no detail"
-        raise Fail("%sHTTP %d: %s" % (prefix, e.code, message))
+        failure = Retryable if e.code in RETRY_STATUS else Fail
+        raise failure("%sHTTP %d: %s" % (prefix, e.code, message))
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
         reason = getattr(e, "reason", None) or e
-        raise Fail("%scannot reach %s: %s"
-                   % (prefix, url.rsplit("/v1/exec", 1)[0],
-                      " ".join(str(reason).split())))
+        raise Retryable("%scannot reach %s: %s"
+                        % (prefix, url.rsplit("/v1/exec", 1)[0],
+                           " ".join(str(reason).split())))
     except ValueError:
         raise Fail("%sthe server sent a reply that is not JSON" % prefix)
 
 
+def post_with_retries(tool, url, token, request, key, budget):
+    """post(), tried again on a Retryable failure until budget seconds have
+    passed since the first attempt. Budget 0 is one attempt."""
+    prefix = "fork-sandbox %s --remote: " % tool
+    start = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return post(tool, url, token, request, key)
+        except Retryable as e:
+            if budget <= 0:
+                raise
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                raise Fail("%s\n%sgave up after %d attempt%s"
+                           % (e, prefix, attempt,
+                              "" if attempt == 1 else "s"), rc=e.rc)
+            ceiling = min(BACKOFF_CAP, BACKOFF_START * 2 ** (attempt - 1))
+            wait = min(random.uniform(ceiling / 2, ceiling), remaining)
+            sys.stderr.write("%sattempt %d failed (%s); retrying in %.1f s\n"
+                             % (prefix, attempt,
+                                str(e)[len(prefix):], wait))
+            sys.stderr.flush()
+            time.sleep(wait)
+
+
 def run(tool, argv):
-    url, token = config(tool)
+    url, token, budget = config(tool)
     argv, stdin, files = rewrite(tool, argv)
     request = {"tool": tool, "argv": argv}
     if stdin is not None:
@@ -202,7 +274,8 @@ def run(tool, argv):
     if files:
         request["files"] = {name: base64.b64encode(data).decode("ascii")
                             for name, data in files.items()}
-    reply = post(tool, url, token, request)
+    key = secrets.token_urlsafe(24) if argv[0] in MUTATING else None
+    reply = post_with_retries(tool, url, token, request, key, budget)
     try:
         rc = int(reply["rc"])
         out = base64.b64decode(reply["stdout_b64"])

@@ -60,8 +60,24 @@ HTTP:
 The reply is always JSON. 200 {"rc", "stdout_b64", "stderr_b64"} when the verb
 ran, whatever its exit code. Otherwise {"error": "<one line>"}: 400 bad
 request, 401 no or bad token, 403 not allowed, 404/405 wrong path or method,
-411/413 missing or oversized length or upload, 504 the verb ran over 60 s and
-was killed.
+409 another request with the same Idempotency-Key is still running, 411/413
+missing or oversized length or upload, 422 an Idempotency-Key reused with a
+different request, 504 the verb ran over 60 s and was killed.
+
+Idempotency. A request for a verb that changes state (send, reply, seen,
+grant, flag, unflag) may carry an "Idempotency-Key" header: 16 to 128 of
+A-Z a-z 0-9 _ -. The first request with a key (per token) runs the verb and,
+once it has COMPLETED (any 200), records its response; a later request with the
+same key and the same body is answered with that recorded response and the
+verb does not run again. The records are files under
+$FORK_SANDBOX_MAIL_ROOT/.postmaster/api-idempotency/, written atomically, so
+they survive a restart of this server; a record older than 24 h is ignored and
+is pruned the next time a record is written. A request that dies before it
+completes (a kill, the 60 s timeout, a crash) leaves no record, so its retry
+runs. While one request holds a key, a second with that key waits up to 30 s
+for it, then gets 409. The header is ignored for the read-only verbs. A server
+without this feature ignores the header too, so a client's retry against one
+runs the verb again. A key is not logged.
 
 Allowlist (verb: positionals; flags; who may run it). A flag is matched
 exactly (no --flag=value, no abbreviation, no combined short flags); its value
@@ -100,7 +116,8 @@ at most 4 MiB decoded, at most 16 files, no unreferenced keys); the server
 writes each file to a private temp directory and deletes it after the call.
 stdin_b64 is at most 4 MiB decoded and stdin is empty when it is absent.
 
-One log line per request goes to stderr: time, label, tool, verb, status, rc.
+One log line per request goes to stderr: time, label, tool, verb, status, rc,
+and the word "replay" when the response was a recorded one.
 It never holds a token, a body, a file or an argv value.
 """
 
@@ -135,6 +152,11 @@ MAX_STDIN = 4 * 1024 * 1024
 MAX_FILES = 16
 MAX_ARGV = 1024
 EXEC_TIMEOUT = 60
+IDEM_HEADER = "Idempotency-Key"
+IDEM_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+IDEM_TTL = 24 * 3600
+IDEM_WAIT = 30
+DEFAULT_MAIL_ROOT = "/var/tmp/claude-scratch/agent-mail"
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 TOOL_SCRIPTS = {
@@ -226,6 +248,9 @@ def refused_header_name(raw):
 OPERATORS = frozenset(["@operator"])
 
 OPERATOR_ONLY = {("postmaster", "flag"), ("postmaster", "unflag")}
+MUTATING = {("mail", "send"), ("mail", "reply"), ("mail", "seen"),
+            ("mail", "grant"), ("postmaster", "flag"),
+            ("postmaster", "unflag")}
 GRANT_FLAGS = ("--allow-namespace", "--reach-probe", "--context-secret")
 
 
@@ -501,7 +526,126 @@ def run_tool(tool, argv, stdin):
     return rc, out, err
 
 
-def handle_exec(entry, raw, ctx):
+# ------------------------------------------------------------- idempotency
+
+_inflight = {}
+_inflight_lock = threading.Lock()
+
+
+def idem_dir():
+    root = os.environ.get("FORK_SANDBOX_MAIL_ROOT") or DEFAULT_MAIL_ROOT
+    return os.path.join(root, ".postmaster", "api-idempotency")
+
+
+def load_record(path, fingerprint):
+    """The recorded (rc, stdout, stderr) at path, or None when there is no
+    live record. Raises ApiError(422) when the key was used for a different
+    request. An unreadable or expired record is no record."""
+    try:
+        if time.time() - os.stat(path).st_mtime > IDEM_TTL:
+            return None
+        with open(path, encoding="ascii") as f:
+            rec = json.load(f)
+        rc = int(rec["rc"])
+        out = base64.b64decode(rec["stdout_b64"], validate=True)
+        err = base64.b64decode(rec["stderr_b64"], validate=True)
+        seen = rec["fingerprint"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if seen != fingerprint:
+        raise ApiError(422, "this Idempotency-Key was used for a different "
+                            "request")
+    return rc, out, err
+
+
+def prune_records(directory):
+    """Delete records (and leftover temp files) older than IDEM_TTL."""
+    cutoff = time.time() - IDEM_TTL
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def store_record(directory, path, fingerprint, result):
+    """Write the record atomically: a temp file in the same directory, synced,
+    then renamed over its final name, so a reader sees all of it or none."""
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    rc, out, err = result
+    fd, tmp = tempfile.mkstemp(prefix=".tmp.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            json.dump({"fingerprint": fingerprint, "rc": rc,
+                       "stdout_b64": base64.b64encode(out).decode("ascii"),
+                       "stderr_b64": base64.b64encode(err).decode("ascii")},
+                      f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    prune_records(directory)
+
+
+def run_idempotent(label, key, raw, execute):
+    """Run execute() once per (token label, key). Returns (result, replayed).
+    The key and the request body are hashed into the record's name and
+    contents, so a record never holds a key and a caller cannot reach
+    another token's record."""
+    name = hashlib.sha256(
+        ("%s\0%s" % (label, key)).encode("utf-8", "surrogatepass")).hexdigest()
+    fingerprint = hashlib.sha256(raw).hexdigest()
+    directory = idem_dir()
+    path = os.path.join(directory, name + ".json")
+    deadline = time.monotonic() + IDEM_WAIT
+    while True:
+        recorded = load_record(path, fingerprint)
+        if recorded is not None:
+            return recorded, True
+        with _inflight_lock:
+            event = _inflight.get(name)
+            mine = event is None
+            if mine:
+                event = _inflight[name] = threading.Event()
+        if mine:
+            break
+        if not event.wait(max(0.0, deadline - time.monotonic())):
+            raise ApiError(409, "another request with this Idempotency-Key "
+                                "is still running")
+    try:
+        # The holder before us may have finished between our look and our
+        # claim.
+        recorded = load_record(path, fingerprint)
+        if recorded is not None:
+            return recorded, True
+        result = execute()
+        try:
+            store_record(directory, path, fingerprint, result)
+        except OSError as e:
+            with Handler.log_lock:
+                sys.stderr.write("could not record an idempotency key: %s\n"
+                                 % e.__class__.__name__)
+                sys.stderr.flush()
+        return result, False
+    finally:
+        with _inflight_lock:
+            del _inflight[name]
+        event.set()
+
+
+def handle_exec(entry, raw, ctx, key=None):
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -569,19 +713,27 @@ def handle_exec(entry, raw, ctx):
         if len(blobs[name]) > MAX_FILE:
             raise ApiError(413, "a file is over %d bytes" % MAX_FILE)
 
-    tmp = tempfile.mkdtemp(prefix="fork-sandbox-mail-api.")
-    try:
-        paths = {}
-        for name, blob in blobs.items():
-            paths[name] = os.path.join(tmp, name)
-            with open(paths[name], "wb") as f:
-                f.write(blob)
-        run_argv = list(argv)
-        for i in attach_at:
-            run_argv[i] = paths[argv[i]]
-        return run_tool(tool, run_argv, stdin)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    def execute():
+        tmp = tempfile.mkdtemp(prefix="fork-sandbox-mail-api.")
+        try:
+            paths = {}
+            for name, blob in blobs.items():
+                paths[name] = os.path.join(tmp, name)
+                with open(paths[name], "wb") as f:
+                    f.write(blob)
+            run_argv = list(argv)
+            for i in attach_at:
+                run_argv[i] = paths[argv[i]]
+            return run_tool(tool, run_argv, stdin)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    if key is None or (tool, verb) not in MUTATING:
+        return execute()
+    result, replayed = run_idempotent(entry.label, key, raw, execute)
+    if replayed:
+        ctx["replay"] = True
+    return result
 
 
 # ------------------------------------------------------------------- server
@@ -595,7 +747,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        self.ctx = {"label": "-", "tool": "-", "verb": "-", "rc": "-"}
+        self.ctx = {"label": "-", "tool": "-", "verb": "-", "rc": "-",
+                    "replay": False}
         self.logged = False
 
     def log_message(self, *args):
@@ -612,9 +765,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.logged:
             self.logged = True
             c = self.ctx
-            line = "%s %s %s %s %d rc=%s\n" % (
+            line = "%s %s %s %s %d rc=%s%s\n" % (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                c["label"], c["tool"], c["verb"], status, c["rc"])
+                c["label"], c["tool"], c["verb"], status, c["rc"],
+                " replay" if c["replay"] else "")
             with Handler.log_lock:
                 sys.stderr.write(line)
                 sys.stderr.flush()
@@ -681,10 +835,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(length)
         if length > MAX_BODY:
             raise ApiError(413, "the body is over %d bytes" % MAX_BODY)
+        key = self.headers.get(IDEM_HEADER)
+        if key is not None and not IDEM_KEY_RE.fullmatch(key):
+            raise ApiError(400, "%s must be 16 to 128 of A-Z a-z 0-9 _ -"
+                           % IDEM_HEADER)
         raw = self.rfile.read(length)
         if len(raw) != length:
             raise ApiError(400, "the body ended early")
-        rc, out, err = handle_exec(entry, raw, self.ctx)
+        rc, out, err = handle_exec(entry, raw, self.ctx, key)
         self.ctx["rc"] = str(rc)
         self.send_json(200, {
             "rc": rc,

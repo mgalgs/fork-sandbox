@@ -127,8 +127,10 @@ Response, always JSON:
 `400` is a malformed request (bad JSON, an unknown key, a NUL in argv, a
 `--body` that is not `-`, an `--attach` naming a file that was not
 uploaded, an unreferenced `files` entry, and so on). `403` is an
-authenticated caller that this token may not do. `504` is a verb that ran
-past its timeout and was killed.
+authenticated caller that this token may not do. `409` is a request whose
+`Idempotency-Key` is still being run by another request (see "Idempotency
+keys"). `422` is an `Idempotency-Key` reused with a different request. `504`
+is a verb that ran past its timeout and was killed.
 
 `--attach <name>` must name a key of `files`, and it must be a plain
 basename: non-empty, no `/`, no leading `.`, not `.` or `..`, no NUL or
@@ -138,8 +140,47 @@ once the call returns. At most 16 files per request, 4 MiB decoded per
 file, 4 MiB decoded for `stdin_b64`.
 
 The server logs one line per request to stderr: time, label (or `-` when
-unauthenticated), tool, verb, HTTP status and rc. It never logs the token,
-the request body, a file, or an argv value.
+unauthenticated), tool, verb, HTTP status and rc, with a trailing `replay`
+when the response was a recorded one. It never logs the token, the request
+body, a file, an idempotency key, or an argv value.
+
+## Idempotency keys
+
+The postmaster pod restarts with `Recreate`, so the API is down for the
+length of a rollout, and a caller whose request was run but whose reply was
+lost cannot tell that from a request that never arrived. A request for a verb
+that changes state (`send`, `reply`, `seen`, `grant`, `flag`, `unflag`) may
+therefore carry an `Idempotency-Key` header: 16 to 128 characters from
+`A-Za-z0-9_-` (anything else is a 400). The server does not mint
+Message-IDs from it or accept one from the caller; the store alone makes
+those, as ever.
+
+- The first request with a key, from a given token, runs the verb. When the
+  verb has *completed* (any 200, whatever its rc), the server records the
+  response. A later request with the same key and the same body gets the
+  recorded response and the verb does not run again; the log line ends in
+  `replay`. The same key with a different body is a 422, and nothing runs.
+  Keys are per token: another token's identical key is a different key.
+- The record is one file under
+  `$FORK_SANDBOX_MAIL_ROOT/.postmaster/api-idempotency/`, on the mail
+  volume, so it survives a restart of the server. Its name is a hash of the
+  token's label and the key, and it holds a hash of the request body and
+  the response: never the key. It is written atomically (a synced temp file
+  renamed into place), so a reader sees all of a record or none of it.
+- A request that dies before the verb completes (the 60 s kill, a crash of
+  the server) leaves no record, and its retry runs the verb. A request that
+  is refused (401, 403, 400, 413) never reaches the key.
+- Records older than 24 h are ignored, and deleted the next time the server
+  writes a record. A retry a day later could therefore run again; the client's
+  budget is minutes.
+- Two requests with one key at once run the verb once: the second waits up
+  to 30 s for the first, then answers with its record, or with 409 when the
+  first has not finished (the client retries a 409). The lock is in the
+  server's memory, which is enough because the mail volume has one writer.
+- The header is ignored for the read-only verbs, and a server that predates
+  it ignores it too (an unknown header is dropped). A client's retries
+  against such a server are at-least-once: a send whose reply was lost can
+  be delivered twice. The client does not detect the server's version.
 
 ## The verb allowlist
 
@@ -226,6 +267,7 @@ lines, parsed by hand, never sourced as shell):
 |---|---|---|
 | `FORK_SANDBOX_MAIL_API_URL` | `K8S_MAIL_API_URL` | e.g. `http://127.0.0.1:8080` |
 | `FORK_SANDBOX_MAIL_API_TOKEN_FILE` | `K8S_MAIL_API_TOKEN_FILE` | path to a file holding the raw token |
+| `FORK_SANDBOX_MAIL_API_RETRY_SECONDS` | `K8S_MAIL_API_RETRY_SECONDS` | the retry budget in whole seconds; default `300`, `0` turns retries off |
 
 A missing URL or token file, or an empty token, is a one-line error naming
 both the environment variable and the `k8s.env` key, and the shim exits 2.
@@ -238,6 +280,28 @@ any other status it prints one line, `fork-sandbox <tool> --remote: HTTP
 <code>: <error>`, to stderr and exits 2 -- this covers a `401` (bad token)
 and a `403` (not allowed) the same as any other failure. A connection
 failure is also a one-line error with exit 2.
+
+**Retries.** A server restart is a window in which calls fail, so the client
+retries on its own, for every verb: when it cannot connect, loses the
+connection, times out waiting for the reply, or gets `409`, `502`, `503` or
+`504`. Any other status is a real answer, a 4xx included, and is returned at
+once without a retry. The wait before attempt *n*+1 is random between half
+of and all of `min(30 s, 1 s * 2^(n-1))` (exponential, jittered, capped), and
+the retries stop when the retry budget, counted from the first attempt, is
+spent: 300 s by default, set by the environment variable or `k8s.env` key in
+the table above, and `0` means a single attempt, exactly as before retries
+existed. A budget that is not a whole number of seconds is a one-line error
+and exit 2. Each retry prints one line to stderr (`fork-sandbox mail
+--remote: attempt 2 failed (<error>); retrying in 1.7 s`); when the budget
+runs out the last error is printed as before, followed by `fork-sandbox mail
+--remote: gave up after N attempts`, and the exit code is 2.
+
+For each invocation of a verb that changes state the client makes one
+random `Idempotency-Key` and sends the same key on every attempt of that
+invocation (see "Idempotency keys"), so a retry after a lost reply returns
+the first result, with the same message id, instead of delivering a second
+message. Read-only verbs send no key. Against a server that predates the
+key, retries are at-least-once.
 
 ## Running the server
 

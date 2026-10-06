@@ -23,9 +23,13 @@ pass=0
 fail=0
 tmpdirs=()
 server_pid=""
+extra_pids=()
 
 cleanup() {
-    local d
+    local d p
+    for p in "${extra_pids[@]-}"; do
+        [[ -n "$p" ]] && kill "$p" 2>/dev/null
+    done
     if [[ -n "$server_pid" ]]; then
         kill "$server_pid" 2>/dev/null
         wait "$server_pid" 2>/dev/null
@@ -77,14 +81,15 @@ tok="$work/tokens"; mkdir -p "$tok"
 # A raw HTTP client: one request, the status on stdout, the response body in
 # $RESP. Options: --tool T, --stdin S, --stdin-file PATH, --file NAME=PATH (repeatable), --raw
 # JSON (send this body as is), --claim-length N (send the headers only),
-# --no-length, --method M, --path P, then `--` and the argv.
+# --no-length, --method M, --path P, --header NAME=VALUE (repeatable), then
+# `--` and the argv.
 cat > "$work/xr.py" <<'PY'
 import base64, http.client, json, os, sys
 
 a = sys.argv[1:]
 token_file = a.pop(0)
 method, path, tool, stdin, raw = "POST", "/v1/exec", None, None, None
-files, claim, no_length, argv = {}, None, False, []
+files, claim, no_length, argv, extra = {}, None, False, [], []
 while a:
     o = a.pop(0)
     if o == "--tool": tool = a.pop(0)
@@ -98,6 +103,7 @@ while a:
     elif o == "--no-length": no_length = True
     elif o == "--method": method = a.pop(0)
     elif o == "--path": path = a.pop(0)
+    elif o == "--header": extra.append(a.pop(0).partition("="))
     elif o == "--": argv = a; break
 if raw is None:
     req = {"tool": tool, "argv": argv}
@@ -111,6 +117,8 @@ conn = http.client.HTTPConnection(host, int(port), timeout=60)
 conn.putrequest(method, path)
 if token_file != "-":
     conn.putheader("Authorization", "Bearer " + open(token_file).read().strip())
+for n, _, v in extra:
+    conn.putheader(n, v)
 if not no_length:
     conn.putheader("Content-Length", claim if claim is not None else str(len(raw)))
 conn.endheaders()
@@ -583,7 +591,7 @@ check "shim: ... and the flag file is there" "by shim" "$(cat "$FORK_SANDBOX_MAI
 as_ laptop postmaster --remote unflag "$tid" > /dev/null 2>&1
 check "shim: postmaster unflag as the operator: rc 0" "0" "$?"
 
-FORK_SANDBOX_MAIL_API_URL="http://127.0.0.1:1" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/laptop" \
+FORK_SANDBOX_MAIL_API_RETRY_SECONDS=0 FORK_SANDBOX_MAIL_API_URL="http://127.0.0.1:1" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/laptop" \
     "$disp" mail --remote list > /dev/null 2> "$work/err"
 check "shim: a connection failure exits 2" "2" "$?"
 check "shim: a connection failure is one line" "1" "$(wc -l < "$work/err")"
@@ -854,6 +862,310 @@ check "list: a positional is 400/403, never run" "1" \
     "$([[ "$(xr "$tok/reader" --tool mail -- list extra)" =~ ^40[03]$ ]] && echo 1 || echo 0)"
 check "send --header X-Review-Target-Set is still refused" "403" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Review-Target-Set: x y")"
+
+printf '== 14. retries and idempotency ==\n'
+
+# A second server on a port the test picks, so it can be stopped and started
+# again at the same address. It shares the store and the tokens file.
+free_port() {
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+nthreads() { find "$FORK_SANDBOX_MAIL_ROOT/threads" -mindepth 1 -maxdepth 1 | wc -l; }
+idem_dir="$FORK_SANDBOX_MAIL_ROOT/.postmaster/api-idempotency"
+idem_files() { find "$idem_dir" -type f -name '*.json' 2>/dev/null | wc -l; }
+
+pport="$(free_port)"
+second_pid=""
+start_second() {
+    "$api" serve --tokens "$tokens_file" --listen "127.0.0.1:$pport" 2>> "$work/second.log" &
+    second_pid=$!
+    extra_pids+=("$second_pid")
+    local _
+    for _ in $(seq 100); do
+        python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1)' "$pport" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
+stop_second() { kill "$second_pid" 2>/dev/null; wait "$second_pid" 2>/dev/null; }
+start_second
+check "the second server is up" "0" "$(python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1)' "$pport" 2>&1 >/dev/null; echo $?)"
+
+send_argv=(send --from @ci-kickoff --to @reviewer --subject idem --body -)
+K1="key-one-0123456789abcdef"
+
+printf -- '-- server: the key --\n'
+n0="$(nthreads)"
+r0="$(idem_files)"
+check "a keyed send: 200" "200" \
+    "$(API_HOSTPORT="127.0.0.1:$pport" xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=$K1" -- "${send_argv[@]}")"
+first_out="$(rjson stdout)"
+check "... one thread was made" "$((n0 + 1))" "$(nthreads)"
+check "... one record was written" "$((r0 + 1))" "$(idem_files)"
+check "... the records are 0600" "600" "$(stat -c %a "$idem_dir"/*.json | sort -u)"
+lacks "... no record holds the key" "$(cat "$idem_dir"/*.json)" "$K1"
+check "the same key and request again: 200" "200" \
+    "$(API_HOSTPORT="127.0.0.1:$pport" xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=$K1" -- "${send_argv[@]}")"
+check "... the recorded stdout comes back" "$first_out" "$(rjson stdout)"
+check "... and no second thread was made" "$((n0 + 1))" "$(nthreads)"
+check "the same key, a different request: 422" "422" \
+    "$(API_HOSTPORT="127.0.0.1:$pport" xr "$tok/ci-kickoff" --tool mail --stdin other --header "Idempotency-Key=$K1" -- "${send_argv[@]}")"
+check "... and nothing was sent" "$((n0 + 1))" "$(nthreads)"
+check "the same key from another token is a different key: 200" "200" \
+    "$(API_HOSTPORT="127.0.0.1:$pport" xr "$tok/laptop" --tool mail --stdin hi --header "Idempotency-Key=$K1" -- send --from @ci-kickoff --to @reviewer --subject idem --body -)"
+check "... and it ran" "$((n0 + 2))" "$(nthreads)"
+check "a key that is too short: 400" "400" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=short" -- "${send_argv[@]}")"
+check "a key with a bad character: 400" "400" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=bad key bad key bad key" -- "${send_argv[@]}")"
+check "... neither sent anything" "$((n0 + 2))" "$(nthreads)"
+check "a refused request (403) leaves no record" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=refused-0123456789abcdef" -- send --from @operator --to @x --subject s --body -)"
+check "... the record count is unchanged" "$((r0 + 2))" "$(idem_files)"
+xr "$tok/laptop" --tool mail --header "Idempotency-Key=readonly-0123456789abcdef" -- list > /dev/null
+check "a read-only verb ignores the key: no record" "$((r0 + 2))" "$(idem_files)"
+
+printf -- '-- server: a restart keeps the records --\n'
+stop_second
+start_second
+check "after a restart, the same key: 200" "200" \
+    "$(API_HOSTPORT="127.0.0.1:$pport" xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=$K1" -- "${send_argv[@]}")"
+check "... the recorded stdout comes back" "$first_out" "$(rjson stdout)"
+check "... and nothing ran" "$((n0 + 2))" "$(nthreads)"
+contains "the log marks a replay" "$(cat "$work/second.log")" " ci-kickoff mail send 200 rc=0 replay"
+lacks "the log never holds a key" "$(cat "$work/second.log")" "$K1"
+
+printf -- '-- server: records expire --\n'
+n1="$(nthreads)"
+touch -d '25 hours ago' "$idem_dir"/*.json
+check "a key past 24 h runs again" "200" \
+    "$(API_HOSTPORT="127.0.0.1:$pport" xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=$K1" -- "${send_argv[@]}")"
+check "... and made a thread" "$((n1 + 1))" "$(nthreads)"
+touch -d '25 hours ago' "$idem_dir"/*.json
+: > "$idem_dir/.tmp.leftover"; touch -d '25 hours ago' "$idem_dir/.tmp.leftover"
+API_HOSTPORT="127.0.0.1:$pport" xr "$tok/ci-kickoff" --tool mail --stdin hi --header "Idempotency-Key=fresh-0123456789abcdef" -- "${send_argv[@]}" > /dev/null
+check "writing a record prunes the old ones, and old temp files" "1" "$(find "$idem_dir" -type f | wc -l)"
+
+printf -- '-- server: no record unless the verb completed, one run per key --\n'
+cat > "$work/idem-unit.py" <<'PY'
+import importlib.util, os, sys, threading, time
+
+spec = importlib.util.spec_from_file_location("api", sys.argv[1])
+api = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(api)
+os.environ["FORK_SANDBOX_MAIL_ROOT"] = sys.argv[2]
+d = api.idem_dir()
+runs = []
+
+def dies():
+    runs.append("dies")
+    raise api.ApiError(504, "killed")
+
+try:
+    api.run_idempotent("t", "half-0123456789abcdef", b"x", dies)
+except api.ApiError:
+    pass
+print("half: records", len([n for n in os.listdir(d) if n.endswith(".json")]) if os.path.isdir(d) else 0)
+print("half: claims left", len(api._inflight))
+
+def ok():
+    runs.append("ok")
+    return 0, b"out", b""
+print("half: retry", api.run_idempotent("t", "half-0123456789abcdef", b"x", dies if False else ok))
+
+count = []
+def slow():
+    count.append(1)
+    time.sleep(0.6)
+    return 0, b"slow", b""
+results = []
+def go():
+    results.append(api.run_idempotent("t", "conc-0123456789abcdef", b"y", slow))
+threads = [threading.Thread(target=go) for _ in range(6)]
+for t in threads: t.start()
+for t in threads: t.join()
+print("conc: runs", len(count), "replays", sum(1 for r in results if r[1]), "of", len(results))
+api.IDEM_WAIT = 0.2
+def slower():
+    time.sleep(1)
+    return 0, b"slower", b""
+box = []
+t = threading.Thread(target=lambda: box.append(api.run_idempotent("t", "wait-0123456789abcdef", b"z", slower)))
+t.start(); time.sleep(0.2)
+try:
+    api.run_idempotent("t", "wait-0123456789abcdef", b"z", slower)
+    print("wait: no 409")
+except api.ApiError as e:
+    print("wait:", e.status)
+t.join()
+PY
+unit_out="$(python3 "$work/idem-unit.py" "$api" "$work/unit-root" 2>&1)"
+contains "a verb killed before it completed leaves no record" "$unit_out" "half: records 0"
+contains "... and no claim" "$unit_out" "half: claims left 0"
+contains "... so the retry runs and gets its result" "$unit_out" "half: retry ((0, b'out', b''), False)"
+contains "six concurrent requests with one key ran the verb once" "$unit_out" "conc: runs 1 replays 5 of 6"
+contains "a request that waits too long for the holder gets 409" "$unit_out" "wait: 409"
+
+check "two concurrent HTTP requests with one key make one thread" "1" "$(
+    n="$(nthreads)"
+    for i in 1 2 3; do
+        ( API_HOSTPORT="127.0.0.1:$pport" RESP="$work/conc$i" xr "$tok/ci-kickoff" --tool mail --stdin hi \
+            --header "Idempotency-Key=concurrent-0123456789abcdef" -- "${send_argv[@]}" > /dev/null ) &
+    done
+    wait
+    echo $(( $(nthreads) - n )))"
+
+printf -- '-- client: the retry budget --\n'
+cat > "$work/proxy.py" <<'PY'
+# A one-connection-at-a-time forwarder in front of the second server. argv:
+# backend-port, plan. The plan is a comma list, one action per connection:
+# pass, drop (forward the request, run it, discard the reply and close),
+# status:N (answer N without forwarding). After the plan, every connection
+# passes. Prints its own port, then serves until killed.
+import socket, sys
+
+backend, plan = int(sys.argv[1]), sys.argv[2].split(",")
+srv = socket.socket()
+srv.bind(("127.0.0.1", 0))
+srv.listen(8)
+print(srv.getsockname()[1], flush=True)
+
+def read_request(c):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = c.recv(65536)
+        if not chunk:
+            return buf
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    while len(rest) < length:
+        rest += c.recv(65536)
+    return buf if len(rest) >= length else buf
+
+def forward(req):
+    b = socket.create_connection(("127.0.0.1", backend))
+    b.sendall(req)
+    out = b""
+    while True:
+        chunk = b.recv(65536)
+        if not chunk:
+            break
+        out += chunk
+    b.close()
+    return out
+
+while True:
+    c, _ = srv.accept()
+    action = plan.pop(0) if plan else "pass"
+    req = read_request(c)
+    if action.startswith("status:"):
+        code = action.split(":")[1]
+        body = b'{"error": "simulated"}\n'
+        c.sendall(("HTTP/1.0 %s X\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+                   % (code, len(body))).encode() + body)
+    else:
+        reply = forward(req)
+        if action == "pass":
+            c.sendall(reply)
+    c.close()
+PY
+start_proxy() {
+    python3 "$work/proxy.py" "$pport" "$1" > "$work/proxy.port" 2>/dev/null &
+    extra_pids+=("$!")
+    local _
+    for _ in $(seq 50); do [[ -s "$work/proxy.port" ]] && break; sleep 0.1; done
+    proxy_port="$(cat "$work/proxy.port")"
+    : > "$work/proxy.port"
+}
+# One shim call against $1 (host:port) with the budget in $2, as ci-kickoff.
+shim_at() {
+    local at="$1" budget="$2"; shift 2
+    FORK_SANDBOX_MAIL_API_URL="http://$at" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/ci-kickoff" \
+        FORK_SANDBOX_MAIL_API_RETRY_SECONDS="$budget" "$disp" "$@"
+}
+dead_port="$(free_port)"
+
+shim_at "127.0.0.1:$dead_port" 0 mail --remote list > /dev/null 2> "$work/err"; rc=$?
+check "budget 0: one attempt, exit 2" "2" "$rc"
+check "budget 0: the one line is as before" "1" "$(wc -l < "$work/err")"
+contains "budget 0: it is the cannot-reach line" "$(cat "$work/err")" "fork-sandbox mail --remote: cannot reach http://127.0.0.1:$dead_port"
+lacks "budget 0: no retry line" "$(cat "$work/err")" "retrying"
+
+start="$SECONDS"
+shim_at "127.0.0.1:$dead_port" 3 mail --remote list > /dev/null 2> "$work/err"; rc=$?
+check "a dead server and a 3 s budget: exit 2 after giving up" "2" "$rc"
+contains "... a retry line names the attempt, the error and the wait" "$(cat "$work/err")" "attempt 1 failed (cannot reach http://127.0.0.1:$dead_port: "
+contains "... and the wait" "$(cat "$work/err")" "retrying in "
+contains "... the last error is printed" "$(tail -n 2 "$work/err" | head -n 1)" "cannot reach"
+contains "... and the last line says how many attempts" "$(tail -n 1 "$work/err")" "gave up after "
+check "... it waited out the budget" "1" "$(( SECONDS - start >= 3 ? 1 : 0 ))"
+check "an invalid budget: exit 2" "2" "$(shim_at "127.0.0.1:$dead_port" soon mail --remote list > /dev/null 2> "$work/err"; echo $?)"
+contains "... naming both keys" "$(cat "$work/err")" "FORK_SANDBOX_MAIL_API_RETRY_SECONDS or K8S_MAIL_API_RETRY_SECONDS"
+
+mkdir -p "$work/retry-config"
+printf 'K8S_MAIL_API_URL=http://127.0.0.1:%s\nK8S_MAIL_API_TOKEN_FILE=%s\nK8S_MAIL_API_RETRY_SECONDS=0\n' \
+    "$dead_port" "$tok/ci-kickoff" > "$work/retry-config/k8s.env"
+env -u FORK_SANDBOX_MAIL_API_URL -u FORK_SANDBOX_MAIL_API_TOKEN_FILE -u FORK_SANDBOX_MAIL_API_RETRY_SECONDS \
+    FORK_SANDBOX_CONFIG_DIR="$work/retry-config" "$disp" mail --remote list > /dev/null 2> "$work/err"
+check "the budget from k8s.env: 0 means one attempt" "1" "$(wc -l < "$work/err")"
+
+printf -- '-- client: a mutating call rides out a stopped server --\n'
+n0="$(nthreads)"
+stop_second
+(
+    sleep 2
+    "$api" serve --tokens "$tokens_file" --listen "127.0.0.1:$pport" 2>> "$work/second.log" &
+    echo $! > "$work/second.pid"
+    wait
+) &
+extra_pids+=("$!")
+shim_at "127.0.0.1:$pport" 30 mail --remote send --from @ci-kickoff --to @reviewer \
+    --subject outage --body - <<< "sent during an outage" > "$work/out" 2> "$work/err"; rc=$?
+second_pid="$(cat "$work/second.pid")"; extra_pids+=("$second_pid")
+check "send while the server is down for 2 s: exit 0 once it returns" "0" "$rc"
+contains "... the retries were reported" "$(cat "$work/err")" "attempt 1 failed"
+check "... the store holds exactly one new thread" "$((n0 + 1))" "$(nthreads)"
+check "... and it is the one printed" "1" "$([[ -d "$FORK_SANDBOX_MAIL_ROOT/threads/$(cat "$work/out")" ]] && echo 1 || echo 0)"
+
+printf -- '-- client: a lost response is not a second message --\n'
+n0="$(nthreads)"
+start_proxy "drop"
+shim_at "127.0.0.1:$proxy_port" 30 mail --remote send --from @ci-kickoff --to @reviewer \
+    --subject lost --body - <<< "the reply is lost" > "$work/out" 2> "$work/err"; rc=$?
+check "the first reply is dropped, the retry succeeds: exit 0" "0" "$rc"
+contains "... one retry was reported" "$(cat "$work/err")" "attempt 1 failed"
+check "... the store holds exactly one new thread" "$((n0 + 1))" "$(nthreads)"
+check "... the result is that thread's id" "1" "$([[ -d "$FORK_SANDBOX_MAIL_ROOT/threads/$(cat "$work/out")" ]] && echo 1 || echo 0)"
+check "a reply (mail reply) the same way: one new message" "0" "$(
+    tid_l="$(cat "$work/out")"
+    before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_l" -type f -name '*.msg' 2>/dev/null | wc -l)"
+    start_proxy "drop"
+    shim_at "127.0.0.1:$proxy_port" 30 mail --remote reply --from @ci-kickoff --reply-to "$tid_l" --body - <<< "lost reply" > /dev/null 2>&1
+    after="$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_l" -type f -name '*.msg' 2>/dev/null | wc -l)"
+    echo $(( after - before - 1 )))"
+
+printf -- '-- client: which failures are retried --\n'
+start_proxy "status:503,status:502,status:504,status:409"
+n0="$(nthreads)"
+shim_at "127.0.0.1:$proxy_port" 60 mail --remote list > /dev/null 2> "$work/err"; rc=$?
+check "503, 502, 504 and 409 are retried: exit 0" "0" "$rc"
+check "... four retry lines" "4" "$(grep -c 'retrying in' "$work/err")"
+contains "... the HTTP status is in the line" "$(cat "$work/err")" "HTTP 503: simulated"
+start_proxy "status:404"
+shim_at "127.0.0.1:$proxy_port" 60 mail --remote list > /dev/null 2> "$work/err"; rc=$?
+check "a 404 is a real answer: exit 2 at once" "2" "$rc"
+check "... one line, no retry" "1" "$(wc -l < "$work/err")"
+start_proxy "status:400"
+shim_at "127.0.0.1:$proxy_port" 60 mail --remote list > /dev/null 2> "$work/err"
+check "a 400 is not retried" "1" "$(wc -l < "$work/err")"
+start="$SECONDS"
+shim_at "127.0.0.1:$pport" 60 mail --remote send --from @operator --to @x --subject s --body - <<< hi > /dev/null 2> "$work/err"; rc=$?
+check "a real 403: exit 2" "2" "$rc"
+check "... with one line, no retry, and quickly" "1" "$(( $(wc -l < "$work/err") == 1 && SECONDS - start < 3 ? 1 : 0 ))"
 
 printf '== 13. the log ==\n'
 

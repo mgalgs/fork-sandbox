@@ -146,6 +146,15 @@ Do these in order.
   `fork-sandbox-postmaster`, then run `install --postmaster` again. This
   discards the old store; it holds no imported threads (see "A fresh
   store").
+- **A rollout no longer loses mail API calls.** The `Recreate` strategy takes
+  the API down for the length of a rollout, but `fork-sandbox mail --remote`
+  and `postmaster --remote` retry through it on their own (a 5 minute budget
+  by default, `K8S_MAIL_API_RETRY_SECONDS` in `k8s.env`), and the server
+  records each state-changing call's idempotency key on the mail volume, so a
+  retried send is not delivered twice. A call is lost only if the rollout
+  outlasts the caller's budget, or if the server is an older version that
+  does not know the key (its retries are at-least-once). See "The `--remote`
+  client" and "Idempotency keys" in [mail-api.md](mail-api.md).
 - **In-flight seats survive a rollout.** A restarted postmaster adopts
   still-running Jobs instead of re-spawning them, so a rollout does not
   lose a seat's work in progress. A Job whose submit never finished pushing
