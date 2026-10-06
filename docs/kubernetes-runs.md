@@ -2295,6 +2295,32 @@ portable `NetworkPolicy`. It does not ship a second. Both the egress gate
 the platform's declared capabilities rather than assuming anything about a
 specific cluster.
 
+## The namespace quota
+
+`install` applies a `ResourceQuota` (`fork-sandbox-quota`) that bounds the
+whole namespace, so an unbounded run of Jobs cannot starve the rest of the
+cluster. Its five limits are optional `k8s.env` keys, read at install time
+like every other `K8S_*` key. Unset, each renders the value in the right-hand
+column, which is what the manifest has always shipped:
+
+| Key                         | Default | Shape                                   |
+| --------------------------- | ------- | --------------------------------------- |
+| `K8S_QUOTA_PODS`            | `10`    | positive integer                        |
+| `K8S_QUOTA_REQUESTS_CPU`    | `10`    | cpu quantity: `4`, `0.5`, `500m`        |
+| `K8S_QUOTA_REQUESTS_MEMORY` | `20Gi`  | integer, optional suffix: `512Mi`, `20G` |
+| `K8S_QUOTA_LIMITS_CPU`      | `20`    | cpu quantity                            |
+| `K8S_QUOTA_LIMITS_MEMORY`   | `40Gi`  | integer, optional suffix                |
+
+Raise them when concurrent runs outgrow the defaults. A claude seat is two
+pods — the agent and its per-run claude-proxy — so a panel of six claude
+seats needs twelve on its own, before a second panel or the shared proxy;
+`K8S_QUOTA_PODS` is usually the first limit to hit. Patching the live object
+with `kubectl` works only until the next `install`, which renders the quota
+again; set the key instead. A malformed value is refused by `install` before
+anything is applied, with an error naming the key. Only the shape is checked,
+not whether the limit is big enough. The `LimitRange` beside it (per-container
+defaults) is not configurable.
+
 ## Limits
 
 Stated rather than solved, in the same spirit `docs/sandbox-backend.md` states
@@ -2376,7 +2402,8 @@ implementation. The rest are unchanged.
    above — a pushed repository needs no remote, so this capability loss the
    original design accepted does not exist in what got built.
 4. **Concurrency and quota.** Still open. `manifests/k8s/00-namespace.yaml`
-   sets a namespace `ResourceQuota` and `LimitRange`, which bounds the
+   sets a namespace `ResourceQuota` (configurable, see "The namespace
+   quota" above) and `LimitRange`, which bounds the
    cluster-wide blast radius of a runaway fleet, but nothing yet bounds how
    many runs one person or one pipeline can have in flight at once.
 5. **The operator inbox.** Resolved: `fork-sandbox-k8s.sh say` writes an
