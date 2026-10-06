@@ -543,6 +543,23 @@ not_contains "a normal run's raw run_end record carries no end_reason key at all
 out="$(query show "$(basename "$rd_normal")")"
 not_contains "show prints no end_reason field for a normal run" "end_reason" "$out"
 
+printf '\n== record: the tidy leg'\''s record is lifted verbatim, and groupable ==\n'
+rd_tidy="$(mk_run_dir tidy-discarded)"
+tmpdirs+=("$rd_tidy")
+cat > "$rd_tidy/summary.json" <<'EOF'
+{"harness":"claude","network":null,"model":"sonnet","branch":"fixture-branch","origin_repo":"/var/tmp/claude-scratch/forks/fixture-origin","base_sha":"0123456789abcdef0123456789abcdef01234567","exit_code":0,"commits":2,"cost_usd":0.02,"duration_seconds":0,"tidy":{"ended":"discarded","detail":"tree differs; the approved history was restored","head_approved":"1111111111111111111111111111111111111111","head_after":"2222222222222222222222222222222222222222","exit":0,"cost_usd":0.01,"usage":null,"retries":[],"clone_restored":false}}
+EOF
+printf '0\n' > "$rd_tidy/exit-code"
+record "$rd_tidy" >/dev/null 2>"$tmp/err"
+out="$(query show "$(basename "$rd_tidy")")"
+contains "show prints the tidy leg's ended outcome" '"ended": "discarded"' "$out"
+contains "show prints the tidy leg's detail" "tree differs" "$out"
+contains "show prints the tidy leg's clone_restored flag" '"clone_restored": false' "$out"
+
+printf '\n== stats: --by tidy.ended groups on the tidy leg'\''s outcome ==\n'
+out="$(query stats --by tidy.ended 2>/dev/null)"
+contains "stats --by tidy.ended groups the discarded fixture run" "discarded" "$out"
+
 printf '\n== record: append creates a missing ~/.claude on a fresh HOME ==\n'
 fresh_home="$tmp/fresh-home"
 mkdir -p "$fresh_home"

@@ -122,6 +122,31 @@ branch after the review loop ended.
                maintainer's next iteration, never to the review loop.
                Group on it directly: `stats --by model,maintainer_loop.ended`
 
+The tidy-history leg (fork-sandbox.sh's "tidy" block, attached to the
+maintain step -- not a flag of its own): runs once, after every other leg,
+only when the pipeline's last step is a maintain step that just approved.
+  tidy           present whenever the pipeline has a maintain step
+               anywhere, same as the loops above; absent, not null, on a
+               pipeline with none (the leg has nothing to attach to). On a
+               pipeline that does have one, this key is never missing even
+               when the leg itself never ran, with `ended: "skipped"` for
+               that case. `ended` is one of `accepted` (the rewrite
+               replaced the approved history), `unchanged` (the leg left
+               the branch exactly as approved -- a valid outcome, not a
+               failure), `discarded` (the rewrite failed one of the
+               runner's own checks -- content identity, staying on the
+               base, no invented trailers -- and the approved history was
+               restored -- a leg that ran out of its wall-clock limit is
+               discarded the same way) or `skipped` (the maintain step was
+               not last, it did not approve, the run was read-only, or a
+               stop was requested) -- `detail` says which. `head_approved`
+               and `head_after` are the shas the runner compared; `cost_usd`
+               and `usage` are already folded into `total_cost_usd` the same
+               way every other loop leg's are. Group on it directly:
+               `stats --by tidy.ended` answers how often a tidy leg actually
+               reshapes a branch versus leaving it alone or getting
+               discarded.
+
 Context refresh (fork-sandbox.sh --refresh-at, on by default at 0.5 on the
 claude harness):
   refresh        how the run's context-refresh chain ended: `none` (disabled,
@@ -291,6 +316,7 @@ SUMMARY_FIELDS = [
     "leg_retries",
     "uncommitted_files",
     "uncommitted_files_list",
+    "tidy",
 ]
 
 
