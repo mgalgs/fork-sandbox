@@ -15,6 +15,9 @@
 #     authorized_keys and runs the forced command found on that line, with the
 #     client's request in SSH_ORIGINAL_COMMAND, as sshd would -- so an
 #     authorized_keys line that is wrong fails here too.
+#   * a destination whose table row has a third column is an ssh_config alias
+#     with that IdentityFile: a connection without `-i` uses that key, so it
+#     is answered by the forced command, as a real alias would be.
 #
 # Host keys are modelled: a mail-key connection to a destination the client
 # has not seen fails ("Host key verification failed") unless the client passed
@@ -64,6 +67,7 @@ while [[ "${1:-}" == -* ]]; do
 done
 dest="$1"; shift
 (( ctl )) && exit 0
+[[ -n "$key" ]] || key="$(awk -F'\t' -v d="$dest" '$1 == d { print $3 }' "$SSH_TABLE")"
 printf 'key=%s opts=%s dest=%s request=%s\n' "${key:+yes}" "${opts[*]}" "$dest" "$*" >> "$SSH_LOG"
 target="$(awk -F'\t' -v d="$dest" '$1 == d { print $2 }' "$SSH_TABLE")"
 if [[ -z "$target" ]]; then
@@ -373,12 +377,60 @@ else
     ok "(running as root: unwritable-file tests skipped)"
 fi
 
+echo "== a peers dest that is a mail-key alias: --setup-dest =="
+# beta-mail is an ssh_config alias for beta whose IdentityFile is alpha's mail
+# key, and the operator's peers line already uses it (docs/agent-mail.md).
+mk_alias_world() {
+    mk_world
+    peer_tool alpha add beta beta-dest --back-dest alpha-dest >/dev/null 2>&1
+    printf 'beta-mail\t%s\t%s\n' "$W/beta/home" "$W/alpha/home/.ssh/lane-mail" >> "$W/table"
+    echo beta-mail >> "$W/alpha/known_hosts"
+    printf 'beta beta-mail\n' > "$W/alpha/home/.config/fork-sandbox/lane-mail-peers"
+}
+mk_alias_world
+before="$(snap)"
+out="$(peer_tool alpha add beta beta-mail --back-dest alpha-dest 2>&1)"; rc=$?
+check "without --setup-dest the alias is refused: exits 1" "1" "$rc"
+contains "it says the dest logs in with a lane-mail key" "$out" "beta-mail logs in with a lane-mail key"
+contains "it says setup cannot run through it" "$out" "setup cannot run through it"
+contains "it tells the operator to pass --setup-dest" "$out" "--setup-dest"
+lacks "it does not show the raw serve refusal" "$out" "lane-mail-serve: refused"
+contains "it says nothing was changed" "$out" "hanged"
+check "no file on either side changed" "$before" "$(snap)"
+
+out="$(peer_tool alpha add beta beta-mail --setup-dest beta-dest --back-dest alpha-dest 2>&1)"; rc=$?
+check "with --setup-dest the same setup completes" "0" "$rc"
+contains "the existing peers line is reported as already in place" "$out" "peer 'beta beta-mail' already in"
+contains "the forward probe passes" "$out" "alpha -> beta: pass (pong beta)"
+contains "the back probe passes" "$out" "beta -> alpha: pass (pong alpha)"
+check "nothing changed on either side" "$before" "$(snap)"
+check "the peers line keeps the alias" "beta beta-mail" "$(file_of alpha .config/fork-sandbox/lane-mail-peers)"
+check "only the refused attempt ran setup commands through the alias" "1" "$(grep 'request=sh -c' "$W/ssh.log" | grep -c 'dest=beta-mail ')"
+check "the setup commands of the second run went to --setup-dest" "2" "$(grep -c 'dest=beta-dest .*request=sh -c.*_remote probe' "$W/ssh.log")"
+check "no apply ever went through the alias" "0" "$(grep -c 'dest=beta-mail .*_remote apply' "$W/ssh.log")"
+check "the forward probe still used the peers dest, with the mail key" "1" \
+    "$(grep 'request=lane-mail-serve ping' "$W/ssh.log" | grep -c 'key=yes .*BatchMode=yes.* dest=beta-mail ')"
+
+mk_alias_world
+out="$(peer_tool alpha add beta beta-mail --one-way --setup-dest beta-dest 2>&1)"; rc=$?
+check "--setup-dest combines with --one-way" "0" "$rc"
+contains "the forward probe passes through the alias" "$out" "alpha -> beta: pass"
+lacks "there is no back probe" "$out" "beta -> alpha"
+
+mk_world
+out="$(peer_tool alpha add beta beta-dest --setup-dest beta-dest --back-dest alpha-dest 2>&1)"; rc=$?
+check "a --setup-dest equal to the dest is the ordinary case" "0" "$rc"
+contains "both probes pass" "$out" "beta -> alpha: pass"
+peer_tool alpha add beta beta-dest --setup-dest >/dev/null 2>&1; check "--setup-dest needs a value" "2" "$?"
+peer_tool alpha add beta beta-dest --setup-dest -oProxyCommand=x >/dev/null 2>&1; check "an option-shaped --setup-dest is refused" "2" "$?"
+
 echo "== usage, help =="
 help_out="$(peer_tool alpha --help)"
 contains "--help documents the verb" "$help_out" "lane-mail-peer add <peer> <ssh-dest>"
 contains "--help says it is operator-only" "$help_out" "never allowlist it for an agent"
 contains "--help documents the authorized_keys line" "$help_out" 'command="<R'"'"'s lane-mail-serve> --peer <S'"'"'s name>",restrict'
 contains "--help documents --one-way" "$help_out" "--one-way"
+contains "--help documents --setup-dest" "$help_out" "--setup-dest"
 peer_tool alpha >/dev/null 2>&1; check "no arguments is a usage error" "2" "$?"
 peer_tool alpha remove beta >/dev/null 2>&1; check "an unknown verb is a usage error" "2" "$?"
 peer_tool alpha add beta >/dev/null 2>&1; check "a missing destination is a usage error" "2" "$?"

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # lane-mail-peer -- Wire two hosts for cross-host lane mail, in one run
 #
-# Usage: lane-mail-peer add <peer> <ssh-dest> [--back-dest <dest>] [--one-way]
+# Usage: lane-mail-peer add <peer> <ssh-dest> [--setup-dest <dest>]
+#                           [--back-dest <dest>] [--one-way]
 #        lane-mail-peer --help
 #
 # Run on host A, in a terminal, by the operator. It reaches host B (`<peer>`)
-# through `<ssh-dest>` using the operator's ORDINARY ssh login -- one that may
-# prompt, so the setup connections are not BatchMode -- and sets up lane mail
+# through `<ssh-dest>` (or `--setup-dest`) using the operator's ORDINARY ssh
+# login -- one that may prompt, so the setup connections are not BatchMode --
+# and sets up lane mail
 # (`@lane:host`; docs/agent-mail.md, "Lane mail between hosts") in both
 # directions, then proves each direction works. It edits authorized_keys, so
 # it is operator-only: never allowlist it for an agent (docs/permissions.md).
@@ -16,7 +18,15 @@
 #                (LANE_MAIL_PEER_NAME, else the short hostname), and `add`
 #                refuses when B's differs.
 #   <ssh-dest>   how A reaches B: anything ssh accepts (user@host, an alias).
-#                It becomes the dest of B's line in A's peers file.
+#                It becomes the dest of B's line in A's peers file, and is
+#                what the probes use.
+#   --setup-dest how A reaches B for the setup connections only (running B's
+#                lane-mail-peer over the operator's login). Default:
+#                <ssh-dest>. Needed when <ssh-dest> is an alias that logs in
+#                with the mail key (as docs/agent-mail.md's manual setup
+#                allows): B's forced command answers that login, so setup
+#                cannot run through it. `add` recognises that, says so, and
+#                changes nothing; pass a dest that uses your ordinary key.
 #   --back-dest  how B reaches A. Default: A's `hostname -f`, so B's login
 #                name is B's own; say user@host to override.
 #   --one-way    wire A -> B only: no mail key, peers line or authorized_keys
@@ -362,7 +372,7 @@ fi
 
 # --- the operator's side ----------------------------------------------------
 
-peer="" ssh_dest="" back_dest="" one_way=0
+peer="" ssh_dest="" setup_dest="" back_dest="" one_way=0
 case "${1:-}" in
     -h|--help|help) usage; exit 0 ;;
     add) shift ;;
@@ -372,6 +382,8 @@ esac
 while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
+        --setup-dest) [[ $# -ge 2 ]] || usage_error "--setup-dest needs a value"; setup_dest="$2"; shift 2 ;;
+        --setup-dest=*) setup_dest="${1#--setup-dest=}"; shift ;;
         --back-dest) [[ $# -ge 2 ]] || usage_error "--back-dest needs a value"; back_dest="$2"; shift 2 ;;
         --back-dest=*) back_dest="${1#--back-dest=}"; shift ;;
         --one-way) one_way=1; shift ;;
@@ -385,9 +397,11 @@ while (( $# )); do
             ;;
     esac
 done
-[[ -n "$peer" && -n "$ssh_dest" ]] || usage_error "usage: lane-mail-peer add <peer> <ssh-dest> [--back-dest <dest>] [--one-way]"
+[[ -n "$peer" && -n "$ssh_dest" ]] || usage_error "usage: lane-mail-peer add <peer> <ssh-dest> [--setup-dest <dest>] [--back-dest <dest>] [--one-way]"
 [[ "$peer" =~ $LANE_MAIL_HOST_RE ]] || usage_error "'$peer' is not a valid peer name (lowercase alphanumeric, '-' and '.')"
 [[ "$ssh_dest" =~ $DEST_RE ]] || usage_error "'$ssh_dest' is not an ssh destination this tool can use (letters, digits, . _ @ : % + -; no leading '-')"
+: "${setup_dest:=$ssh_dest}"
+[[ "$setup_dest" =~ $DEST_RE ]] || usage_error "'$setup_dest' is not an ssh destination this tool can use (letters, digits, . _ @ : % + -; no leading '-')"
 for tool in ssh ssh-keygen; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found on PATH"
 done
@@ -407,7 +421,7 @@ fi
 cm_dir="$(mktemp -d /tmp/lane-mail-peer.XXXXXX)"
 cm_opts=(-o ControlMaster=auto -o "ControlPath=$cm_dir/%C" -o ControlPersist=120)
 cleanup() {
-    ssh "${cm_opts[@]}" -O exit "$ssh_dest" >/dev/null 2>&1 || true
+    ssh "${cm_opts[@]}" -O exit "$setup_dest" >/dev/null 2>&1 || true
     rm -rf -- "$cm_dir"
 }
 trap cleanup EXIT
@@ -421,7 +435,7 @@ remote() {
     errf="$(mktemp)"
     remote_rc=0
     # shellcheck disable=SC2029  # the command is built here and expanded here: every word is a validated token
-    remote_stdout="$(ssh "${cm_opts[@]}" "$ssh_dest" "sh -c '$script' lane-mail-peer _remote $*" 2>"$errf")" || remote_rc=$?
+    remote_stdout="$(ssh "${cm_opts[@]}" "$setup_dest" "sh -c '$script' lane-mail-peer _remote $*" 2>"$errf")" || remote_rc=$?
     remote_err="$(cat "$errf")"
     rm -f -- "$errf"
 }
@@ -452,16 +466,21 @@ run_remote() {
     local rc
     remote "$@"
     rc=$remote_rc
+    # B's authorized_keys forced command answering is lane-mail-serve's own
+    # refusal, which a real lane-mail-peer never prints.
+    if (( rc != 0 && rc != 3 )) && grep -q '^lane-mail-serve: refused: ' <<<"$remote_err"; then
+        die "$setup_dest logs in with a lane-mail key (B's forced command answered), so setup cannot run through it. Pass --setup-dest with a login that uses your ordinary ssh key. Nothing was changed on either side."
+    fi
     case "$rc" in
         0|3) ;;
-        127) die "fork-sandbox is not installed on $ssh_dest (no ~/.claude/scripts/lane-mail-peer there); install it there first. Nothing was changed on either side." ;;
-        *) die "could not run lane-mail-peer on $ssh_dest (exit $rc): $(oneline "$(tr '\n' ' ' <<<"$remote_err")"). Nothing was changed on either side." ;;
+        127) die "fork-sandbox is not installed on $setup_dest (no ~/.claude/scripts/lane-mail-peer there); install it there first. Nothing was changed on either side." ;;
+        *) die "could not run lane-mail-peer on $setup_dest (exit $rc): $(oneline "$(tr '\n' ' ' <<<"$remote_err")"). Nothing was changed on either side." ;;
     esac
 }
 
 # --- checks: nothing is changed until every one has passed ------------------
 
-echo "lane-mail-peer: checking $self and $peer ($ssh_dest)"
+echo "lane-mail-peer: checking $self and $peer ($setup_dest)"
 
 local_send="$(side_run inspect --peer "$peer" --send-dest "$ssh_dest")" || [[ $? == 3 ]] || die "local check failed"
 note_refusals "$self" "$local_send"
@@ -475,7 +494,7 @@ remote_inspect="$remote_stdout"
 note_refusals "$peer" "$remote_inspect"
 read_name="$(first_tagged "$remote_inspect" name)"
 if [[ -n "$read_name" && "$read_name" != "$peer" ]]; then
-    problems+=("$peer: the host at $ssh_dest calls itself '$read_name', not '$peer'; use '$read_name' (names are read, <peer> is only an assertion)")
+    problems+=("$peer: the host at $setup_dest calls itself '$read_name', not '$peer'; use '$read_name' (names are read, <peer> is only an assertion)")
 fi
 peer_pub="$(first_tagged "$remote_inspect" pubkey)"
 
@@ -546,7 +565,7 @@ if (( ! one_way )); then
     if (( remote_rc == 0 )); then
         show_probe "$peer" "$self" "$remote_stdout"
     else
-        probe_lines+=("$peer -> $self: FAIL (could not run the probe on $ssh_dest, exit $remote_rc)")
+        probe_lines+=("$peer -> $self: FAIL (could not run the probe on $setup_dest, exit $remote_rc)")
         failed=1
     fi
 fi
