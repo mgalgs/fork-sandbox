@@ -1940,9 +1940,15 @@ Three `k8s.env` keys cap what a spec can claim, since a repo — the thing
   (`500m`, `1`). Default `1000m`.
 - `K8S_SERVICE_MAX_MEMORY` — the per-service memory cap, a Kubernetes memory
   quantity (`512Mi`, `1Gi`). Default `1Gi`.
+- `K8S_SERVICE_MAX_STARTUP_SECONDS` — the per-service cap on
+  `readyWhen.startupSeconds` (see
+  [docs/sandbox-services.md](sandbox-services.md)). Default `600` (10
+  minutes); a spec's own `readyWhen` with no `startupSeconds` defaults to
+  180 seconds, clamped down if this cap is tighter.
 
 A spec over any of these is refused before the Job is even assembled, naming
-the offending field and which `k8s.env` key raises it.
+the offending field and which `k8s.env` key raises it. `submit` and
+`validate-services` apply the identical cap.
 
 Two more keys resolve a `services[].image` ref — see
 [docs/sandbox-services.md](sandbox-services.md)'s own `services[].image`
@@ -1966,6 +1972,35 @@ summary here:
 `fork-sandbox validate-services <file>` applies the same two keys the
 same way, and prints which rule it applied (unset, or the resolved
 prefix/allowlist) alongside the limits line.
+
+### A slow service gets time, not a restart
+
+Kubernetes' own `startupProbe` default (10s period, 3 failures — about 30s)
+is nowhere near enough for a service that legitimately takes longer to come
+up, such as a database restoring a seed on a shared CPU — and restarting a
+sidecar that is still starting only resets its progress, so it can end up
+never becoming ready at all. `readyWhen` here never renders that probe on
+the service container; see
+[docs/sandbox-services.md](sandbox-services.md)'s "What the harness
+guarantees on every sidecar" for the dedicated `service-ready` initContainer
+that replaces it (and why that container, not the service's own, is where
+the check runs — load-bearing for a service bound to `127.0.0.1` only).
+
+`submit`'s own pod-ready wait accounts for this: its budget is **180
+seconds (the same base this path always used, covering scheduling and a
+cold image pull) plus the longest `readyWhen.startupSeconds` among this
+run's services** — so it never gives up before Kubernetes itself would. A
+spec with no `readyWhen` changes nothing: the budget stays 180s, exactly as
+before this existed.
+
+When the budget still runs out — a service that is actually broken, not
+merely slow — `submit`'s error names the unready container(s) by name, with
+their restart count, last termination reason and exit code, and a tail of
+their log, instead of `kubectl wait`'s own bare "timed out waiting for the
+condition". Pod events are not retained on every cluster, so this container
+status and log (still readable on the live, not-yet-reaped pod) are the
+evidence. Nothing here ever reads or prints the `claude-token` Secret or any
+other credential.
 
 ## Attribution: fork-sandbox/owner and free-form labels
 
@@ -2055,16 +2090,18 @@ rather than waiting for a general `--copy-files`.
 There is no install step, because there is no egress to install anything
 with — see "Limits" below. Whatever a run needs is already in the image.
 
-**Scripts ship as a ConfigMap, not baked into the image.** Four of them:
+**Scripts ship as a ConfigMap, not baked into the image.** Among them:
 `scripts/fork-sandbox-k8s-entrypoint.sh` (the main container),
 `scripts/fork-sandbox-k8s-egress-gate.sh` (the initContainer),
-`scripts/fork-sandbox-k8s-inbox-write.sh` (run on demand, over `kubectl exec
--i`, by the `say` verb — see "The operator inbox" above), and
+`scripts/fork-sandbox-k8s-service-ready.sh` (an initContainer, rendered only
+when a per-run service declares a `readyWhen` — see "Per-run services"
+above), `scripts/fork-sandbox-k8s-inbox-write.sh` (run on demand, over
+`kubectl exec -i`, by the `say` verb — see "The operator inbox" above), and
 `scripts/fork-sandbox-k8s-review-loop.sh` (run by the entrypoint after the
 coding leg, only when `--review-loop` was given — see "The cluster review
-loop" above). All four are mounted in from a per-run ConfigMap `submit`
-renders, rather than compiled into `K8S_IMAGE`. Iterating on any of them
-needs no image rebuild and no registry push — only a re-`submit`.
+loop" above). Every one of them is mounted in from a per-run ConfigMap
+`submit` renders, rather than compiled into `K8S_IMAGE`. Iterating on any of
+them needs no image rebuild and no registry push — only a re-`submit`.
 
 ## Bringing your own image and registry
 

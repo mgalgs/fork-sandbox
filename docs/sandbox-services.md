@@ -213,10 +213,32 @@ sandboxEnv:
   mounted as its own `emptyDir`. Needed because the container runs with
   `readOnlyRootFilesystem: true` and a service still needs somewhere to
   write. Each must be absolute and must not contain a `..` component.
-- `services[].readyWhen.tcpPort` — optional. Renders a `startupProbe` so the
-  agent does not race the service coming up. There is no `exec` form: a
-  command here would be repo-controlled execution, which is exactly what a
-  spec (as opposed to a hook) removes.
+- `services[].readyWhen.tcpPort` — optional, so the agent does not race the
+  service coming up. **Binding the service to `127.0.0.1` only is supported
+  and recommended**: a sidecar shares the agent's network namespace already,
+  so there is no reason to also bind the pod-wide address, and this check is
+  built to work against a loopback-only listener. Unlike a plain Kubernetes
+  `startupProbe` (whose `tcpSocket`/`httpGet` form dials the **pod IP** from
+  the node, and so can never see a `127.0.0.1`-only listener), this renders
+  as a separate, dedicated initContainer — `service-ready`, built from the
+  **agent's own image**, never the service's, since a distroless or minimal
+  service image may carry no shell to run a check in — that connects to
+  `127.0.0.1:<tcpPort>` from inside the pod's shared network namespace and
+  blocks the agent container from starting until every service answers.
+  Because no probe is attached to the service container itself, a slow
+  service is never killed and restarted for failing one — restarting a
+  sidecar that is still starting only resets its progress, so it would
+  never become ready at all. There is no `exec` form: a command here would
+  be repo-controlled execution, which is exactly what a spec (as opposed to
+  a hook) removes.
+- `services[].readyWhen.startupSeconds` — optional, how long the
+  `service-ready` check above waits for this one service before giving up.
+  Defaults to **180 seconds** — long enough for a realistically seeded
+  service (a database restoring a seed on a shared CPU, say) — and is
+  capped by the operator's `K8S_SERVICE_MAX_STARTUP_SECONDS` in `k8s.env`
+  (default `600`); a spec that asks for more is refused at validation,
+  naming the field and the key. See `docs/kubernetes-runs.md`'s "Per-run
+  services" section for how this feeds submit's own pod-ready budget.
 - `services[].resources` — optional, `cpu` and `memory`; omitted members
   default to the configured cap, and all values are capped by the harness —
   see `docs/kubernetes-runs.md`'s `K8S_SERVICES_MAX` /
@@ -258,12 +280,12 @@ The same parser the cluster path runs can check a spec on its own:
     fork-sandbox validate-services .agents/sandbox-services/services.yaml
 
     .agents/sandbox-services/services.yaml: valid services spec
-    limits applied: K8S_SERVICES_MAX=8 (built-in default), K8S_SERVICE_MAX_CPU=1000m (built-in default), K8S_SERVICE_MAX_MEMORY=1Gi (built-in default)
+    limits applied: K8S_SERVICES_MAX=8 (built-in default), K8S_SERVICE_MAX_CPU=1000m (built-in default), K8S_SERVICE_MAX_MEMORY=1Gi (built-in default), K8S_SERVICE_MAX_STARTUP_SECONDS=600 (built-in default)
     image refs: K8S_SERVICE_REGISTRY unset (no relative refs), K8S_SERVICE_REGISTRIES unset (fully qualified refs unrestricted)
 
 It applies the per-run caps the cluster path would — `K8S_SERVICES_MAX` /
-`K8S_SERVICE_MAX_CPU` / `K8S_SERVICE_MAX_MEMORY` from this machine's
-`k8s.env` when set, otherwise the same built-in defaults — and prints which
+`K8S_SERVICE_MAX_CPU` / `K8S_SERVICE_MAX_MEMORY` / `K8S_SERVICE_MAX_STARTUP_SECONDS`
+from this machine's `k8s.env` when set, otherwise the same built-in defaults — and prints which
 limits it applied with their source, so a pass is only a guarantee under the
 limits it names. The same applies to `K8S_SERVICE_REGISTRY` /
 `K8S_SERVICE_REGISTRIES`: the `image refs:` line says which rule resolved
@@ -293,6 +315,12 @@ Each service renders as a **native sidecar**: an `initContainers` entry with
 exits on its own — a regular container would hang the run until its TTL. A
 native sidecar starts before the main container, runs alongside it, and is
 terminated by the kubelet when the agent's own container exits.
+
+**The sidecar itself carries no probe at all.** A `readyWhen` renders as a
+separate `service-ready` initContainer instead (see `readyWhen.tcpPort`
+above) — so restarting a sidecar that is still starting, which would only
+reset its progress and is never useful, cannot happen here. Nothing kills a
+slow-but-legitimate service for taking its time.
 
 Two consequences worth knowing before reaching for this:
 

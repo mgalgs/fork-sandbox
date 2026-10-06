@@ -11,9 +11,9 @@
 # the whole point of --dry-run existing -- see docs/kubernetes-runs.md.
 #
 # It covers:
-#   - shellcheck on the seven new scripts (the client, the platform plugin,
-#     the pod entrypoint, the egress gate, the inbox writer, the review
-#     loop, the context extractor).
+#   - shellcheck on the eight new scripts (the client, the platform plugin,
+#     the pod entrypoint, the egress gate, the service-ready checker, the
+#     inbox writer, the review loop, the context extractor).
 #   - yamllint on manifests/k8s/ and on the install/submit/run --dry-run
 #     renders.
 #   - fork-sandbox-k8s-platform-generic's two verbs.
@@ -514,6 +514,7 @@ lib_sh="$repo_dir/scripts/fork-sandbox-lib.sh"
 platform_generic="$repo_dir/scripts/fork-sandbox-k8s-platform-generic"
 entrypoint_sh="$repo_dir/scripts/fork-sandbox-k8s-entrypoint.sh"
 gate_sh="$repo_dir/scripts/fork-sandbox-k8s-egress-gate.sh"
+service_ready_sh="$repo_dir/scripts/fork-sandbox-k8s-service-ready.sh"
 inbox_write_sh="$repo_dir/scripts/fork-sandbox-k8s-inbox-write.sh"
 review_loop_sh="$repo_dir/scripts/fork-sandbox-k8s-review-loop.sh"
 outbox_extract_sh="$repo_dir/scripts/fork-sandbox-k8s-outbox-extract.sh"
@@ -536,7 +537,7 @@ printf '== shellcheck ==\n'
 if ! command -v shellcheck >/dev/null 2>&1; then
     printf '  SKIP  shellcheck not installed\n'
 else
-    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$outbox_extract_sh" "$context_extract_sh"; do
+    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$service_ready_sh" "$inbox_write_sh" "$review_loop_sh" "$outbox_extract_sh" "$context_extract_sh"; do
         out="$(shellcheck "$f" 2>&1)"
         if [[ -z "$out" ]]; then ok "shellcheck: $(basename "$f")"; else no "shellcheck: $(basename "$f")" "$out"; fi
     done
@@ -13646,8 +13647,8 @@ if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$svc1_out" 2>&1)"
     if [[ -z "$out" ]]; then ok "yamllint: one-service submit --dry-run output"; else no "yamllint: one-service submit --dry-run output" "$out"; fi
 fi
-check "one-service spec: initContainers has exactly two entries (egress-gate, postgres)" \
-    2 "$(svc_initcontainers_count "$svc1_out")"
+check "one-service spec: initContainers has exactly three entries (egress-gate, postgres, service-ready)" \
+    3 "$(svc_initcontainers_count "$svc1_out")"
 if grep -qF -- '        - name: postgres' "$svc1_out" \
     && grep -A1 -F -- '        - name: postgres' "$svc1_out" | grep -qF 'image: "registry.example/rootless/postgres:16"'; then
     ok "one-service spec: the sidecar's name and image render as given"
@@ -13677,10 +13678,39 @@ if grep -qF 'value: "dev"' "$svc1_out"; then
 else
     no "one-service spec: env renders the given literal value" "$(cat "$svc1_out")"
 fi
-if grep -A2 -F 'startupProbe:' "$svc1_out" | grep -qF 'port: 5432'; then
-    ok "readyWhen.tcpPort renders a startupProbe"
+if grep -qF 'startupProbe:' "$svc1_out"; then
+    no "readyWhen.tcpPort renders no startupProbe on the sidecar (a kubelet tcpSocket probe dials the pod IP, never 127.0.0.1)" \
+        "found startupProbe:"
 else
-    no "readyWhen.tcpPort renders a startupProbe" "$(cat "$svc1_out")"
+    ok "readyWhen.tcpPort renders no startupProbe on the sidecar (a kubelet tcpSocket probe dials the pod IP, never 127.0.0.1)"
+fi
+if grep -qF -- '        - name: service-ready' "$svc1_out"; then
+    ok "readyWhen.tcpPort renders a service-ready initContainer"
+else
+    no "readyWhen.tcpPort renders a service-ready initContainer" "$(cat "$svc1_out")"
+fi
+svc1_ready_block="$(awk '/^        - name: service-ready$/{f=1} f&&/^        - name:/&&!/^        - name: service-ready$/{exit} f&&/^      [a-zA-Z]/{exit} f' "$svc1_out")"
+if grep -qF 'image: registry.example/you/fork-sandbox:latest' <<< "$svc1_ready_block"; then
+    ok "the service-ready checker uses the AGENT's own image, never the service's"
+else
+    no "the service-ready checker uses the AGENT's own image, never the service's" "$svc1_ready_block"
+fi
+if grep -qF 'command: ["bash", "/mnt/fork-sandbox/service-ready.sh"]' <<< "$svc1_ready_block"; then
+    ok "the service-ready checker runs service-ready.sh"
+else
+    no "the service-ready checker runs service-ready.sh" "$svc1_ready_block"
+fi
+if grep -A1 -F -- '- name: SERVICE_READY_CHECKS' <<< "$svc1_ready_block" | grep -qF 'value: "postgres:5432:180"'; then
+    ok "the service-ready checker's env carries name:port:<default 180s window>"
+else
+    no "the service-ready checker's env carries name:port:<default 180s window>" "$svc1_ready_block"
+fi
+if grep -qF 'allowPrivilegeEscalation: false' <<< "$svc1_ready_block" \
+    && grep -qF 'readOnlyRootFilesystem: true' <<< "$svc1_ready_block" \
+    && grep -qF 'drop: ["ALL"]' <<< "$svc1_ready_block"; then
+    ok "the service-ready checker carries the harness's own security context"
+else
+    no "the service-ready checker carries the harness's own security context" "$svc1_ready_block"
 fi
 if grep -qF -- '- name: postgres-wd0' "$svc1_out" \
     && grep -A1 -F -- '- name: postgres-wd0' "$svc1_out" | grep -qF 'mountPath: "/var/lib/postgresql/data"'; then
@@ -13713,7 +13743,7 @@ else
 fi
 
 # Two services: both present, both ports distinct, and no readyWhen means
-# no startupProbe.
+# no startupProbe and no service-ready initContainer.
 svc2_dir="$(svc_mk_repo 'version: 1
 services:
   - name: a
@@ -13747,6 +13777,11 @@ if grep -qF 'startupProbe:' "$svc2_out"; then
     no "no readyWhen renders no startupProbe" "found startupProbe: with no readyWhen given"
 else
     ok "no readyWhen renders no startupProbe"
+fi
+if grep -qF 'service-ready' "$svc2_out"; then
+    no "no readyWhen renders no service-ready initContainer" "found service-ready with no readyWhen given"
+else
+    ok "no readyWhen renders no service-ready initContainer"
 fi
 
 # Resources are always rendered, including when the spec omits them or gives
@@ -13796,6 +13831,374 @@ if grep -A12 -F -- '        - name: partial' "$svc_cap_out" | grep -qF 'cpu: "25
 else
     no "partial resources preserves cpu and defaults memory to its cap" "$svc_partial_block"
 fi
+
+printf '\n== per-run services: submit'"'"'s pod-ready budget covers the longest readyWhen window ==\n'
+# A slow-but-legitimate service must get enough time, and submit's own
+# budget must not give up before Kubernetes would -- acceptance "Submit's
+# pod-ready budget is at least the longest sidecar window, plus margin for
+# image pulls". No real cluster: a date stub that advances the clock 100s
+# per `date +%s` call exhausts any budget almost instantly (sleep is
+# stubbed to a no-op too), the same technique the no-services "never gets a
+# pod" case above uses -- only the expected budget number differs here.
+svc_budget_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: postgres
+    image: registry.example/rootless/postgres:16
+    port: 5432
+    readyWhen:
+      tcpPort: 5432
+      startupSeconds: 45
+')"
+
+# Rendering with an explicit spec value: acceptance 1/6 wants this checked
+# directly, not only inferred from the wait budget below -- the service-ready
+# checker's own env must carry the spec's 45s, not the 180s default (already
+# covered for the no-startupSeconds case by the one-service spec test above).
+svc_budget_render_out="$(newdir)/svc-budget-render.yaml"; tmpdirs+=("$(dirname "$svc_budget_render_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-budget-render --model moonshotai/kimi-k3 \
+    "$svc_budget_dir" "$handoff_file" > "$svc_budget_render_out" 2>/tmp/fs-k8s-test-svc-budget-render.err; then
+    ok "rendering with an explicit readyWhen.startupSeconds exits 0"
+else
+    no "rendering with an explicit readyWhen.startupSeconds exits 0" \
+        "$(cat /tmp/fs-k8s-test-svc-budget-render.err)"
+fi
+if grep -A1 -F -- '- name: SERVICE_READY_CHECKS' "$svc_budget_render_out" \
+    | grep -qF 'value: "postgres:5432:45"'; then
+    ok "rendering with readyWhen.startupSeconds=45 carries 45 in SERVICE_READY_CHECKS, not the 180s default"
+else
+    no "rendering with readyWhen.startupSeconds=45 carries 45 in SERVICE_READY_CHECKS, not the 180s default" \
+        "$(cat "$svc_budget_render_out")"
+fi
+
+svc_budget_stub_dir="$(newdir)"; tmpdirs+=("$svc_budget_stub_dir")
+cat > "$svc_budget_stub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$svc_budget_stub_dir/sleep" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat > "$svc_budget_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get|delete) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|exec) cat >/dev/null ;;
+    get)
+        case "$*" in
+            *"pod -l job-name="*) ;; # never visible
+            *) printf 'stub-pod\n' ;;
+        esac
+        ;;
+esac
+exit 0
+STUB
+svc_budget_real_date="$(type -P date)"
+cat > "$svc_budget_stub_dir/date" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == "+%s" ]]; then
+    n=\$(cat "\$K8S_STUB_DATE_COUNTER" 2>/dev/null || echo 0)
+    n=\$(( n + 1 ))
+    echo "\$n" > "\$K8S_STUB_DATE_COUNTER"
+    echo \$(( n * 100 ))
+else
+    exec "$svc_budget_real_date" "\$@"
+fi
+STUB
+chmod +x "$svc_budget_stub_dir/git" "$svc_budget_stub_dir/sleep" "$svc_budget_stub_dir/kubectl" "$svc_budget_stub_dir/date"
+svc_budget_home="$(newdir)"; tmpdirs+=("$svc_budget_home")
+svc_budget_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$svc_budget_log")")
+svc_budget_date_counter="$(newdir)/date-counter"; tmpdirs+=("$(dirname "$svc_budget_date_counter")")
+PATH="$svc_budget_stub_dir:$PATH" K8S_STUB_LOG="$svc_budget_log" HOME="$svc_budget_home" \
+    K8S_STUB_DATE_COUNTER="$svc_budget_date_counter" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-svc-budget --model moonshotai/kimi-k3 --harness pi \
+    "$svc_budget_dir" "$handoff_file" >/tmp/fs-k8s-test-svc-budget.out 2>&1 </dev/null
+svc_budget_rc=$?
+if (( svc_budget_rc != 0 )) && grep -q 'created no pod within 225s' /tmp/fs-k8s-test-svc-budget.out; then
+    ok "pod-ready budget is 180s base + the service's own 45s readyWhen window (225s)"
+else
+    no "pod-ready budget is 180s base + the service's own 45s readyWhen window (225s)" \
+        "rc=$svc_budget_rc out=$(cat /tmp/fs-k8s-test-svc-budget.out)"
+fi
+rm -f /tmp/fs-k8s-test-svc-budget.out
+
+printf '\n== per-run services: submit'"'"'s timeout diagnostics name the unready container ==\n'
+# Acceptance "On timeout, submit's error names the unready container(s),
+# with restart count, last termination reason/exit code and a log tail" --
+# pod events are not retained on every cluster, so the container status and
+# log are the only evidence. The pod here IS visible (unlike the budget
+# test above) and the Ready wait fails the way a real timed-out `kubectl
+# wait` would; the stubbed `get pod ... -o json` reports one unready
+# initContainer (postgres: not ready, 3 restarts, last exit 1) alongside
+# two ready ones (egress-gate, agent). `kubectl logs ... -c postgres`
+# (no --previous) returns nothing -- the current instance just restarted
+# and has not logged anything yet -- while `... -c postgres --previous`
+# returns a fixed line, standing in for the crash that the restart count
+# and last-exit-code are reporting. Both must reach submit's own output.
+svc_diag_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: postgres
+    image: registry.example/rootless/postgres:16
+    port: 5432
+    readyWhen:
+      tcpPort: 5432
+')"
+svc_diag_stub_dir="$(newdir)"; tmpdirs+=("$svc_diag_stub_dir")
+cat > "$svc_diag_stub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$svc_diag_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get|delete|logs) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|exec) cat >/dev/null ;;
+    get)
+        case "$*" in
+            *"pod -l job-name="*"-o name"*) printf 'pod/stub-pod\n' ;;
+            *"pod -l job-name="*"-o jsonpath="*) printf 'stub-pod' ;;
+            *"pod stub-pod -o json"*)
+                cat <<'JSON'
+{"status":{"initContainerStatuses":[{"name":"egress-gate","ready":true,"restartCount":0},{"name":"postgres","ready":false,"restartCount":3,"lastState":{"terminated":{"reason":"Error","exitCode":1}}}],"containerStatuses":[{"name":"agent","ready":true,"restartCount":0}]}}
+JSON
+                ;;
+            *) printf 'stub-pod\n' ;;
+        esac
+        ;;
+    wait)
+        case "$*" in
+            *"-l job-name="*) echo "error: timed out waiting for the condition" >&2; exit 1 ;;
+        esac
+        ;;
+    logs)
+        case "$*" in
+            *"-c postgres"*" --previous"*) printf 'FATAL: could not read pg_hba.conf\n' ;;
+            *"-c postgres"*) ;; # current instance just restarted -- nothing logged yet
+        esac
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$svc_diag_stub_dir/git" "$svc_diag_stub_dir/kubectl"
+svc_diag_home="$(newdir)"; tmpdirs+=("$svc_diag_home")
+svc_diag_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$svc_diag_log")")
+PATH="$svc_diag_stub_dir:$PATH" K8S_STUB_LOG="$svc_diag_log" HOME="$svc_diag_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-svc-diag --model moonshotai/kimi-k3 --harness pi \
+    "$svc_diag_dir" "$handoff_file" >/tmp/fs-k8s-test-svc-diag.out 2>&1 </dev/null
+svc_diag_rc=$?
+svc_diag_out="$(cat /tmp/fs-k8s-test-svc-diag.out)"
+if (( svc_diag_rc != 0 )) && [[ "$svc_diag_out" == *"postgres"* ]]; then
+    ok "timeout diagnostics name the unready container"
+else
+    no "timeout diagnostics name the unready container" "rc=$svc_diag_rc out=$svc_diag_out"
+fi
+if [[ "$svc_diag_out" == *"restarts=3"* ]]; then
+    ok "timeout diagnostics report the unready container's restart count"
+else
+    no "timeout diagnostics report the unready container's restart count" "$svc_diag_out"
+fi
+if [[ "$svc_diag_out" == *"last-reason=Error"* && "$svc_diag_out" == *"last-exit-code=1"* ]]; then
+    ok "timeout diagnostics report the last termination reason and exit code"
+else
+    no "timeout diagnostics report the last termination reason and exit code" "$svc_diag_out"
+fi
+if [[ "$svc_diag_out" == *"FATAL: could not read pg_hba.conf"* ]]; then
+    ok "timeout diagnostics include a log tail for the unready container"
+else
+    no "timeout diagnostics include a log tail for the unready container" "$svc_diag_out"
+fi
+# The current instance's own tail is empty here (it only just restarted),
+# so the crash log above can only have reached submit's output via the
+# separate `kubectl logs --previous` tail this restartCount=3 triggers.
+if [[ "$svc_diag_out" == *"previous log tail (kubectl logs"*"--previous)"* ]]; then
+    ok "timeout diagnostics also tail the previous instance's log for a restarted container"
+else
+    no "timeout diagnostics also tail the previous instance's log for a restarted container" "$svc_diag_out"
+fi
+if [[ "$svc_diag_out" != *"egress-gate: restarts="* && "$svc_diag_out" != *"agent: restarts="* ]]; then
+    ok "timeout diagnostics do not name containers that are already ready"
+else
+    no "timeout diagnostics do not name containers that are already ready" "$svc_diag_out"
+fi
+rm -f /tmp/fs-k8s-test-svc-diag.out
+
+printf '\n== per-run services: timeout diagnostics never print the agent'"'"'s own log ==\n'
+# The agent container is the one place --context-secret and the claude-token
+# Secret are mounted or injected (fork-sandbox-k8s.sh's job render) --
+# kubectl logs reproduces whatever the container itself printed, which this
+# script does not control, so the handoff's "No Secret content is ever
+# printed" means the agent's raw log tail must never reach this diagnostic,
+# even though its status fields (none of them Secret-bearing) still should.
+# No services spec needed: this is about the agent container generically.
+agent_diag_stub_dir="$(newdir)"; tmpdirs+=("$agent_diag_stub_dir")
+cat > "$agent_diag_stub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$agent_diag_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get|delete|logs) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|exec) cat >/dev/null ;;
+    get)
+        case "$*" in
+            *"pod -l job-name="*"-o name"*) printf 'pod/stub-pod\n' ;;
+            *"pod -l job-name="*"-o jsonpath="*) printf 'stub-pod' ;;
+            *"pod stub-pod -o json"*)
+                cat <<'JSON'
+{"status":{"initContainerStatuses":[{"name":"egress-gate","ready":true,"restartCount":0}],"containerStatuses":[{"name":"agent","ready":false,"restartCount":2,"lastState":{"terminated":{"reason":"Error","exitCode":1}}}]}}
+JSON
+                ;;
+            *) printf 'stub-pod\n' ;;
+        esac
+        ;;
+    wait)
+        case "$*" in
+            *"-l job-name="*) echo "error: timed out waiting for the condition" >&2; exit 1 ;;
+        esac
+        ;;
+    logs)
+        case "$*" in
+            *"-c agent"*) printf 'leaked-context-secret-marker-should-never-print\n' ;;
+        esac
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$agent_diag_stub_dir/git" "$agent_diag_stub_dir/kubectl"
+agent_diag_home="$(newdir)"; tmpdirs+=("$agent_diag_home")
+agent_diag_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$agent_diag_log")")
+PATH="$agent_diag_stub_dir:$PATH" K8S_STUB_LOG="$agent_diag_log" HOME="$agent_diag_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-agent-diag --model moonshotai/kimi-k3 --harness pi \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-agent-diag.out 2>&1 </dev/null
+agent_diag_rc=$?
+agent_diag_out="$(cat /tmp/fs-k8s-test-agent-diag.out)"
+if [[ "$agent_diag_out" != *"leaked-context-secret-marker-should-never-print"* ]]; then
+    ok "timeout diagnostics never print the agent container's raw log"
+else
+    no "timeout diagnostics never print the agent container's raw log" "$agent_diag_out"
+fi
+if (( agent_diag_rc != 0 )) && [[ "$agent_diag_out" == *"restarts=2"* \
+    && "$agent_diag_out" == *"last-reason=Error"* && "$agent_diag_out" == *"last-exit-code=1"* ]]; then
+    ok "timeout diagnostics still report the agent's restart count and exit code"
+else
+    no "timeout diagnostics still report the agent's restart count and exit code" \
+        "rc=$agent_diag_rc out=$agent_diag_out"
+fi
+if [[ "$agent_diag_out" == *"log tail omitted"* ]]; then
+    ok "timeout diagnostics explain why the agent's log tail is omitted"
+else
+    no "timeout diagnostics explain why the agent's log tail is omitted" "$agent_diag_out"
+fi
+rm -f /tmp/fs-k8s-test-agent-diag.out
+
+printf '\n== per-run services: timeout diagnostics tail a sidecar the checker, not kubelet, knows failed ==\n'
+# A service sidecar carries no readinessProbe of its own (a kubelet
+# tcpSocket/httpGet probe dials the pod IP, never the 127.0.0.1 bind the
+# sidecar needs), so it reports ready=true the instant it starts even when
+# the service inside never opens its port. Here postgres reports ready
+# while the separate service-ready checker (the one thing that actually
+# tried 127.0.0.1:5432) does not -- the opposite status combination from
+# the "names the unready container" test above, which this fix is for: the
+# evidence must still include postgres's own log, not just the checker's.
+# postgres also carries 2 restarts here, with nothing on its current
+# instance's log (it only just restarted) -- so this exercises the
+# "also_tail" code path's own `kubectl logs --previous` fallback, the
+# ready-but-broken-sidecar counterpart to the unready-container test above.
+sidecar_diag_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: postgres
+    image: registry.example/rootless/postgres:16
+    port: 5432
+    readyWhen:
+      tcpPort: 5432
+')"
+sidecar_diag_stub_dir="$(newdir)"; tmpdirs+=("$sidecar_diag_stub_dir")
+cat > "$sidecar_diag_stub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$sidecar_diag_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get|delete|logs) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|exec) cat >/dev/null ;;
+    get)
+        case "$*" in
+            *"pod -l job-name="*"-o name"*) printf 'pod/stub-pod\n' ;;
+            *"pod -l job-name="*"-o jsonpath="*) printf 'stub-pod' ;;
+            *"pod stub-pod -o json"*)
+                cat <<'JSON'
+{"status":{"initContainerStatuses":[{"name":"egress-gate","ready":true,"restartCount":0},{"name":"postgres","ready":true,"restartCount":2,"lastState":{"terminated":{"reason":"Error","exitCode":1}}},{"name":"service-ready","ready":false,"restartCount":0,"lastState":{"terminated":{"reason":"Error","exitCode":1}}}],"containerStatuses":[{"name":"agent","ready":true,"restartCount":0}]}}
+JSON
+                ;;
+            *) printf 'stub-pod\n' ;;
+        esac
+        ;;
+    wait)
+        case "$*" in
+            *"-l job-name="*) echo "error: timed out waiting for the condition" >&2; exit 1 ;;
+        esac
+        ;;
+    logs)
+        case "$*" in
+            *"-c postgres"*" --previous"*) printf 'FATAL: password authentication failed for user "dev"\n' ;;
+            *"-c postgres"*) ;; # current instance just restarted -- nothing logged yet
+            *"-c service-ready"*) printf 'connect: connection refused\n' ;;
+        esac
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$sidecar_diag_stub_dir/git" "$sidecar_diag_stub_dir/kubectl"
+sidecar_diag_home="$(newdir)"; tmpdirs+=("$sidecar_diag_home")
+sidecar_diag_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$sidecar_diag_log")")
+PATH="$sidecar_diag_stub_dir:$PATH" K8S_STUB_LOG="$sidecar_diag_log" HOME="$sidecar_diag_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-sidecar-diag --model moonshotai/kimi-k3 --harness pi \
+    "$sidecar_diag_dir" "$handoff_file" >/tmp/fs-k8s-test-sidecar-diag.out 2>&1 </dev/null
+sidecar_diag_rc=$?
+sidecar_diag_out="$(cat /tmp/fs-k8s-test-sidecar-diag.out)"
+if (( sidecar_diag_rc != 0 )) && [[ "$sidecar_diag_out" == *"service-ready"* ]]; then
+    ok "timeout diagnostics name the failed service-ready checker"
+else
+    no "timeout diagnostics name the failed service-ready checker" \
+        "rc=$sidecar_diag_rc out=$sidecar_diag_out"
+fi
+if [[ "$sidecar_diag_out" == *'FATAL: password authentication failed for user "dev"'* ]]; then
+    ok "timeout diagnostics tail the ready-but-broken sidecar's own log too"
+else
+    no "timeout diagnostics tail the ready-but-broken sidecar's own log too" "$sidecar_diag_out"
+fi
+# As above: postgres's current-instance log is empty here, so that crash
+# line can only have reached submit's output through the also_tail path's
+# own `kubectl logs --previous` fallback for a restarted (restarts=2) sidecar.
+if [[ "$sidecar_diag_out" == *"previous log tail (kubectl logs"*"--previous)"* ]]; then
+    ok "timeout diagnostics also tail the previous log for a restarted ready-but-broken sidecar"
+else
+    no "timeout diagnostics also tail the previous log for a restarted ready-but-broken sidecar" "$sidecar_diag_out"
+fi
+rm -f /tmp/fs-k8s-test-sidecar-diag.out
 
 printf '\n== per-run services: --services-trust-ref gates the spec like the local hook ==\n'
 svc_trust_dir="$(mktemp -d "$HOME/src/fs-k8s-svc-trust-test.XXXXXX")"; tmpdirs+=("$svc_trust_dir")
@@ -13908,6 +14311,21 @@ services:
     image: registry.example/x:1
     port: 5432
 '
+# service-ready is itself a harness container name once any service
+# declares a readyWhen (fork-sandbox-k8s.sh renders the checker under that
+# exact name) -- a spec using it for a service would collide with that
+# initContainer and make Kubernetes reject the Job, not render a working
+# ready check.
+svc_refuses "reserved name: service-ready" \
+    "is reserved by the harness's own pod containers" \
+    'version: 1
+services:
+  - name: service-ready
+    image: registry.example/x:1
+    port: 5432
+    readyWhen:
+      tcpPort: 5432
+'
 svc_refuses "duplicate name across services" \
     "is used by more than one service; names must be unique" \
     'version: 1
@@ -13978,7 +14396,7 @@ services:
       - /data
 '
 svc_refuses "readyWhen unknown key" \
-    "unknown key 'execCommand'; only 'tcpPort' is supported" \
+    "unknown key 'execCommand'; only 'tcpPort' and 'startupSeconds' are supported" \
     'version: 1
 services:
   - name: db
@@ -13995,6 +14413,17 @@ services:
     image: registry.example/x:1
     port: 5432
     readyWhen: {}
+'
+svc_refuses "readyWhen.startupSeconds over the built-in cap" \
+    "readyWhen.startupSeconds: 700 exceeds the per-service cap 600 (K8S_SERVICE_MAX_STARTUP_SECONDS in k8s.env)" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    readyWhen:
+      tcpPort: 5432
+      startupSeconds: 700
 '
 svc_refuses "too many services" \
     "more than the 8 allowed" \
@@ -14155,7 +14584,7 @@ fi
 # The fixture k8s.env names none of the cap keys, so the built-in defaults
 # apply -- and the output must say so, not just be silent about it.
 check "validate-only: prints the limits it applied (built-in defaults)" \
-    'K8S_SERVICES_MAX=8 (built-in default), K8S_SERVICE_MAX_CPU=1000m (built-in default), K8S_SERVICE_MAX_MEMORY=1Gi (built-in default)' \
+    'K8S_SERVICES_MAX=8 (built-in default), K8S_SERVICE_MAX_CPU=1000m (built-in default), K8S_SERVICE_MAX_MEMORY=1Gi (built-in default), K8S_SERVICE_MAX_STARTUP_SECONDS=600 (built-in default)' \
     "$(sed -n 's/^limits applied: //p' "$svc_val_out")"
 if [[ "$(find "$svc_validate_dir" -mindepth 1 -maxdepth 1 | wc -l)" == 1 \
     && -f "$svc_validate_dir/services.yaml" ]]; then
@@ -14344,15 +14773,81 @@ else
     no "validate-only: a malformed K8S_SERVICE_MAX_MEMORY names k8s.env, not the spec" \
         "rc=$svc_val_badmem_rc: $svc_val_badmem_out"
 fi
+printf 'K8S_SERVICE_MAX_STARTUP_SECONDS=soon\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_badstartup_out=""; svc_val_badstartup_rc=0
+svc_val_badstartup_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_val_badstartup_rc=$?
+if (( svc_val_badstartup_rc != 0 )) \
+    && [[ "$svc_val_badstartup_out" == *"K8S_SERVICE_MAX_STARTUP_SECONDS: must be a positive whole number of seconds"* \
+    && "$svc_val_badstartup_out" == *"$svc_val_cfg_bad/k8s.env"* \
+    && "$svc_val_badstartup_out" != *"services.yaml"* ]]; then
+    ok "validate-only: a malformed K8S_SERVICE_MAX_STARTUP_SECONDS names k8s.env, not the spec"
+else
+    no "validate-only: a malformed K8S_SERVICE_MAX_STARTUP_SECONDS names k8s.env, not the spec" \
+        "rc=$svc_val_badstartup_rc: $svc_val_badstartup_out"
+fi
+# 0 is not "a positive whole number of seconds" either -- and unlike a
+# non-numeric value, it used to pass the shape check and then silently
+# clamp every readyWhen's window to 0s (min(180, 0)), failing a normally
+# slow service immediately instead of refusing the config.
+printf 'K8S_SERVICE_MAX_STARTUP_SECONDS=0\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_zerostartup_out=""; svc_val_zerostartup_rc=0
+svc_val_zerostartup_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_val_zerostartup_rc=$?
+if (( svc_val_zerostartup_rc != 0 )) \
+    && [[ "$svc_val_zerostartup_out" == *"K8S_SERVICE_MAX_STARTUP_SECONDS: must be a positive whole number of seconds"* \
+    && "$svc_val_zerostartup_out" == *"$svc_val_cfg_bad/k8s.env"* \
+    && "$svc_val_zerostartup_out" != *"services.yaml"* ]]; then
+    ok "validate-only: K8S_SERVICE_MAX_STARTUP_SECONDS=0 is refused, not a silent 0s window"
+else
+    no "validate-only: K8S_SERVICE_MAX_STARTUP_SECONDS=0 is refused, not a silent 0s window" \
+        "rc=$svc_val_zerostartup_rc: $svc_val_zerostartup_out"
+fi
+# The same key, same shape bug, at the cluster path's own config-load gate
+# (fork-sandbox-k8s.sh), not just the validate-only mirror above.
+svc_zerostartup_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: postgres
+    image: registry.example/rootless/postgres:16
+    port: 5432
+    readyWhen:
+      tcpPort: 5432
+')"
+svc_zerostartup_cfg="$(newdir)"; tmpdirs+=("$svc_zerostartup_cfg")
+cp "$config_dir/k8s.env" "$svc_zerostartup_cfg/k8s.env"
+printf 'K8S_SERVICE_MAX_STARTUP_SECONDS=0\n' >> "$svc_zerostartup_cfg/k8s.env"
+refuses "submit: K8S_SERVICE_MAX_STARTUP_SECONDS=0 in k8s.env is refused, not a silent 0s window" \
+    "K8S_SERVICE_MAX_STARTUP_SECONDS must be a positive integer, got" \
+    env FORK_SANDBOX_CONFIG_DIR="$svc_zerostartup_cfg" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-zerostartup --model moonshotai/kimi-k3 \
+    "$svc_zerostartup_dir" "$handoff_file"
 
-# The 6-positional-argument form the cluster path uses must render exactly
+# The cap refusal belongs at validate-services too, not only at submit
+# (acceptance 2: "Over the cap is refused at validate-services and at
+# submit, naming the field and the key") -- the existing coverage for this
+# message (svc_refuses "readyWhen.startupSeconds over the built-in cap"
+# below) only exercises the submit --dry-run path.
+printf 'version: 1\nservices:\n  - name: postgres\n    image: registry.example/rootless/postgres:16\n    port: 5432\n    readyWhen:\n      tcpPort: 5432\n      startupSeconds: 700\n' \
+    > "$svc_validate_dir/overcap.yaml"
+svc_val_overcap_out=""; svc_val_overcap_rc=0
+svc_val_overcap_out="$(env FORK_SANDBOX_CONFIG_DIR="$config_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/overcap.yaml" 2>&1)" || svc_val_overcap_rc=$?
+if (( svc_val_overcap_rc != 0 )) \
+    && [[ "$svc_val_overcap_out" == *"readyWhen.startupSeconds: 700 exceeds the per-service cap 600 (K8S_SERVICE_MAX_STARTUP_SECONDS in k8s.env)"* ]]; then
+    ok "validate-only: an over-cap readyWhen.startupSeconds is refused, naming the field and the key"
+else
+    no "validate-only: an over-cap readyWhen.startupSeconds is refused, naming the field and the key" \
+        "rc=$svc_val_overcap_rc: $svc_val_overcap_out"
+fi
+
+# The 7-positional-argument form the cluster path uses must render exactly
 # as before, and a wrong argument count still fails with usage.
 svc_val_render_dir="$(newdir)/out"; tmpdirs+=("$(dirname "$svc_val_render_dir")")
 if python3 "$svc_parse_py" "$svc_validate_dir/services.yaml" \
-    "$svc_val_render_dir" 8 1000m 1Gi; then
-    ok "render form: 6 positional arguments still exits 0"
+    "$svc_val_render_dir" 8 1000m 1Gi 600; then
+    ok "render form: 7 positional arguments still exits 0"
 else
-    no "render form: 6 positional arguments still exits 0"
+    no "render form: 7 positional arguments still exits 0"
 fi
 for f in containers.yaml prompt-services.txt grace; do
     if [[ -f "$svc_val_render_dir/$f" ]]; then

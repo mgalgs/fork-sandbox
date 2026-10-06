@@ -3,16 +3,16 @@
 fork-sandbox-k8s.sh.
 
 Usage: fork-sandbox-k8s-services-parse.py <file> <out-dir> <max-services>
-                                           <max-cpu> <max-memory>
+                                           <max-cpu> <max-memory> <max-startup>
        fork-sandbox-k8s-services-parse.py <file>    (validate only)
 
 The validate-only form (reached as `fork-sandbox validate-services <file>`)
 checks the spec and exits 0/1 without writing anything. It applies the same
 limits the cluster path would -- K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU /
-K8S_SERVICE_MAX_MEMORY from the site's k8s.env when available, otherwise
-the same built-in defaults -- and prints which limits it applied, so a
-passing result is never mistaken for a guarantee under a different site's
-configuration.
+K8S_SERVICE_MAX_MEMORY / K8S_SERVICE_MAX_STARTUP_SECONDS from the site's
+k8s.env when available, otherwise the same built-in defaults -- and prints
+which limits it applied, so a passing result is never mistaken for a
+guarantee under a different site's configuration.
 
 The cluster path takes declarative data, never an executable hook: the repo
 commits this file, and the harness (not the repo) synthesizes the Job's
@@ -24,9 +24,10 @@ that would let a service escape the harness's own security context (no
 securityContext, hostPath, privileged, capabilities, hostNetwork or service
 account -- not rejected, just not expressible).
 
-<max-services>, <max-cpu> and <max-memory> are the per-run caps from
-K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU / K8S_SERVICE_MAX_MEMORY in
-k8s.env (fork-sandbox-k8s.sh resolves their defaults before calling this).
+<max-services>, <max-cpu>, <max-memory> and <max-startup> are the per-run
+caps from K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU / K8S_SERVICE_MAX_MEMORY /
+K8S_SERVICE_MAX_STARTUP_SECONDS in k8s.env (fork-sandbox-k8s.sh resolves
+their defaults before calling this).
 
 Every services[].image is also resolved against two more k8s.env keys,
 read directly from the site's config by both call forms (never passed as
@@ -46,12 +47,33 @@ fork-sandbox-k8s.sh splices into the Job it builds, so no further parsing
 of this script's output is needed on the bash side:
 
     containers.yaml       initContainers entries, one per service (native
-                           sidecars: restartPolicy: Always), or absent
+                           sidecars: restartPolicy: Always), or absent.
+                           Carries no startupProbe -- see ready-checks
+                           below for why the check moved out of this
+                           container entirely.
     volumes.yaml           one emptyDir volume per writableDirs entry, or
                            absent
     sandbox-env            KEY=VALUE lines from `sandboxEnv`, or absent if
                            `sandboxEnv` was not given
     prompt-services.txt    "<name> 127.0.0.1:<port>" lines, or absent
+    ready-checks           "<name> <tcpPort> <startupSeconds>" lines, one
+                           per service with a `readyWhen`, or absent. A
+                           kubelet tcpSocket/httpGet startupProbe dials the
+                           POD IP from the node, so it can never see a
+                           service bound to 127.0.0.1 only (the recommended
+                           bind for a per-run database sharing the agent's
+                           network namespace -- see docs/sandbox-services.md).
+                           fork-sandbox-k8s.sh instead renders a dedicated
+                           "service-ready" initContainer, built from the
+                           AGENT's own image (never the service's, which
+                           may be distroless and shell-less), that connects
+                           to 127.0.0.1:<tcpPort> from inside the pod's
+                           shared network namespace and blocks the agent
+                           container from starting until every service
+                           answers or its own <startupSeconds> runs out.
+                           Because no probe is attached to the service
+                           container itself, a slow service is never
+                           killed and restarted for failing one.
     grace                  present (containing "10") iff at least one
                            service is defined
 
@@ -84,6 +106,13 @@ except ImportError:
 SPEC_PATH = ".agents/sandbox-services/services.yaml"
 SUPPORTED_VERSIONS = (1,)
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+# A readyWhen with no startupSeconds gets this many seconds by default
+# (clamped down if K8S_SERVICE_MAX_STARTUP_SECONDS is tighter) -- "a few
+# minutes" of margin for a realistic seeded service on a shared node, per
+# docs/sandbox-services.md. Restarting a sidecar that is still starting is
+# never useful, so this must comfortably clear a slow-but-normal startup,
+# well past Kubernetes' own ~30s probe default.
+DEFAULT_STARTUP_SECONDS = 180
 # A services[].image spelled "./name:tag" resolves against
 # K8S_SERVICE_REGISTRY -- see resolve_image's own header for why this sigil
 # and not a boolean field. REGISTRY_PREFIX_RE is K8S_SERVICE_REGISTRY's own
@@ -113,7 +142,7 @@ ALLOWED_REGISTRIES = None
 # sourced file is a bash syntax error.
 SERVICE_ENV_KEY_RE = re.compile(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$")
 SANDBOX_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-RESERVED_NAMES = ("egress-gate", "agent")
+RESERVED_NAMES = ("egress-gate", "agent", "service-ready")
 
 # 8/10/12/14-space indents matching the Job's existing initContainers /
 # volumes blocks in fork-sandbox-k8s.sh -- see its own initContainers and
@@ -204,12 +233,22 @@ def parse_memory(value, path, spec_path=None):
     return int(m.group(1)) * MEMORY_MULT[m.group(2)]
 
 
+def parse_seconds(value, path, spec_path=None):
+    value = text_field(value, path, spec_path=spec_path)
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        fail(f"{path}: must be a positive whole number of seconds, got "
+             f"{value!r}", spec_path=spec_path)
+    return int(value)
+
+
 def parse_doc(doc):
     # Validate configured defaults even when a service omits one or both
     # resource members. Otherwise a malformed cap would be copied into the
     # rendered Job and only rejected later by Kubernetes.
     max_cpu_milli = parse_cpu(MAX_CPU, "K8S_SERVICE_MAX_CPU")
     max_memory_bytes = parse_memory(MAX_MEMORY, "K8S_SERVICE_MAX_MEMORY")
+    max_startup_seconds = parse_seconds(MAX_STARTUP_SECONDS,
+                                         "K8S_SERVICE_MAX_STARTUP_SECONDS")
     if not isinstance(doc, dict):
         fail("the document must be a mapping with 'version' and 'services'")
     for key in doc:
@@ -323,20 +362,36 @@ def parse_doc(doc):
                 writable_dirs.append(entry)
 
         ready_tcp_port = None
+        ready_startup_seconds = None
         if "readyWhen" in item:
             rw_doc = item["readyWhen"]
             if not isinstance(rw_doc, dict):
                 fail(f"{path}.readyWhen: must be a mapping")
             for key in rw_doc:
-                if key != "tcpPort":
+                if key not in ("tcpPort", "startupSeconds"):
                     fail(f"{path}.readyWhen: unknown key '{key}'; only "
-                         f"'tcpPort' is supported -- there is no 'exec' "
-                         f"form, since a command here would be "
-                         f"repo-controlled execution")
+                         f"'tcpPort' and 'startupSeconds' are supported -- "
+                         f"there is no 'exec' form, since a command here "
+                         f"would be repo-controlled execution")
             if "tcpPort" not in rw_doc:
                 fail(f"{path}.readyWhen: needs 'tcpPort'")
             ready_tcp_port = positive_int(
                 rw_doc["tcpPort"], f"{path}.readyWhen.tcpPort", 1, 65535)
+            # Restarting a sidecar that is still starting is never useful
+            # (docs/sandbox-services.md), so the default window is "a few
+            # minutes", not Kubernetes' own ~30s probe default -- clamped
+            # down if the operator's own cap is tighter than that default.
+            ready_startup_seconds = min(DEFAULT_STARTUP_SECONDS,
+                                         max_startup_seconds)
+            if "startupSeconds" in rw_doc:
+                ready_startup_seconds = positive_int(
+                    rw_doc["startupSeconds"],
+                    f"{path}.readyWhen.startupSeconds", 1, None)
+                if ready_startup_seconds > max_startup_seconds:
+                    fail(f"{path}.readyWhen.startupSeconds: "
+                         f"{ready_startup_seconds} exceeds the per-service "
+                         f"cap {MAX_STARTUP_SECONDS} "
+                         f"(K8S_SERVICE_MAX_STARTUP_SECONDS in k8s.env)")
 
         cpu, memory = MAX_CPU, MAX_MEMORY
         if "resources" in item:
@@ -363,6 +418,7 @@ def parse_doc(doc):
         services.append({
             "name": name, "image": image, "port": port, "env": env,
             "writableDirs": writable_dirs, "readyTcpPort": ready_tcp_port,
+            "readyStartupSeconds": ready_startup_seconds,
             "cpu": cpu, "memory": memory,
         })
 
@@ -405,10 +461,16 @@ def render_container(svc):
         for j, wdir in enumerate(svc["writableDirs"]):
             lines.append(f'{I4}- name: {svc["name"]}-wd{j}')
             lines.append(f'{I5}mountPath: "{wdir}"')
-    if svc["readyTcpPort"] is not None:
-        lines += [f"{I3}startupProbe:",
-                  f"{I4}tcpSocket:",
-                  f'{I5}port: {svc["readyTcpPort"]}']
+    # No startupProbe here: a kubelet tcpSocket/httpGet probe dials the POD
+    # IP from the node, so it can never see a service bound to 127.0.0.1
+    # only -- the recommended bind for a per-run database sharing the
+    # agent's network namespace. fork-sandbox-k8s.sh renders a separate
+    # "service-ready" initContainer instead, built from the agent's own
+    # image, that checks readyWhen.tcpPort over the pod's shared loopback
+    # -- see this script's own module docstring ("ready-checks") and
+    # fork-sandbox-k8s-service-ready.sh. One upshot: with no probe on this
+    # container, a slow service is never killed and restarted for failing
+    # one.
     lines.append(f"{I3}resources:")
     for block in ("requests", "limits"):
         lines.append(f"{I4}{block}:")
@@ -450,6 +512,9 @@ def main():
               "".join(f"{k}={v}\n" for k, v in sandbox_env.items()))
     write_if(os.path.join(OUT_DIR, "prompt-services.txt"),
               "".join(f'{s["name"]} 127.0.0.1:{s["port"]}\n' for s in services))
+    write_if(os.path.join(OUT_DIR, "ready-checks"),
+              "".join(f'{s["name"]} {s["readyTcpPort"]} {s["readyStartupSeconds"]}\n'
+                       for s in services if s["readyTcpPort"] is not None))
     write_if(os.path.join(OUT_DIR, "grace"), "10\n" if services else "")
 
 
@@ -609,17 +674,19 @@ def resolve_image(raw, path, prefix, allowed):
 def resolve_limits():
     """The per-run caps, resolved the same way the cluster path resolves
     them (fork-sandbox-k8s.sh): K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU /
-    K8S_SERVICE_MAX_MEMORY from the config's k8s.env when available,
-    otherwise the same built-in defaults. Returns the three values, a flag
-    per value saying whether it came from the config's k8s.env (so a
-    malformed one can be blamed on the config file, not the spec), plus a
-    line naming which limits came from where, so a passing result is never
-    mistaken for a guarantee under a different site's configuration."""
+    K8S_SERVICE_MAX_MEMORY / K8S_SERVICE_MAX_STARTUP_SECONDS from the
+    config's k8s.env when available, otherwise the same built-in defaults.
+    Returns the four values, a flag per value saying whether it came from
+    the config's k8s.env (so a malformed one can be blamed on the config
+    file, not the spec), plus a line naming which limits came from where,
+    so a passing result is never mistaken for a guarantee under a
+    different site's configuration."""
     k8s_env = k8s_env_path()
     values, from_cfg, where = [], [], []
     for key, default in (("K8S_SERVICES_MAX", "8"),
                          ("K8S_SERVICE_MAX_CPU", "1000m"),
-                         ("K8S_SERVICE_MAX_MEMORY", "1Gi")):
+                         ("K8S_SERVICE_MAX_MEMORY", "1Gi"),
+                         ("K8S_SERVICE_MAX_STARTUP_SECONDS", "600")):
         cfg = read_env_key(k8s_env, key)
         if cfg:  # empty value == unset, the way ${VAR:-default} treats it
             values.append(cfg)
@@ -629,7 +696,7 @@ def resolve_limits():
             values.append(default)
             from_cfg.append(False)
             where.append(f"{key}={default} (built-in default)")
-    return values[0], values[1], values[2], from_cfg, ", ".join(where)
+    return values[0], values[1], values[2], values[3], from_cfg, ", ".join(where)
 
 
 def validate_only():
@@ -640,8 +707,9 @@ def validate_only():
     # Failure messages should name the file the user actually gave, not
     # the in-repo path the cluster path reads.
     SPEC_PATH = FILE
-    global MAX_SERVICES, MAX_CPU, MAX_MEMORY
-    MAX_SERVICES, MAX_CPU, MAX_MEMORY, from_cfg, limits_line = resolve_limits()
+    global MAX_SERVICES, MAX_CPU, MAX_MEMORY, MAX_STARTUP_SECONDS
+    MAX_SERVICES, MAX_CPU, MAX_MEMORY, MAX_STARTUP_SECONDS, from_cfg, limits_line = \
+        resolve_limits()
     # The cluster path (fork-sandbox-k8s.sh) validates this key against
     # ^[0-9]+$ at config load, so a shape it rejects there is a k8s.env
     # error, not a spec error: check the string with the same pattern
@@ -651,15 +719,18 @@ def validate_only():
         fail(f"K8S_SERVICES_MAX must be a positive integer, got "
              f"'{MAX_SERVICES}'", spec_path=k8s_env_path())
     MAX_SERVICES = int(MAX_SERVICES)
-    # The other two caps are checked inside parse_doc, which names the
-    # spec file. When one of them came from k8s.env, the config file is
-    # what is wrong, not the spec: pre-check it here with the config file
-    # named, the same attribution the K8S_SERVICES_MAX check above does.
+    # The other caps are checked inside parse_doc, which names the spec
+    # file. When one came from k8s.env, the config file is what is wrong,
+    # not the spec: pre-check it here with the config file named, the same
+    # attribution the K8S_SERVICES_MAX check above does.
     if from_cfg[1]:
         parse_cpu(MAX_CPU, "K8S_SERVICE_MAX_CPU", spec_path=k8s_env_path())
     if from_cfg[2]:
         parse_memory(MAX_MEMORY, "K8S_SERVICE_MAX_MEMORY",
                      spec_path=k8s_env_path())
+    if from_cfg[3]:
+        parse_seconds(MAX_STARTUP_SECONDS, "K8S_SERVICE_MAX_STARTUP_SECONDS",
+                      spec_path=k8s_env_path())
     doc = load_doc(FILE)
     global PREFIX, ALLOWED_REGISTRIES
     PREFIX, ALLOWED_REGISTRIES, registry_line = resolve_registry_rules()
@@ -672,7 +743,7 @@ def validate_only():
 if __name__ == "__main__":
     usage = (
         "Usage: fork-sandbox-k8s-services-parse.py <file> <out-dir> "
-        "<max-services> <max-cpu> <max-memory>\n"
+        "<max-services> <max-cpu> <max-memory> <max-startup>\n"
         "       or: fork-sandbox-k8s-services-parse.py <file>  "
         "(validate only: checks the spec, writes nothing)\n")
     if len(sys.argv) == 2:
@@ -685,10 +756,10 @@ if __name__ == "__main__":
         # Validate-only mode: no out-dir, no rendering.
         FILE = sys.argv[1]
         validate_only()
-    elif len(sys.argv) == 6:
+    elif len(sys.argv) == 7:
         FILE, OUT_DIR = sys.argv[1], sys.argv[2]
         MAX_SERVICES = int(sys.argv[3])
-        MAX_CPU, MAX_MEMORY = sys.argv[4], sys.argv[5]
+        MAX_CPU, MAX_MEMORY, MAX_STARTUP_SECONDS = sys.argv[4], sys.argv[5], sys.argv[6]
         main()
     else:
         sys.stderr.write(usage)

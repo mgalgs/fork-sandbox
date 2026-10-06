@@ -333,6 +333,7 @@ PLUMBING=(
     fork-sandbox-k8s-outbox-extract.sh
     fork-sandbox-k8s-platform-generic
     fork-sandbox-k8s-review-loop.sh
+    fork-sandbox-k8s-service-ready.sh
     fork-sandbox-k8s-services-parse.py
     fork-sandbox-k8s-wake.sh
     fork-sandbox-lib.sh

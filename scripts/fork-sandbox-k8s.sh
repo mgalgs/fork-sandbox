@@ -907,15 +907,25 @@ K8S_RUN_TTL="$(read_env_value "$k8s_env" K8S_RUN_TTL || true)"
 K8S_RUN_TTL="${K8S_RUN_TTL:-3600}"
 # Per-run services caps -- see docs/sandbox-services.md's cluster section.
 # A repo must not be able to claim the namespace: these bound how many
-# services and how much cpu/memory a committed services.yaml can ask for.
-# The cpu/memory shapes are validated by fork-sandbox-k8s-services-parse.py
-# itself (the only place that needs a Kubernetes-quantity parser), not here.
+# services, how much cpu/memory, and how long a startup window a committed
+# services.yaml can ask for. The cpu/memory/seconds shapes are validated by
+# fork-sandbox-k8s-services-parse.py itself (the only place that needs a
+# Kubernetes-quantity parser), not here.
 K8S_SERVICES_MAX="$(read_env_value "$k8s_env" K8S_SERVICES_MAX || true)"
 K8S_SERVICES_MAX="${K8S_SERVICES_MAX:-8}"
 K8S_SERVICE_MAX_CPU="$(read_env_value "$k8s_env" K8S_SERVICE_MAX_CPU || true)"
 K8S_SERVICE_MAX_CPU="${K8S_SERVICE_MAX_CPU:-1000m}"
 K8S_SERVICE_MAX_MEMORY="$(read_env_value "$k8s_env" K8S_SERVICE_MAX_MEMORY || true)"
 K8S_SERVICE_MAX_MEMORY="${K8S_SERVICE_MAX_MEMORY:-1Gi}"
+# The per-service readyWhen.startupSeconds cap -- see "Restarting a sidecar
+# that is still starting is never useful" in docs/sandbox-services.md.
+# 600s (10 minutes) is deliberately generous: the spec's own default is far
+# below this (see fork-sandbox-k8s-services-parse.py's DEFAULT_STARTUP_SECONDS),
+# and this key exists only to bound how far a spec can push submit's own
+# pod-ready budget (see pod_budget in cmd_submit), not to suggest 600s is a
+# normal wait.
+K8S_SERVICE_MAX_STARTUP_SECONDS="$(read_env_value "$k8s_env" K8S_SERVICE_MAX_STARTUP_SECONDS || true)"
+K8S_SERVICE_MAX_STARTUP_SECONDS="${K8S_SERVICE_MAX_STARTUP_SECONDS:-600}"
 GIT_USER_NAME="$(read_env_value "$k8s_env" GIT_USER_NAME || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-fork-sandbox agent}"
 GIT_USER_EMAIL="$(read_env_value "$k8s_env" GIT_USER_EMAIL || true)"
@@ -1010,6 +1020,11 @@ if [[ "${1-}" != check-grant && -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_valu
 fi
 if [[ "${1-}" != check-grant && ! "$K8S_SERVICES_MAX" =~ ^[0-9]+$ ]]; then
     echo "Error: K8S_SERVICES_MAX must be a positive integer, got '$K8S_SERVICES_MAX'." >&2
+    exit 1
+fi
+if [[ "${1-}" != check-grant && ! "$K8S_SERVICE_MAX_STARTUP_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: K8S_SERVICE_MAX_STARTUP_SECONDS must be a positive integer, got" >&2
+    echo "'$K8S_SERVICE_MAX_STARTUP_SECONDS'." >&2
     exit 1
 fi
 
@@ -4429,6 +4444,134 @@ cmd_check_grant() {
     fi
 }
 
+# Called when cmd_submit's own `kubectl wait --for=condition=Ready pod`
+# times out. Pod events are not retained on every cluster,
+# so the container status and log (both still on the live, not-yet-reaped
+# pod) are the evidence, named here instead of the bare "timed out waiting
+# for the condition" kubectl itself would print. Scoped to whichever
+# container(s) report not ready -- in practice a stuck service sidecar or
+# the service-ready initContainer.
+#
+# The agent container is the one place a Secret CAN surface in this
+# output: --context-secret and the claude-token Secret are both mounted or
+# injected there alone (fork-sandbox-k8s.sh's own job render), never into a
+# service sidecar or service-ready, which carry only the fixed env this
+# script writes. kubectl logs reproduces whatever the container itself
+# printed, which this script does not control -- so if the agent entrypoint
+# or harness ever echoes that mount while dying, tailing it here would
+# print the Secret to submit's own stderr. Submit never prints Secret
+# content, so that tail is skipped. The agent's
+# status (restart count, reason, exit code -- never Secret-bearing) is
+# still reported; only its raw log tail is skipped.
+#
+# $2, when given, is services_ready_checks's own "name:port:seconds
+# name2:port2:seconds2" text. A service sidecar carries no readinessProbe
+# of its own (a kubelet tcpSocket/httpGet probe dials the pod IP, never the
+# 127.0.0.1 bind the sidecar needs -- see
+# fork-sandbox-k8s-services-parse.py's ready-checks header), so it reports
+# ready=true the moment it starts even when the service inside never opens
+# its port. When that happens, the ONLY unready container is the separate
+# service-ready checker, and its own log says "connection refused" or
+# similar -- not why the service itself failed. So whenever service-ready
+# is unready, every sidecar it is checking is tailed too, regardless of
+# that sidecar's own (possibly misleading) ready status.
+#
+# A container with restartCount > 0 has a lastState.terminated to go with
+# that count, but its CURRENT instance -- the one plain `kubectl logs`
+# tails -- may not have logged anything yet (freshly restarted, still
+# starting, or waiting out CrashLoopBackOff). Whenever restarts > 0, also
+# tail `kubectl logs --previous`: that is where the crash the restart count
+# and last-exit-code are reporting actually printed its output.
+k8s_report_unready_pod() {
+    local pod="$1" ready_checks="${2:-}" pod_json
+    if ! pod_json="$(kubectl get pod "$pod" -o json --request-timeout=60s 2>/dev/null)"; then
+        echo "fork-sandbox-k8s: could not read pod $pod's status for diagnostics." >&2
+        return 0
+    fi
+    local unready
+    unready="$(jq -r '
+        (.status.initContainerStatuses // []) + (.status.containerStatuses // [])
+        | map(select(.ready != true)) | .[].name
+    ' <<< "$pod_json" 2>/dev/null || true)"
+    if [[ -z "$unready" ]]; then
+        echo "fork-sandbox-k8s: pod $pod did not become Ready in time, but every" >&2
+        echo "container reports ready -- inspect it with:" >&2
+        echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe pod $pod" >&2
+        return 0
+    fi
+    echo "fork-sandbox-k8s: pod $pod did not become Ready in time. Unready container(s):" >&2
+
+    local -a also_tail=()
+    if [[ -n "$ready_checks" ]] && grep -qx 'service-ready' <<< "$unready"; then
+        local entry svc_name
+        for entry in $ready_checks; do
+            svc_name="${entry%%:*}"
+            grep -qx "$svc_name" <<< "$unready" || also_tail+=("$svc_name")
+        done
+    fi
+
+    local c restarts reason exit_code
+    while IFS= read -r c; do
+        [[ -n "$c" ]] || continue
+        restarts="$(jq -r --arg c "$c" '
+            (.status.initContainerStatuses // []) + (.status.containerStatuses // [])
+            | map(select(.name == $c)) | .[0].restartCount // 0
+        ' <<< "$pod_json" 2>/dev/null || echo "?")"
+        reason="$(jq -r --arg c "$c" '
+            (.status.initContainerStatuses // []) + (.status.containerStatuses // [])
+            | map(select(.name == $c))
+            | .[0].lastState.terminated.reason // .[0].state.waiting.reason // .[0].state.terminated.reason // "unknown"
+        ' <<< "$pod_json" 2>/dev/null || echo "unknown")"
+        exit_code="$(jq -r --arg c "$c" '
+            (.status.initContainerStatuses // []) + (.status.containerStatuses // [])
+            | map(select(.name == $c))
+            | .[0].lastState.terminated.exitCode // .[0].state.terminated.exitCode // "n/a"
+        ' <<< "$pod_json" 2>/dev/null || echo "n/a")"
+        echo "  - $c: restarts=$restarts last-reason=$reason last-exit-code=$exit_code" >&2
+        if [[ "$c" == agent ]]; then
+            echo "    log tail omitted: the agent container is the one that may hold a" >&2
+            echo "    mounted Secret (--context-secret or the claude-token), so its raw log" >&2
+            echo "    is never printed here." >&2
+        else
+            echo "    log tail (kubectl logs $pod -c $c):" >&2
+            if ! kubectl logs "$pod" -c "$c" --tail=20 --request-timeout=60s 2>/dev/null \
+                    | sed 's/^/      /' >&2; then
+                echo "      (no log captured yet)" >&2
+            fi
+            if [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > 0 )); then
+                echo "    previous log tail (kubectl logs $pod -c $c --previous):" >&2
+                if ! kubectl logs "$pod" -c "$c" --previous --tail=20 --request-timeout=60s 2>/dev/null \
+                        | sed 's/^/      /' >&2; then
+                    echo "      (no previous log captured)" >&2
+                fi
+            fi
+        fi
+    done <<< "$unready"
+
+    local a
+    for a in "${also_tail[@]}"; do
+        restarts="$(jq -r --arg c "$a" '
+            (.status.initContainerStatuses // []) + (.status.containerStatuses // [])
+            | map(select(.name == $c)) | .[0].restartCount // 0
+        ' <<< "$pod_json" 2>/dev/null || echo "?")"
+        echo "  - $a: reports ready (restarts=$restarts), but service-ready's own check" >&2
+        echo "    did not pass -- $a carries no probe of its own, so a service that" >&2
+        echo "    crashed or never opened its port still shows ready:" >&2
+        echo "    log tail (kubectl logs $pod -c $a):" >&2
+        if ! kubectl logs "$pod" -c "$a" --tail=20 --request-timeout=60s 2>/dev/null \
+                | sed 's/^/      /' >&2; then
+            echo "      (no log captured yet)" >&2
+        fi
+        if [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > 0 )); then
+            echo "    previous log tail (kubectl logs $pod -c $a --previous):" >&2
+            if ! kubectl logs "$pod" -c "$a" --previous --tail=20 --request-timeout=60s 2>/dev/null \
+                    | sed 's/^/      /' >&2; then
+                echo "      (no previous log captured)" >&2
+            fi
+        fi
+    done
+}
+
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
@@ -5127,6 +5270,12 @@ cmd_submit() {
     local services_containers="" services_volumes=""
     local services_grace_env="" services_prompt_text="" sandbox_env_content=""
     local sandbox_env_present=0
+    # SERVICE_READY_CHECKS for fork-sandbox-k8s-service-ready.sh
+    # ("name:port:seconds", space-separated) and the longest window among
+    # them, 0 when no service declares a readyWhen -- cmd_submit's
+    # pod_budget (below) must cover at least this, and the service-ready
+    # initContainer is rendered only when this is non-empty.
+    local services_ready_checks="" services_ready_max=0
     if git -C "$origin_repo" cat-file -e \
             "${services_rev}:.agents/sandbox-services/services.yaml" 2>/dev/null; then
         # --services-trust-ref gates this exactly as the local path's hook
@@ -5171,7 +5320,8 @@ cmd_submit() {
             local services_out="$services_dir/out"
             if ! python3 "$script_dir/fork-sandbox-k8s-services-parse.py" \
                     "$services_spec_file" "$services_out" "$K8S_SERVICES_MAX" \
-                    "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY"; then
+                    "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
+                    "$K8S_SERVICE_MAX_STARTUP_SECONDS"; then
                 rm -rf -- "$services_dir"
                 exit 1
             fi
@@ -5191,6 +5341,14 @@ cmd_submit() {
             if [[ -f "$services_out/sandbox-env" ]]; then
                 sandbox_env_present=1
                 sandbox_env_content="$(cat "$services_out/sandbox-env")"
+            fi
+            if [[ -f "$services_out/ready-checks" ]]; then
+                local rc_name rc_port rc_seconds
+                while read -r rc_name rc_port rc_seconds; do
+                    [[ -n "$rc_name" ]] || continue
+                    services_ready_checks+="${services_ready_checks:+ }$rc_name:$rc_port:$rc_seconds"
+                    (( rc_seconds > services_ready_max )) && services_ready_max=$rc_seconds
+                done < "$services_out/ready-checks"
             fi
             rm -rf -- "$services_dir"
         fi
@@ -5452,6 +5610,7 @@ cmd_submit() {
 
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
     local gate_sh="$script_dir/fork-sandbox-k8s-egress-gate.sh"
+    local service_ready_sh="$script_dir/fork-sandbox-k8s-service-ready.sh"
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
     local context_extract_sh="$script_dir/fork-sandbox-k8s-context-extract.sh"
     local inbox_hook_sh="$script_dir/fork-sandbox-inbox-hook.sh"
@@ -5622,6 +5781,45 @@ KEYS
 )"
     fi
 
+    # The service-ready initContainer, rendered only when at least one
+    # service declares a readyWhen (services_ready_checks, built above from
+    # fork-sandbox-k8s-services-parse.py's ready-checks output) -- a spec
+    # with no readyWhen has nothing to wait for, the same as today. Placed
+    # AFTER the service sidecars (services_containers) in the
+    # initContainers list below, so it starts once they have, and built
+    # from RUN_IMAGE -- the agent's own image, never a service's, which may
+    # be distroless and shell-less -- see
+    # fork-sandbox-k8s-service-ready.sh's own header for why the check
+    # cannot live on the sidecar itself (a kubelet tcpSocket/httpGet probe
+    # dials the pod IP, never 127.0.0.1) and why no probe on the sidecar
+    # means a slow service is never killed and restarted for failing one.
+    local service_ready_container="" service_ready_configmap_key=""
+    if [[ -n "$services_ready_checks" ]]; then
+        service_ready_configmap_key=$'\n'"$(cat <<KEYS
+  service-ready.sh: |
+$(indent_block < "$service_ready_sh")
+KEYS
+)"
+        service_ready_container=$'\n'"$(cat <<KEYS
+        - name: service-ready
+          image: $RUN_IMAGE
+          command: ["bash", "/mnt/fork-sandbox/service-ready.sh"]
+          env:
+            - name: SERVICE_READY_CHECKS
+              value: "$services_ready_checks"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /mnt/fork-sandbox
+              readOnly: true
+KEYS
+)"
+    fi
+
     # MODEL_DISCOVERY, set only when this run is wired to a named
     # endpoint AND will actually use the pi proxy -- a pi coding leg,
     # or any run carrying a --review-loop (the loop always runs pi): it
@@ -5782,7 +5980,7 @@ $(indent_block < "$inbox_write_sh")
   context-extract.sh: |
 $(indent_block < "$context_extract_sh")
   handoff.md: |
-$(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${refresh_configmap_keys}${services_env_configmap_key}
+$(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${refresh_configmap_keys}${services_env_configmap_key}${service_ready_configmap_key}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -5832,7 +6030,7 @@ spec:
           volumeMounts:
             - name: scripts
               mountPath: /mnt/fork-sandbox
-              readOnly: true${services_containers}
+              readOnly: true${services_containers}${service_ready_container}
       containers:
         - name: agent
           image: $RUN_IMAGE
@@ -6305,7 +6503,12 @@ EOF
     # then wait for Ready, both inside one budget. External date/sleep, not
     # bash builtins, so the tests can stub them; no `wait --for=create`
     # (needs kubectl 1.31+).
-    local pod_budget=180 pod_start pod_elapsed pod_remaining
+    #
+    # The 180s base covers scheduling and a cold image pull.
+    # services_ready_max (0 when no service declares a readyWhen) is added
+    # on top, never folded into it, so a service's own startup window is
+    # covered IN ADDITION to that base margin, not instead of it.
+    local pod_budget=$(( 180 + services_ready_max )) pod_start pod_elapsed pod_remaining
     pod_start="$(date +%s)"
     while [[ -z "$(kubectl get pod -l "job-name=$safe_name" -o name 2>/dev/null || true)" ]]; do
         if (( $(date +%s) - pod_start >= pod_budget )); then
@@ -6319,13 +6522,24 @@ EOF
     pod_elapsed=$(( $(date +%s) - pod_start ))
     pod_remaining=$(( pod_budget - pod_elapsed ))
     (( pod_remaining >= 10 )) || pod_remaining=10
-    kubectl wait --for=condition=Ready "pod" -l "job-name=$safe_name" --timeout="${pod_remaining}s"
 
     local pod_name
     pod_name="$(kubectl get pod -l "job-name=$safe_name" -o jsonpath='{.items[0].metadata.name}')"
     if [[ -z "$pod_name" ]]; then
         echo "Error: could not find the pod for job $safe_name." >&2
         exit 1
+    fi
+
+    local pod_wait_rc=0
+    kubectl wait --for=condition=Ready "pod" -l "job-name=$safe_name" --timeout="${pod_remaining}s" \
+        || pod_wait_rc=$?
+    if (( pod_wait_rc != 0 )); then
+        # Pod events are not retained on every cluster, so the container
+        # status and log -- still readable on this live, not-yet-reaped
+        # pod -- are the evidence named here, instead of kubectl wait's own
+        # bare "timed out waiting for the condition".
+        k8s_report_unready_pod "$pod_name" "$services_ready_checks"
+        exit "$pod_wait_rc"
     fi
 
     # The push line names the revision the branch starts from, so an
