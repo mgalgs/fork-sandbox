@@ -146,6 +146,15 @@ review targets are refused on a cross-host message. The receiving side,
 `lane-mail-serve`, is an ssh forced command and is not something a session
 runs; do not add a rule for it (docs/agent-mail.md, "Lane mail between hosts").
 
+**`lane-mail-peer` — operator only; never allowlist it.** `lane-mail-peer add`
+appends a line to `~/.ssh/authorized_keys`, creates an ssh key, and edits
+`lane-mail.env` and the peers file on this host and on the peer it logs into.
+It reaches the peer over the operator's ordinary (possibly prompting) ssh
+login, which is not something a session should be able to spend. Run it
+yourself, in a terminal; it is on `PATH` only so you can, and so the peer can
+run its half of the setup. Do not add a `Bash(lane-mail-peer:*)` rule, or one
+for its path under `~/.claude/scripts`.
+
 **`lane-mail-watch.sh` — read-only.** It only ever calls `lane-mail.sh inbox
 <lane>` in a loop and prints what comes back. It mutates nothing. Its
 `--wait` mode is the same read-only loop with a different exit condition —

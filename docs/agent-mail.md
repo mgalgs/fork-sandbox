@@ -365,6 +365,45 @@ own watcher and unread-mail hook see a new message in `beta`'s own store.
 It replies with `lane-mail.sh reply --from @backend --reply-to <id>` and the
 reply lands in `alpha`'s store, threaded under the original.
 
+**Wiring two hosts: `lane-mail-peer add`.** Both hosts need `install.sh`
+run. Then, on host `alpha`, in a terminal, as yourself:
+
+```
+lane-mail-peer add beta beta.example.test        # alpha <-> beta, both ways
+lane-mail-peer add beta beta.example.test --one-way
+lane-mail-peer add beta beta.example.test --back-dest me@alpha.example.test
+```
+
+`add` reaches `beta` through your ordinary ssh login (it may prompt; those
+setup connections are not BatchMode), wires the pair in both directions,
+and proves each direction works. `beta` is an assertion: each host's name
+is read from the host itself (`LANE_MAIL_PEER_NAME`, else its short
+hostname), and `add` refuses if `beta` calls itself something else. The
+second argument is how `alpha` reaches `beta`; `--back-dest` is how `beta`
+reaches `alpha` (default: `alpha`'s `hostname -f`, with `beta`'s own login
+name, so say `user@host` if that is not the account that should receive).
+`--one-way` wires `alpha` to `beta` only.
+
+Every check on both sides (names, that `beta` has fork-sandbox installed,
+existing entries, conflicts) runs before either side is changed; a refusal
+changes nothing. The edits are the manual steps listed under "What `add`
+does" below, and each is idempotent: run `add` again and it reports that
+nothing needed changing. A peers-file line with the same name but a different
+destination, or a `LANE_MAIL_SSH` set to something else, is refused with both
+values named; you decide, there is no `--force`.
+
+It ends by pinging each wired direction through the real delivery path
+(`LANE_MAIL_SSH`, BatchMode, `lane-mail-serve ping`) and checking the pong
+names the expected host. During `add` only, the probe passes
+`StrictHostKeyChecking=accept-new`, since `beta` may never have connected to
+`alpha`, and prints the host key fingerprint it accepted; ordinary deliveries
+keep ssh's default strict checking. It exits non-zero if any probe fails;
+the changes stay in place and the report says what was changed and what
+failed.
+
+`lane-mail-peer` edits `authorized_keys`; it is the operator's command, not
+for an agent to run, and must not be allowlisted (docs/permissions.md).
+
 **Addresses.** `@lane` is a lane on this host; `@lane:host` is a lane on the
 peer called `host` (lowercase alphanumeric, `-` and `.`). A host knows its
 own peer name — `LANE_MAIL_PEER_NAME` in `~/.config/fork-sandbox/lane-mail.env`,
@@ -412,7 +451,20 @@ hosts, hosts delivered before the failure are named. There is no retry queue:
 re-send. A cross-host message carries no attachments, grants or review target,
 and `--from` must be a lane on this host.
 
-**Enabling a peer: the receiving host.** Add one line to `~/.ssh/authorized_keys`
+**What `add` does, by hand.** For each direction, from the sending host `S`
+to the receiving host `R`:
+
+1. On `S`, a mail key, one per host and reused for every peer:
+   `ssh-keygen -t ed25519 -N '' -C lane-mail@<S> -f ~/.ssh/lane-mail`
+   (created only if missing, never overwritten; no passphrase because
+   deliveries are unattended).
+2. On `S`, in `lane-mail.env`, `LANE_MAIL_SSH=ssh -i <absolute path of that
+   key> -o IdentitiesOnly=yes`. The value is split on whitespace with no tilde
+   expansion, so the path must be absolute. `~/.ssh/config` is not touched.
+3. On `S`, the peers-file line for `R` (see "What a send does").
+4. On `R`, the receiving line, below.
+
+**The receiving host.** Add one line to `~/.ssh/authorized_keys`
 on the host that will *receive* from `alpha`, using a key that `alpha` has
 for it:
 
@@ -421,12 +473,16 @@ command="lane-mail-serve --peer alpha",restrict ssh-ed25519 AAAA... lane-mail@al
 ```
 
 `alpha` is the sender's own peer name, and the entry for this host in
-`alpha`'s peers file must be this host's own peer name (see above). Use the script's absolute path
-(`~/.claude/scripts/lane-mail-serve` after `install.sh`) if it is not on the
-`PATH` a non-interactive ssh login gets. `install.sh` puts the script on `PATH`
-but never edits `authorized_keys` or any ssh config; that line is the
-operator's decision. The sender needs the mirror-image peers-file entry, and
-the receiving host needs one pointing back before it can reply.
+`alpha`'s peers file must be this host's own peer name (see above). `add`
+writes the absolute install path, `~/.claude/scripts/lane-mail-serve` as that
+host's `$HOME` spells it, rather than a path into a checkout, so moving the
+checkout does not break the line; by hand, use that path unless
+`lane-mail-serve` is on the `PATH` a non-interactive ssh login gets.
+`install.sh` puts the script on `PATH` but never edits `authorized_keys` or any
+ssh config; `lane-mail-peer add` does, when you run it. The sender needs the
+mirror-image peers-file entry, and the receiving host needs a key of its own
+and an entry pointing back before it can reply: `add` does both directions
+unless `--one-way`.
 
 **Trust model.** The key grants "drop mail here" and never a shell:
 

@@ -310,6 +310,7 @@ PORCELAIN=(
     fork-sandbox.sh
     fork-task.sh
     lane-mail-hook.sh         # Stop/UserPromptSubmit hook command: settings.json invokes it by bare name
+    lane-mail-peer            # operator command; edits authorized_keys, so never allowlisted; the peer runs its half at this exact link path
     lane-mail-serve           # authorized_keys forced command on the receiving host: invoked by bare name
     lane-mail-watch.sh
     lane-mail.sh

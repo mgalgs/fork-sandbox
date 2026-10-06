@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+# lane-mail-peer -- Wire two hosts for cross-host lane mail, in one run
+#
+# Usage: lane-mail-peer add <peer> <ssh-dest> [--back-dest <dest>] [--one-way]
+#        lane-mail-peer --help
+#
+# Run on host A, in a terminal, by the operator. It reaches host B (`<peer>`)
+# through `<ssh-dest>` using the operator's ORDINARY ssh login -- one that may
+# prompt, so the setup connections are not BatchMode -- and sets up lane mail
+# (`@lane:host`; docs/agent-mail.md, "Lane mail between hosts") in both
+# directions, then proves each direction works. It edits authorized_keys, so
+# it is operator-only: never allowlist it for an agent (docs/permissions.md).
+#
+#   <peer>       what B calls itself. It is an ASSERTION: each side's name is
+#                READ from that side's own lane_mail_self_name
+#                (LANE_MAIL_PEER_NAME, else the short hostname), and `add`
+#                refuses when B's differs.
+#   <ssh-dest>   how A reaches B: anything ssh accepts (user@host, an alias).
+#                It becomes the dest of B's line in A's peers file.
+#   --back-dest  how B reaches A. Default: A's `hostname -f`, so B's login
+#                name is B's own; say user@host to override.
+#   --one-way    wire A -> B only: no mail key, peers line or authorized_keys
+#                line for B -> A.
+#
+# What it changes, per direction S -> R (S sends, R receives), as the manual
+# steps of docs/agent-mail.md describe:
+#
+#   S: a mail key ~/.ssh/lane-mail (ed25519, no passphrase: deliveries are
+#      unattended), one per host and reused for every peer; created only if
+#      missing, never overwritten.
+#   S: LANE_MAIL_SSH in lane-mail.env, `ssh -i <absolute key path> -o
+#      IdentitiesOnly=yes`, only when absent. ~/.ssh/config is never edited.
+#   S: a line `<R's name> <dest>` in the lane-mail-peers file.
+#   R: ONE appended line in ~/.ssh/authorized_keys,
+#          command="<R's lane-mail-serve> --peer <S's name>",restrict <key>
+#      using the install path (~/.claude/scripts), not a path into a
+#      checkout. Skipped if the key is already in the file on any line. The
+#      file (0600) and ~/.ssh (0700) are created if missing; other lines are
+#      never touched. It is one append, so it either lands whole or not.
+#
+# Every edit is idempotent: a second `add` on the same pair changes nothing
+# and says so. A peers line with the same name and a different dest, or a
+# LANE_MAIL_SSH that is set to something else, is REFUSED naming both values;
+# the operator decides, there is no --force.
+#
+# Order: every check on both sides (names, installs, existing entries,
+# conflicts) runs before anything is changed on either side. B must already
+# have fork-sandbox installed: the remote half is B's own installed
+# lane-mail-peer, found at ~/.claude/scripts on B, not on a non-interactive
+# login's PATH. If it is missing `add` refuses before changing anything.
+#
+# Then it pings each wired direction through the real delivery path
+# (LANE_MAIL_SSH, BatchMode, `lane-mail-serve ping`) and checks the pong names
+# the expected host. During `add` only, the probe passes
+# `-o StrictHostKeyChecking=accept-new`, because B may never have connected
+# to A; the host key fingerprint it accepted is printed. Ordinary deliveries
+# keep ssh's default strict checking. A failed probe exits non-zero and leaves
+# the setup in place; fix the cause and re-run.
+#
+# Exit: 0 wired and every probe passed; 1 refused or a probe failed;
+# 2 usage.
+#
+# Internal: `lane-mail-peer _remote inspect|apply|probe ...` is the half that
+# runs on a host (B over ssh, A in-process). It prints `<tag><TAB><text>`
+# lines and is not a user interface.
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/lane-mail-lib.sh"
+
+DEST_RE='^[A-Za-z0-9_][A-Za-z0-9._@:%+-]*$'
+KEY_TYPE_RE='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com)$'
+KEY_B64_RE='^[A-Za-z0-9+/]+=*$'
+
+usage() {
+    sed -n '2,/^[^#]/{ /^#/s/^# \{0,1\}//p }' "$0"
+}
+
+die() { printf 'lane-mail-peer: %s\n' "$*" >&2; exit 1; }
+usage_error() { printf 'lane-mail-peer: %s\n' "$*" >&2; exit 2; }
+
+oneline() {
+    local s="${1:0:300}"
+    s="${s//[^[:print:]]/?}"
+    printf '%s' "$s"
+}
+
+# --- this host's side -------------------------------------------------------
+# One host's half of a pairing, run on the host itself. The same code runs on
+# A (in-process) and on B (over ssh), so the two sides cannot drift.
+
+install_dir="$HOME/.claude/scripts"
+key_path="$HOME/.ssh/lane-mail"
+
+emit() { printf '%s\t%s\n' "$1" "$2"; }
+
+# Appends one line to a file as a single write, first terminating a final
+# line that lacks its newline. Creates the file with $3 if missing.
+append_line() {
+    local file="$1" line="$2" mode="$3" prefix=""
+    if [[ ! -e "$file" ]]; then
+        ( umask 077; : >> "$file" )
+        chmod "$mode" "$file"
+    elif [[ -s "$file" && -n "$(tail -c1 "$file")" ]]; then
+        prefix=$'\n'
+    fi
+    printf '%s%s\n' "$prefix" "$line" >> "$file"
+}
+
+# Prints the 1-based line number of the first line of $1 holding $2 as a
+# whitespace-delimited field, or nothing.
+find_key_line() {
+    [[ -f "$1" ]] || return 0
+    awk -v b="$2" '{ for (i = 1; i <= NF; i++) if ($i == b) { print NR; exit } }' "$1"
+}
+
+# Prints what the peers file gives for peer $1 -- the rest of its first line
+# -- or nothing.
+peers_entry() {
+    local file name rest line
+    file="$(lane_mail_peers_file)"
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read -r name rest <<<"$line"
+        if [[ "$name" == "$1" ]]; then
+            printf '%s' "$rest"
+            return 0
+        fi
+    done < "$file"
+}
+
+# side_run <inspect|apply> --peer NAME [--send-dest DEST] [--recv]
+#          [--recv-key TYPE,B64]
+# --send-dest: this side sends to the peer (mail key, LANE_MAIL_SSH, peers
+# line). --recv: this side receives from the peer (an authorized_keys line
+# for --recv-key, if the key is known yet). inspect only reports; apply
+# re-checks, and changes nothing if anything is refused.
+side_run() {
+    local mode="$1"; shift
+    local peer="" send_dest="" recv=0 rtype="" rb64="" rkey=""
+    while (( $# )); do
+        case "$1" in
+            --peer) peer="${2:-}"; shift 2 ;;
+            --send-dest) send_dest="${2:-}"; shift 2 ;;
+            --recv) recv=1; shift ;;
+            --recv-key) rkey="${2:-}"; shift 2 ;;
+            *) usage_error "_remote: unknown argument '$1'" ;;
+        esac
+    done
+    [[ "$peer" =~ $LANE_MAIL_HOST_RE ]] || usage_error "_remote: bad --peer"
+    [[ -z "$send_dest" || "$send_dest" =~ $DEST_RE ]] || usage_error "_remote: bad --send-dest"
+    if [[ -n "$rkey" ]]; then
+        rtype="${rkey%%,*}"; rb64="${rkey#*,}"
+        [[ "$rtype" =~ $KEY_TYPE_RE && "$rb64" =~ $KEY_B64_RE ]] || usage_error "_remote: bad --recv-key"
+    fi
+
+    local -a refusals=() changes=() sames=() notes=()
+    local name
+    if ! name="$(lane_mail_self_name)"; then
+        emit refuse "this host has no valid peer name; set LANE_MAIL_PEER_NAME in $(lane_mail_config_dir)/lane-mail.env"
+        return 3
+    fi
+    emit name "$name"
+    [[ "$peer" != "$name" ]] || refusals+=("the peer name '$peer' is this host's own name")
+    case "$HOME" in
+        ''|*[[:space:]\"\'\\]*) refusals+=("HOME '$HOME' has a space or quote, which cannot go in an authorized_keys command or LANE_MAIL_SSH") ;;
+    esac
+
+    local do_key=0 do_env=0 do_peers=0 do_auth=0 my_type="" my_b64="" pub=""
+    local want_ssh="ssh -i $key_path -o IdentitiesOnly=yes"
+    local env_file peers_file authkeys serve cur line
+    env_file="$(lane_mail_config_dir)/lane-mail.env"
+    peers_file="$(lane_mail_peers_file)"
+    authkeys="$HOME/.ssh/authorized_keys"
+    serve="$install_dir/lane-mail-serve"
+
+    if [[ -n "$send_dest" ]]; then
+        if [[ -f "$key_path" && -f "$key_path.pub" ]]; then
+            read -r my_type my_b64 _ < "$key_path.pub" || true
+            sames+=("mail key $key_path exists")
+        elif [[ -f "$key_path" ]]; then
+            if pub="$(ssh-keygen -y -P '' -f "$key_path" 2>/dev/null)"; then
+                read -r my_type my_b64 _ <<<"$pub"
+                sames+=("mail key $key_path exists (no .pub; derived from the private key)")
+            else
+                refusals+=("$key_path exists but its public key cannot be read (passphrase-protected?); it is never overwritten")
+            fi
+        elif [[ -e "$key_path.pub" ]]; then
+            refusals+=("$key_path.pub exists without $key_path; remove or restore it, a key is never overwritten")
+        else
+            do_key=1
+            changes+=("create mail key $key_path (ed25519, no passphrase)")
+        fi
+        if (( do_key == 0 )) && [[ ! "$my_type" =~ $KEY_TYPE_RE || ! "$my_b64" =~ $KEY_B64_RE ]]; then
+            refusals+=("$key_path.pub is not a public key this tool can use")
+        fi
+
+        if cur="$(lane_mail_env_value LANE_MAIL_SSH)"; then
+            if [[ "$cur" == "$want_ssh" ]]; then
+                sames+=("LANE_MAIL_SSH already set in $env_file")
+            else
+                refusals+=("LANE_MAIL_SSH in $env_file is '$cur', but the mail key needs '$want_ssh'; set it to that yourself (or remove the line) and re-run")
+            fi
+        else
+            do_env=1
+            changes+=("set LANE_MAIL_SSH='$want_ssh' in $env_file")
+        fi
+
+        cur="$(peers_entry "$peer")"
+        if [[ -z "$cur" ]]; then
+            do_peers=1
+            changes+=("add peer '$peer $send_dest' to $peers_file")
+        elif [[ "$cur" == "$send_dest" ]]; then
+            sames+=("peer '$peer $send_dest' already in $peers_file")
+        else
+            refusals+=("$peers_file already has '$peer $cur'; this would add '$peer $send_dest'. Edit it yourself and re-run")
+        fi
+    fi
+
+    if (( recv )); then
+        if [[ ! -x "$serve" ]]; then
+            refusals+=("lane-mail-serve is not at $serve; install fork-sandbox on this host (install.sh)")
+        elif [[ "$serve" == *[[:space:]\"\\]* ]]; then
+            refusals+=("the lane-mail-serve path '$serve' has a space or quote")
+        fi
+        line=""
+        [[ -n "$rb64" ]] && line="$(find_key_line "$authkeys" "$rb64")"
+        if [[ -n "$line" ]]; then
+            sames+=("the key is already in $authkeys (line $line)")
+            if ! sed -n "${line}p" "$authkeys" | grep -qF "lane-mail-serve --peer $peer\""; then
+                notes+=("line $line of $authkeys holds that key without 'lane-mail-serve --peer $peer' as its forced command; check it")
+            fi
+        else
+            do_auth=1
+            changes+=("authorize $peer's mail key in $authkeys (forced command: $serve --peer $peer)")
+        fi
+    fi
+
+    local r
+    if (( ${#refusals[@]} )); then
+        for r in "${refusals[@]}"; do emit refuse "$r"; done
+        return 3
+    fi
+
+    if [[ "$mode" == apply ]]; then
+        if (( do_key )); then
+            [[ -d "$HOME/.ssh" ]] || mkdir -m 700 "$HOME/.ssh"
+            ssh-keygen -q -t ed25519 -N '' -C "lane-mail@$name" -f "$key_path" </dev/null >/dev/null
+            read -r my_type my_b64 _ < "$key_path.pub"
+        fi
+        if (( do_env )); then
+            mkdir -p "$(dirname "$env_file")"
+            append_line "$env_file" "LANE_MAIL_SSH=$want_ssh" 644
+        fi
+        if (( do_peers )); then
+            mkdir -p "$(dirname "$peers_file")"
+            append_line "$peers_file" "$peer $send_dest" 644
+        fi
+        if (( do_auth )); then
+            [[ -d "$HOME/.ssh" ]] || mkdir -m 700 "$HOME/.ssh"
+            append_line "$authkeys" "command=\"$serve --peer $peer\",restrict $rtype $rb64 lane-mail@$peer" 600
+        fi
+    fi
+    [[ -n "$my_b64" ]] && emit pubkey "$my_type,$my_b64"
+    for r in ${changes[@]+"${changes[@]}"}; do emit change "$r"; done
+    for r in ${sames[@]+"${sames[@]}"}; do emit same "$r"; done
+    for r in ${notes[@]+"${notes[@]}"}; do emit note "$r"; done
+    return 0
+}
+
+# side_probe --peer NAME --expect NAME: ping the peer through this host's real
+# delivery path, with first-contact host keys accepted (and reported).
+side_probe() {
+    local peer="" expect=""
+    while (( $# )); do
+        case "$1" in
+            --peer) peer="${2:-}"; shift 2 ;;
+            --expect) expect="${2:-}"; shift 2 ;;
+            *) usage_error "_remote: unknown argument '$1'" ;;
+        esac
+    done
+    [[ "$peer" =~ $LANE_MAIL_HOST_RE && "$expect" =~ $LANE_MAIL_HOST_RE ]] || usage_error "_remote: bad probe arguments"
+
+    local entry dest ssh_value timeout
+    entry="$(peers_entry "$peer")"
+    dest="${entry%% *}"
+    if [[ -z "$entry" || "$dest" != "$entry" || ! "$dest" =~ $DEST_RE ]]; then
+        emit fail "no usable peer '$peer' in $(lane_mail_peers_file)"
+        return 0
+    fi
+    local -a ssh_cmd
+    ssh_value="$(lane_mail_env_value LANE_MAIL_SSH || true)"
+    read -ra ssh_cmd <<<"${ssh_value:-ssh}"
+    timeout="$(lane_mail_env_value LANE_MAIL_SSH_TIMEOUT || true)"
+    [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout > 0 )) || timeout=10
+
+    local out err rc=0 fp="" l why=""
+    local errf
+    errf="$(mktemp)"
+    out="$("${ssh_cmd[@]}" -o BatchMode=yes -o ConnectTimeout="$timeout" \
+        -o StrictHostKeyChecking=accept-new -o LogLevel=VERBOSE \
+        "$dest" lane-mail-serve ping </dev/null 2>"$errf")" || rc=$?
+    err="$(cat "$errf")"
+    rm -f -- "$errf"
+    while IFS= read -r l; do
+        case "$l" in
+            "Server host key: "*) fp="${l#Server host key: }" ;;
+            Authenticated\ *|Transferred:*|Bytes\ per\ second:*|Connection\ to\ *|Warning:\ Permanently*|debug1:*|'') ;;
+            *) why+="$l " ;;
+        esac
+    done <<<"$err"
+    [[ -z "$fp" ]] || emit fingerprint "$fp"
+    if (( rc == 0 )) && [[ "$out" == "pong $expect" ]]; then
+        emit pass "$out"
+    elif (( rc == 0 )); then
+        emit fail "$dest answered '$(oneline "$out")', expected 'pong $expect'"
+    else
+        emit fail "ssh to $dest failed (exit $rc): $(oneline "${why:-no error output}")"
+    fi
+}
+
+remote_main() {
+    local op="${1:-}"
+    [[ -n "$op" ]] || usage_error "_remote needs an operation"
+    shift
+    case "$op" in
+        inspect|apply) side_run "$op" "$@" ;;
+        probe) side_probe "$@" ;;
+        *) usage_error "_remote: unknown operation '$op'" ;;
+    esac
+}
+
+if [[ "${1:-}" == _remote ]]; then
+    shift
+    rc=0
+    remote_main "$@" || rc=$?
+    exit "$rc"
+fi
+
+# --- the operator's side ----------------------------------------------------
+
+peer="" ssh_dest="" back_dest="" one_way=0
+case "${1:-}" in
+    -h|--help|help) usage; exit 0 ;;
+    add) shift ;;
+    '') usage >&2; exit 2 ;;
+    *) usage_error "unknown verb '$1' (the only verb is: add; see --help)" ;;
+esac
+while (( $# )); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --back-dest) [[ $# -ge 2 ]] || usage_error "--back-dest needs a value"; back_dest="$2"; shift 2 ;;
+        --back-dest=*) back_dest="${1#--back-dest=}"; shift ;;
+        --one-way) one_way=1; shift ;;
+        -*) usage_error "unknown option '$1'" ;;
+        *)
+            if [[ -z "$peer" ]]; then peer="$1"
+            elif [[ -z "$ssh_dest" ]]; then ssh_dest="$1"
+            else usage_error "unexpected argument '$1'"
+            fi
+            shift
+            ;;
+    esac
+done
+[[ -n "$peer" && -n "$ssh_dest" ]] || usage_error "usage: lane-mail-peer add <peer> <ssh-dest> [--back-dest <dest>] [--one-way]"
+[[ "$peer" =~ $LANE_MAIL_HOST_RE ]] || usage_error "'$peer' is not a valid peer name (lowercase alphanumeric, '-' and '.')"
+[[ "$ssh_dest" =~ $DEST_RE ]] || usage_error "'$ssh_dest' is not an ssh destination this tool can use (letters, digits, . _ @ : % + -; no leading '-')"
+for tool in ssh ssh-keygen; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool not found on PATH"
+done
+
+self="$(lane_mail_self_name)" || die "this host has no valid peer name; set LANE_MAIL_PEER_NAME in $(lane_mail_config_dir)/lane-mail.env"
+[[ "$peer" != "$self" ]] || die "'$peer' is this host's own peer name"
+
+if (( ! one_way )); then
+    if [[ -z "$back_dest" ]]; then
+        back_dest="$(hostname -f 2>/dev/null || true)"
+        [[ -n "$back_dest" ]] || die "cannot work out how $peer reaches this host (hostname -f failed); pass --back-dest"
+    fi
+    [[ "$back_dest" =~ $DEST_RE ]] || die "back destination '$back_dest' is not usable; pass --back-dest <dest>"
+fi
+
+# One ssh connection shared by every setup call, so a password prompts once.
+cm_dir="$(mktemp -d /tmp/lane-mail-peer.XXXXXX)"
+cm_opts=(-o ControlMaster=auto -o "ControlPath=$cm_dir/%C" -o ControlPersist=120)
+cleanup() {
+    ssh "${cm_opts[@]}" -O exit "$ssh_dest" >/dev/null 2>&1 || true
+    rm -rf -- "$cm_dir"
+}
+trap cleanup EXIT
+
+# remote <op> <args...>: B's own installed lane-mail-peer, found by path.
+remote_stdout="" remote_rc=0
+remote() {
+    # shellcheck disable=SC2016  # $HOME and "$@" are for B's shell, on purpose
+    local script='p="$HOME/.claude/scripts/lane-mail-peer"; if [ -x "$p" ]; then exec "$p" "$@"; fi; echo "lane-mail-peer: not installed at $p" >&2; exit 127'
+    local errf
+    errf="$(mktemp)"
+    remote_rc=0
+    # shellcheck disable=SC2029  # the command is built here and expanded here: every word is a validated token
+    remote_stdout="$(ssh "${cm_opts[@]}" "$ssh_dest" "sh -c '$script' lane-mail-peer _remote $*" 2>"$errf")" || remote_rc=$?
+    remote_err="$(cat "$errf")"
+    rm -f -- "$errf"
+}
+
+# Prints the text of every line tagged $2 in the protocol stream $1, made
+# printable: what a remote host sends back is shown, never interpreted.
+tagged() {
+    local tag text
+    while IFS=$'\t' read -r tag text; do
+        [[ "$tag" == "$2" ]] && oneline "$text" && printf '\n'
+    done <<<"$1"
+    return 0
+}
+first_tagged() { tagged "$1" "$2" | head -1; }
+
+problems=()      # "<host>: <reason>", every refusal found by the checks
+note_refusals() {   # note_refusals <host> <stream>
+    local r
+    while IFS= read -r r; do
+        [[ -z "$r" ]] || problems+=("$1: $r")
+    done < <(tagged "$2" refuse)
+}
+
+# run_remote <op> <args...>: sets remote_stdout; dies if B cannot be asked.
+# Exit 3 is B refusing (its reasons are in the stdout); anything else
+# non-zero is not a protocol answer.
+run_remote() {
+    local rc
+    remote "$@"
+    rc=$remote_rc
+    case "$rc" in
+        0|3) ;;
+        127) die "fork-sandbox is not installed on $ssh_dest (no ~/.claude/scripts/lane-mail-peer there); install it there first. Nothing was changed on either side." ;;
+        *) die "could not run lane-mail-peer on $ssh_dest (exit $rc): $(oneline "$(tr '\n' ' ' <<<"$remote_err")"). Nothing was changed on either side." ;;
+    esac
+}
+
+# --- checks: nothing is changed until every one has passed ------------------
+
+echo "lane-mail-peer: checking $self and $peer ($ssh_dest)"
+
+local_send="$(side_run inspect --peer "$peer" --send-dest "$ssh_dest")" || [[ $? == 3 ]] || die "local check failed"
+note_refusals "$self" "$local_send"
+self_pub="$(first_tagged "$local_send" pubkey)"
+
+remote_args=(inspect --peer "$self" --recv)
+[[ -z "$self_pub" ]] || remote_args+=(--recv-key "$self_pub")
+(( one_way )) || remote_args+=(--send-dest "$back_dest")
+run_remote "${remote_args[@]}"
+remote_inspect="$remote_stdout"
+note_refusals "$peer" "$remote_inspect"
+read_name="$(first_tagged "$remote_inspect" name)"
+if [[ -n "$read_name" && "$read_name" != "$peer" ]]; then
+    problems+=("$peer: the host at $ssh_dest calls itself '$read_name', not '$peer'; use '$read_name' (names are read, <peer> is only an assertion)")
+fi
+peer_pub="$(first_tagged "$remote_inspect" pubkey)"
+
+local_recv=""
+if (( ! one_way )); then
+    recv_args=(inspect --peer "$peer" --recv)
+    [[ -z "$peer_pub" ]] || recv_args+=(--recv-key "$peer_pub")
+    local_recv="$(side_run "${recv_args[@]}")" || [[ $? == 3 ]] || die "local check failed"
+    note_refusals "$self" "$local_recv"
+fi
+
+if (( ${#problems[@]} )); then
+    for r in "${problems[@]}"; do printf 'lane-mail-peer: refused: %s\n' "$r" >&2; done
+    echo "lane-mail-peer: nothing was changed on either side" >&2
+    exit 1
+fi
+
+# --- changes ----------------------------------------------------------------
+
+report=()      # "<host>: <what>"
+unchanged=()
+notes=()
+collect() {    # collect <host> <stream>
+    local l
+    while IFS= read -r l; do [[ -z "$l" ]] || report+=("$1: $l"); done < <(tagged "$2" change)
+    while IFS= read -r l; do [[ -z "$l" ]] || unchanged+=("$1: $l"); done < <(tagged "$2" same)
+    while IFS= read -r l; do [[ -z "$l" ]] || notes+=("$1: $l"); done < <(tagged "$2" note)
+}
+
+out="$(side_run apply --peer "$peer" --send-dest "$ssh_dest")" || die "changing this host failed part way (re-run to finish; it is idempotent)"
+collect "$self" "$out"
+self_pub="$(first_tagged "$out" pubkey)"
+
+remote_args=(apply --peer "$self" --recv --recv-key "$self_pub")
+(( one_way )) || remote_args+=(--send-dest "$back_dest")
+run_remote "${remote_args[@]}"
+if (( remote_rc != 0 )); then
+    note_refusals "$peer" "$remote_stdout"
+    for r in "${problems[@]}"; do printf 'lane-mail-peer: refused: %s\n' "$r" >&2; done
+    die "$peer refused after this host had been changed; re-run once fixed (it is idempotent)"
+fi
+collect "$peer" "$remote_stdout"
+peer_pub="$(first_tagged "$remote_stdout" pubkey)"
+
+if (( ! one_way )); then
+    out="$(side_run apply --peer "$peer" --recv --recv-key "$peer_pub")" || die "authorizing $peer on this host failed (re-run to finish; it is idempotent)"
+    collect "$self" "$out"
+fi
+
+# --- probes -----------------------------------------------------------------
+
+failed=0
+probe_lines=()
+show_probe() {   # show_probe <from> <to> <stream>
+    local pass fail fp
+    pass="$(first_tagged "$3" pass)"; fail="$(first_tagged "$3" fail)"; fp="$(first_tagged "$3" fingerprint)"
+    if [[ -n "$pass" ]]; then
+        probe_lines+=("$1 -> $2: pass ($pass)")
+    else
+        probe_lines+=("$1 -> $2: FAIL (${fail:-no answer})")
+        failed=1
+    fi
+    [[ -z "$fp" ]] || probe_lines+=("    host key accepted on first contact: $fp")
+}
+show_probe "$self" "$peer" "$(side_probe --peer "$peer" --expect "$peer")"
+if (( ! one_way )); then
+    run_remote probe --peer "$self" --expect "$self"
+    if (( remote_rc == 0 )); then
+        show_probe "$peer" "$self" "$remote_stdout"
+    else
+        probe_lines+=("$peer -> $self: FAIL (could not run the probe on $ssh_dest, exit $remote_rc)")
+        failed=1
+    fi
+fi
+
+# --- report -----------------------------------------------------------------
+
+if (( ${#report[@]} )); then
+    echo "changed:"
+    printf '  %s\n' "${report[@]}"
+else
+    suffix=""
+    (( ! one_way )) || suffix=" (one way)"
+    echo "nothing to change: $self and $peer are already wired$suffix"
+fi
+if (( ${#unchanged[@]} )); then
+    echo "already in place:"
+    printf '  %s\n' "${unchanged[@]}"
+fi
+if (( ${#notes[@]} )); then
+    echo "check:"
+    printf '  %s\n' "${notes[@]}"
+fi
+echo "probes:"
+printf '  %s\n' "${probe_lines[@]}"
+if (( failed )); then
+    echo "lane-mail-peer: a probe failed; the changes above stay in place. Fix the cause and re-run (it is idempotent)." >&2
+    exit 1
+fi
