@@ -9,15 +9,18 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
 - `@` typed at a word start (start of the box, or after whitespace) opens a
   picker in the band above the prompt. A mid-word `@` (an email address) is
   left alone. While the picker is open the box shows a full-width `＠` and what
-  you have typed after it (`＠al`). It is not an ASCII `@` because that opens
+  you have typed after it (`＠al`), then one space with the cursor before it
+  (Claude Code sends no Ctrl-F for a cursor that cannot move, and the cursor
+  would otherwise sit at the box's end); the space is removed again whenever
+  the picker closes and is never sent. The mark is not an ASCII `@` because that opens
   Claude Code's own menu over the picker; and the box must not be empty,
   because Claude Code sends no Enter or Backspace to a mod for an empty one.
 - The characters you type next filter the list: prefix matches first, then
   substring matches. The list is live lanes (registered sessions), then lanes
   that only have a mailbox, then each of those qualified with each peer host
   from the peers file (`@lane:host`).
-- Enter inserts the top match where the `@` was, followed by a space. It does
-  not send the prompt. With no match, the `@` and what you typed are put back
+- Enter inserts the highlighted match (the top one until you move it, see
+  Keys) where the `@` was, followed by a space. It does not send the prompt. With no match, the `@` and what you typed are put back
   as plain text (also not sent).
 - A space or other non-lane character, or a cursor move, cancels: the `＠` and
   what you typed become a plain `@` and text (and Claude Code's own menu may
@@ -40,13 +43,19 @@ picker uses none of them; Enter reaches it as a submit.
 | Key | In the picker |
 | --- | --- |
 | letters, digits, `-` `.` `:` | filter |
-| Enter | insert the top match (the band's `>` row); nothing is sent |
+| Ctrl-F | highlight the next match (down the band); stops at the last |
+| Ctrl-B | highlight the previous match (up the band); stops at the first |
+| Enter | insert the highlighted match (the band's `>` row); nothing is sent |
 | Backspace | trim the filter; on an empty filter, drop the `＠` |
 | `@` (on an empty filter) | `@@`: close, pass one `@` to the stock menu |
 | space or other punctuation, a cursor move | not a lane: cancel, keeping what was typed |
 
-To pick a lane other than the top one, type more of its name (`@fs:` narrows
-to the cross-host forms). The cursor ends at the end of the prompt after an
+Ctrl-F and Ctrl-B are the keys because they are the ones that reach a mod
+(Up, Down, Tab, Ctrl-N/P do not); while the picker is open they never move
+the cursor or change the box, and with it closed they are the editor's own
+cursor-forward/back. Typing or trimming the filter puts the highlight back on
+the top match; typing more of the name (`@fs:` narrows to the cross-host
+forms) is the other way to reach a lane. The cursor ends at the end of the prompt after an
 Enter, wherever the `@` was.
 
 ## Try it

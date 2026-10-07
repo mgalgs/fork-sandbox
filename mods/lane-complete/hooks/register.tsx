@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { LanePicker } from '../types'
-import { MARK, VISIBLE, finish, matchLanes, mentionContext, mentions, parseLanes, shown, step } from './lanes'
+import { VISIBLE, finish, highlighted, matchLanes, mentionContext, mentions, parseLanes, plain, shown, step } from './lanes'
 import type { Lane } from './lanes'
 
 // How often the lane list is re-read, in the background; never per keystroke.
@@ -64,8 +64,8 @@ export const register: Register = on => {
         return { drop: 'lane picked' }
       }
       // A box that is not the one shown was changed behind the picker: send it
-      // as it is, with a real `@` for any mark left in it.
-      e = { ...e, text: e.text.replaceAll(MARK, '@') }
+      // as it is, with a real `@` for the mark and without the space we added.
+      e = { ...e, text: plain(open, e.text).text }
     }
 
     const named = mentions(e.text, lanes)
@@ -81,6 +81,7 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const matches = matchLanes(lanes, open.filter)
     const shown = matches.slice(0, VISIBLE)
+    const current = highlighted(open, lanes)
 
     return (
       <Box flexDirection="column">
@@ -90,12 +91,12 @@ export const register: Register = on => {
         </Text>
         {shown.length === 0 && <Text dimColor>  no lane matches; Enter keeps @{open.filter} as typed</Text>}
         {shown.map((lane, i) => (
-          <Text key={lane.address} bold={i === 0} color={i === 0 ? 'cyan' : undefined} dimColor={lane.source === 'peer' && i !== 0}>
-            {i === 0 ? '> ' : '  '}
+          <Text key={lane.address} bold={i === current} color={i === current ? 'cyan' : undefined} dimColor={lane.source === 'peer' && i !== current}>
+            {i === current ? '> ' : '  '}
             {lane.address}
           </Text>
         ))}
-        <Text dimColor>Enter inserts the top match · keep typing to narrow · Backspace trims · space cancels · @ again: stock menu</Text>
+        <Text dimColor>Enter inserts the marked row · C-f next, C-b previous · keep typing to narrow · Backspace trims · space cancels · @ again: stock menu</Text>
       </Box>
     )
   })

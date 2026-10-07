@@ -90,6 +90,12 @@ function isWordStart(text: string, at: number): boolean {
   return at === 0 || /\s/.test(text.charAt(at - 1))
 }
 
+/** The row the picker has highlighted, kept inside the visible matches. */
+export function highlighted(p: LanePicker, lanes: readonly Lane[], by = 0): number {
+  const rows = Math.min(matchLanes(lanes, p.filter).length, VISIBLE)
+  return Math.max(0, Math.min((p.index ?? 0) + by, rows - 1))
+}
+
 /** The box with the picker's choice at its anchor, in place of the `@` and filter; one space after it unless one follows. */
 function accept(p: LanePicker, address: string) {
   const at = Math.min(p.anchor, p.text.length)
@@ -109,25 +115,48 @@ export const MARK = '\uFF20'
  * in the text at the anchor, so the box is never empty (Claude Code fires no
  * submit and no Backspace edit for an empty one) and the operator sees what
  * they typed. `p.text` is the box without them.
+ *
+ * One space follows the filter, with the cursor before it: the editor emits
+ * no edit for a cursor-forward that cannot move (the cursor at the box's end,
+ * where it sits after a start-of-box `@al`), and C-f must always arrive. The
+ * space is ours alone: `plain` takes it out again on every way out.
  */
 export function shown(p: LanePicker) {
-  return splice(p.text, Math.min(p.anchor, p.text.length), `${MARK}${p.filter}`)
+  const at = Math.min(p.anchor, p.text.length)
+  return { text: splice(p.text, at, `${MARK}${p.filter} `).text, cursor: at + 1 + p.filter.length }
 }
 
-/** A box as `shown` made it, with a real `@` where the mark is: what a cancel leaves. */
-export function unmarked(p: LanePicker, text: string) {
-  const at = Math.min(p.anchor, text.length)
-  return text.charAt(at) === MARK ? `${text.slice(0, at)}@${text.slice(at + 1)}` : text
+/** Where `shown` puts its space (the cursor sits here). */
+function padAt(p: LanePicker): number {
+  return Math.min(p.anchor, p.text.length) + 1 + p.filter.length
 }
 
 /**
- * The box an Enter pressed with the picker open leaves: the best match in
- * place of the `@` and filter, or with none the `@` and filter as plain text.
+ * A box as `shown` made it, as plain text: a real `@` where the mark is and
+ * the space taken out, which is what any way out of the picker leaves. A
+ * position in the shown box maps to `at(i)` here. A box that is not quite the
+ * shown one (changed behind the picker) loses only the parts that are there.
+ */
+export function plain(p: LanePicker, text: string) {
+  const anchor = Math.min(p.anchor, text.length)
+  const pad = padAt(p)
+  const marked = text.charAt(anchor) === MARK
+  const unmarked = marked ? `${text.slice(0, anchor)}@${text.slice(anchor + 1)}` : text
+  const padded = marked && text.charAt(pad) === ' '
+  return {
+    text: padded ? unmarked.slice(0, pad) + unmarked.slice(pad + 1) : unmarked,
+    at: (i: number) => (padded && i > pad ? i - 1 : i),
+  }
+}
+
+/**
+ * The box an Enter pressed with the picker open leaves: the highlighted match
+ * in place of the `@` and filter, or with none the `@` and filter as plain text.
  * The caller drops the submit and puts this box back.
  */
 export function finish(p: LanePicker, lanes: readonly Lane[]) {
-  const best = matchLanes(lanes, p.filter)[0]
-  return best === undefined ? { text: unmarked(p, shown(p).text), cursor: shown(p).cursor } : accept(p, best.address)
+  const best = matchLanes(lanes, p.filter)[highlighted(p, lanes)]
+  return best === undefined ? { text: plain(p, shown(p).text).text, cursor: shown(p).cursor } : accept(p, best.address)
 }
 
 /**
@@ -163,7 +192,14 @@ export function step(picker: LanePicker | null, lanes: readonly Lane[], e: Edit)
   const isBackspace = name === 'backspace' || (name === undefined && e.inputText === '' && e.end > e.start && !isMod)
   if (isBackspace) {
     if (picker.filter === '') return close({ text: picker.text, cursor: Math.min(picker.anchor, picker.text.length) })
-    return open({ ...picker, filter: picker.filter.slice(0, -1) })
+    return open({ anchor: picker.anchor, text: picker.text, filter: picker.filter.slice(0, -1) })
+  }
+
+  // C-f / C-b are the editor's cursor-forward/back, which would cancel the
+  // picker; here they move the highlight (next / previous), clamped at both
+  // ends, and the box is answered as shown so the cursor never moves.
+  if (key !== undefined && key.ctrl === true && key.meta !== true && (key.key === 'f' || key.key === 'b')) {
+    return open({ ...picker, index: highlighted({ ...picker, index: highlighted(picker, lanes) }, lanes, key.key === 'f' ? 1 : -1) })
   }
 
   // `@@`: a second `@` right after the swallowed one goes on to the stock
@@ -175,18 +211,19 @@ export function step(picker: LanePicker | null, lanes: readonly Lane[], e: Edit)
   }
 
   if (name === undefined && !isMod && FILTER_CHARS.test(e.inputText)) {
-    return open({ ...picker, filter: picker.filter + e.inputText.toLowerCase() })
+    return open({ anchor: picker.anchor, text: picker.text, filter: picker.filter + e.inputText.toLowerCase() })
   }
 
   // Anything else (a space, punctuation, a paste of prose, a cursor move, an
   // unknown key) is not a lane: the `@` and what was typed stay as plain text,
   // with the character typed after them.
+  const kept = plain(picker, e.text)
   if (name === undefined && !isMod && e.inputText !== '') {
-    const kept = unmarked(picker, e.text)
-    const text = kept.slice(0, e.start) + e.inputText + kept.slice(e.end)
-    return close({ text, cursor: e.start + e.inputText.length })
+    const start = kept.at(e.start)
+    const text = kept.text.slice(0, start) + e.inputText + kept.text.slice(kept.at(e.end))
+    return close({ text, cursor: start + e.inputText.length })
   }
-  return close({ text: unmarked(picker, e.text), cursor: e.cursor })
+  return close({ text: kept.text, cursor: kept.at(e.cursor) })
 }
 
 /**
