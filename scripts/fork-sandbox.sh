@@ -1718,6 +1718,51 @@ if [[ "${1-}" == configure ]]; then
     exit 0
 fi
 
+# --resume is intercepted here too, for the same reason `configure` is: the
+# flag-parsing loop below has no notion of it, and giving it one would mean
+# threading a whole second CLI's worth of validation, locking and
+# detachment through 9000 lines this orchestration does not need to touch.
+# Scanned by hand rather than folded into the real loop because it must run
+# before ANY of that loop's own flags are consumed -- --resume computes
+# several of them (--session-state, --resume-session, --branch) itself and
+# refuses them if the caller also gave them directly (see
+# fork-sandbox-resume-lib.sh). self is this same script, resolved once, so
+# the resume orchestrator's detached worker can re-invoke it as a plain
+# (non---resume) run without guessing its own path.
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+fs_resume_state_dir="" fs_resume_base=""
+fs_resume_fwd=()
+fs_resume_i=0
+fs_resume_argv=("$@")
+while (( fs_resume_i < ${#fs_resume_argv[@]} )); do
+    case "${fs_resume_argv[$fs_resume_i]}" in
+        --resume)
+            fs_resume_state_dir="${fs_resume_argv[$((fs_resume_i+1))]:?--resume requires a directory}"
+            fs_resume_i=$(( fs_resume_i + 2 ))
+            ;;
+        --base)
+            fs_resume_base="${fs_resume_argv[$((fs_resume_i+1))]:?--base requires a branch name}"
+            fs_resume_i=$(( fs_resume_i + 2 ))
+            ;;
+        *)
+            fs_resume_fwd+=("${fs_resume_argv[$fs_resume_i]}")
+            fs_resume_i=$(( fs_resume_i + 1 ))
+            ;;
+    esac
+done
+if [[ -n "$fs_resume_base" && -z "$fs_resume_state_dir" ]]; then
+    echo "Error: --base requires --resume." >&2
+    exit 1
+fi
+if [[ -n "$fs_resume_state_dir" ]]; then
+    # shellcheck source-path=SCRIPTDIR
+    # shellcheck source=fork-sandbox-resume-lib.sh
+    # shellcheck disable=SC1091
+    source "$script_dir/fork-sandbox-resume-lib.sh"
+    fs_resume_main "$fs_resume_state_dir" "$fs_resume_base" "${fs_resume_fwd[@]}"
+    exit $?
+fi
+
 usage() {
     # The header block is the documentation: print it from line 2 down to the
     # first non-comment line.
@@ -1737,6 +1782,7 @@ display_config_path() {
 
 branch=""
 checkout_ref=""
+allow_existing_branch=false
 model=""
 model_option=""
 model_given=false
@@ -1844,6 +1890,15 @@ while [[ "${1:-}" == -* ]]; do
         --branch)
             branch="${2:?--branch requires a name}"
             shift 2
+            ;;
+        --allow-existing-branch)
+            # Internal: skips fs_check_branch_free below. The ONLY caller
+            # that deliberately targets a branch expected to already exist
+            # is fork-sandbox-resume-lib.sh's own inner invocation (a
+            # --resume --base continuation, fast-forwarding a moving
+            # branch) -- not a documented end-user flag.
+            allow_existing_branch=true
+            shift
             ;;
         --harness)
             harness_spec="${2:?--harness requires claude, pi or codex}"
@@ -3851,6 +3906,7 @@ if [[ "$k8s_mode" == true ]]; then
     # commit in the origin repo) before anything is created, so there is
     # nothing to validate here.
     [[ -n "$checkout_ref" ]] && k8s_argv+=(--checkout "$checkout_ref")
+    $allow_existing_branch && k8s_argv+=(--allow-existing-branch)
     [[ -n "$services_trust_ref" ]] && k8s_argv+=(--services-trust-ref "$services_trust_ref")
     # Forwarded as the raw string, not the byte count already parsed above:
     # fork-sandbox-k8s.sh does its own parsing, so there is one source of
@@ -5779,7 +5835,11 @@ origin_repo="$(fs_repo_toplevel "$project_path")"
 branch="${branch:-sandbox-$(date +%Y%m%d-%H%M%S)}"
 
 fs_reject_unsafe_chars "$origin_repo" "$branch"
-fs_check_branch_free "$origin_repo" "$branch"
+# --allow-existing-branch skips this: fast-forward-only is enforced at
+# fetch-back time instead (the runner's own non-force refspec), which is
+# the property a continuation actually needs -- the branch being already
+# there is the point, not a collision. See that flag's own comment, above.
+$allow_existing_branch || fs_check_branch_free "$origin_repo" "$branch"
 
 # The clone starts at the origin repo's HEAD, so that is what the session's
 # commits are measured against later. --checkout moves that start point, and

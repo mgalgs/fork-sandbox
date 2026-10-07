@@ -346,6 +346,7 @@ PLUMBING=(
     fork-sandbox-postmaster-pod-init.sh
     fork-sandbox-preset-parse.py
     fork-sandbox-refresh.sh
+    fork-sandbox-resume-lib.sh  # sourced by fork-sandbox.sh for --resume
     fork-sandbox-runner.sh
     fork-sandbox-stop-guard.sh
     lane-mail-lib.sh          # sourced by lane-mail.sh, lane-mail-serve and fork-sandbox-mail.sh
