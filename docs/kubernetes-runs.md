@@ -314,7 +314,9 @@ best-effort — a failure to set it never fails the fetch itself, since
 commit — a screenshot, a rendered report, a coverage tree. `run` also pulls
 back `/work/outbox` from inside the pod, over the same `kubectl exec`
 channel `fetch` uses, and lands it at `--outbox-dir`'s path on the host —
-default `/var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox`. This is
+default `<run-dir>/outbox` for a run with a run directory. A standalone
+`collect` uses `/var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox`,
+cleared first so a re-collect never carries an earlier run's files. This is
 the cluster counterpart of the local sandbox's own unconditional
 `$run_dir/outbox`: a place for something a human will look at that does not
 belong in a commit, described to the agent in `fs_emit_prompt_preamble`'s
@@ -388,8 +390,8 @@ transcript: `/work/events*.jsonl` (one per review-loop leg — `events.jsonl`
 the coding leg, `events-review-N.jsonl` and `events-fix-N.jsonl` the legs
 after it) plus the agent's
 stderr log (`pi-stderr.log` or `claude-stderr.log`) — and land it in an
-`evidence` directory **sibling to the outbox**, e.g. `/var/tmp/claude-
-scratch/forks/k8s-<safe-branch>/evidence`. Alongside the transcript files,
+`evidence` directory **sibling to the outbox**, e.g. `<run-dir>/evidence`.
+Alongside the transcript files,
 the same directory holds `pod-log-<container>.log`: the `kubectl logs`
 capture of every container in the pod, main and initContainers. That
 second half exists because what the entrypoint did *before the agent ever

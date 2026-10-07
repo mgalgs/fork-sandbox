@@ -518,6 +518,66 @@ What to expect while it is on:
   context windows, and distrust of a run's own self-report are the default
   discipline, not a flag. (`--long` is still accepted; it changes nothing.)
 
+## Driving fork-sandbox from another program
+
+A client that keeps one long-lived agent conversation per unit of work —
+one state dir, one draft branch, many notes submitted over time — drives
+fork-sandbox with `--resume` instead of a bare `run`:
+
+```
+fork-sandbox run --resume <state-dir> [--base <draft>] [extra args...] <project> <note.md>
+```
+
+`<state-dir>` is a directory under the scratch root, the same place a
+`--session-state` directory lives (fork-sandbox creates it on first use).
+It submits, prints exactly the run directory on stdout, and returns —
+well under 60 seconds, detaching on `--k8s` rather than blocking for the
+run's whole length; a local run already detaches via tmux on its own.
+Submitting the same `<note.md>` path again prints the same run directory
+and starts nothing new — safe to retry after a crash. A second, different
+note submitted while the first is still active is refused outright,
+never raced against the first run's session store: one state dir runs
+one agent at a time.
+
+**The branch.** The first submit in a fresh state dir starts a new
+conversation on a fresh branch off the project's main branch (no
+`--base`). Hand that branch back as `--base <draft>` on every later
+submit into the same state dir, and each run starts from the draft's own
+tip, continues the same agent conversation (the previous run's session is
+discovered and resumed automatically), and fetches back into the *same*
+branch name, fast-forward only — a non-fast-forward (the branch moved
+elsewhere while the run was in flight) fails that run and leaves the old
+tip untouched. fork-sandbox never mints a second branch for a state dir
+on its own; if continuing one branch is ever blocked by something real,
+the run fails rather than silently forking a new name.
+
+**Polling.** `fork-sandbox status --json <run-dir>` carries at least
+`state` (`queued` | `working` | `replied` | `failed`), `branch` (fetched
+into the project repo before `state` becomes `replied`), and `reply_file`
+(`<run-dir>/outbox/reply.md` — the agent's own reply when it wrote one,
+otherwise the rendered session result, readable once `state` is
+`replied`). Every key `status --json` already had stays exactly as it
+was; these are additive, and present whether or not the run was started
+by hand or through `--resume`.
+
+The fetch-back into the project repo is not forced, and git refuses to
+update a branch that is checked out in that repo or any of its
+worktrees. Keep the draft branch checked out nowhere while a run is in
+flight; read it with `git show` or a detached checkout.
+
+**What `--resume` owns vs. what it refuses.** It computes
+`--session-state`, `--resume-session` and the branch's starting point
+itself, so those flags (and `--branch`, `--session-id`, `--clone-dir`)
+are refused alongside it — pass `--base` instead to choose the branch.
+Everything else (`--harness`, `--model`, `--k8s`, `--timeout`, ...) is
+forwarded through untouched. Scope: the default single-leg pipeline,
+local or `--k8s` — a composed preset or review loop is not refused, but
+is not what this was built or tested against.
+
+fork-sandbox's own bookkeeping for a state dir lives under
+`<state-dir>/.fork-sandbox/`; it never reads or writes
+`<state-dir>/session.json`, which belongs to the client.
+
 ## A fleet that emails itself
 
 Everything above runs one agent: a handoff goes in, a branch comes back.
