@@ -711,6 +711,29 @@ else, so there is somewhere for this to land; once the push completes, the
 client writes a sentinel and the pod clones its own bare repo, checks out the
 branch, and proceeds.
 
+**On a composed (`--run-dir`) pod, the clone target already exists, and
+cloning into it needs an exemption first.** `/work/clone` there is its own
+dedicated `emptyDir` volume (see "A leg cannot write the runner's own
+state" below), mounted before the entrypoint ever runs -- its directory
+already exists, owned by whoever created the volume (the kubelet, as
+root), group-writable by the pod's `fsGroup` but not owned by this
+container's uid. git's own ownership check (the fix for CVE-2022-24765)
+refuses to operate on a directory it does not consider safely owned by
+the running uid -- `fatal: detected dubious ownership` -- which is exactly
+what a real cluster run hit: the entrypoint's `git clone` failed outright,
+before the pod ever ran a leg. The fix is the one the error message's own
+suggested command performs: `git config --global --add safe.directory`,
+naming `/work/repo.git` and `/work/clone` by their exact paths (never a
+wildcard), run by the entrypoint before the clone and by
+`fork-sandbox-k8s-leg-loop.sh` before its first request -- each container
+has its own `$HOME`, so each sets it up once, for itself. This is a
+statement about *ownership* only; it trusts nothing about what either
+directory *contains* -- hooks, filters and attributes all still apply
+exactly as before. The legacy single-container pod shape never hits this:
+there, `/work/clone` is a plain subdirectory the entrypoint creates itself
+under the shared `/work` volume, so it is already owned by this uid by
+construction, and the exemption is a no-op for it.
+
 Three things follow, and all three are improvements over the original plan:
 
 - **It resolves open question 3 outright.** The original design could not run
@@ -1037,7 +1060,12 @@ already runs its own end-of-run uncommitted-work check (the same one a
 local run runs, against the clone directly rather than through a sandbox
 backend), and that check only records what it finds, the same as local,
 never commits it (see "The durable run log" above for why the fixed-
-skeleton shape's own sweep does not generalize here). A claude leg that
+skeleton shape's own sweep does not generalize here). On a composed pod,
+the check's own `git status`/`add`/`diff`/`reset` run in the LEG
+container, relayed over the same `fs_run_leg_split` request/response
+protocol every other leg already uses, never directly in the `agent`
+container -- see "A leg cannot write the runner's own state" above for
+why. A claude leg that
 ends its own turn normally is still caught first by the stop-guard hook
 (installed whenever any composed seat is claude, the same as locally),
 which refuses to let the turn end with uncommitted work. What has no such
@@ -1085,15 +1113,341 @@ tidy-history leg's verification and publish are host-side only)`, and the
 pod never reaches the tidy leg at all. No rewrite is ever published from a
 cluster run.
 
-**Known limit: a leg can write the runner's own state.** In the pod, the
-runner and the legs it starts share one container and one writable run
-directory. A leg can therefore rewrite `run.sh`, `pipeline.json`, later
-steps' prompts and the inbox settings, and so skip or forge a later step.
-A local run does not have this gap: its legs never see the run directory,
-and the inbox is bound read-only. Until the pod separates the two, treat a
-composed `--k8s` run's review and maintain verdicts as advisory. What
-reaches the host is still bounded: `collect` takes only the allowlisted
-artifacts above, and the branch arrives as git objects.
+**A leg cannot write the runner's own state.** The walker
+(`fork-sandbox-runner.sh`, run through `fork-sandbox-k8s-entrypoint.sh`'s
+`RUN_DIR` arm) and every leg it starts used to share one container, one
+uid and one writable run directory -- which meant a leg could rewrite
+`run.sh`, `pipeline.json`, a later step's prompt or the inbox settings,
+and so skip or forge a later step's verdict. A composed `--k8s` run's pod
+now splits across two containers instead, so the thing that cannot be
+trusted (a leg: an AI agent running arbitrary commands) and the thing that
+decides what runs next and what the run reports are never the same
+process tree:
+
+- **The `agent` container** is the walker -- the same container name and
+  the same `fork-sandbox-k8s-entrypoint.sh` entrypoint a single-leg pod
+  already uses, so every `kubectl exec`/`logs`/`get` this project's own
+  client makes against a running pod keeps working unchanged regardless
+  of which shape the pod turns out to be. It mounts the run directory
+  (`run.sh`, `pipeline.json`, `progress.json`, every step's prompt, the
+  settings/hooks/stop-guard a later leg runs under) **read-write**, and
+  never executes a leg's own harness invocation itself.
+- **The `leg` container**, started by `fork-sandbox-k8s-leg-loop.sh`,
+  mounts the exact same run-directory volume **read-only**. Nothing a leg
+  does -- however it tries -- can write any file under it, because the
+  mount itself refuses the write at the kernel level before either
+  container's own code runs; there is no code path to get wrong by
+  choosing it, the way there was when both ran in one container.
+
+The two containers trade exactly one thing over this split: a leg's own
+command, and its own output. `fork-sandbox-runner.sh`'s `fs_run_leg_split`
+(the pod-side body of `fs_run_lock_closed`, the one function every leg
+invocation in this file already ran through) writes a request --
+argv, stdin and a fresh random token, nothing else -- under the run
+directory, which only the `agent` container can do; `fork-sandbox-k8s-
+leg-loop.sh` runs exactly that command and writes the response -- its
+stdout, stderr and exit code -- to a dedicated hand-off directory, mounted
+read-write in the `leg` container and read-only in the `agent`'s, so a leg
+can hand back its own output and nothing else's. The hand-off directory
+is one volume, not one per request, so without the token a leg could
+`mkdir`/`touch` a forged "done" for the NEXT request number -- predictable,
+being this one's own number plus one -- before that request's real leg
+had even started; the response lives at `<n>-<token>`, and the token for
+request *n+1* does not exist anywhere a leg can read until the `agent`
+container issues that request, which only happens once request *n*'s own
+leg is confirmed dead (see the sweep below). Nothing about *what* a leg
+may legitimately produce changed: it still commits to the clone (now its
+own dedicated volume, read-write in both containers -- legitimate work,
+not state this split exists to protect) and still writes its verdict into
+the clone's `.git/` the same way it always has; `fork-sandbox-runner.sh`
+still reads that file itself, unchanged, because by the time it does, the
+`leg` container has confirmed (see below) that nothing which could still
+write it is running.
+
+**The `agent` container never executes anything a leg could have
+planted.** The clone is leg-writable, so a leg can leave behind a
+`.git/hooks/post-index-change` hook, or a `filter.<name>.clean` entry in
+`.git/config` plus a matching `.gitattributes` line -- either fires on a
+plain `git status` with nothing uncommitted, and no `-c` switch disables
+an attribute-driven filter (confirmed by experiment, against a real
+clone). The run-end uncommitted-work check's own `git
+status`/`add`/`diff`/`reset` is therefore relayed through
+`fs_run_leg_split`, the same request/response protocol every other leg
+already uses, rather than run directly in the `agent` container -- the
+one container that holds real, trusted run-directory state. It runs in
+the `leg` container instead -- read-only run directory, swept after
+every request, exactly like any other leg's work -- so a leg-planted
+hook or filter that fires on it does so somewhere that holds nothing the
+run trusts. Its reply (the status text, and the patch when there is
+uncommitted work to save) is read back the same way a leg's own
+stdout/stderr already is: refused outright unless it is a plain regular
+file (closing a FIFO-or-symlink substitution a leg could otherwise leave
+in the hand-off directory -- see "A tampered hand-off file fails the
+leg, not the pod" below), bounded in size and time, and never parsed as
+anything but text. No `-c core.fsmonitor=`/`core.hooksPath=` is attempted
+here, deliberately: the fix is to make it not matter where a leg-planted
+hook or filter runs, not to chase which `-c` switch suppresses the next
+one.
+- What the `agent` container DOES still do with the clone directly: read
+  its branch head over `git ls-remote` (`clone_branch_head`) and fetch
+  from it (both outside any pod shape's `fetch_back`, and both going
+  through the same upload-pack transport the host's own `fetch` uses) --
+  neither reads a blob, so neither a hook nor a filter runs on either
+  path (confirmed by experiment). It also still calls `git config --global
+  --add safe.directory` once, at startup, naming the clone's own path
+  literally (see "Getting the repository in: by push, not by clone"
+  above) -- a statement about *ownership*, which git's own CVE-2022-24765
+  check is unrelated to hooks, filters or attributes, and trusts nothing
+  about what the clone contains.
+- What it does NOT do: run `status`, `add`, `diff`, `reset`, `commit`, or
+  any other porcelain or plumbing command that would read the clone's
+  config, hooks or attributes, against the clone, in the composed shape.
+  (The legacy single-container pod shape, which never gained this split,
+  still runs the uncommitted check directly, with only `core.fsmonitor=`/
+  `--no-ext-diff` disabled on the command line -- an accepted, advisory-
+  only limitation of that older shape, not this one; see "The legacy
+  cluster review loop" below.)
+
+**A tampered hand-off file fails the leg, not the pod.** The sweep below
+undoes a leftover PROCESS; it does nothing about a leftover FILE. A leg
+can see the whole hand-off volume while it runs, and before it exits it
+can replace its own `stdout` or `stderr` with a FIFO or a symlink -- a
+filesystem change the sweep cannot touch. An unbounded `cat` of a FIFO
+with no writer left blocks forever: the run would never report approved,
+but the pod would hang until `K8S_RUN_TTL`/the Job deadline instead of
+failing within it. `fs_run_leg_split` -- the same function that reads a
+leg's `rc`, `stdout` and `stderr` back, including the uncommitted-work
+check's relayed status/patch above -- refuses outright, writing nothing,
+unless each is a plain regular file (`fs_leg_handoff_read`), and reads
+whatever passes that check bounded in both size
+(`FORK_SANDBOX_LEG_OUTPUT_MAX_BYTES`, default 16 MiB) and time
+(`FORK_SANDBOX_LEG_OUTPUT_TIMEOUT`, default 20s). No race against the leg
+itself is possible here: this only runs once both `done` exists and
+`$RUN_DIR/.leg-req/lock` (see "`done` alone proves nothing..." below) is
+confirmed free, which the `leg` container's own sweep and `rc`/`done`
+write (below) only let happen once every process that leg could have
+started is already confirmed dead -- so nothing is left alive to swap
+the file back between the type check and the read.
+
+**A leftover process cannot reach the next leg.** `fork-sandbox-k8s-leg-
+loop.sh` is the `leg` container's own command, so it is PID 1 of that
+container's pid namespace. After a leg's own process exits -- however it
+exits, including ignoring `SIGTERM` -- the loop sends `SIGKILL` to every
+other process it can still reach (`kill -KILL -1`), which on Linux is
+every process left in that pid namespace, full stop: a leg that called
+`setsid(2)` to leave its process group, or that double-forked so its
+parent could exit without it, is still a process in that same pid
+namespace and still cannot block, ignore or catch `SIGKILL`. The one
+escape this would not close -- the leg creating its own nested pid
+namespace to hide a process from the sweep -- needs `CAP_SYS_ADMIN` for
+`unshare(CLONE_NEWPID)`, and this pod's `securityContext` already drops
+every capability (see "The agent pod" below), so the syscall itself
+fails before the hiding place can exist. This sweep runs once per leg,
+strictly after that leg's own process exits and strictly before the loop
+releases `$RUN_DIR/.leg-req/lock` (below) -- which, not `done`, is what
+makes this true for the NEXT leg too: the `agent` container never issues
+request `n+1` until it has confirmed request `n`'s lock is free, so
+nothing request `n`'s own leg started can still be alive to read request
+`n+1`'s token once it appears.
+
+**`done` alone proves nothing; `$RUN_DIR/.leg-req/lock` is what the
+`agent` container actually trusts.** The whole hand-off volume is
+leg-writable, not scoped per-request (the same kernel-mount limit the
+token above exists to work around), so a leg can write its own
+`<n>-<token>/done` (and `rc`, `stdout`) itself, at any time, including
+long before its real process exits -- a plain existence check on `done`
+would let that leg tell the `agent` container the false "leg `n` is done
+and dead" while the real process, or anything it started, keeps running.
+Closing this needs a signal a leg cannot produce. `$RUN_DIR/.leg-req/
+lock` is one: a single file for the whole run, created empty by the
+`agent` container before the first request is ever issued.
+`fork-sandbox-k8s-leg-loop.sh` opens it -- read-only, like the rest of
+`$RUN_DIR` in this container, which is enough, because `flock`'s
+exclusive lock does not require the fd to be opened for writing -- and
+holds `flock -x` on it from strictly before it spawns a leg's own
+process until strictly after that leg's sweep and its own `rc`/`done`
+write are both done. `fs_run_leg_split`'s own wait is for `done` to
+exist AND for a non-blocking `flock -n` on its own fd to the same file to
+succeed, in that order (so it never even attempts the lock before a
+request has been picked up), releasing the lock again the moment both
+hold. A leg can forge `done`'s content at will, but it cannot make the
+loop's exclusive hold let go early, and it cannot unlink or replace the
+lock file to start over on a fresh, unlocked inode -- the mount is
+read-only -- so a forged `done` written while the real leg, or anything
+it left behind, might still be running is simply ignored: the `agent`
+container keeps waiting until the lock is actually free, at which point
+the loop has already overwritten `rc` and `done` with the genuine values
+anyway. This needs no new uid or capability: the loop and the leg it
+spawns still share one uid and one hand-off volume, exactly as "The
+agent pod" below describes -- the lock file is just another file under
+that same read-only-to-the-leg mount, like the token before it.
+
+**The `leg` container's own loop ends when the runner does.** The `agent`
+container touches `$RUN_DIR/.leg-shutdown` from an `EXIT` trap, so it
+fires on every way the runner's own `run.sh` can end -- success, failure,
+a stop request or an error nobody anticipated -- not just the happy path;
+`fork-sandbox-k8s-leg-loop.sh` checks for that file every time it is
+waiting for the next request, and exits once it sees it. Without this,
+the `leg` container polls `$RUN_DIR/.leg-req` forever once the `agent`
+container is gone, and a Job with two containers only reaches `Complete`
+once both have exited -- so a composed run would occupy cluster
+resources indefinitely after a successful fetch and `K8S_RUN_TTL` had
+both already passed.
+
+**Tampering fails closed.** `fs_run_leg_split` waits for the `leg`
+container's response with a deadline
+(`FORK_SANDBOX_LEG_TIMEOUT`, default 6 hours); if the `leg` container
+never answers -- killed, wedged, or simply gone -- the leg is treated as
+failed, the same outcome a leg that exited non-zero already produces, and
+the walker's own existing "a leg that failed ends the loop as a harness
+error" handling takes it from there. Killing or wedging the walker itself
+(the `agent` container) stops the run from progressing at all: no
+request is ever written, so the `leg` container has nothing to run, and
+no approving verdict can be reported for a run that never reached the
+step it would have come from. Either way, nothing on the path to a
+reported verdict can be forced into reporting an approval the run never
+earned.
+
+**What reaches the host is still bounded independently of all of this:**
+`collect` takes only the allowlisted artifacts above, and the branch
+arrives as git objects, exactly as before this split existed.
+
+**The clone, leg-handoff, leg-home (the leg container's `$HOME`) and the
+leg container's own `/tmp` volumes all carry a `sizeLimit`,
+`K8S_LEG_VOLUME_SIZE_LIMIT` in `k8s.env` (a Kubernetes quantity, e.g.
+`8Gi`; default `8Gi`).** A leg could otherwise fill the node's ephemeral
+storage on purpose and get the pod evicted for free; capping these four
+means it instead hits ITS OWN cap and the pod is evicted for exactly the
+volume the leg itself filled -- the run still fails closed (no
+`.run-complete`, so `wait` reports it as a dead pod, the same outcome a
+crashed container already produces), just sooner and more legibly than
+exhausting the whole node would. This is deliberately different from the
+single-leg shape's own `work` volume below, which carries no `sizeLimit`
+at all: `work` there co-hosts the outbox, an operator-raised,
+legitimately large artifact (`FS_OUTBOX_MAX_BYTES`), and an emptyDir
+`sizeLimit` breach evicts the whole pod rather than merely refusing the
+oversized thing -- losing the branch along with the outbox would be the
+wrong trade for a run that did nothing wrong. **The composed shape's
+`outbox` volume is the same case and is equally uncapped, deliberately: a
+leg can still fill the node's disk through it before the client's own
+`FS_OUTBOX_MAX_BYTES` check ever runs (that check is a client-side
+refusal at fetch time, never a pod-side guard) -- an accepted risk, not
+an oversight.** `clone`, `leg-handoff`, `home` and `tmp` hold nothing a
+legitimate run grows without bound, so there is no such
+legitimate-oversized case to protect for them.
+
+**`--context-secret`'s mount follows the task, not the container named
+"agent."** See "Getting a Secret in: `--context-secret`" below for the
+flag itself. On this shape the `agent` container is the walker: it never
+executes a leg's own harness invocation (see "A leg cannot write the
+runner's own state" above), so a credential meant for the run's own task
+has no reader there. The Secret is mounted in the `leg` container
+instead, the one that actually runs the task.
+
+**A leg's `$HOME` and `/tmp` are rebuilt from nothing before every leg,
+never only once at container start.** Locally, `claude-sandboxed` gives
+every leg a fresh, ephemeral `$HOME`; this is this shape's equivalent.
+Both are this container's own emptyDirs, shared by every leg in the pod:
+left leg-writable across legs, leg 1 could plant `~/.gitconfig`
+(`core.fsmonitor`, `core.hooksPath`), a claude `~/.claude/settings.json`
+hook, or a `~/.pi/agent` extension, and have it fire inside a LATER leg's
+own lifetime, before that leg's own sweep -- including overwriting a
+reviewer's own verdict after the reviewer wrote it.
+`fork-sandbox-k8s-leg-loop.sh` wipes and rebuilds both from
+`$RUN_DIR/.leg-setup` (read-only here, owned by the agent container)
+before every leg, closing that gap for `$HOME`/`/tmp` specifically. If
+the reset cannot empty either one, the loop exits rather than run another
+leg on the leftovers, and the walker fails the run on the stale heartbeat.
+
+**`/dev/shm` and System V IPC are not reset.** The pod's containers share
+one IPC namespace, so a file in `/dev/shm` or a shared-memory segment one
+leg leaves behind is still there for the next. Nothing reads config or
+code from either place, so this is a channel between legs, not a way to
+make a later leg run something; a local run's legs do not share them.
+
+**What a leg plants INSIDE the clone is a shared limit with local runs,
+not something this shape closes.** `.git/config`, `.git/hooks`,
+`.claude/settings*.json`, `.pi/` and test scripts a leg commits all
+persist in the clone across every later leg, in a pod exactly as they do
+in a local composed run's own single, shared clone -- a reviewer that
+runs the code under review can be subverted by that code, either way.
+Nothing here defends against it: a reviewer/maintainer leg is expected
+to exercise judgment about code it is about to trust, the same posture a
+human reviewer takes. If a local run ever grows a defense against a
+specific clone-side vector, the pod must grow the matching one, but none
+exists today.
+
+**A leg runs as this loop's own uid, in its own pid namespace, as its
+descendant -- never trust that relationship alone to protect the loop.**
+Same-uid `ptrace` is unconditional unless Yama restricts it:
+`kernel.yama.ptrace_scope >= 1` ("restricted ptrace") denies a process
+from attaching to anything but its own descendants, and this loop is the
+leg's ancestor, never its descendant, so no leg can ever declare itself
+an allowed tracer of it either. With `ptrace_scope` at `0` or with no
+Yama LSM compiled in at all, a leg could `PTRACE_ATTACH` to this loop (or
+write `/proc/1/mem`) and release the completion lock early, skip the
+sweep, or forge `done` while the real leg is still alive -- reopening
+every hole the lock and the sweep exist to close. **`fork-sandbox-k8s-
+leg-loop.sh` therefore refuses to start unless `kernel.yama.ptrace_scope`
+reads `1`, `2` or `3`: every node that runs a composed pipeline needs
+this set, a real node requirement this shape imposes and the operator
+must satisfy, not something the pod spec alone can guarantee.**
+
+**The loop survives anything a leg can do to it short of `SIGKILL` from
+outside its own pid namespace.** A non-interactive bash running as PID 1
+and blocked in `wait` takes `SIGINT`'s default action and exits, even
+though a few other signals are already survived with no trap at all by
+the kernel's own "a default-disposition signal sent to a pid namespace's
+PID 1 is discarded" rule -- a leg is this loop's own descendant, same
+uid, same pid namespace, so it can send any signal at will. The loop
+traps every externally sendable, default-terminating signal, so none of
+them can end it. A leg itself starts with every signal at its default
+action, so `timeout` and the harness's own kills still work inside it.
+Separately, a leg can damage its own response directory (`chmod` it
+unwritable, replace `rc` or `done` with a FIFO or a directory, or swap the
+directory itself for a symlink) to make the loop's `rc`/`done` write fail
+or land where the walker never looks; the loop recovers -- the leg's captured
+stdout/stderr survive whenever a plain `chmod` back is enough, and are
+only lost on the rarer replace-the-directory case -- and reports that leg
+as failed either way, rather than dying itself. If `done` still is not a
+regular file once the lock is free, the walker fails the leg at once. The
+loop's own heartbeat files (below) get the same treatment: unlike a
+request's own response directory, they are never given a fresh path
+between legs, so a leg could otherwise replace one with a FIFO or a
+directory and wedge or freeze every later heartbeat.
+
+**A dead or wedged loop (an OOM kill, a node problem -- not a leg's own
+doing, which the paragraph above already closes) is noticed in minutes,
+not at `FORK_SANDBOX_LEG_TIMEOUT` (6h).** The loop writes a heartbeat, a
+fresh timestamp under the hand-off directory, independent of any
+in-flight request, on an interval far shorter than the grace/staleness
+bounds `fs_run_leg_split` watches it with
+(`FORK_SANDBOX_LEG_LOOP_HEARTBEAT_GRACE`/`_TIMEOUT`, default 300s/90s).
+As long as it keeps advancing the loop is alive, no matter how long the
+CURRENT leg has legitimately been running -- legs may still run for
+hours; nothing here caps that.
+
+**The agent container's own read of a leg's verdict
+(`.git/<idx>-verdict.md`) is bounded, the same way a leg's hand-off files
+already are.** The clone is leg-writable, so a leg controls this file's
+size and type too -- up to the clone volume's own cap, in one line,
+which could exhaust the agent container's memory or its run volume. Both
+places this is read go through the same bounded, regular-file-only read
+(`fs_leg_handoff_read`) a leg's own stdout/stderr already get; a refused
+read is treated as no usable verdict, never as an approval the leg never
+earned.
+
+**The legacy cluster review loop (`--review-loop` on the fixed-skeleton
+shape, below) does not get this split.** `fork-sandbox-k8s-review-loop.sh`
+runs every review and fix leg directly inside the same single container
+`fork-sandbox-k8s-entrypoint.sh`'s coding leg already ran in -- a
+different, much older code path than the composed walker above, built
+before this round and not reached by it. Giving it the same isolation
+would mean splitting the single-leg pod shape itself, which the vast
+majority of real runs still use; that is a larger, separate change this
+round does not make. Until it does, treat a `--review-loop` run's review
+and fix verdicts as advisory, the same caution the paragraph above used
+to state for the composed shape.
 
 **The fixed-skeleton (legacy) shapes above — `--harness`, `--review-loop`,
 `--review-harness pi` — are untouched.** They dispatch exactly as they
@@ -1926,9 +2280,15 @@ lacks `fork-sandbox/context=true`, or carries `fork-sandbox/branch`. It
 reads only the labels, never the data. `--dry-run` renders the volume and
 the mount and skips the label check.
 
-The mount is on the agent container only, not the init containers. The
-volume uses `defaultMode: 0440`; the pod runs with `fsGroup: 1000`, so the
-group read bit is enough.
+The mount is never on an init container. On the single-leg (legacy)
+shape it is on the agent container, the only container that runs the
+task. On a composed (`--run-dir`) shape's pod it is on the `leg`
+container instead, never the `agent` container -- the `agent` container
+there is the walker, which never executes a leg's own harness invocation
+itself, so it has no use for a credential meant for the run's own task;
+see "A leg cannot write the runner's own state" above. The volume uses
+`defaultMode: 0440`; the pod runs with `fsGroup: 1000`, so the group
+read bit is enough.
 
 The site creates the Secret in the fork-sandbox namespace and labels it. The
 installer does not:
@@ -2269,6 +2629,21 @@ path can be *stronger* than a workstation rather than merely equal — a
 platform plugin declares one via the `runtimeclass` capability key in
 `docs/k8s-platform.md`; `generic` declares `none`.
 
+**A composed (`--run-dir`) run's pod carries two containers, `agent` and
+`leg`, under this exact same posture — see "A leg cannot write the
+runner's own state" under "Composed pipelines on `--k8s`" above for what
+isolates them from each other and why.** Neither container gains a
+capability, root, privilege escalation or a service-account token the
+single-container shape above does not already lack; the isolation
+between them comes entirely from which volumes each one mounts and
+whether that mount is read-only, a property the pod spec states and the
+kubelet enforces before either container's own code runs. This is a
+deliberate consequence of the posture above: inside one container, a
+process cannot become a different uid without a privilege this pod
+grants to nobody, so uid separation was never an option here — two
+containers, not two users in one, is what "not a dropped capability
+answer" looks like.
+
 **The prompt's carrier**, in v1, is a ConfigMap key (`handoff.md`), mounted
 read-only alongside the entrypoint and egress-gate scripts and read on pi's
 stdin. This is the "small data needed at start" case the original design
@@ -2288,9 +2663,14 @@ above), `scripts/fork-sandbox-k8s-inbox-write.sh` (run on demand, over
 `kubectl exec -i`, by the `say` verb — see "The operator inbox" above), and
 `scripts/fork-sandbox-k8s-review-loop.sh` (run by the entrypoint after the
 coding leg, only when `--review-loop` was given — see "The cluster review
-loop" above). Every one of them is mounted in from a per-run ConfigMap
-`submit` renders, rather than compiled into `K8S_IMAGE`. Iterating on any of
-them needs no image rebuild and no registry push — only a re-`submit`.
+loop" above), and `scripts/fork-sandbox-k8s-leg-loop.sh` (the `leg`
+container's own command, for a composed `--run-dir` run only — see
+"Composed pipelines on `--k8s`" above; shipped in every pod's ConfigMap
+regardless of run kind, the same as the others here, but only a composed
+run's pod spec ever names it as a container's `command`). Every one of
+them is mounted in from a per-run ConfigMap `submit` renders, rather than
+compiled into `K8S_IMAGE`. Iterating on any of them needs no image
+rebuild and no registry push — only a re-`submit`.
 
 ## Bringing your own image and registry
 
