@@ -250,26 +250,27 @@ printf '\n== fork-sandbox.sh: lock held across the run_cleanup -> fetch-back gap
 # first act, before the branch fetch-back, 0-commit branch removal and
 # summary ran. Those all still need the workspace, so a third process taking
 # the lock in that gap would race a live fetch. An instrumented copy of the
-# launcher inserts a marker file + a short sleep right after the runner's
+# runner inserts a marker file + a short sleep right after its
 # `run_cleanup` call and before the fetch-back (the only bare, unindented
 # call to it in the whole script, so the insertion point is unambiguous),
 # giving this test a window to probe the lock file from outside during
 # exactly that gap.
 
 instr_dir="$(mktmp_dir "$scratch/fs-locklife-instr.XXXXXX")"
-# fork-sandbox.sh sources its siblings (fork-sandbox-lib.sh among them) from
-# its own script_dir, so the instrumented copy needs them alongside it too;
-# symlinking the rest of scripts/ in unmodified is cheaper than copying it.
+# fork-sandbox.sh resolves its siblings, the runner among them, from the
+# directory of its own real path, so the launcher must be a real copy here,
+# not a symlink back into scripts/. The rest is symlinked in unmodified.
 for f in "$repo_dir/scripts"/*; do
     bn="$(basename "$f")"
-    [[ "$bn" == "fork-sandbox.sh" ]] && continue
+    [[ "$bn" == "fork-sandbox.sh" || "$bn" == "fork-sandbox-runner.sh" ]] && continue
     ln -s "$f" "$instr_dir/$bn"
 done
 instrumented="$instr_dir/fork-sandbox.sh"
+cp "$launcher" "$instrumented"
 sed "/^run_cleanup\$/a touch \"\$run_dir/.probe-before-fetch\"; sleep 2" \
-    "$launcher" > "$instrumented"
-chmod +x "$instrumented"
-if ! grep -q '.probe-before-fetch' "$instrumented"; then
+    "$repo_dir/scripts/fork-sandbox-runner.sh" > "$instr_dir/fork-sandbox-runner.sh"
+chmod +x "$instrumented" "$instr_dir/fork-sandbox-runner.sh"
+if ! grep -q '.probe-before-fetch' "$instr_dir/fork-sandbox-runner.sh"; then
     no "the lock is still held between run_cleanup and the fetch-back" \
         "sed insertion point not found; the anchor line may have moved"
 else
