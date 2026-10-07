@@ -73,27 +73,47 @@ printf '== pin: no host-side git command targets the clone ==\n'
 # own header comment (the fetch-back's "Nothing below runs git inside the
 # clone") for why that distinction is load-bearing, not stylistic.
 #
-# One deliberate exception: fork-sandbox-runner.sh's own runner_in_sandbox=1
-# branch (a --k8s pod run), where this runner IS already running unconfined
-# relative to the clone -- there is no separate sandbox backend left to
-# hand it to. Those lines (the status check, and the save-as-a-patch
-# block for a pod leg's uncommitted work) each carry their own comment
-# naming them as the allowed exception; excluded here by that same text
-# so a NEW host-side git
-# call against the clone still fails this pin.
+# Two deliberate exceptions, each excluded below by its own trailing marker
+# comment, so a NEW host-side git call against the clone still fails this
+# pin:
+# 1. fork-sandbox-runner.sh's own runner_in_sandbox=1, no-leg-split branch
+#    (the legacy single-container --k8s pod shape), where this runner IS
+#    already running unconfined relative to the clone and there is no
+#    separate sandbox backend, and no second container, to hand it to.
+#    Marked "the one allowed exception".
+# 2. fork-sandbox-runner.sh's composed (--run-dir) pod branch, which relays
+#    the same two git invocations to fs_run_leg_split instead of running
+#    them here -- see "A leg cannot write the runner's own state" in
+#    docs/kubernetes-runs.md. Still literally source text naming
+#    -C "$clone_dir" (fs_run_leg_split's
+#    whole argv, including the clone path, has to be written out
+#    somewhere), so the pin would otherwise flag it as a new regression --
+#    excluded here by its own trailing marker, "relayed to the leg
+#    container", but ONLY when the same line also calls fs_run_leg_split,
+#    so a future direct git call could not silently reuse that marker's
+#    text to slip past this pin.
 # shellcheck disable=SC2016  # the pattern is literal source text to grep for, not to expand
-if grep -nE -- '-C "\$clone_dir"|cd "\$clone_dir"' "$repo_dir/scripts/fork-sandbox.sh" \
-    "$repo_dir/scripts/fork-sandbox-lib.sh" "$repo_dir/scripts/fork-sandbox-runner.sh" \
-    | grep -v -F 'the one allowed exception' | grep -q .; then
+uwp_clone_dir_lines() {
+    grep -nE -- '-C "\$clone_dir"|cd "\$clone_dir"' "$repo_dir/scripts/fork-sandbox.sh" \
+        "$repo_dir/scripts/fork-sandbox-lib.sh" "$repo_dir/scripts/fork-sandbox-runner.sh" \
+        | grep -v -F 'the one allowed exception' \
+        | grep -v -E 'fs_run_leg_split.*relayed to the leg container'
+}
+if [[ -z "$(uwp_clone_dir_lines)" ]]; then
+    ok "fork-sandbox.sh, fork-sandbox-lib.sh and fork-sandbox-runner.sh run no git directly against the clone"
+else
     # shellcheck disable=SC2016
     no "fork-sandbox.sh, fork-sandbox-lib.sh and fork-sandbox-runner.sh run no git directly against the clone" \
-        "$(grep -nE -- '-C "\$clone_dir"|cd "\$clone_dir"' \
-            "$repo_dir/scripts/fork-sandbox.sh" "$repo_dir/scripts/fork-sandbox-lib.sh" \
-            "$repo_dir/scripts/fork-sandbox-runner.sh" \
-            | grep -v -F 'the one allowed exception')"
-else
-    ok "fork-sandbox.sh, fork-sandbox-lib.sh and fork-sandbox-runner.sh run no git directly against the clone"
+        "$(uwp_clone_dir_lines)"
 fi
+# The flip side of exception 2 above: a line carrying the "relayed to the
+# leg container" marker but NOT calling fs_run_leg_split would silently
+# defeat the pin, so that combination is refused outright, independent of
+# whether any such line happens to exist today.
+# shellcheck disable=SC2016
+uwp_mismarked="$(grep -nE -- '-C "\$clone_dir"|cd "\$clone_dir"' "$repo_dir/scripts/fork-sandbox-runner.sh" \
+    | grep -F 'relayed to the leg container' | grep -v -F 'fs_run_leg_split')"
+check "every 'relayed to the leg container' line actually calls fs_run_leg_split" "" "$uwp_mismarked"
 
 launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
 mkdir -p "$launcher_home/src"
@@ -295,6 +315,36 @@ $proj_objects_real" "$(cat "$status_argv" 2>/dev/null)"
     else
         no "runner_in_sandbox=1: git-status.txt is still written" "missing (rc=$rerun_rc)"
     fi
+
+    # Adversarial: a leg has full write access to the clone, including
+    # .git/config -- not just the working tree. Plant a core.fsmonitor
+    # hook that leaves its own marker, then rerun the same
+    # runner_in_sandbox=1 check (now running unconfined against the
+    # clone, in the state-writable container for a composed pod run) and
+    # confirm the hook never fires: the -c core.fsmonitor= override on
+    # every direct git call against the clone must win over whatever a
+    # leg wrote into the clone's own config.
+    fsmonitor_marker="$launcher_home/fsmonitor-ran"
+    rm -f "$fsmonitor_marker"
+    cat > "$stub_dir/fsmonitor-hook.sh" <<EOF
+#!/usr/bin/env bash
+printf 'ran\n' > "$fsmonitor_marker"
+printf '\n'
+exit 0
+EOF
+    chmod +x "$stub_dir/fsmonitor-hook.sh"
+    git -C "$clone_dir_dirty" config core.fsmonitor "$stub_dir/fsmonitor-hook.sh"
+    rm -f "$status_argv"
+    HOME="$launcher_home" PATH="$stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+        FORK_SANDBOX_BACKEND=fake-run FIXTURE_STATUS_ARGV="$status_argv" \
+        timeout 60 bash "$rd_dirty/run.sh" >/dev/null 2>&1
+    if [[ -f "$fsmonitor_marker" ]]; then
+        no "runner_in_sandbox=1: a leg-planted core.fsmonitor hook never runs against the clone" \
+            "marker file was created -- the hook ran"
+    else
+        ok "runner_in_sandbox=1: a leg-planted core.fsmonitor hook never runs against the clone"
+    fi
+    git -C "$clone_dir_dirty" config --unset core.fsmonitor
 else
     no "a dirty run produced a run directory" "run_real failed"
 fi

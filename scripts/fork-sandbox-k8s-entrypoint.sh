@@ -203,6 +203,21 @@
 #                   unused except where this script reads pipeline.json
 #                   directly (model discovery, claude credential install).
 #                   Unset means today's legacy behaviour, unchanged.
+#   FORK_SANDBOX_LEG_HANDOFF_DIR
+#                   runner mode only: set when fork-sandbox-k8s.sh's pod
+#                   spec runs this run's legs in a SEPARATE container (see
+#                   "Composed pipelines on --k8s" in
+#                   docs/kubernetes-runs.md) rather than in this one. When
+#                   set, this script relays the pi-model-discovery and
+#                   claude-credential setup it just did to that container
+#                   (fork-sandbox-k8s-leg-loop.sh) via $RUN_DIR/.leg-setup,
+#                   instead of that container redoing the same network
+#                   calls itself. This script never execs a leg directly
+#                   in this mode -- see fork-sandbox-runner.sh's
+#                   fs_run_leg_split for the request/response protocol
+#                   `bash "$RUN_DIR/run.sh"` uses instead once this is set.
+#                   Unset means every leg still runs in this same
+#                   container, exactly as before this existed.
 #
 
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
@@ -757,6 +772,31 @@ fi
 # the branch that actually exists before cloning, so the clone lands
 # directly on it.
 git --git-dir="$repo_bare" symbolic-ref HEAD "refs/heads/$BRANCH"
+
+# In the composed (RUN_DIR) pod shape, clone_dir is its OWN dedicated
+# emptyDir volume (see "A leg cannot write the runner's own state" in
+# docs/kubernetes-runs.md), not a subdirectory this container creates
+# itself -- so its mount ROOT already exists, owned by whatever created
+# the volume (the kubelet, as root) and group-owned by the pod's fsGroup,
+# which is enough for this uid to WRITE into it but not enough to make
+# this uid its OWNER. git's ownership check (the CVE-2022-24765 fix)
+# refuses to operate in a directory it does not consider safely owned --
+# "fatal: detected dubious ownership", confirmed on a real cluster at
+# exactly this line. repo_bare needs no such exemption in the composed
+# shape (it is a fresh subdirectory THIS container creates under the
+# shared "work" volume, so it is always owned by this uid already), but
+# exempting it here too costs nothing and keeps this script correct even
+# if a future platform or volume layout changes that assumption.
+#
+# This trusts nothing about what either directory CONTAINS -- hooks,
+# filters and attributes still apply exactly as before -- it only tells
+# git that THIS uid, which the pod's securityContext already fixes for
+# the whole container, may treat this ownership as expected, the same
+# no-op the error message's own suggested command performs. --global, not
+# --system: $HOME here is a per-container emptyDir no other pod or run
+# ever shares.
+git config --global --add safe.directory "$repo_bare"
+git config --global --add safe.directory "$clone_dir"
 
 echo "fork-sandbox-k8s-entrypoint: cloning to $clone_dir" >&2
 git clone --quiet "$repo_bare" "$clone_dir"
@@ -1409,6 +1449,39 @@ if [[ -n "$RUN_DIR" ]]; then
     fi
     if (( pipeline_has_claude )); then
         claude_pod_credentials
+    fi
+    # FORK_SANDBOX_LEG_HANDOFF_DIR is set only when fork-sandbox-k8s.sh's
+    # pod spec split this run across a runner and a leg container (see
+    # "Composed pipelines on --k8s" in docs/kubernetes-runs.md) -- which is
+    # every composed run now, but the check stays explicit rather than
+    # assuming RUN_DIR implies it, so a pod built from an older ConfigMap
+    # that still runs everything in one container (no leg-loop.sh, no
+    # second container to relay to) is not left waiting on a hand-off that
+    # will never arrive. This container just finished the ONLY
+    # network-touching setup a leg needs (the pi proxy's model discovery
+    # above, the claude credential placeholder just above this) -- relay
+    # the result to the leg container's own $HOME instead of redoing it
+    # there, which would mean a second discovery round that could
+    # disagree with this one. See fork-sandbox-k8s-leg-loop.sh's own
+    # header for the read side of this hand-off.
+    if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+        leg_setup_dir="$RUN_DIR/.leg-setup"
+        mkdir -p "$leg_setup_dir"
+        if [[ -d "$HOME/.pi/agent" ]]; then
+            rm -rf "$leg_setup_dir/pi-agent"
+            cp -a "$HOME/.pi/agent" "$leg_setup_dir/pi-agent"
+        fi
+        if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+            cp "$HOME/.claude/.credentials.json" "$leg_setup_dir/claude-credentials.json"
+        fi
+        if [[ -f "$HOME/.claude.json" ]]; then
+            cp "$HOME/.claude.json" "$leg_setup_dir/claude.json"
+        fi
+        if [[ -f "${FORK_SANDBOX_K8S_PI_MODEL_MAP:-/work/pi-model-map.json}" ]]; then
+            cp "${FORK_SANDBOX_K8S_PI_MODEL_MAP:-/work/pi-model-map.json}" \
+                "$leg_setup_dir/pi-model-map.json"
+        fi
+        touch "$leg_setup_dir/ready"
     fi
     # The entire leg walk -- code, review, fix, maintain, in whatever
     # order pipeline.json names -- happens inside run.sh, through the

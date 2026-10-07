@@ -52,6 +52,25 @@ if (( fetch_back )); then
 fi
 rm -f -- "$run_dir/tidy.json" "$run_dir/tidy.pgid"
 
+# FORK_SANDBOX_LEG_HANDOFF_DIR is set only pod-side, only for a composed
+# (--run-dir) run, by fork-sandbox-k8s.sh's pod spec -- never for a local
+# run, and never for a single-leg or legacy-review-loop pod, both of which
+# keep running every leg in-process exactly as before. When it is set, this
+# run's own leg container (fork-sandbox-k8s-leg-loop.sh) holds the actual
+# harness invocations, reached over the request/response protocol
+# fs_run_leg_split below implements; see that function's own comment, and
+# "Composed pipelines on --k8s" in docs/kubernetes-runs.md, for why this
+# split exists and what it closes. Request numbers under $run_dir/.leg-req
+# must start fresh for THIS invocation of run.sh -- a manual re-run in the
+# same run dir (the same case the tidy-state guard above and the retry
+# accounting elsewhere in this file already guard against) must not resume
+# numbering a previous invocation's leg container could still be replying
+# to, nor reuse a number whose hand-off directory already holds a previous
+# invocation's response.
+if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+    rm -rf -- "$run_dir/.leg-req"
+fi
+
 # fork-sandbox-stop.sh's graceful path signals this runner's whole process
 # GROUP with TERM (a bash trap does not fire while a foreground child is
 # running, so the leg's own child gets the signal directly and dies first).
@@ -89,7 +108,239 @@ fi
 # close then targets an unset fd, errors internally and is swallowed, and
 # "$@" still runs.
 fs_run_lock_closed() {
+    if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+        fs_run_leg_split "$@"
+        return
+    fi
     ( { exec {clone_lock_fd}>&-; } 2>/dev/null; "$@" )
+}
+
+# fs_run_leg_split: fs_run_lock_closed's pod-side counterpart, used
+# whenever FORK_SANDBOX_LEG_HANDOFF_DIR is set (a composed --run-dir pod
+# run -- see the setup above). "$@" is a leg's own argv, exactly as
+# fs_run_lock_closed would otherwise exec it directly; here it is instead
+# handed to fork-sandbox-k8s-leg-loop.sh, running as PID 1 of a SEPARATE
+# container that mounts $run_dir read-only and the clone read-write (the
+# reverse of this container's own mounts) -- so nothing this leg does can
+# write run.sh, pipeline.json, progress.json, a later leg's prompt, or any
+# other file this runner reads to decide what happens next, no matter what
+# the leg runs. The request/response protocol is the full contract; see
+# fork-sandbox-k8s-leg-loop.sh's own header for the other half, including
+# why the leg container is safe to trust once it reports a request "done".
+#
+# Every caller already does `fs_run_lock_closed "${cmd[@]}" < "$prompt"
+# ... | tee ... | formatter`, piped, which runs this function in a forked
+# subshell -- so neither this function nor its caller may rely on an
+# in-process variable surviving between calls (one would silently reset to
+# empty on every single call). The request number is instead derived from
+# a counter FILE under $run_dir (one writer at a time, by this run's own
+# "never two legs in flight" rule -- see "Out of scope" in the handoff this
+# implements), which is ordinary persistent state, not shell state, so it
+# survives the subshell exactly like any other file write would.
+#
+# $@ becomes the request's argv verbatim; this function's own stdin (the
+# prompt file every caller already redirects onto fd 0) is drained into
+# the request's "stdin" file byte for byte, so the leg loop does not need
+# to know the prompt's path, only that a file with this exact content is
+# what the leg should read as ITS stdin -- this works identically whether
+# the caller's redirect was a real file or something else seekable, and
+# avoids ever having to resolve a pod-side path across the two containers.
+# The response's stdout/stderr are read back and written to this
+# function's own fd 1/fd 2, which is exactly what the direct-exec branch
+# above would have left them connected to -- so every caller's own
+# tee/formatter pipeline around this call needs no changes at all.
+#
+# The response directory name is $n PLUS a token this call generates
+# fresh, never $n alone: the whole hand-off volume is read-write in the
+# leg container (one dedicated volume, not split per-request -- a kernel
+# mount cannot be scoped that finely), so request n's own leg, while it
+# is still running, could otherwise `mkdir`/`touch` a "done" for request
+# n+1 (or any n+k) under a path it can predict just by reading this
+# counter file -- forging a later step's result before that step's real
+# leg has even started. The token is generated here, in this (trusted)
+# container, and handed to the leg loop only via $reqdir/token, which is
+# part of $run_dir -- read-only in the leg container, so a leg can read
+# the token for a request already issued to it but can never learn, let
+# alone write, the token for a request not yet issued. That makes every
+# future response path unguessable from inside a leg, which is the
+# property this exists for.
+#
+# A forged "done" needs no such guess, though: the whole hand-off volume
+# is leg-writable, so request n's own leg can write its OWN "<n>-<token>/
+# done" itself, at any time, including long before its real process
+# exits -- "done"'s mere existence proves nothing. $run_dir/.leg-req/lock,
+# created empty here (idempotent -- every call after the first just finds
+# it already there) before this request's "go" is ever written, is the
+# signal this function actually trusts: fork-sandbox-k8s-leg-loop.sh
+# opens the same file and holds `flock -x` on it from strictly before it
+# spawns the leg's own process until strictly after that leg's sweep and
+# its own "rc"/"done" write are both done (see that script's header for
+# why the sweep itself closes every OTHER way a leg could outlive its
+# exit). A leg cannot shorten that hold or unlink the file to start over
+# on a fresh, unlocked inode ($run_dir is read-only in the leg container),
+# so the wait below requires "done" to exist AND a non-blocking `flock -n`
+# acquire on this function's own fd to the same file to succeed, in that
+# order: "done" is checked first so this function never even attempts the
+# lock while the request has not been picked up yet (the lock starts
+# free, same as it looks once a genuine answer has landed, so checking it
+# alone, before any request has even been issued, would prove nothing).
+# Once both hold, the lock is released immediately, so the next request's
+# own call can use the same file. That also closes "a leg can read a
+# later request's token": the `agent` container never writes request
+# n+1's "go" until request n's lock is confirmed free, which cannot
+# happen while request n's own leg, or anything it started, is still
+# alive to read that token once it appears.
+fs_run_leg_split() {
+    (
+        local seq_file="$run_dir/.leg-req-seq" n reqdir token leg_handoff_dir deadline leg_rc
+        local lockfile="$run_dir/.leg-req/lock" reqlockfd
+        local heartbeat_file="$FORK_SANDBOX_LEG_HANDOFF_DIR/heartbeat" now
+        local hb_grace_deadline hb_timeout hb_seen=0 hb_last_value="" hb_last_seen_at=0 hb_value
+        n=$(( $(cat "$seq_file" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$seq_file"
+        reqdir="$run_dir/.leg-req/$n"
+        token="$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n')"
+        [[ -n "$token" ]] || token="fallback-$$-$RANDOM-$(date +%s%N)"
+        leg_handoff_dir="$FORK_SANDBOX_LEG_HANDOFF_DIR/$n-$token"
+        mkdir -p "$reqdir"
+        [[ -e "$lockfile" ]] || : > "$lockfile"
+        printf '%s' "$token" > "$reqdir/token"
+        printf '%s\0' "$@" > "$reqdir/argv"
+        cat <&0 > "$reqdir/stdin"
+        touch "$reqdir/go"
+
+        exec {reqlockfd}<"$lockfile"
+
+        # A dead or wedged leg container (OOM, a node problem -- not a
+        # leg's own doing, which the sweep, the signal traps and the
+        # response-directory recovery in fork-sandbox-k8s-leg-loop.sh keep
+        # from ever reaching this state) would otherwise only be noticed
+        # at FORK_SANDBOX_LEG_TIMEOUT (six hours), since "done" never
+        # appearing is the only signal this wait had. The loop writes a
+        # heartbeat -- a fresh timestamp under $FORK_SANDBOX_LEG_HANDOFF_DIR,
+        # independent of any single request -- on an interval far shorter
+        # than this grace/timeout pair; as long as it keeps advancing, the
+        # loop is alive, no matter how long the CURRENT leg has
+        # legitimately been running (legs run for hours; this must never
+        # cap that). Two separate bounds, because "never started" and
+        # "stopped mid-run" need different grace: FORK_SANDBOX_LEG_LOOP_HEARTBEAT_GRACE
+        # (default 300s) covers the loop's own startup (waiting on
+        # .leg-setup/ready, image pull, scheduling) before any heartbeat
+        # need exist yet; FORK_SANDBOX_LEG_LOOP_HEARTBEAT_TIMEOUT (default
+        # 90s) is how long a heartbeat may go stale, once seen, before
+        # this gives up on it -- comfortably above the writer's own
+        # interval (default 5s) so ordinary scheduling jitter is never
+        # mistaken for death.
+        hb_grace_deadline=$(( $(date +%s) + ${FORK_SANDBOX_LEG_LOOP_HEARTBEAT_GRACE:-300} ))
+        hb_timeout="${FORK_SANDBOX_LEG_LOOP_HEARTBEAT_TIMEOUT:-90}"
+        deadline=$(( $(date +%s) + ${FORK_SANDBOX_LEG_TIMEOUT:-21600} ))
+        until [[ -f "$leg_handoff_dir/done" ]] && flock -n "$reqlockfd"; do
+            now="$(date +%s)"
+            if (( now >= deadline )); then
+                printf 'fork-sandbox: the leg container never answered request %s (no %s/done within %ss); treating this leg as failed\n' \
+                    "$n" "$leg_handoff_dir" "${FORK_SANDBOX_LEG_TIMEOUT:-21600}" >&2
+                exit 1
+            fi
+            # A "done" the loop could not turn back into a regular file
+            # would never satisfy the -f above; fail now instead of at the
+            # six-hour deadline.
+            if [[ -e "$leg_handoff_dir/done" || -L "$leg_handoff_dir/done" ]] \
+                && { [[ -L "$leg_handoff_dir/done" ]] || [[ ! -f "$leg_handoff_dir/done" ]]; } \
+                && flock -n "$reqlockfd"; then
+                printf 'fork-sandbox: request %s answered with a %s/done that is not a regular file; treating this leg as failed\n' \
+                    "$n" "$leg_handoff_dir" >&2
+                exit 1
+            fi
+            # The heartbeat file lives in the leg-writable hand-off
+            # volume, so a leg can replace it with a FIFO (a plain,
+            # unbounded `cat` of that with no reader blocks this wait
+            # forever instead of ever reaching the deadline checks below)
+            # or leave malformed text in it after a genuine heartbeat was
+            # already seen. fs_leg_handoff_read's bounded, regular-file-
+            # only read (see its own comment below) refuses both without
+            # blocking, returning empty; empty or malformed is handled the
+            # same as "no fresh heartbeat this tick", below.
+            hb_value="$(fs_leg_handoff_read "$heartbeat_file" 2>/dev/null)"
+            if [[ "$hb_value" =~ ^[0-9]+$ ]] && { (( hb_seen == 0 )) || [[ "$hb_value" != "$hb_last_value" ]]; }; then
+                hb_last_value="$hb_value"; hb_last_seen_at="$now"; hb_seen=1
+            elif (( hb_seen == 0 )); then
+                if (( now >= hb_grace_deadline )); then
+                    printf 'fork-sandbox: leg container never started answering (%ss); request %s failed\n' \
+                        "${FORK_SANDBOX_LEG_LOOP_HEARTBEAT_GRACE:-300}" "$n" >&2
+                    exit 1
+                fi
+            # A heartbeat already seen once that then stops advancing --
+            # whether because the loop died, or because a leg corrupted
+            # the file -- must still be caught here; it is not enough to
+            # only catch it while the file reads back as a fresh, valid
+            # timestamp.
+            elif (( now - hb_last_seen_at >= hb_timeout )); then
+                printf 'fork-sandbox: leg container heartbeat stale %ss; request %s failed\n' \
+                    "$hb_timeout" "$n" >&2
+                exit 1
+            fi
+            sleep 1
+        done
+        flock -u "$reqlockfd" 2>/dev/null || true
+        exec {reqlockfd}<&-
+
+        leg_rc="$(fs_leg_handoff_read "$leg_handoff_dir/rc" 2>/dev/null)"
+        [[ "$leg_rc" =~ ^-?[0-9]+$ ]] || leg_rc=1
+        fs_leg_handoff_read "$leg_handoff_dir/stdout" || leg_rc=1
+        fs_leg_handoff_read "$leg_handoff_dir/stderr" >&2 || leg_rc=1
+        exit "$leg_rc"
+    )
+}
+
+# fs_leg_handoff_read PATH: writes PATH's content to this function's own
+# stdout, bounded in both size and time, and refuses outright -- writing
+# nothing, returning nonzero -- unless PATH is a plain regular file no
+# larger than the configured cap.
+#
+# Why: a leg can see the whole hand-off volume while it runs (see
+# fs_run_leg_split's own comment on the token), and before it exits it can
+# replace its own stdout or stderr file with a FIFO or a symlink. That is a
+# filesystem change, not a process, so fork-sandbox-k8s-leg-loop.sh's own
+# sweep -- which kills every process the exiting leg could have started --
+# does not undo it. A plain, unbounded `cat` of a FIFO with no writer left
+# blocks forever: the run never reports approved, but the pod hangs until
+# its deadline instead of failing within it. The time cap is defense in
+# depth against a read that blocks for some other reason even once the
+# type and size checks above have passed.
+#
+# The size check is a separate `stat`, not "read up to the cap and call it
+# done": `head -c N` exits 0 whether or not the file actually had more than
+# N bytes, so reading through it alone cannot tell a file that fits from
+# one truncated at the cap -- it would make a leg's oversized regular file
+# succeed with silently truncated content instead of failing the request,
+# the same hole a FIFO or symlink closes by failing instead of hanging.
+# `stat` reads metadata only, so checking size first, before ever reading
+# the content, costs nothing extra against a file sized up to the leg-
+# writable volumes' own sizeLimit (K8S_LEG_VOLUME_SIZE_LIMIT in
+# fork-sandbox-k8s.sh).
+#
+# No TOCTOU window worth closing: by the time fs_run_leg_split calls this,
+# it has already seen $leg_handoff_dir/done, which the leg loop writes only
+# once its sweep confirms every process that request's leg could have
+# started is dead -- so nothing is left alive to swap PATH out between the
+# checks below and the read.
+fs_leg_handoff_read() {
+    local path="$1" max="${FORK_SANDBOX_LEG_OUTPUT_MAX_BYTES:-16777216}" size
+    if [[ -L "$path" ]] || [[ ! -f "$path" ]]; then
+        printf 'fork-sandbox: refusing to read %s: not a plain regular file\n' "$path" >&2
+        return 1
+    fi
+    size="$("$FS_TIMEOUT" "${FORK_SANDBOX_LEG_OUTPUT_TIMEOUT:-20}" stat -c '%s' -- "$path" 2>/dev/null)"
+    if [[ ! "$size" =~ ^[0-9]+$ ]]; then
+        printf 'fork-sandbox: refusing to read %s: could not determine its size\n' "$path" >&2
+        return 1
+    fi
+    if (( size > max )); then
+        printf 'fork-sandbox: refusing to read %s: %s bytes over the %s-byte cap\n' \
+            "$path" "$size" "$max" >&2
+        return 1
+    fi
+    "$FS_TIMEOUT" "${FORK_SANDBOX_LEG_OUTPUT_TIMEOUT:-20}" head -c "$max" -- "$path"
 }
 
 # The tidy leg's own variant: same lock-fd close, but records this
@@ -581,7 +832,26 @@ release_clone_lock() {
         { exec {clone_lock_fd}>&-; } 2>/dev/null || true
     fi
 }
-trap 'run_cleanup; release_clone_lock' EXIT
+# Tells the leg container (fork-sandbox-k8s-leg-loop.sh) this runner is
+# done starting legs, so its own loop -- polling $run_dir/.leg-req for a
+# request that will never come once this process is gone -- can exit
+# instead of running forever and leaving the pod's Job unable to reach
+# Complete. A no-op when FORK_SANDBOX_LEG_HANDOFF_DIR is unset (every run
+# but a composed pod one). In the EXIT trap, like run_cleanup and
+# release_clone_lock beside it, because this runner can end on success,
+# on failure, on a stop request or on an error nobody anticipated, and
+# the leg container needs to hear about every one of those, not just the
+# happy path. Safe to fire after any point in the run: every request this
+# runner issued has already been answered (fs_run_leg_split blocks on
+# exactly that) by the time this process is about to exit, so there is no
+# in-flight request this could race.
+fs_signal_leg_shutdown() {
+    [[ -n "${_leg_shutdown_signaled:-}" ]] && return 0
+    _leg_shutdown_signaled=1
+    [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]] || return 0
+    touch "$run_dir/.leg-shutdown" 2>/dev/null || true
+}
+trap 'fs_signal_leg_shutdown; run_cleanup; release_clone_lock' EXIT
 # Every codex seat's credential file, written once here instead of the
 # three copy-pasted blocks this replaced (one each for the implement,
 # review and maintainer seats, none of which could reach a composed
@@ -2708,7 +2978,21 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                 # The run dir outlives the clone, so the copy is the
                 # record. Take the original away in the same breath, so
                 # iteration i+1 cannot re-read it.
-                cp -- "$cur_verdict_file" "$cur_copy" 2>/dev/null
+                #
+                # On a composed --k8s pod, the clone is leg-writable, so
+                # the leg controls this file's size and type too. Bounded
+                # the same way a leg's own hand-off files already are
+                # (fs_leg_handoff_read): regular file only, capped in size
+                # and time, so an oversized verdict cannot exhaust this
+                # container's memory or run-volume, and a FIFO cannot
+                # hang it. A read that fails this leaves no $cur_copy,
+                # which the empty-verdict check right below already
+                # treats as a harness error -- the same outcome the
+                # pre-existing -L/!-f check above already gives a plain
+                # missing or symlinked file.
+                fs_leg_handoff_read "$cur_verdict_file" > "$cur_copy.part" 2>/dev/null \
+                    && mv -f "$cur_copy.part" "$cur_copy" \
+                    || rm -f "$cur_copy.part"
                 rm -f "$cur_verdict_file"
                 if [[ ! -s "$cur_copy" ]]; then
                     cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an empty verdict"
@@ -2881,7 +3165,17 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                 [[ "$leg_rc" != 0 ]] && cur_detail+="$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
             else
                 cur_copy="$run_dir/${cur_step_idx}-$([[ "$cur_kind" == maintainer ]] && echo maintain || echo review)-verdict-${cur_i}.md"
-                cp -- "$cur_verdict_file" "$cur_copy"; rm -f "$cur_verdict_file"
+                # See the matching comment on the legacy copy above --
+                # same bound, same reason: the clone is leg-writable on a
+                # composed --k8s pod, so the leg controls this file's
+                # size and type too. A refused read leaves no $cur_copy,
+                # so `head -n1` below reads nothing and this iteration
+                # ends as harness-error, never as an approval it never
+                # earned.
+                fs_leg_handoff_read "$cur_verdict_file" > "$cur_copy.part" 2>/dev/null \
+                    && mv -f "$cur_copy.part" "$cur_copy" \
+                    || rm -f "$cur_copy.part"
+                rm -f "$cur_verdict_file"
                 cur_line="$(head -n1 "$cur_copy" | tr -d '\000-\037\177' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
                 if [[ "$cur_line" == APPROVED ]]; then cur_findings=0; cur_ended=approved
                 elif [[ "$cur_line" == FINDINGS ]]; then
@@ -3343,7 +3637,13 @@ fi
 # under, for the same reason nothing below runs git against the clone on
 # the HOST: the clone's .git/config is writable by the sandbox, and a key
 # such as core.fsmonitor runs on the HOST the next time anything there
-# executes git. Most of what fork-sandbox itself writes into the clone
+# executes git. A composed (--run-dir) pod takes this further still: the
+# "sandbox" there is a SEPARATE container (see the leg-split branch
+# below), not merely a confined process in this one, because a leg's own
+# hooks/filters are not fully disable-able by any `-c` switch (confirmed
+# by experiment) -- the fix is to make it not matter where they run, not
+# to keep chasing which switch suppresses them. Most of
+# what fork-sandbox itself writes into the clone
 # lives under .git (fs_lock_clone_dir's own comment says why), never the
 # working tree. The one working-tree exception, a services hook's
 # <clone-dir>/.env.sandbox (docs/sandbox-services.md), is listed in
@@ -3377,16 +3677,42 @@ if [[ "${#fs_alternates[@]}" -gt 0 ]]; then
         uncommitted_bind_flags+=(--bind-ro "$uncommitted_alt")
     done
 fi
-if (( runner_in_sandbox )); then
-    # runner_in_sandbox: this runner is already running unconfined relative
-    # to the clone -- a pod leg ran with no bwrap layer between it and the
-    # clone in the first place (see the pod leg wrapper, fork-sandbox-
-    # k8s-leg.sh), so there is no
-    # separate sandbox backend left to ask and no host/sandbox boundary
-    # this git invocation would be crossing. The uncommitted-test.sh pin
+if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+    # Composed (--run-dir) pod: relayed to the LEG container over the same
+    # request/response protocol every other leg uses (fs_run_leg_split),
+    # never run directly in this (agent) container. The clone is
+    # read-write in both containers, so a leg can plant a
+    # .git/hooks/post-index-change hook, or a filter.<x>.clean
+    # entry plus a matching .gitattributes line, either of which fires on a
+    # plain `git status` with nothing uncommitted -- no `-c` switch turns
+    # off an attribute-driven filter, so core.fsmonitor=/core.hooksPath=
+    # cannot close this on their own. Running the check here instead of
+    # disabling what it might trigger: whatever a leg-planted hook or
+    # filter does, it does it in the leg container, which holds no
+    # run-directory write access and is swept (fork-sandbox-k8s-
+    # leg-loop.sh's own sweep) before this call's response is trusted. Its
+    # stdout is read back the same untrusted way any other leg's output
+    # already is -- bounded in size and time, refused outright if it is
+    # not a plain regular file, never parsed as anything but text -- see
+    # fs_leg_handoff_read.
+    fs_run_leg_split git -C "$clone_dir" status --porcelain --untracked-files=all < /dev/null > "$run_dir/git-status.txt" 2> "$run_dir/git-status.log"  # relayed to the leg container, never executed here
+    uncommitted_status_rc=$?
+elif (( runner_in_sandbox )); then
+    # runner_in_sandbox, no leg split: the legacy single-container pod
+    # shape (no --run-dir), which never gained the agent/leg split above --
+    # see "The legacy cluster review loop" in docs/kubernetes-runs.md. This
+    # runner is already running unconfined relative to the clone (a pod leg
+    # ran with no bwrap layer between it and the clone in the first place,
+    # see the pod leg wrapper, fork-sandbox-k8s-leg.sh), so there is no
+    # separate sandbox backend to ask, and no second container to relay to
+    # either: the harness and this check share the one container that
+    # shape has. -c core.fsmonitor= still
+    # disables a leg-planted fsmonitor hook on the command line, which
+    # outranks the clone's own config -- this is the known, accepted
+    # advisory-only posture that shape keeps; the uncommitted-test.sh pin
     # that forbids a host-side git command against the clone excludes this
     # one line by the trailing marker comment below.
-    "$FS_TIMEOUT" 20 git -C "$clone_dir" status --porcelain --untracked-files=all > "$run_dir/git-status.txt" 2> "$run_dir/git-status.log"  # the one allowed exception
+    "$FS_TIMEOUT" 20 git -c core.fsmonitor= -C "$clone_dir" status --porcelain --untracked-files=all > "$run_dir/git-status.txt" 2> "$run_dir/git-status.log"  # the one allowed exception
     uncommitted_status_rc=$?
 elif fs_resolve_backend "$script_dir"; then
     "$FS_TIMEOUT" 20 "$FS_BACKEND_BIN" --workdir "$clone_dir" \
@@ -3430,9 +3756,25 @@ if (( runner_in_sandbox )) && (( uncommitted_status_rc == 0 )) && (( uncommitted
     # does not have. The index is reset right after, so this leaves no
     # trace in the clone's own state for anything later in this same
     # run that might read it.
-    git -C "$clone_dir" add -A  # the one allowed exception
-    "$FS_TIMEOUT" 20 git -C "$clone_dir" diff --cached --binary > "$run_dir/uncommitted.patch" 2>> "$run_dir/git-status.log"  # the one allowed exception
-    git -C "$clone_dir" reset --quiet  # the one allowed exception
+    if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+        # Composed pod: same relay as the status check above, same reason
+        # -- see its comment. core.fsmonitor=/--no-ext-diff are omitted
+        # here on purpose, not merely dropped: this runs in the leg
+        # container, where a leg-planted hook or filter firing changes
+        # nothing it did not already have the run of, so disabling them
+        # would protect nothing.
+        fs_run_leg_split bash -c '
+            git -C "$1" add -A
+            git -C "$1" diff --cached --binary --no-ext-diff
+            git -C "$1" reset --quiet
+        ' _ "$clone_dir" < /dev/null > "$run_dir/uncommitted.patch" 2>> "$run_dir/git-status.log"  # relayed to the leg container, never executed here
+    else
+        # runner_in_sandbox, no leg split: same legacy, advisory-only
+        # posture as the status check's own "no leg split" branch above.
+        git -c core.fsmonitor= -C "$clone_dir" add -A  # the one allowed exception
+        "$FS_TIMEOUT" 20 git -c core.fsmonitor= -C "$clone_dir" diff --cached --binary --no-ext-diff > "$run_dir/uncommitted.patch" 2>> "$run_dir/git-status.log"  # the one allowed exception
+        git -c core.fsmonitor= -C "$clone_dir" reset --quiet  # the one allowed exception
+    fi
     [[ -s "$run_dir/uncommitted.patch" ]] || rm -f "$run_dir/uncommitted.patch"
 fi
 

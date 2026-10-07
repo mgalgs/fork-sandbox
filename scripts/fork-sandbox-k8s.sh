@@ -974,6 +974,21 @@ K8S_CLUSTER_DOMAIN="${K8S_CLUSTER_DOMAIN:-cluster.local}"
 K8S_DENIED_PROBE="$(read_env_value "$k8s_env" K8S_DENIED_PROBE || true)"
 K8S_RUN_TTL="$(read_env_value "$k8s_env" K8S_RUN_TTL || true)"
 K8S_RUN_TTL="${K8S_RUN_TTL:-3600}"
+# Caps how large the clone, leg-handoff and leg-home emptyDirs may grow in
+# the composed (--run-dir) pod shape -- see "A leg cannot write the
+# runner's own state" in docs/kubernetes-runs.md. A plain Kubernetes
+# quantity, the same shape K8S_SERVICE_MAX_MEMORY below already uses.
+# Unlike the single-leg shape's own "work" volume (see the comment beside
+# its emptyDir, further down, for why THAT one stays unlimited), hitting
+# this limit evicting the pod is the outcome wanted here, not an accident
+# to avoid: these three volumes hold nothing this project trusts a leg to
+# grow without bound (the clone's legitimate size is the operator's own
+# repository, which does not change leg to leg), so a leg that fills one
+# on purpose should fail the run closed, not exhaust the node. Generous by
+# default for exactly that reason -- a real repository plus a normal
+# leg's own stdout/stderr should never come close.
+K8S_LEG_VOLUME_SIZE_LIMIT="$(read_env_value "$k8s_env" K8S_LEG_VOLUME_SIZE_LIMIT || true)"
+K8S_LEG_VOLUME_SIZE_LIMIT="${K8S_LEG_VOLUME_SIZE_LIMIT:-8Gi}"
 # Per-run services caps -- see docs/sandbox-services.md's cluster section.
 # A repo must not be able to claim the namespace: these bound how many
 # services, how much cpu/memory, and how long a startup window a committed
@@ -1093,6 +1108,12 @@ if [[ "${1-}" != check-grant && -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+
     echo "Error: K8S_RUN_TTL must be a number of seconds, got '$K8S_RUN_TTL'." >&2
     exit 1
 fi
+if [[ "${1-}" != check-grant \
+    && ! "$K8S_LEG_VOLUME_SIZE_LIMIT" =~ ^[0-9]+(\.[0-9]+)?(Ei|Pi|Ti|Gi|Mi|Ki|E|P|T|G|M|K)?$ ]]; then
+    echo "Error: K8S_LEG_VOLUME_SIZE_LIMIT must be a Kubernetes quantity" >&2
+    echo "(e.g. 8Gi), got '$K8S_LEG_VOLUME_SIZE_LIMIT'." >&2
+    exit 1
+fi
 if [[ "${1-}" != check-grant && -n "$K8S_ALLOW_UNLISTED_MODEL" && "$K8S_ALLOW_UNLISTED_MODEL" != 1 ]]; then
     echo "Error: K8S_ALLOW_UNLISTED_MODEL in $k8s_env must be 1 (or unset)," >&2
     echo "got '$K8S_ALLOW_UNLISTED_MODEL'." >&2
@@ -1135,6 +1156,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_PROXY_ALLOW_NS" "$K8S_CLUSTER_DOMAIN" \
         "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
         "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
+        "$K8S_LEG_VOLUME_SIZE_LIMIT" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
         "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
@@ -5943,11 +5965,12 @@ cmd_submit() {
     local service_ready_sh="$script_dir/fork-sandbox-k8s-service-ready.sh"
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
     local context_extract_sh="$script_dir/fork-sandbox-k8s-context-extract.sh"
+    local leg_loop_sh="$script_dir/fork-sandbox-k8s-leg-loop.sh"
     local inbox_hook_sh="$script_dir/fork-sandbox-inbox-hook.sh"
     local stop_guard_sh="$script_dir/fork-sandbox-stop-guard.sh"
     local refresh_sh="$script_dir/fork-sandbox-refresh.sh"
     local lib_sh="$script_dir/fork-sandbox-lib.sh"
-    for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$context_extract_sh"; do
+    for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$context_extract_sh" "$leg_loop_sh"; do
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
 
@@ -6256,8 +6279,21 @@ CENV
 )"
     fi
 
-    # --context-secret's mount and volume, agent container only. defaultMode
-    # 0440 with the pod's fsGroup 1000 gives the agent group read.
+    # --context-secret's mount and volume. defaultMode 0440 with the pod's
+    # fsGroup 1000 gives the mounting container's group read.
+    #
+    # Which container actually gets this mount differs by shape, and has
+    # to -- a --context-secret exists to give
+    # the RUN'S OWN TASK a credential (e.g. an API key a seat's work must
+    # exercise), never the walker. The single-leg (legacy) shape has one
+    # container, which both runs the task and IS "the agent" -- so
+    # $context_secret_volume_mount is used there unchanged, below. The
+    # composed (--run-dir) shape splits those two roles: the `agent`
+    # container is the walker, fork-sandbox-runner.sh, which never
+    # executes a leg's own harness invocation itself (see "A leg cannot
+    # write the runner's own state" in docs/kubernetes-runs.md) -- so it
+    # has no use for the secret and does not mount it; only the `leg`
+    # container, which actually runs the task, does.
     local context_secret_volume_mount="" context_secret_volume=""
     if [[ -n "$context_secret" ]]; then
         context_secret_volume_mount=$'\n'"$(cat <<CENV
@@ -6315,6 +6351,253 @@ CENV
             "$refresh_sh" "$continuation_header" "$handoff_file")"
     fi
 
+    # leg-loop.sh is shipped in the ConfigMap unconditionally (like
+    # entrypoint.sh/egress-gate.sh above) rather than only for --run-dir: a
+    # single-leg or legacy-review-loop pod never references it (its own
+    # command stays "bash .../entrypoint.sh"), so shipping it costs
+    # nothing there and keeps every pod's ConfigMap the same shape
+    # regardless of run kind.
+    #
+    # Isolation for a composed (--run-dir) run: see "Composed pipelines on
+    # --k8s" in docs/kubernetes-runs.md. The walker (fork-sandbox-
+    # runner.sh, via entrypoint.sh's RUN_DIR arm) keeps running in the
+    # "agent" container -- the same name a single-leg pod's own one
+    # container already uses, deliberately: every kubectl exec/logs/get
+    # call site this script makes against a running pod names "agent"
+    # explicitly below, and that works unchanged for either pod shape only
+    # because the name is the same one in both. That container mounts
+    # $run_dir_flag (the run directory -- run.sh, pipeline.json,
+    # progress.json, every step's prompt, the verdict a leg already wrote
+    # once this runner has copied it out -- see run_leg's own `rm -f
+    # "$cur_verdict_file"` before every review/maintain iteration)
+    # read-write; a leg never runs in this container at all. Every leg
+    # instead runs in a SEPARATE "leg" container, started by
+    # fork-sandbox-k8s-leg-loop.sh, which mounts the SAME run-directory
+    # volume read-ONLY -- so nothing a leg does, no matter how it tries,
+    # can write run.sh, pipeline.json, a later step's prompt, or any of
+    # the runner's own bookkeeping, because the kernel's own read-only
+    # bind mount refuses the write before either container's code ever
+    # runs. The two containers trade requests and responses over
+    # fork-sandbox-runner.sh's fs_run_leg_split and
+    # fork-sandbox-k8s-leg-loop.sh's own loop -- the request side writes
+    # under $run_dir_flag (so only the agent container can issue one), the
+    # response side under the dedicated "leg-handoff" volume below,
+    # mounted read-write in the leg container and read-only in the
+    # agent's, so a leg can hand back its own output and nothing else's.
+    # The clone and
+    # the outbox move to their OWN dedicated volumes, read-write in BOTH
+    # containers (real work and real artifacts, legitimately produced by
+    # whichever leg is running, and reading them back is not a privilege
+    # a leg's own container needs to be denied) -- carved out of the
+    # single "work" emptyDir a single-leg pod still uses unsplit, so the
+    # leg container never mounts the REST of "work" (the bare repository,
+    # the push/fetch sentinels) at all; a leg that could write
+    # /work/.run-complete early could fool a client's `wait` into fetching
+    # a half-finished branch, which is exactly the kind of forged
+    # end-of-run state this split exists to prevent.
+    local leg_handoff_dir="/handoff"
+    # Named so it can be handed to the leg container as FORK_SANDBOX_CLONE_DIR
+    # below -- unlike the agent container, which discovers this same path as
+    # a local variable inside fork-sandbox-k8s-entrypoint.sh, leg-loop.sh has
+    # no entrypoint-generation step of its own to bake it into, so it has to
+    # arrive as an env var instead.
+    local leg_clone_dir="/work/clone"
+    local containers_yaml volumes_yaml
+    if [[ -n "$run_dir_flag" ]]; then
+        containers_yaml="$(cat <<CYAML
+        - name: agent
+          image: $RUN_IMAGE
+          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: BRANCH
+              value: "$branch"
+            - name: HARNESS
+              value: "$harness"
+            - name: MODEL
+              value: "$model"
+            - name: PROXY_BASE_URL
+              value: "$proxy_base_url"
+            - name: GIT_USER_NAME
+              value: "$GIT_USER_NAME"
+            - name: GIT_USER_EMAIL
+              value: "$GIT_USER_EMAIL"
+            - name: RUN_TTL
+              value: "$K8S_RUN_TTL"
+            - name: OUTBOX_MAX_BYTES
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
+            - name: FORK_SANDBOX_LEG_HANDOFF_DIR
+              value: "$leg_handoff_dir"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /mnt/fork-sandbox
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: runner-tmp
+              mountPath: /tmp
+            - name: clone
+              mountPath: $leg_clone_dir
+            - name: outbox
+              mountPath: /work/outbox
+            - name: run
+              mountPath: $run_dir_flag
+            - name: leg-handoff
+              mountPath: $leg_handoff_dir
+              readOnly: true${thread_volume_mount}${attach_volume_mount}
+        - name: leg
+          image: $RUN_IMAGE
+          command: ["bash", "/mnt/fork-sandbox/leg-loop.sh"]
+          env:
+            - name: HOME
+              value: /home/agent
+            - name: RUN_DIR
+              value: "$run_dir_flag"
+            - name: FORK_SANDBOX_LEG_HANDOFF_DIR
+              value: "$leg_handoff_dir"
+            - name: FORK_SANDBOX_CLONE_DIR
+              value: "$leg_clone_dir"${claude_env}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /mnt/fork-sandbox
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/agent
+            - name: clone
+              mountPath: $leg_clone_dir
+            - name: outbox
+              mountPath: /work/outbox
+            - name: run
+              mountPath: $run_dir_flag
+              readOnly: true
+            - name: leg-handoff
+              mountPath: $leg_handoff_dir${thread_volume_mount}${attach_volume_mount}${context_secret_volume_mount}
+CYAML
+)"
+        volumes_yaml="$(cat <<VYAML
+        - name: scripts
+          configMap:
+            name: $safe_name-scripts
+        - name: work
+          emptyDir: {}
+        - name: runner-tmp
+          emptyDir: {}
+        # This is the LEG container's own /tmp (mounted at /tmp there,
+        # below) -- a leg can fill it without
+        # bound, same as home/clone/leg-handoff, so it gets the same cap.
+        # It is NOT runner-tmp above, the agent container's own /tmp,
+        # which only ever holds the walker's own scratch state.
+        - name: tmp
+          emptyDir:
+            sizeLimit: $K8S_LEG_VOLUME_SIZE_LIMIT
+        # home (the leg container's $HOME), clone, leg-handoff and tmp
+        # above are the four volumes a leg can fill without bound
+        # otherwise -- see K8S_LEG_VOLUME_SIZE_LIMIT's own comment above.
+        # outbox and work (the single-leg shape's own volume, further
+        # below) are deliberately NOT capped the same way: outbox holds a
+        # legitimately large, operator-raised artifact
+        # (FS_OUTBOX_MAX_BYTES), and an emptyDir sizeLimit breach evicts
+        # the whole pod rather than just refusing the oversized thing,
+        # which would cost the branch along with the outbox -- a worse
+        # trade than the one this cap makes for home/clone/leg-handoff/tmp,
+        # none of which a legitimate run ever needs to grow without bound.
+        # A leg can still fill the outbox's underlying node storage before
+        # the client's own pull-back check ever runs (that check is a
+        # client-side refusal at fetch time, not a pod-side guard) -- an
+        # accepted risk, identical to the one the single-leg shape's own
+        # "work" volume (which co-hosts ITS outbox) already accepts, for
+        # the same reason.
+        - name: home
+          emptyDir:
+            sizeLimit: $K8S_LEG_VOLUME_SIZE_LIMIT
+        - name: clone
+          emptyDir:
+            sizeLimit: $K8S_LEG_VOLUME_SIZE_LIMIT
+        - name: outbox
+          emptyDir: {}
+        - name: leg-handoff
+          emptyDir:
+            sizeLimit: $K8S_LEG_VOLUME_SIZE_LIMIT${thread_volume}${attach_volume}${context_secret_volume}${services_volumes}${run_dir_volume}
+VYAML
+)"
+    else
+        containers_yaml="$(cat <<CYAML
+        - name: agent
+          image: $RUN_IMAGE
+          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]
+          env:
+            - name: HOME
+              value: /home/agent
+            - name: BRANCH
+              value: "$branch"
+            - name: HARNESS
+              value: "$harness"
+            - name: MODEL
+              value: "$model"
+            - name: PROXY_BASE_URL
+              value: "$proxy_base_url"
+            - name: GIT_USER_NAME
+              value: "$GIT_USER_NAME"
+            - name: GIT_USER_EMAIL
+              value: "$GIT_USER_EMAIL"
+            - name: RUN_TTL
+              value: "$K8S_RUN_TTL"
+            - name: OUTBOX_MAX_BYTES
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /mnt/fork-sandbox
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/agent${thread_volume_mount}${attach_volume_mount}${context_secret_volume_mount}${run_dir_volume_mount}
+CYAML
+)"
+        volumes_yaml="$(cat <<VYAML
+        - name: scripts
+          configMap:
+            name: $safe_name-scripts
+        - name: work
+          # Deliberately no sizeLimit here. /work holds the outbox this
+          # file's own OUTBOX_MAX_BYTES budgets -- but an emptyDir sizeLimit
+          # is enforced by the kubelet EVICTING THE WHOLE POD the moment
+          # it's crossed, which would destroy the clone and the branch along
+          # with the oversized outbox. A refused pull-back (the outcome
+          # OUTBOX_MAX_BYTES actually produces, via cmd_collect's pull-back guard
+          # and the pod-side warning in fork-sandbox-k8s-entrypoint.sh) is
+          # far cheaper than losing the whole run to eviction. If you're
+          # about to add one back: don't -- the cap already has an
+          # enforcement point, and it isn't this.
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}${thread_volume}${attach_volume}${context_secret_volume}${services_volumes}${run_dir_volume}
+VYAML
+)"
+    fi
+
     local job_rendered rendered
     job_rendered="$(cat <<EOF
 ---
@@ -6335,6 +6618,8 @@ $(indent_block < "$gate_sh")
 $(indent_block < "$inbox_write_sh")
   context-extract.sh: |
 $(indent_block < "$context_extract_sh")
+  leg-loop.sh: |
+$(indent_block < "$leg_loop_sh")
   handoff.md: |
 $(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${refresh_configmap_keys}${services_env_configmap_key}${service_ready_configmap_key}
 ---
@@ -6388,63 +6673,9 @@ spec:
               mountPath: /mnt/fork-sandbox
               readOnly: true${services_containers}${service_ready_container}
       containers:
-        - name: agent
-          image: $RUN_IMAGE
-          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]
-          env:
-            - name: HOME
-              value: /home/agent
-            - name: BRANCH
-              value: "$branch"
-            - name: HARNESS
-              value: "$harness"
-            - name: MODEL
-              value: "$model"
-            - name: PROXY_BASE_URL
-              value: "$proxy_base_url"
-            - name: GIT_USER_NAME
-              value: "$GIT_USER_NAME"
-            - name: GIT_USER_EMAIL
-              value: "$GIT_USER_EMAIL"
-            - name: RUN_TTL
-              value: "$K8S_RUN_TTL"
-            - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          volumeMounts:
-            - name: scripts
-              mountPath: /mnt/fork-sandbox
-              readOnly: true
-            - name: work
-              mountPath: /work
-            - name: tmp
-              mountPath: /tmp
-            - name: home
-              mountPath: /home/agent${thread_volume_mount}${attach_volume_mount}${context_secret_volume_mount}${run_dir_volume_mount}
+$containers_yaml
       volumes:
-        - name: scripts
-          configMap:
-            name: $safe_name-scripts
-        - name: work
-          # Deliberately no sizeLimit here. /work holds the outbox this
-          # file's own OUTBOX_MAX_BYTES budgets -- but an emptyDir sizeLimit
-          # is enforced by the kubelet EVICTING THE WHOLE POD the moment
-          # it's crossed, which would destroy the clone and the branch along
-          # with the oversized outbox. A refused pull-back (the outcome
-          # OUTBOX_MAX_BYTES actually produces, via cmd_collect's pull-back guard
-          # and the pod-side warning in fork-sandbox-k8s-entrypoint.sh) is
-          # far cheaper than losing the whole run to eviction. If you're
-          # about to add one back: don't -- the cap already has an
-          # enforcement point, and it isn't this.
-          emptyDir: {}
-        - name: tmp
-          emptyDir: {}
-        - name: home
-          emptyDir: {}${thread_volume}${attach_volume}${context_secret_volume}${services_volumes}${run_dir_volume}
+$volumes_yaml
 EOF
 )"
     rendered="${grant_rendered}${claude_proxy_rendered}${job_rendered}"
@@ -7056,12 +7287,12 @@ EOF
     done
     local push_rc=0
     (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null push --quiet \
-        "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-receive-pack /work/repo.git" \
+        "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i -c agent $pod_name -- git-receive-pack /work/repo.git" \
         "$push_src:refs/heads/$branch" "${extra_refspecs[@]}") || push_rc=$?
     if (( push_rc != 0 )); then
         echo "Error: the repository push to pod $pod_name failed (git exit $push_rc)." >&2
         echo "fork-sandbox-k8s: the pod's agent container log, for the reason:" >&2
-        kubectl logs "$pod_name" 2>/dev/null \
+        kubectl logs "$pod_name" -c agent 2>/dev/null \
             || echo "fork-sandbox-k8s: (the container log is not available yet)" >&2
         exit 1
     fi
@@ -7075,7 +7306,7 @@ EOF
     # binary-stream reason as the repository push above.
     if [[ -n "$context_ro" ]]; then
         echo "fork-sandbox-k8s: pushing context ($context_ro) to pod $pod_name" >&2
-        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+        kubectl exec -i -c agent "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_CONTEXT_DIR" "$CONTEXT_MAX_BYTES" context < "$context_tar"
         rm -f -- "$context_tar"
     fi
@@ -7086,13 +7317,13 @@ EOF
     # different behaviour.
     if [[ -n "$thread_dir" ]]; then
         echo "fork-sandbox-k8s: pushing thread ($thread_dir) to pod $pod_name" >&2
-        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+        kubectl exec -i -c agent "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_THREAD_DIR" "$CONTEXT_MAX_BYTES" context < "$thread_tar"
         rm -f -- "$thread_tar"
     fi
     if [[ -n "$attach_dir" ]]; then
         echo "fork-sandbox-k8s: pushing attachments ($attach_dir) to pod $pod_name" >&2
-        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+        kubectl exec -i -c agent "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_ATTACH_DIR" "$CONTEXT_MAX_BYTES" context < "$attach_tar"
         rm -f -- "$attach_tar"
     fi
@@ -7104,22 +7335,26 @@ EOF
     # the entrypoint to look.
     if [[ -n "$session_state" ]]; then
         echo "fork-sandbox-k8s: pushing session store ($session_state) to pod $pod_name" >&2
-        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+        kubectl exec -i -c agent "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_SESSION_DIR" "$CONTEXT_MAX_BYTES" context < "$session_tar"
         rm -f -- "$session_tar"
     fi
 
     # Runner mode's own push, after the repository and every other input --
     # the entrypoint's RUN_DIR handling waits on .inputs-complete exactly
-    # like the single-leg path does, so this has to land before it.
+    # like the single-leg path does, so this has to land before it. The
+    # "run" volume is mounted in the agent container too (read-write,
+    # same as a single-leg pod) even though a composed run's own leg
+    # container mounts it read-only -- see "Composed pipelines on --k8s"
+    # in docs/kubernetes-runs.md.
     if [[ -n "$run_dir_flag" ]]; then
         echo "fork-sandbox-k8s: pushing the run directory ($run_dir_flag) to pod $pod_name" >&2
-        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+        kubectl exec -i -c agent "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$run_dir_flag" "$CONTEXT_MAX_BYTES" context < "$run_dir_tar"
         rm -f -- "$run_dir_tar"
     fi
 
-    kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
+    kubectl exec -c agent "$pod_name" -- sh -c 'touch /work/.inputs-complete'
     # The pod has been told its inputs are complete: see
     # INPUTS_PUSH_EXPECTED above and cmd_resume's check of the pair.
     printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$run_dir/run.env"
@@ -7215,10 +7450,10 @@ cmd_fetch() {
     # included -- so a hook in project_path's repo would otherwise run here
     # as well.
     (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null fetch --quiet \
-        "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-upload-pack /work/clone" \
+        "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i -c agent $pod_name -- git-upload-pack /work/clone" \
         "refs/heads/$branch:refs/heads/$branch")
 
-    kubectl exec "$pod_name" -- sh -c 'touch /work/.fetched' || true
+    kubectl exec -c agent "$pod_name" -- sh -c 'touch /work/.fetched' || true
     echo "fork-sandbox-k8s: fetched into $origin_repo as branch $branch" >&2
 
     # set -euo pipefail above already stopped this function if the fetch
@@ -7293,7 +7528,7 @@ cmd_say() {
     # translation to the message bytes on their way to `cat`.
     local epoch write_out
     epoch="$(date +%s)"
-    if ! write_out="$(printf '%s\n' "$text" | kubectl exec -i "$pod_name" -- \
+    if ! write_out="$(printf '%s\n' "$text" | kubectl exec -i -c agent "$pod_name" -- \
         sh /mnt/fork-sandbox/inbox-write.sh "$epoch" "$POD_INBOX_DIR" 2>&1)"; then
         echo "Error: could not write the addendum into pod $pod_name: $write_out" >&2
         exit 1
@@ -7770,7 +8005,7 @@ cmd_wait() {
         # One kubectl exec per probe, as the header comment promises -- this
         # single call both checks for the sentinel and reads it, so a
         # completed run needs no second round trip.
-        if run_complete="$(kubectl exec "${probe_kubectl_opts[@]}" "$pod_name" -- cat /work/.run-complete 2>/dev/null)"; then
+        if run_complete="$(kubectl exec "${probe_kubectl_opts[@]}" -c agent "$pod_name" -- cat /work/.run-complete 2>/dev/null)"; then
             break
         fi
 
@@ -8022,7 +8257,7 @@ cmd_collect() {
     if (( review_loop_cap > 0 )); then
         local loop_json loop_err
         loop_err="$(mktemp)"
-        if loop_json="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/review-loop.json 2> "$loop_err")" \
+        if loop_json="$(kubectl exec --request-timeout=60s -c agent "$pod_name" -- cat /work/review-loop.json 2> "$loop_err")" \
             && jq -e . >/dev/null 2>&1 <<< "$loop_json"; then
             local loop_ended loop_detail loop_iters loop_last_findings
             loop_ended="$(jq -r '.ended // "unknown"' <<< "$loop_json")"
@@ -8077,7 +8312,7 @@ cmd_collect() {
     local outbox_agent_count=0 outbox_operator_count=0
     outbox_tar="$(mktemp)"
     outbox_err="$(mktemp)"
-    kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
+    kubectl exec --request-timeout=60s -c agent "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
             | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar" \
             || outbox_rc=$?
     # Size check BEFORE exit status: an outbox well past the cap makes
@@ -8212,7 +8447,7 @@ cmd_collect() {
     local events_tar events_err events_rc=0
     events_tar="$(mktemp)"
     events_err="$(mktemp)"
-    kubectl exec --request-timeout=60s "$pod_name" -- \
+    kubectl exec --request-timeout=60s -c agent "$pod_name" -- \
             sh -c 'cd /work && find . -maxdepth 1 -name "events*.jsonl" -o -name "pi-stderr.log" -o -name "claude-stderr.log" -o -name "claude-stderr-*.log" -o -name "handoff-*.md" -o -name "continuation-prompt-*.md" -o -name "refresh.json" -o -name "refresh.log" | tar cf - --files-from=-' \
             2> "$events_err" \
             | head -c "$((FS_RUN_EVIDENCE_MAX_BYTES + 1))" > "$events_tar" \
@@ -8311,7 +8546,7 @@ cmd_collect() {
         local session_pull_tar session_pull_err session_pull_rc=0 session_pull_tmp=""
         session_pull_tar="$(mktemp)"
         session_pull_err="$(mktemp)"
-        kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/session-store . 2> "$session_pull_err" \
+        kubectl exec --request-timeout=60s -c agent "$pod_name" -- tar cf - -C /work/session-store . 2> "$session_pull_err" \
                 | head -c "$((CONTEXT_MAX_BYTES + 1))" > "$session_pull_tar" \
                 || session_pull_rc=$?
         # Same size-check-before-exit-status ordering as the outbox pull
@@ -8414,7 +8649,7 @@ cmd_collect() {
         local run_dir_pull_tar run_dir_pull_err run_dir_pull_rc=0 run_dir_pull_tmp=""
         run_dir_pull_tar="$(mktemp)"
         run_dir_pull_err="$(mktemp)"
-        kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C "$run_dir" . 2> "$run_dir_pull_err" \
+        kubectl exec --request-timeout=60s -c agent "$pod_name" -- tar cf - -C "$run_dir" . 2> "$run_dir_pull_err" \
                 | head -c "$((CONTEXT_MAX_BYTES + 1))" > "$run_dir_pull_tar" \
                 || run_dir_pull_rc=$?
         # Same size-check-before-exit-status ordering as the outbox and
@@ -8714,7 +8949,7 @@ cmd_collect() {
     # been for it. Narrowed to digits-only above guards against it being
     # anything other than a plain exit code.
     local agent_exit_code
-    agent_exit_code="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/.run-complete 2>/dev/null || true)"
+    agent_exit_code="$(kubectl exec --request-timeout=60s -c agent "$pod_name" -- cat /work/.run-complete 2>/dev/null || true)"
     [[ "$agent_exit_code" =~ ^[0-9]+$ ]] || agent_exit_code=""
 
     # How many commits the run produced. The measure that answers that
@@ -8749,7 +8984,7 @@ cmd_collect() {
     before_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
     local base_err
     base_err="$(mktemp)"
-    base_sha="$(kubectl exec --request-timeout=60s "$pod_name" -- \
+    base_sha="$(kubectl exec --request-timeout=60s -c agent "$pod_name" -- \
         git -C /work/repo.git rev-parse -q --verify "refs/heads/$branch" 2> "$base_err" || true)"
     rm -f -- "$base_err"
 

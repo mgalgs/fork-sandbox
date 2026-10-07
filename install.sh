@@ -332,6 +332,7 @@ PLUMBING=(
     fork-sandbox-k8s-egress-gate.sh
     fork-sandbox-k8s-entrypoint.sh
     fork-sandbox-k8s-inbox-write.sh
+    fork-sandbox-k8s-leg-loop.sh
     fork-sandbox-k8s-leg.sh
     fork-sandbox-k8s-outbox-extract.sh
     fork-sandbox-k8s-platform-generic
