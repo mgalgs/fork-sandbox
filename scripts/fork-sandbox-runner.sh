@@ -3889,6 +3889,23 @@ if (( fetched )); then
     upstream_line="$(fs_apply_upstream "$origin_repo" "$branch" "$upstream" "$upstream_reason")"
 fi
 
+# A plain (non-tidy) fetch that did not land -- most commonly a
+# non-fast-forward, from a branch moved or re-pointed in $origin_repo while
+# this run was in flight -- fails the run: its work is reachable only in the
+# clone. The tidy_kept_ref cases above are excluded: a tidy discard/collision
+# has its own "kept at this holding ref" reporting (fs_tidy_publish is
+# create-only by design) and stays "fetched: false, exit 0". Only overridden
+# when rc is still 0: a run that already failed keeps its own failure.
+if (( fetch_back )) && (( ! fetched )) && [[ -z "$tidy_kept_ref" ]] && (( rc == 0 )); then
+    rc=1
+    # exit-code was already written above, before this fetch ever ran (see
+    # that write's own comment) -- overwritten here too, so a reader of the
+    # file (fork-sandbox-status.sh's run_state, polling right now) and a
+    # reader of summary.json's exit_code (written later, from this same
+    # $rc) agree, instead of the file alone still claiming success.
+    printf '%s\n' "$rc" > "$run_dir/exit-code"
+fi
+
 # The two holding refs the tidy block above may have used to snapshot the
 # approved and candidate heads host-side are cleaned up now -- but ONLY
 # once the branch they protect actually reached the origin (fetched=1):
@@ -4448,6 +4465,42 @@ session_id_json=""
 if [[ -n "$session_state" ]]; then
     session_id_json="$(fs_session_discover_id "$harness" "$session_state" "$session_id_given")"
 fi
+
+# outbox/reply.md: use the agent's own reply when it wrote one; otherwise
+# render the session account as a fallback. Written BEFORE summary.json:
+# --json calls a run "replied" once summary.json exists, so reply.md must
+# already be there. A render that fails fails the run (below), the same way
+# a lost fetch-back race does, rather than report success with nothing to
+# read. Never runs
+# at all for a pod leg (fetch_back=0) -- $script_dir there is the pod's
+# own staged copy of scripts/, which is not guaranteed to carry
+# fork-sandbox-status.sh, and the host-side cmd_collect writes this same
+# file for a --k8s run instead, once the branch is actually back in the
+# user's own repo.
+reply_rendered=true
+if (( fetch_back )) && [[ -x "$script_dir/fork-sandbox-status.sh" ]]; then
+    # The agent can write here: anything but a regular file (a FIFO would
+    # block the write below forever) is refused, never opened.
+    if [[ -L "$run_dir/outbox/reply.md" ]] \
+        || { [[ -e "$run_dir/outbox/reply.md" ]] && [[ ! -f "$run_dir/outbox/reply.md" ]]; }; then
+        reply_rendered=false
+    elif [[ ! -f "$run_dir/outbox/reply.md" ]] \
+        && ! { mkdir -p -- "$run_dir/outbox" 2>/dev/null \
+            && "$script_dir/fork-sandbox-status.sh" --result "$run_dir" \
+                > "$run_dir/outbox/reply.md" 2>/dev/null; }; then
+        reply_rendered=false
+    fi
+fi
+# Same "only overridden when rc is still 0" rule the fetch-back override
+# above uses: a run that already failed on its own terms keeps reporting
+# that failure, not this one. exit-code is rewritten too, for the same
+# reason that override rewrites it -- a reader polling it right now must
+# not see success for a run whose reply this very check just found missing.
+if [[ "$reply_rendered" != true ]] && (( rc == 0 )); then
+    rc=1
+    printf '%s\n' "$rc" > "$run_dir/exit-code"
+fi
+
 ended_at="$(date +%s)"
 
 # Present whenever the pipeline has a maintain step anywhere (tidy.json

@@ -1252,6 +1252,8 @@ agent_res_cfg() {
     local d; d="$(newdir)"; tmpdirs+=("$d")
     { cat "$config_dir/k8s.env"; (( $# )) && printf '%s\n' "$@"; } > "$d/k8s.env"
     install -m 600 "$config_dir/pi.env" "$d/pi.env"
+    # Without it a claude render falls back to the operator's own credentials.
+    [[ ! -f "$config_dir/claude.env" ]] || install -m 600 "$config_dir/claude.env" "$d/claude.env"
     printf '%s' "$d"
 }
 check "no K8S_AGENT_* keys set: the agent container has no resources stanza, exactly as before" \
@@ -1747,6 +1749,49 @@ else
         "not found in $pi_fail_log: $(cat "$pi_fail_log")"
 fi
 rm -f /tmp/fs-k8s-test-pi-grant-fail.out
+
+# A plain (non---run-dir) submit's run.env is the ONLY writer for a legacy
+# --k8s run, and fork-sandbox-status.sh hard-refuses any run directory
+# without a version= key -- the gap this fixture proves closed. run.env is
+# already written by the time the Job apply runs (and the failure trap
+# disarms run_dir deletion right before that apply -- see cmd_submit's own
+# comment), so reusing the same Job-apply-failure stub above still leaves
+# a real run.env on disk to read, with the submit itself expected to fail.
+printf '\n== submit (plain, no --run-dir): run.env carries version= and started_at= ==\n'
+verenv_home="$(newdir)"; tmpdirs+=("$verenv_home")
+verenv_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$verenv_log")")
+verenv_out="$(newdir)/verenv.out"; tmpdirs+=("$(dirname "$verenv_out")")
+verenv_before="$(date +%s)"
+PATH="$pi_fail_stub_dir:$PATH" K8S_STUB_LOG="$verenv_log" HOME="$verenv_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-run-env-version --model moonshotai/kimi-k3 --harness pi \
+    "$proj_dir" "$handoff_file" > "$verenv_out" 2>&1
+verenv_rd="$(sed -n 's/^  run dir:  *//p' "$verenv_out" | head -1)"
+if [[ -n "$verenv_rd" && -f "$verenv_rd/run.env" ]]; then
+    verenv_version="$(sed -n 's/^version=//p' "$verenv_rd/run.env" | head -1)"
+    verenv_started="$(sed -n 's/^started_at=//p' "$verenv_rd/run.env" | head -1)"
+    if [[ "$verenv_version" == "1" ]]; then
+        ok "a plain submit's run.env carries version=1"
+    else
+        no "a plain submit's run.env carries version=1" "$(cat "$verenv_rd/run.env")"
+    fi
+    if [[ "$verenv_started" =~ ^[0-9]+$ ]] && (( verenv_started >= verenv_before )); then
+        ok "a plain submit's run.env carries a fresh started_at="
+    else
+        no "a plain submit's run.env carries a fresh started_at=" "$(cat "$verenv_rd/run.env")"
+    fi
+    if "$repo_dir/scripts/fork-sandbox-status.sh" "$verenv_rd" >/dev/null 2>&1; then
+        ok "fork-sandbox-status.sh accepts a plain --k8s run dir now that version= is written"
+    else
+        no "fork-sandbox-status.sh accepts a plain --k8s run dir now that version= is written" \
+            "$("$repo_dir/scripts/fork-sandbox-status.sh" "$verenv_rd" 2>&1)"
+    fi
+    rm -rf -- "$verenv_rd"
+else
+    no "a plain submit's run.env carries version=1" "no run dir found in: $(cat "$verenv_out")"
+    no "a plain submit's run.env carries a fresh started_at=" "no run dir found"
+    no "fork-sandbox-status.sh accepts a plain --k8s run dir now that version= is written" "no run dir found"
+fi
 
 # The claude harness installs its own, richer failure trap. Once the Job
 # has been applied, a failure in a later step (here, the Job's pod Ready
@@ -8820,6 +8865,36 @@ collectstub_collect() {
     "$k8s_sh" collect "$@" > "$out" 2>&1
 }
 
+# The default standalone destination is reused and refreshed for a later
+# collect of the same branch, including its sibling evidence directory.
+collect_default_root="/var/tmp/claude-scratch/forks/k8s-fs-k8s-test-collect-default"
+tmpdirs+=("$collect_default_root")
+collect_default_first="$(newdir)"; collect_default_second="$(newdir)"
+collect_default_work_first="$(newdir)"; collect_default_work_second="$(newdir)"
+tmpdirs+=("$collect_default_first" "$collect_default_second" "$collect_default_work_first" "$collect_default_work_second")
+printf 'first\n' > "$collect_default_first/first.txt"
+printf 'second\n' > "$collect_default_second/second.txt"
+printf 'first event\n' > "$collect_default_work_first/events.jsonl"
+printf 'second event\n' > "$collect_default_work_second/events-2.jsonl"
+collect_default_log="$(newdir)/kubectl.log"; collect_default_out="$(newdir)/collect.txt"
+tmpdirs+=("$(dirname "$collect_default_log")" "$(dirname "$collect_default_out")")
+if K8S_STUB_OUTBOX_RC=0 K8S_STUB_OUTBOX_DIR="$collect_default_first" K8S_STUB_WORK_DIR="$collect_default_work_first" \
+    collectstub_collect "$collect_default_log" "$collect_default_out" \
+    --branch fs-k8s-test-collect-default "$proj_dir" \
+    && K8S_STUB_OUTBOX_RC=0 K8S_STUB_OUTBOX_DIR="$collect_default_second" K8S_STUB_WORK_DIR="$collect_default_work_second" \
+    collectstub_collect "$collect_default_log" "$collect_default_out" \
+    --branch fs-k8s-test-collect-default "$proj_dir" \
+    && [[ -f "$collect_default_root/outbox/second.txt" \
+        && ! -e "$collect_default_root/outbox/first.txt" \
+        && -f "$collect_default_root/evidence/events-2.jsonl" \
+        && ! -e "$collect_default_root/evidence/events.jsonl" ]] \
+    && [[ "$(find /var/tmp/claude-scratch/forks -maxdepth 1 -type d -name 'k8s-fs-k8s-test-collect-default*' | wc -l)" == 1 ]]; then
+    ok "standalone re-collect reuses one branch directory with only current artifacts"
+else
+    no "standalone re-collect reuses one branch directory with only current artifacts" \
+        "$(cat "$collect_default_out"; find /var/tmp/claude-scratch/forks -maxdepth 1 -type d -name 'k8s-fs-k8s-test-collect-default*')"
+fi
+
 # 1. A readable outbox lands at the --outbox-dir path, and the fetch still
 # happens.
 collect_log1="$(newdir)/kubectl.log"; collect_out1="$(newdir)/out1.txt"; collect_dest1="$(newdir)/outbox-1"
@@ -9384,6 +9459,14 @@ refresh_sum_case() {
     local tag="$1" tokens="$2" work="$3"
     refresh_sum_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$refresh_sum_rd")
     {
+        # version=1: collect's own reply.md render (fork-sandbox-status.sh
+        # --result) now feeds into exit_code (a failed render fails the
+        # run -- see that write's own comment), and status.sh refuses any
+        # run.env with no version= key outright. A real run.env always has
+        # one by the time collect runs; this fixture needs it too, or every
+        # case below would report exit_code 1 for a reason that has nothing
+        # to do with what it is actually testing.
+        printf 'version=1\n'
         printf 'mode=run\n'
         printf 'harness=claude\n'
         printf 'model=some-model\n'
@@ -18654,6 +18737,9 @@ for rule in "/events/list" "/resourcequotas/get"; do
     done
 done
 
+# Runner-mode dry runs with a Claude seat need a valid credential even
+# though they never contact a cluster. Use the suite's existing fixture.
+printf 'CLAUDE_CREDENTIALS=%s\n' "$claude_override_cred" > "$config_dir/claude.env"
 printf '\n== fork-sandbox-k8s.sh --run-dir (runner mode) ==\n'
 # --run-dir wires through submit/run's own validation, Job rendering and
 # push, and through the entrypoint's RUN_DIR arm -- all driven by a run
@@ -19026,8 +19112,13 @@ printf '\n== fork-sandbox-k8s.sh collect: RUNNER=1 run-directory pull-back and s
 # never the whole pulled file, since it sits on an emptyDir every leg in
 # the pod can write to. Also merge the pod's own summary.json with the
 # client's, client keys winning on overlap.
-rdcol_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol.XXXXXX)"; tmpdirs+=("$rdcol_run_dir")
-printf 'RUNNER=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$proj_dir" > "$rdcol_run_dir/run.env"
+# The real prefix (fork-sandbox-status.sh refuses any other) and a
+# version= line: collect's own reply.md render now feeds into exit_code
+# (a failed render fails the run), so this fixture has to pass that
+# script's own minimum bar for "a fork-sandbox run directory", the same
+# as a real cmd_submit-created run.env always does by this point.
+rdcol_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.fs-k8s-test-rdcol.XXXXXX)"; tmpdirs+=("$rdcol_run_dir")
+printf 'version=1\nRUNNER=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$proj_dir" > "$rdcol_run_dir/run.env"
 
 rdcol_pod_dir="$(newdir)"; tmpdirs+=("$rdcol_pod_dir")
 printf '{"total_cost_usd":0.5,"commits":9,"exit_code":42}' > "$rdcol_pod_dir/summary.json"
@@ -19123,8 +19214,9 @@ fi
 # these are in the copy-back allowlist, so none land, even though they
 # sit right alongside summary.json and step-2-loop.json (which DO land,
 # proven above) in the very same pod directory.
-rdcol3_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol3.XXXXXX)"; tmpdirs+=("$rdcol3_run_dir")
-printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol3_run_dir/run.env"
+# Real prefix + version=, same reason as rdcol_run_dir above.
+rdcol3_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.fs-k8s-test-rdcol3.XXXXXX)"; tmpdirs+=("$rdcol3_run_dir")
+printf 'version=1\nRUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol3_run_dir/run.env"
 rdcol3_pod_dir="$(newdir)"; tmpdirs+=("$rdcol3_pod_dir")
 printf '{"total_cost_usd":0.1}' > "$rdcol3_pod_dir/summary.json"
 printf '99\n' > "$rdcol3_pod_dir/exit-code"
@@ -19561,6 +19653,31 @@ if [[ "$(jq -r '.branch' <<< "$rdlive2_status_json" 2>/dev/null)" == "$rdlive2_b
     ok "status --json works on the composed k8s run dir and reports the host's own facts"
 else
     no "status --json works on the composed k8s run dir and reports the host's own facts" "$rdlive2_status_json"
+fi
+if [[ "$(jq -r '.state' <<< "$rdlive2_status_json" 2>/dev/null)" == "replied" ]] \
+    && [[ "$(jq -r '.reply_file' <<< "$rdlive2_status_json" 2>/dev/null)" == "$rdlive2_run_dir/outbox/reply.md" ]]; then
+    ok "status --json on the composed k8s run dir adds state: replied and reply_file"
+else
+    no "status --json on the composed k8s run dir adds state: replied and reply_file" "$rdlive2_status_json"
+fi
+if [[ -s "$rdlive2_run_dir/outbox/reply.md" ]]; then
+    ok "collect writes outbox/reply.md for a composed k8s run"
+else
+    no "collect writes outbox/reply.md for a composed k8s run" \
+        "$(ls -la "$rdlive2_run_dir/outbox" 2>&1)"
+fi
+rdlive2_summary="$(cat -- "$rdlive2_run_dir/summary.json")"
+if [[ "$(jq -r '.outbox' <<< "$rdlive2_summary")" == "$rdlive2_run_dir/outbox" ]]; then
+    ok "summary.json carries the outbox path for a composed k8s run"
+else
+    no "summary.json carries the outbox path for a composed k8s run" "$rdlive2_summary"
+fi
+if [[ "$(jq -r '.started_at | type' <<< "$rdlive2_summary")" == "number" ]] \
+    && [[ "$(jq -r '.ended_at | type' <<< "$rdlive2_summary")" == "number" ]] \
+    && [[ "$(jq -r '.duration_seconds' <<< "$rdlive2_summary")" -ge 0 ]]; then
+    ok "summary.json carries started_at/ended_at/duration_seconds for a composed k8s run"
+else
+    no "summary.json carries started_at/ended_at/duration_seconds for a composed k8s run" "$rdlive2_summary"
 fi
 
 printf '\n== fork-sandbox-runner.sh: a pod leg'"'"'s uncommitted work is saved as a patch, never committed ==\n'
@@ -20858,6 +20975,7 @@ fi
 # The size limit is operator-tunable via k8s.env, and validated.
 sizelim_config_dir="$(newdir)"; tmpdirs+=("$sizelim_config_dir")
 cp "$config_dir/k8s.env" "$sizelim_config_dir/k8s.env"
+cp "$config_dir/claude.env" "$sizelim_config_dir/claude.env"
 printf 'K8S_LEG_VOLUME_SIZE_LIMIT=2Gi\n' >> "$sizelim_config_dir/k8s.env"
 sizelim_fixture="$(rd_make_fixture claude)"; tmpdirs+=("$sizelim_fixture")
 sizelim_out="$(newdir)/sizelim.yaml"; tmpdirs+=("$(dirname "$sizelim_out")")

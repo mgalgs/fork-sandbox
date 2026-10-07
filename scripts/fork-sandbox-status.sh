@@ -861,6 +861,30 @@ elapsed_human() {
     human_duration "$(elapsed_seconds)"
 }
 
+# `kill -0` alone cannot tell a running process from a zombie one: POSIX
+# leaves a zombie's pid allocated, not yet reaped by its parent, precisely
+# so its exit status stays collectible -- so signal 0 against it still
+# succeeds. The --resume contract rules that answer out explicitly:
+# polling must not depend on the submitter's pid being alive, because the
+# client's own PID 1 may not reap, and a finished submitter can linger as
+# a zombie indefinitely. On Linux, /proc/<pid>/stat's third field is the
+# single-letter process state, and 'Z' names exactly this case; comm
+# (field 2) is parenthesized and can itself contain ") ", so the split
+# anchors on the LAST ") " the same way fs_proc_start_time's own
+# /proc/<pid>/stat read does. Without /proc (no Linux procfs), this can
+# only fall back to kill -0's own answer.
+fs_status_pid_alive() {
+    local pid="$1" stat_line rest state
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [[ -r "/proc/$pid/stat" ]] && stat_line="$(cat -- "/proc/$pid/stat" 2>/dev/null)" \
+        && [[ -n "$stat_line" ]]; then
+        rest="${stat_line##*) }"
+        state="${rest%% *}"
+        [[ "$state" == "Z" ]] && return 1
+    fi
+    return 0
+}
+
 # starting | running | abandoned | done | failed
 run_state() {
     local rc pid
@@ -874,23 +898,43 @@ run_state() {
         return
     fi
     if ! pid="$(run_file_read pid 2>/dev/null)"; then
-        # A composed --k8s run never gets a pid file: its agent runs in a
-        # pod, not under this host's tmux, so there is no local process to
-        # record one for. Its run.env instead carries k8s_client_pid --
-        # the host-side client that submitted the pod and is waiting on
-        # it, recorded under a key fork-sandbox-stop.sh never reads, so it
-        # cannot be mistaken for a killable local runner (see that key's
-        # own writer, in fork-sandbox.sh, for why "pid" would be unsafe
-        # here). network=cluster is this shape's only tell -- a run dir
-        # that reaches this function at all already has a version=, and
-        # the only writer of version= that ever omits a pid file is this
-        # one.
+        # Neither a composed nor a plain --k8s run ever gets a pid file:
+        # the agent runs in a pod, not under this host's tmux, so there is
+        # no local process to record one for. run.env instead carries
+        # k8s_client_pid -- the host-side process watching the run through
+        # to collect (fork-sandbox.sh's own launcher, pre-exec, for a
+        # composed run; fork-sandbox-k8s.sh's cmd_run/cmd_resume,
+        # k8s_record_client_pid, for a plain one), recorded under a key
+        # fork-sandbox-stop.sh never reads, so it cannot be mistaken for a
+        # killable local runner (see that key's own writers for why "pid"
+        # would be unsafe here). network=cluster is this shape's only
+        # tell -- a run dir that reaches this function at all already has
+        # a version=, and the only writers of version= that ever omit a
+        # pid file are these.
         if [[ "$network" == "cluster" ]]; then
             local k8s_pid
             k8s_pid="$(run_env_get k8s_client_pid)"
             k8s_pid="${k8s_pid//[^0-9]/}"
-            if [[ -n "$k8s_pid" ]] && kill -0 "$k8s_pid" 2>/dev/null; then
+            if [[ -n "$k8s_pid" ]] && fs_status_pid_alive "$k8s_pid"; then
                 printf 'running'
+            elif [[ "$(run_env_get INPUTS_PUSH_EXPECTED)" == true \
+                && "$(run_env_get INPUTS_PUSH_COMPLETE)" != true ]]; then
+                # k8s_record_client_pid only runs once cmd_submit has
+                # returned to cmd_run/cmd_resume, which is after
+                # INPUTS_PUSH_COMPLETE is already written (see that
+                # writer's own comment in fork-sandbox-k8s.sh) -- so a
+                # submit still pushing the pod's inputs has no
+                # k8s_client_pid yet even though it is very much alive, so
+                # it reads "starting" (-> queued), not "abandoned", until
+                # the push is far too old to still be in progress.
+                local submitted_at
+                submitted_at="$(run_env_get SUBMITTED_AT)"
+                if [[ "$submitted_at" =~ ^[0-9]+$ ]] \
+                    && (( $(date +%s) - submitted_at > 7200 )); then
+                    printf 'abandoned'
+                else
+                    printf 'starting'
+                fi
             else
                 printf 'abandoned'
             fi
@@ -911,6 +955,39 @@ exit_code() {
     local rc
     rc="$(run_file_read exit-code 2>/dev/null)" || { printf '?'; return; }
     printf '%s' "${rc//[^0-9-]/}"
+}
+
+# The --resume contract's own state vocabulary (queued|working|replied|failed),
+# a mapping from run_state()'s starting|running|abandoned|done|failed, not a
+# replacement for it: that vocabulary is this script's human-readable prose,
+# this one is what a program polling --json compares against. abandoned has
+# no good home in four states and is reported as failed -- the run never will
+# reply, which is the fact a poller needs, not the distinction between "died"
+# and "never going to finish" that abandoned draws for a human reader.
+contract_state() {
+    case "$(run_state)" in
+        starting) printf 'queued' ;;
+        running) printf 'working' ;;
+        # exit-code lands before the fetch-back and reply.md. replied promises
+        # both, so it waits for the process that writes them to exit.
+        done)
+            if run_finalizer_alive; then printf 'working'; else printf 'replied'; fi
+            ;;
+        abandoned|failed) printf 'failed' ;;
+    esac
+}
+
+# The runner (local) or the k8s client (network=cluster): whichever process
+# finishes the run after its exit-code is written.
+run_finalizer_alive() {
+    local p
+    p="$(run_file_read pid 2>/dev/null)" || p=""
+    p="${p//[^0-9]/}"
+    if [[ -z "$p" && "$network" == "cluster" ]]; then
+        p="$(run_env_get k8s_client_pid)"
+        p="${p//[^0-9]/}"
+    fi
+    [[ -n "$p" ]] && fs_status_pid_alive "$p"
 }
 
 # end_reason: absent on every ordinary run (it ended on its own).
@@ -1185,12 +1262,32 @@ case "$mode" in
 
     json)
         # The machine-readable twin of the summary, written when the run
-        # ends. Print nothing but the JSON, so this pipes into jq.
-        if ! run_file_read summary.json; then
-            echo "Error: $run_dir has no summary.json. It is written when the" >&2
-            echo "run ends, so a run still going, or one that died before the" >&2
-            echo "fetch, does not have one yet." >&2
-            exit 1
+        # ends, now augmented with two keys a program driving a run through
+        # --resume (or any other --k8s or local run) can poll on without a
+        # separate summary.json existence check: `state`
+        # (queued|working|replied|failed -- see contract_state) and
+        # `reply_file`, the path a finished run's agent reply or fallback
+        # account lands at (see the local runner's and cmd_collect's write).
+        # A run with no summary.json yet (still going, or dead before the
+        # fetch) gets a state-only stand-in. Every key summary.json carries
+        # is passed through untouched; this only ever adds.
+        #
+        # Once summary.json exists the run is over, by definition -- state
+        # is derived from ITS OWN exit_code (the same rule run_fleet_json's
+        # fleet-member case already applies), never from run_state(), which
+        # reads exit-code/pid files a composed or --k8s run's summary.json
+        # may stand in for without either ever existing on disk.
+        reply_file_path="$run_dir/outbox/reply.md"
+        if summary_json="$(run_file_read summary.json 2>/dev/null)"; then
+            printf '%s' "$summary_json" | jq --arg reply_file "$reply_file_path" \
+                '. + {state: (if (.exit_code | type) != "number" then "failed"
+                              elif .exit_code == 0 then "replied"
+                              else "failed" end),
+                      reply_file: $reply_file}'
+        else
+            jq -n --arg state "$(contract_state)" --arg branch "$branch" \
+                --arg reply_file "$reply_file_path" \
+                '{state: $state, branch: $branch, reply_file: $reply_file}'
         fi
         ;;
 

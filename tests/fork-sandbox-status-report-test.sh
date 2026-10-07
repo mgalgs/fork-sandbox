@@ -43,8 +43,29 @@ printf 'APPROVED\nChecked: useful evidence.\n\n## Report\nfirst\n\n## Report\nse
 out="$($status --result "$rd")"
 [[ "$out" == *"== report: review leg 6 (APPROVED) — verdict, no usable report section =="* ]] || { echo "duplicate report fallback banner missing"; exit 1; }
 [[ "$out" == *$'first\n\n## Report\nsecond\n\n== the session'* ]] || { echo "duplicate report did not fall back to whole verdict"; exit 1; }
-json="$($status --json "$rd" 2>/dev/null || true)"
-[[ -z "$json" ]] || { echo "unexpected json without summary"; exit 1; }
+# --json with no summary.json yet (done-by-exit-code, but the fetch that
+# writes summary.json never ran in this fixture) now prints a state-only
+# stand-in instead of hard-failing: a poller must be able to read `state`
+# through to "replied"/"failed" without summary.json ever existing.
+json="$($status --json "$rd")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "replied" ]] \
+    || { echo "json state wrong without summary: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .branch)" == "test" ]] \
+    || { echo "json branch wrong without summary: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .reply_file)" == "$rd/outbox/reply.md" ]] \
+    || { echo "json reply_file wrong without summary: $json"; exit 1; }
+# The runner writes exit-code before its fetch-back and reply.md: while the
+# process in pid is still alive, an exit 0 is not yet a reply.
+sleep 30 & finalizer=$!
+printf '%s\n' "$finalizer" > "$rd/pid"
+json="$($status --json "$rd")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "working" ]] \
+    || { kill "$finalizer"; echo "replied while the runner was still finishing: $json"; exit 1; }
+kill "$finalizer"; wait "$finalizer" 2>/dev/null
+json="$($status --json "$rd")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "replied" ]] \
+    || { echo "not replied once the runner exited: $json"; exit 1; }
+rm -f -- "$rd/pid"
 ln -s /etc/passwd "$rd/review-verdict-4.md"
 if "$status" --result "$rd" >/dev/null 2>&1; then
     echo "symlinked verdict was accepted"; exit 1
@@ -601,14 +622,15 @@ new_run_dir
 printf '{"steps":[{"action":"code","harness":"claude","model":"haiku","repeat":1,"network":null,"fix":null}]}\n' \
     > "$rd_new/pipeline.json"
 printf '0\n' > "$rd_new/exit-code"
-printf '{"branch":"test"}\n' > "$rd_new/summary.json"
+printf '{"branch":"test","exit_code":0}\n' > "$rd_new/summary.json"
 out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 rc=$?
 [[ $rc -eq 0 && "$out" != *"is not a fork-sandbox run file"* ]] \
     || { echo "plain status choked on a run dir carrying pipeline.json (rc=$rc): $out"; exit 1; }
 json="$(timeout 12 "$status" --json "$rd_new" 2>&1)"
 rc=$?
-[[ $rc -eq 0 && "$json" == '{"branch":"test"}' ]] \
+[[ $rc -eq 0 && "$(printf '%s' "$json" | jq -r .branch)" == "test" \
+    && "$(printf '%s' "$json" | jq -r .state)" == "replied" ]] \
     || { echo "--json choked on a run dir carrying pipeline.json (rc=$rc): $json"; exit 1; }
 
 # 11b. The actual, checkable claim: resolve_run_file's literal-name allowlist
@@ -770,18 +792,27 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" == *"state:    failed (exit 143, after "*", stop timeout kill)"* ]] \
     || { echo "stop-timeout end_reason not read from the run-log fallback: $out"; exit 1; }
 
-# 18. --json on one run dir, no --set, stays exactly the bare object it
-# always was -- byte-identical, fixture-diffed rather than substring
-# matched -- and the hard exit 1 on a missing summary.json is untouched.
+# 18. --json on one run dir, no --set, carries every pre-existing key of
+# the bare object untouched -- fixture-diffed on the subset, rather than
+# substring matched -- plus the new additive state/reply_file keys. The
+# hard exit 1 on a missing summary.json is gone; see the --resume contract
+# cases above.
 new_run_dir
 printf '{"branch":"test","exit_code":0,"total_cost_usd":1.25}\n' > "$rd_new/summary.json"
 out="$("$status" --json "$rd_new" 2>&1)"
-[[ "$out" == '{"branch":"test","exit_code":0,"total_cost_usd":1.25}' ]] \
-    || { echo "single-dir --json is no longer byte-identical to the pre-fleet shape: $out"; exit 1; }
+[[ "$(printf '%s' "$out" | jq -c '{branch,exit_code,total_cost_usd}')" \
+    == '{"branch":"test","exit_code":0,"total_cost_usd":1.25}' ]] \
+    || { echo "single-dir --json dropped or changed a pre-existing key: $out"; exit 1; }
+[[ "$(printf '%s' "$out" | jq -r .state)" == "replied" ]] \
+    || { echo "single-dir --json state wrong: $out"; exit 1; }
+# 18b. --json on a run dir with no summary.json at all no longer hard-exits
+# -- it prints the state-only stand-in (queued, here: no exit-code, no pid,
+# so run_state() reads "starting") -- the behavior change the --resume
+# contract cases above exist to prove.
 new_run_dir
-if "$status" --json "$rd_new" >/dev/null 2>&1; then
-    echo "--json on a run dir with no summary.json did not hard-exit"; exit 1
-fi
+out="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$out" | jq -r .state)" == "queued" ]] \
+    || { echo "--json on a run dir with no summary.json had the wrong state: $out"; exit 1; }
 
 # 19. 2+ dirs, no --set: the wrapper shape, runs in argument order.
 new_run_dir; rdX="$rd_new"
@@ -1211,4 +1242,36 @@ out="$("$status" "$rd_new" 2>&1)"
 [[ "$out" != *"job:"* ]] \
     || { echo "a composed k8s run dir with no recorded job name printed a job line anyway: $out"; exit 1; }
 
-echo "88 passed, 0 failed"
+# 9. --json on a run whose summary.json already exists: state and
+# reply_file are added on top, and every key summary.json already carried
+# (branch, exit_code, harness) stays exactly as written -- additive, never
+# a rename.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-json-summary
+origin_repo=/tmp/origin
+clone_dir=/tmp/clone
+started_at=$(date +%s)
+EOF
+cat > "$rd_new/summary.json" <<'EOF'
+{"branch":"test-json-summary","exit_code":0,"harness":"claude"}
+EOF
+json="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "replied" ]] \
+    || { echo "json state wrong with a done summary: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .reply_file)" == "$rd_new/outbox/reply.md" ]] \
+    || { echo "json reply_file wrong with a done summary: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .branch)" == "test-json-summary" ]] \
+    || { echo "json dropped the existing branch key: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .harness)" == "claude" ]] \
+    || { echo "json dropped an unrelated existing key: $json"; exit 1; }
+
+# 9b. The same, but a nonzero exit_code: state reads failed, not replied.
+printf '{"branch":"test-json-summary","exit_code":1,"harness":"claude"}' \
+    > "$rd_new/summary.json"
+json="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "failed" ]] \
+    || { echo "json state wrong with a failed summary: $json"; exit 1; }
+
+echo "90 passed, 0 failed"

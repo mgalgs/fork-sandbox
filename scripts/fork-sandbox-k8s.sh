@@ -269,8 +269,8 @@
 # local and k8s runs agree on defaults and refusals (pi is refused).
 #
 # --outbox-dir DIR (run, collect): where to land the pod's /work/outbox after the
-# agent finishes. Defaults to
-# /var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox. Pulled back over
+# agent finishes. Defaults to the run directory's outbox for a run with a
+# run directory; a standalone collect uses the branch's scratch directory. Pulled back over
 # the same kubectl exec channel fetch uses, through
 # fork-sandbox-k8s-outbox-extract.sh, which refuses the whole archive if it
 # is oversized or contains anything unsafe (absolute paths, `..` components,
@@ -5046,10 +5046,16 @@ cmd_submit() {
     local refresh_at="" refresh_enabled=0 refresh_max="" refresh_context_window=""
     local refresh_threshold_tokens="" refresh_ceiling_tokens=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
+    # Internal: set only by fork-sandbox.sh's own --resume orchestration,
+    # which is the one caller that deliberately targets a branch it
+    # expects to already exist (the moving draft a prior run in the same
+    # state dir left behind) -- see fs_check_branch_free's call below.
+    local allow_existing_branch=false
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
+            --allow-existing-branch) allow_existing_branch=true; shift ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
             --extra-ref) extra_refs_raw+=("${2:?--extra-ref requires NAME=SHA}"); shift 2 ;;
@@ -5673,7 +5679,11 @@ cmd_submit() {
     fi
     local origin_repo
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
-    fs_check_branch_free "$origin_repo" "$branch" || exit 1
+    # --allow-existing-branch skips this: fast-forward-only is enforced at
+    # fetch-back time instead (cmd_fetch's own non-force refspec), which is
+    # the property a continuation actually needs -- the branch being
+    # already there is the point, not a collision.
+    $allow_existing_branch || fs_check_branch_free "$origin_repo" "$branch" || exit 1
 
     # The pod image for this run: --image, then K8S_PROJECT_IMAGES's entry
     # for this project's basename, then K8S_IMAGE -- see resolve_run_image's
@@ -6904,17 +6914,8 @@ EOF
     # exists, so its own trap could not yet reference run_dir too).
     trap 'rm -f -- "${K8S_SUBMIT_SESSION_TAR:-}"; [[ "$run_dir_created_here" == true ]] && rm -rf -- "$run_dir"' EXIT
 
-    # Printed as soon as the directory exists, not only once submit
-    # finishes: a submit that dies below at the repository push or any
-    # kubectl create still leaves this directory on disk, populated with
-    # whatever submit had established by then, and with nothing printed
-    # there would be no way for an orchestrator -- or an operator cleaning
-    # up by hand -- to learn it exists at all. (A death during the context
-    # spool just above the cluster work, by contrast, takes this directory
-    # with it -- see the trap set right after this directory was created
-    # -- but this line still ran first, so that failure is attributable
-    # too, even though there is no longer anything on disk to point at.)
-    # Same line shape
+    # The run dir is printed after run.env is written below, so a client
+    # can poll status --json as soon as it receives the path. Same line shape
     # fork-sandbox.sh's own local launcher prints (two leading spaces,
     # "run dir:", two spaces), so a caller fanning out -- this project's
     # own test suites, or an external panel launcher calling
@@ -6922,7 +6923,6 @@ EOF
     # scrapes it with the identical `sed -n 's/^  run dir:  *//p'` either
     # path uses, and gets the same value whether this submit goes on to
     # succeed or not.
-    printf '  run dir:  %s\n' "$run_dir" >&2
 
     # The run's provenance, when the launching shell declared one -- same
     # absence convention and same file name as fork-sandbox.sh's own local
@@ -7015,7 +7015,22 @@ EOF
     # precisely so this line, the only writer of it, decides.
     local run_env_redirect=">"
     [[ -n "$run_dir_flag" ]] && run_env_redirect=">>"
+    local submit_started_at
+    submit_started_at="$(date +%s)"
     {
+        # version= and started_at=: a standalone submit (no --run-dir) is
+        # the ONLY writer of run.env for a plain --k8s run, and
+        # fork-sandbox-status.sh hard-refuses any run directory without a
+        # version= key at all (see that script's own version= check) --
+        # today's gap this closes. Runner mode never prints these: the
+        # launcher's own writer (fork-sandbox.sh, before this submit ever
+        # ran) already did, and run_env_redirect's append here must not
+        # produce a second version= line for read_env_value/run_env_get's
+        # first-match-wins rule to still mean the launcher's value.
+        if [[ -z "$run_dir_flag" ]]; then
+            printf 'version=1\n'
+            printf 'started_at=%s\n' "$submit_started_at"
+        fi
         printf 'mode=run\n'
         printf 'harness=%s\n' "$harness"
         printf 'network=cluster\n'
@@ -7041,7 +7056,7 @@ EOF
         printf 'REVIEW_LOOP=%s\n' "$review_loop_recorded"
         printf 'KEEP=%s\n' "$keep"
         printf 'TIMEOUT=%s\n' "$run_timeout"
-        printf 'SUBMITTED_AT=%s\n' "$(date +%s)"
+        printf 'SUBMITTED_AT=%s\n' "$submit_started_at"
         # Written at the FIRST write: a run.env carrying this key promises
         # INPUTS_PUSH_COMPLETE=true follows once the pod has its inputs, and
         # `resume` (which a restarted postmaster's adopt path runs) refuses
@@ -7095,6 +7110,7 @@ EOF
     else
         mv -f -- "$run_dir/run.env.submit-part" "$run_dir/run.env"
     fi
+    printf '  run dir:  %s\n' "$run_dir" >&2
 
     K8S_LAST_SUBMIT_RUN_DIR="$run_dir"
 
@@ -7589,17 +7605,31 @@ cmd_fetch() {
     # firing on any Git command that performs reference updates, fetch
     # included -- so a hook in project_path's repo would otherwise run here
     # as well.
+    # A caller that wraps this call in `if`/`!` (cmd_collect, below) needs
+    # the fetch's own exit status to tell a lost fast-forward race from a
+    # landed one -- under set -euo pipefail this bare command would
+    # otherwise take the whole process down right here on a rejected
+    # fetch, with no chance for a caller to catch it at all, so the rc is
+    # captured explicitly instead of left to propagate on its own.
+    local fetch_rc=0
     (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null fetch --quiet \
         "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i -c agent $pod_name -- git-upload-pack /work/clone" \
-        "refs/heads/$branch:refs/heads/$branch")
+        "refs/heads/$branch:refs/heads/$branch") || fetch_rc=$?
 
+    # Touched regardless of the fetch's own outcome: it is the pod's
+    # signal to stop idling and exit, and a rejected fetch (the branch
+    # moved in $origin_repo while the pod ran) is not a reason to leave
+    # the pod running any longer than a landed one would.
     kubectl exec -c agent "$pod_name" -- sh -c 'touch /work/.fetched' || true
+    if (( fetch_rc != 0 )); then
+        echo "fork-sandbox-k8s: warning: fetching branch '$branch' from pod $pod_name failed (exit $fetch_rc) -- most likely a non-fast-forward (the branch moved in $origin_repo while the pod ran); its old tip there is untouched." >&2
+        return "$fetch_rc"
+    fi
     echo "fork-sandbox-k8s: fetched into $origin_repo as branch $branch" >&2
 
-    # set -euo pipefail above already stopped this function if the fetch
-    # itself failed, so reaching here means the branch exists in
-    # $origin_repo -- the only precondition fs_apply_upstream needs. It
-    # never fails the fetch: it always returns 0.
+    # Reaching here means the branch exists in $origin_repo at the pod's
+    # tip -- the only precondition fs_apply_upstream needs. It never fails
+    # the fetch itself: it always returns 0.
     local upstream_line
     upstream_line="$(fs_apply_upstream "$origin_repo" "$branch" "$upstream" "$upstream_reason")"
     echo "$upstream_line" >&2
@@ -8446,8 +8476,16 @@ cmd_collect() {
     # bounded with --request-timeout: a hung connection may now delay the
     # fetch, but it cannot hang indefinitely.
     local outbox_dest="$outbox_dir"
-    [[ -n "$outbox_dest" ]] \
-        || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
+    if [[ -z "$outbox_dest" ]]; then
+        if [[ -n "$run_dir" ]]; then
+            outbox_dest="$run_dir/outbox"
+        else
+            outbox_dest="$FS_SCRATCH_ROOT/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
+            # A later run or re-collect of this branch must start with its
+            # own artifacts. The extractor refuses a nonempty destination.
+            rm -rf -- "$outbox_dest" "$(dirname -- "$outbox_dest")/evidence"
+        fi
+    fi
     local outbox_tar outbox_err outbox_ok=true outbox_rc=0
     local outbox_agent_count=0 outbox_operator_count=0
     outbox_tar="$(mktemp)"
@@ -9072,6 +9110,17 @@ cmd_collect() {
             fi
         fi
         [[ -n "$run_dir_pull_tmp" && -e "$run_dir_pull_tmp" ]] && rm -rf -- "$run_dir_pull_tmp"
+    elif [[ -n "$run_dir" && "$evidence_ok" == true && -s "$evidence_dir/events.jsonl" && ! -e "$run_dir/events.jsonl" ]]; then
+        # Runner mode copies its own events*.jsonl straight into run_dir
+        # above (the run_dir_pull_entry allowlist); a legacy (non-runner)
+        # --k8s run never goes through that pull at all, and its
+        # transcript landed only in evidence_dir, a SIBLING of run_dir, not
+        # inside it -- fork-sandbox-status.sh (and this function's own
+        # reply.md write, below) only ever look under run_dir. Mirrored
+        # here, read-only evidence copied in verbatim, so a plain --k8s
+        # run's status/result/reply.md read exactly as a local or composed
+        # run's would. `-e` guards a re-collect that already has one.
+        cp -- "$evidence_dir/events.jsonl" "$run_dir/events.jsonl" 2>/dev/null || true
     fi
 
     # The agent's own exit code, from the sentinel the entrypoint writes
@@ -9144,7 +9193,17 @@ cmd_collect() {
         [[ -n "$upstream_from_env" ]] && fetch_argv+=(--upstream "$upstream_from_env")
         [[ -n "$upstream_reason_from_env" ]] && fetch_argv+=(--upstream-none "$upstream_reason_from_env")
     fi
-    cmd_fetch "${fetch_argv[@]}" "$project_path"
+    # Wrapped in `if`, not called bare: under set -euo pipefail a bare
+    # call would take this whole process down the moment cmd_fetch's own
+    # git fetch lost a fast-forward race, with no summary.json ever
+    # written at all -- the `if` suppresses that for this whole call
+    # (cmd_fetch's own rc capture, inside, needs exactly this to work; see
+    # its own comment). cmd_fetch already touches /work/.fetched and warns
+    # on this path, so there is nothing left to do here but remember it.
+    local fetch_ok=true
+    if ! cmd_fetch "${fetch_argv[@]}" "$project_path"; then
+        fetch_ok=false
+    fi
     after_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
     if [[ -n "$base_sha" ]]; then
         [[ "$base_sha" == "$after_sha" ]] && zero_commits=true
@@ -9195,6 +9254,7 @@ cmd_collect() {
         local run_log_harness run_log_model run_log_commits=""
         local run_log_claude_source="" run_log_claude_via=""
         local run_log_image="" run_log_image_source=""
+        local run_log_exit_code run_log_started_at run_log_ended_at run_log_duration_block
         run_log_harness="$(read_env_value "$run_dir/run.env" harness || true)"
         run_log_model="$(read_env_value "$run_dir/run.env" model || true)"
         run_log_image="$(read_env_value "$run_dir/run.env" image || true)"
@@ -9289,6 +9349,63 @@ cmd_collect() {
             run_log_tidy_has_maintain=true
             [[ -s "$run_dir/tidy.json" ]] && run_log_tidy_json="$(cat -- "$run_dir/tidy.json")"
         fi
+        # exit_code: a fetch that lost the fast-forward race (fetch_ok=
+        # false, above) overrides a clean agent exit the same way the
+        # local runner's own rc override does -- a run that "succeeded"
+        # with its work stranded, unreachable from the branch the caller
+        # was told to expect, must not report done. A harness-side failure
+        # (agent_exit_code already nonzero) is left exactly as the agent
+        # reported it; this never clears an existing failure, only adds one.
+        run_log_exit_code="${agent_exit_code:-null}"
+        if [[ "$fetch_ok" != true ]] && [[ "${agent_exit_code:-0}" == "0" ]]; then
+            run_log_exit_code=1
+        fi
+        # The agent's reply, when present, is the file the client reads.
+        # Otherwise render the session account at that path. The pod's
+        # fetch_back=0 skips this host-side fallback.
+        # Written BEFORE summary.json (below), not after: --json's own
+        # contract_state calls a run "replied" the moment summary.json
+        # exists, so writing reply.md afterward -- worse, best-effort,
+        # possibly never -- let a poller see "replied" with a reply_file
+        # that was not there yet or never would be. A render failure is
+        # folded into run_log_exit_code the same way a lost fetch-back race
+        # already is, just above, rather than silently reported as success
+        # with nothing to read.
+        local reply_ok=true
+        if [[ "$outbox_ok" == true && -f "$outbox_dest/reply.md" && ! -L "$outbox_dest/reply.md" ]]; then
+            mkdir -p -- "$run_dir/outbox" 2>/dev/null \
+                && { [[ "$outbox_dest" == "$run_dir/outbox" ]] \
+                    || cp -- "$outbox_dest/reply.md" "$run_dir/outbox/reply.md"; } \
+                || reply_ok=false
+        else
+            mkdir -p -- "$run_dir/outbox" 2>/dev/null \
+                && "$script_dir/fork-sandbox-status.sh" --result "$run_dir" \
+                    > "$run_dir/outbox/reply.md" 2>/dev/null \
+                || reply_ok=false
+        fi
+        if [[ "$reply_ok" == true ]]; then
+            :
+        elif [[ "${agent_exit_code:-0}" == "0" ]]; then
+            run_log_exit_code=1
+        fi
+        # started_at/ended_at/duration_seconds: a plain --k8s run's
+        # summary.json never carried these at all (the local run's own
+        # summary.json has always had them) -- started_at is read back from
+        # run.env, written at submit time (either by THIS script's own
+        # standalone writer, above, or by fork-sandbox.sh's launcher writer
+        # in runner mode); ended_at is simply now, since collect is what
+        # decides a run is over. Left out of the object (not emitted as
+        # null) when started_at cannot be read at all, rather than claim a
+        # duration that was never measured.
+        run_log_started_at="$(read_env_value "$run_dir/run.env" started_at 2>/dev/null || true)"
+        run_log_ended_at="$(date +%s)"
+        run_log_duration_block='{}'
+        if [[ "$run_log_started_at" =~ ^[0-9]+$ ]]; then
+            run_log_duration_block="$(jq -n --argjson started_at "$run_log_started_at" \
+                --argjson ended_at "$run_log_ended_at" \
+                '{started_at: $started_at, ended_at: $ended_at,
+                  duration_seconds: ($ended_at - $started_at)}')"
+        fi
         if jq -n \
             --arg mode "run" \
             --arg harness "$run_log_harness" \
@@ -9300,9 +9417,11 @@ cmd_collect() {
             --arg origin_repo "$origin_repo" \
             --arg run_dir "$run_dir" \
             --arg base_sha "$base_sha" \
-            --argjson exit_code "${agent_exit_code:-null}" \
-            --argjson fetched true \
+            --argjson exit_code "$run_log_exit_code" \
+            --argjson fetched "$fetch_ok" \
             --arg commits "$run_log_commits" \
+            --arg outbox "$outbox_dest" \
+            --argjson duration_block "$run_log_duration_block" \
             --arg claude_credentials_source "$run_log_claude_source" \
             --arg claude_credentials_via "$run_log_claude_via" \
             --arg session_state "$pull_session_state" \
@@ -9323,6 +9442,7 @@ cmd_collect() {
                 base_sha: (if $base_sha == "" then null else $base_sha end),
                 exit_code: $exit_code,
                 fetched: $fetched,
+                outbox: $outbox,
                 commits: (if $commits == "" then null else ($commits | tonumber) end),
             }
             + (if $claude_credentials_via == "" then {} else {
@@ -9334,7 +9454,8 @@ cmd_collect() {
                 session_id: (if $session_id == "" then null else $session_id end),
             } end)
             + (if $tidy_has_maintain_step then {tidy: $tidy} else {} end)
-            + $refresh_block' > "$run_dir/summary.json.part" 2>/dev/null; then
+            + $refresh_block
+            + $duration_block' > "$run_dir/summary.json.part" 2>/dev/null; then
             mv -f -- "$run_dir/summary.json.part" "$run_dir/summary.json"
         else
             rm -f -- "$run_dir/summary.json.part"
@@ -9440,8 +9561,15 @@ cmd_collect() {
         # wait is over) always has agent_exit_code set by this point, so an
         # empty value here means a standalone collect against a pod whose
         # agent never finished, which must not fabricate a done/failed state.
+        # $run_log_exit_code, not raw $agent_exit_code: a lost fast-forward
+        # race already overrode that above to a failure even when the agent
+        # itself exited 0, and this is the one file every terminal-state
+        # consumer (status --json, --monitor-terminal, `run --wait`) reads
+        # as the run's own outcome -- writing the agent's unoverridden code
+        # here would let all of them report success for a run whose branch
+        # never landed, while summary.json alone said otherwise.
         if [[ -n "$agent_exit_code" && ! -e "$run_dir/exit-code" ]]; then
-            printf '%s\n' "$agent_exit_code" > "$run_dir/exit-code" 2>/dev/null || true
+            printf '%s\n' "$run_log_exit_code" > "$run_dir/exit-code" 2>/dev/null || true
         fi
     fi
 
@@ -9494,6 +9622,36 @@ cmd_collect() {
         echo "fork-sandbox-k8s: ################################################" >&2
     else
         cmd_rm --branch "$branch"
+    fi
+}
+
+# Records this process as the one watching $1 (a run dir) through to
+# collect. fork-sandbox-status.sh's run_state() already treats
+# k8s_client_pid, under network=cluster, as a liveness signal (never a
+# kill target -- that branch's own comment explains why) for a composed
+# --k8s run, whose host-side launcher writes it before exec'ing into this
+# script with the same pid. A plain `run`/`resume` (this file's own
+# submit+wait+collect verbs) reaches that exact same shape -- one process,
+# alive from here through collect -- but cmd_submit's own run.env writer
+# never prints this key, because a bare `submit` alone has no wait/collect
+# to follow and must not claim this pid speaks for the whole run. Called
+# only from cmd_run and cmd_resume, the two callers that DO commit to
+# seeing a run through, right before each hands off to k8s_run_tail below
+# -- without it, run_state() reads every plain --k8s run as "abandoned"
+# for its entire active life (no local pid file, network=cluster, and no
+# k8s_client_pid key at all), long before any Job failure actually
+# happened. Rewrites the key in place (the cost=/model=/outbox_bytes=
+# quartet's own idiom) rather than appending, so a resume by a new process
+# after an old one died replaces the stale pid instead of leaving it as
+# the first, authoritative match.
+k8s_record_client_pid() {
+    local run_dir="$1"
+    [[ -n "$run_dir" && -f "$run_dir/run.env" ]] || return 0
+    if grep -v '^k8s_client_pid=' "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
+        printf 'k8s_client_pid=%s\n' "$$" >> "$run_dir/run.env.part"
+        mv -f "$run_dir/run.env.part" "$run_dir/run.env"
+    else
+        rm -f "$run_dir/run.env.part"
     fi
 }
 
@@ -9567,10 +9725,24 @@ k8s_run_tail() {
     [[ -n "$run_dir" ]] && collect_argv+=(--run-dir "$run_dir")
     cmd_collect "${collect_argv[@]}" "$project_path"
 
+    # cmd_collect's own exit status is not captured (see the comment
+    # above this function's wait, on why) -- but $agent_rc alone is not
+    # this run's real outcome either: a lost fast-forward race makes
+    # collect overwrite $run_dir/exit-code with a failure even when the
+    # agent itself exited 0 (see that write, inside cmd_collect). Read
+    # the corrected value back rather than report the agent's raw code
+    # here, so this process's own exit status agrees with exit-code and
+    # summary.json instead of contradicting both of them.
+    local tail_rc="$agent_rc" exit_code_written
+    if [[ -n "$run_dir" ]] && exit_code_written="$(tr -dc '0-9-' < "$run_dir/exit-code" 2>/dev/null)" \
+        && [[ "$exit_code_written" =~ ^-?[0-9]+$ ]]; then
+        tail_rc="$exit_code_written"
+    fi
+
     # The one line this verb prints that none of its three phases can: it
     # reports the agent's exit code, which collect does not know.
     echo "fork-sandbox-k8s: run complete. branch=$branch agent_exit=$agent_rc landed_in=$project_path" >&2
-    exit "$agent_rc"
+    exit "$tail_rc"
 }
 
 # resume: run's tail for a run submit already created; see the header.
@@ -9633,6 +9805,7 @@ cmd_resume() {
         exit 1
     fi
 
+    k8s_record_client_pid "$run_dir"
     k8s_run_tail "$run_dir" "$branch" "$timeout" "$project" \
         "$outbox_dir" "$outbox_max_bytes" "$review_loop" "$keep"
 }
@@ -9650,10 +9823,12 @@ cmd_run() {
     local thread_dir="" attach_dir="" image_flag="" run_dir_flag=""
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
+    local allow_existing_branch=false
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
+            --allow-existing-branch) allow_existing_branch=true; shift ;;
             --keep) keep=true; shift ;;
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; timeout_given=true; shift 2 ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
@@ -9844,6 +10019,7 @@ cmd_run() {
     [[ -n "$checkout_ref" ]] && submit_argv+=(--checkout "$checkout_ref")
     [[ -n "$services_trust_ref" ]] && submit_argv+=(--services-trust-ref "$services_trust_ref")
     [[ -n "$task_meta" ]] && submit_argv+=(--task-meta "$task_meta")
+    $allow_existing_branch && submit_argv+=(--allow-existing-branch)
     # Unconditional, unlike the scalar flags above: an empty labels_raw
     # array is itself the "no --label given" signal, so the loop simply
     # forwards nothing rather than needing a separate -n guard.
@@ -9877,6 +10053,7 @@ cmd_run() {
     # docs/kubernetes-runs.md.
     local run_dir="$K8S_LAST_SUBMIT_RUN_DIR"
 
+    k8s_record_client_pid "$run_dir"
     k8s_run_tail "$run_dir" "$branch" "$timeout" "$project_path" \
         "$outbox_dir" "$outbox_max_bytes" "$review_loop_cap" "$keep"
 }

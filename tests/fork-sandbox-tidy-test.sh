@@ -1086,6 +1086,48 @@ else
     no "T-B16: a run whose branch name collides mid-run still exits 0"
 fi
 
+# T-P1 (not a tidy case at all: a PLAIN pipeline, no maintain/tidy step,
+# whose target branch collides mid-run the same way T-B16's does). Before
+# this fix, a plain fetch that lost this race left fetched: false in
+# summary.json but exit-code/rc at whatever the agent itself exited with --
+# a run that silently "succeeded" with its work stranded in the clone only.
+# approved-clobber's own verdict-file write is inert here (no review/
+# maintain loop reads it); only its origin-clobbering side effect matters.
+# run_stubbed itself is not reusable for this one: it treats the launch's
+# own nonzero exit as a setup failure and prints no run dir -- exactly the
+# outcome this case means to produce on purpose -- so this calls $launcher
+# directly and scrapes the run dir from its output regardless of rc, the
+# same "  run dir:  " pattern run_stubbed's own sed uses.
+clobber_branch_p="sandbox-test-tidy-plain-clobber-$$"
+prep_stub 'approved-clobber'
+outp1="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+    FAKE_SCRIPT="$script_file" FAKE_COMMIT_COUNT="$commit_count" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND="${FORK_SANDBOX_BACKEND:-fake-image}" \
+    FS_LEG_RETRY_DELAYS="${FS_LEG_RETRY_DELAYS:-0 0}" \
+    FAKE_CLOBBER_BRANCH="$clobber_branch_p" \
+    timeout 60 "$launcher" --foreground --harness claude \
+        --branch "$clobber_branch_p" "$proj" "$handoff" 2>&1)"
+rc_p1=$?
+rdp1="$(printf '%s\n' "$outp1" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rdp1" ]]; then
+    tmpdirs+=("$rdp1")
+    check "T-P1: a plain run whose branch name collides mid-run exits nonzero" \
+        "1" "$rc_p1"
+    check "T-P1: exit-code file reports failure, not the agent's own 0" \
+        "1" "$(cat "$rdp1/exit-code" 2>/dev/null)"
+    check "T-P1: summary.json.exit_code agrees with exit-code" \
+        "1" "$(jq -r '.exit_code' "$rdp1/summary.json" 2>/dev/null)"
+    check "T-P1: summary.json.fetched is false" \
+        "false" "$(jq -r '.fetched' "$rdp1/summary.json" 2>/dev/null)"
+    check "T-P1: the origin branch still holds the colliding commit, not this run's work" \
+        "an unrelated commit that appeared on this branch name while the run was in flight" \
+        "$(git -C "$proj" log -1 --format=%s "refs/heads/$clobber_branch_p")"
+else
+    no "T-P1: a plain run whose branch name collides mid-run exits nonzero" \
+        "no run dir in output (rc=$rc_p1): $outp1"
+fi
+
 # T-B17 (finding, restore path): the same collision, but this time the tidy
 # leg itself is discarded (a tree-changing squash), so publish goes through
 # the tidy_restore branch instead -- the one that republishes the approved
