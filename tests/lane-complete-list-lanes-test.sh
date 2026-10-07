@@ -62,6 +62,77 @@ peer${tab}hostone"
 check "live first, then mailbox-only, then peers; deduped; invalid and self dropped" \
     "$want" "$(list)"
 
+# Remote lanes: the From: of a stored message, header block only.
+msg() {  # msg <thread> <file>; the message on stdin
+    mkdir -p "$scratch/root/threads/$1"
+    cat > "$scratch/root/threads/$1/$2.msg"
+}
+msg t1 001-a <<'EOF'
+Message-ID: m1
+From: @builder:hostb
+To: @alpha
+Subject: hello
+
+Plain body.
+EOF
+msg t1 002-b <<'EOF'
+Message-ID: m2
+From: @builder:hostb
+To: @alpha
+Subject: again
+
+Duplicate sender.
+EOF
+msg t2 001-c <<'EOF'
+Message-ID: m3
+From: @alpha
+To: @onlyto:farhost, @mistyped:otherhost
+Cc: @onlycc:ccghost
+Subject: nobody answers
+
+From: @inbody:bodyhost
+EOF
+msg t3 001-d <<'EOF'
+Message-ID: m4
+From: @ownlane:selfhost
+To: @alpha
+Subject: from this host
+
+EOF
+msg t4 001-e <<'EOF'
+Message-ID: m5
+From: @Bad Lane:hostx
+To: @alpha
+Subject: bad names
+
+EOF
+msg t4 002-f <<'EOF'
+Message-ID: m6
+From: @good-lane:-badhost
+To: @alpha
+Subject: bad host
+
+EOF
+msg t5 001-g <<'EOF'
+Message-ID: m7
+From: @second:hosttwo
+Subject: another sender
+
+EOF
+want="live${tab}alpha
+mailbox${tab}beta
+remote${tab}builder:hostb
+remote${tab}second:hosttwo
+peer${tab}hostone"
+check "remote lanes: From: headers only; own host, dups, malformed, To, Cc, body excluded" \
+    "$want" "$(list)"
+printf 'From: @notamsg:hostz\n' > "$scratch/root/threads/t5/note.txt"
+check "non-message files in the store are ignored" "$want" "$(list)"
+rm -rf "$scratch/root/threads"
+check "no thread store: only the original sources" "live${tab}alpha
+mailbox${tab}beta
+peer${tab}hostone" "$(list)"
+
 check "--help prints the header" "list-lanes.sh -- Print the lane-mail lanes the lane-complete mod can offer" \
     "$(list --help | head -1)"
 list --bogus >/dev/null 2>&1; check "unknown argument exits 1" "1" "$?"

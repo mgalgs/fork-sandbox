@@ -7,6 +7,8 @@
 #
 #   live     a lane some session registered (`lane-mail.sh register`)
 #   mailbox  a lane that only has a mailbox under the lane-mail root
+#   remote   a lane on another host that has written to this one: the `From:`
+#            address (`@lane:host`) of a message in the local thread store
 #   peer     a peer host from the peers file (a lane on it is `@lane:<peer>`)
 #
 # Every path comes from the lane-mail scripts themselves, so this never holds
@@ -17,8 +19,16 @@
 # directory is the checkout this mod sits in (mods/lane-complete/../../scripts)
 # or, for a mod installed elsewhere, wherever lane-mail.sh is on PATH.
 #
-# Read-only and quick (a few directory listings); the mod calls it from a
-# background timer, never per keystroke. Exits 1 with the reason on stderr
+# The remote source reads only the header block (up to the first blank line)
+# of each message under $LANE_MAIL_ROOT/threads, and only its `From:` line: a
+# mistyped To:/Cc: nobody answered, or a body that quotes an address, never
+# makes a candidate. Addresses on this host's own peer name are skipped. It is
+# offline (no ssh, no peer query) -- a lane that has never written here is not
+# offered, only reachable as `@lane:host` by typing.
+#
+# Read-only and quick (a few directory listings and one pass over the local
+# message store); the mod calls it from a background timer, never per
+# keystroke. Exits 1 with the reason on stderr
 # when the lane-mail scripts cannot be found.
 
 set -euo pipefail
@@ -75,9 +85,30 @@ for d in "$LANE_MAIL_ROOT"/agents/*/; do
     [[ "$lane" =~ $LANE_MAIL_LANE_RE ]] && emit mailbox "$lane"
 done
 
+self="$(lane_mail_self_name || true)"
+
+# Senders: the From: of every stored message, headers only. awk prints each
+# distinct value once; the names are validated here, as for the other sources.
+# shellcheck disable=SC2016  # the awk program is meant to be literal
+if [[ -d "$LANE_MAIL_ROOT/threads" ]]; then
+    while IFS= read -r from; do
+        [[ "$from" =~ ^@([^:]+):([^:]+)$ ]] || continue
+        lane="${BASH_REMATCH[1]}" host="${BASH_REMATCH[2]}"
+        [[ "$lane" =~ $LANE_MAIL_LANE_RE && "$host" =~ $LANE_MAIL_HOST_RE ]] || continue
+        [[ "$host" == "$self" ]] && continue
+        emit remote "$lane:$host"
+    done < <(find "$LANE_MAIL_ROOT/threads" -mindepth 2 -maxdepth 2 -name '*.msg' -type f -print0 2>/dev/null |
+        xargs -0 -r awk '
+            FNR == 1 { head = 1 }
+            head && /^[ \t\r]*$/ { head = 0 }
+            head && /^From:/ {
+                v = substr($0, 6); gsub(/^[ \t]+|[ \t\r]+$/, "", v)
+                if (!(v in got)) { got[v] = 1; print v }
+            }' | sort -u)
+fi
+
 peers="$(lane_mail_peers_file)"
 if [[ -f "$peers" ]]; then
-    self="$(lane_mail_self_name || true)"
     while IFS= read -r row || [[ -n "$row" ]]; do
         [[ -z "$row" || "$row" == \#* ]] && continue
         read -r peer _ <<<"$row"

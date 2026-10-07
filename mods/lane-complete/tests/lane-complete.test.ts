@@ -248,6 +248,17 @@ test('parseLanes orders live, mailbox, then peers, drops bad names', () => {
   expect(lanes.map(l => l.address)).toEqual(['@alpha', '@beta', '@alpha:hostone', '@beta:hostone'])
 })
 
+test('parseLanes lists remote lanes after mailbox lanes, once, and drops malformed ones', () => {
+  const out = parseLanes('live\talpha\nremote\tbuilder:hostb\nremote\tbuilder:hostb\nremote\tBad:host\nremote\tnohost\nremote\ta:b:c\npeer\thostb\n')
+  expect(out.map(l => l.address)).toEqual(['@alpha', '@builder:hostb', '@alpha:hostb'])
+  expect(out[1]?.source).toBe('remote')
+})
+
+test('a remote lane from the thread store counts as known on submit', () => {
+  const known = parseLanes('remote\tbuilder:hostb\n')
+  expect(mentions('ask @builder:hostb, then @builder:other', known)).toEqual(['@builder:hostb'])
+})
+
 test('matchLanes puts prefix matches before substring matches', () => {
   const found = matchLanes([{ address: '@xalpha', source: 'live' }, { address: '@alpha', source: 'live' }], 'alp')
   expect(found.map(l => l.address)).toEqual(['@alpha', '@xalpha'])

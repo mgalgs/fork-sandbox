@@ -8,7 +8,7 @@ import type { LanePicker } from '../types'
 export type Lane = {
   /** The lane-mail address as it is typed: `@lane` or `@lane:host`. */
   address: string
-  source: 'live' | 'mailbox' | 'peer'
+  source: 'live' | 'mailbox' | 'remote' | 'peer'
 }
 
 /** The part of a prompt.edit input the picker reads. */
@@ -34,21 +34,29 @@ export type Step = {
 export const VISIBLE = 6
 
 const NAME = /^[a-z0-9][a-z0-9.-]*$/
+const REMOTE = /^[a-z0-9][a-z0-9-]*:[a-z0-9][a-z0-9.-]*$/
 const FILTER_CHARS = /^[A-Za-z0-9:.-]+$/
 
 /**
  * Parses list-lanes.sh output (`<source>\t<name>` lines) into addresses:
- * live lanes, then mailbox-only lanes, then each local lane qualified with
- * each peer host (the peers file names hosts, not their lanes, and a lane is
- * usually run on both ends of a link).
+ * live lanes, then mailbox-only lanes, then remote lanes that have written
+ * here (`lane:host`), then each local lane qualified with each peer host (the
+ * peers file names hosts, not their lanes, and a lane is usually run on both
+ * ends of a link).
  */
 export function parseLanes(stdout: string): Lane[] {
   const live: string[] = []
   const mailbox: string[] = []
+  const remote: string[] = []
   const peers: string[] = []
   for (const line of stdout.split('\n')) {
     const [source, name] = line.split('\t')
-    if (name === undefined || !NAME.test(name)) continue
+    if (name === undefined) continue
+    if (source === 'remote') {
+      if (REMOTE.test(name)) remote.push(name)
+      continue
+    }
+    if (!NAME.test(name)) continue
     if (source === 'live') live.push(name)
     else if (source === 'mailbox') mailbox.push(name)
     else if (source === 'peer') peers.push(name)
@@ -62,6 +70,7 @@ export function parseLanes(stdout: string): Lane[] {
   }
   for (const name of live) add(`@${name}`, 'live')
   for (const name of mailbox) add(`@${name}`, 'mailbox')
+  for (const name of remote) add(`@${name}`, 'remote')
   for (const name of [...live, ...mailbox]) {
     for (const peer of peers) add(`@${name}:${peer}`, 'peer')
   }

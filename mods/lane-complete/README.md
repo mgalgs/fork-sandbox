@@ -17,8 +17,9 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
   because Claude Code sends no Enter or Backspace to a mod for an empty one.
 - The characters you type next filter the list: prefix matches first, then
   substring matches. The list is live lanes (registered sessions), then lanes
-  that only have a mailbox, then each of those qualified with each peer host
-  from the peers file (`@lane:host`).
+  that only have a mailbox, then remote lanes that have written to this host
+  (see below), then each local lane qualified with each peer host from the
+  peers file (`@lane:host`).
 - Enter inserts the highlighted match (the top one until you move it, see
   Keys) where the `@` was, followed by a space. It does not send the prompt. With no match, the `@` and what you typed are put back
   as plain text (also not sent).
@@ -33,6 +34,27 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
   (`lane-mail.sh send --from @<own lane> --to @<lane> --subject ... --body -`).
   Whether to send, or only to refer to the lane, is Claude's call from your
   wording. The mod never sends anything itself.
+
+## Remote lanes that have written here
+
+A lane on another host, such as `@builder:hostb`, is offered once it has
+sent this host a message. `bin/list-lanes.sh` reads the headers of every
+message in the local thread store (`$LANE_MAIL_ROOT/threads/`) and takes each
+`From: @lane:host` address. Picking one inserts the full `@lane:host`, and a
+prompt that mentions it gets the same lane-mail note as a local lane.
+
+Limits:
+
+- Only `From:` counts. A `To:` or `Cc:` address (a mistyped one nobody
+  answered, say) is never offered, and neither is an address quoted in a
+  message body: only the header block, up to the first blank line, is read.
+- A lane that has never written here is not offered; type it as
+  `@lane:host` (or pick the peer-qualified form of a local lane name).
+- Addresses on this host's own peer name are skipped; malformed lane or host
+  names are dropped.
+- Offline: no ssh and no peer query, just one pass over the local store each
+  time the list is refreshed. A lane that stops writing stays listed for as
+  long as its messages are kept.
 
 ## Keys
 
