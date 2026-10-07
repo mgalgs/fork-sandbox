@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { LanePicker } from '../types'
-import { VISIBLE, finish, matchLanes, mentionContext, mentions, parseLanes, step } from './lanes'
+import { MARK, VISIBLE, finish, matchLanes, mentionContext, mentions, parseLanes, shown, step } from './lanes'
 import type { Lane } from './lanes'
 
 // How often the lane list is re-read, in the background; never per keystroke.
@@ -45,22 +45,27 @@ export const register: Register = on => {
     const result = step(open, lanes, e)
     if (result.picker !== open) await update($, picker, () => result.picker)
 
+    if (result.replay !== undefined) return next({ ...e, ...result.replay })
     return result.box ?? next(e)
   })
 
-  // Enter with the picker open is the choice, not a send: the typed filter
-  // lives in the picker, not the box, so the submit is dropped and the whole
-  // box put back with the best match (or, with none, what was typed) in it.
+  // Enter with the picker open is the choice, not a send: the submit is
+  // dropped and the box put back with the best match (or, with none, as it
+  // stands, `@` and filter in it as plain text) in place of the `@` and what was typed.
   // Otherwise a submit never rewrites the text: it only adds a note for the
   // model when the prompt names a lane.
   on('prompt.submit', async ($, e, next) => {
     const open = await read($, picker)
     if (open !== null) {
       await update($, picker, () => null)
-      const box = finish(open, lanes, e.text)
-      // The cursor ends at the box's end: fill has no way to place it.
-      await $.prompt.fill({ text: box.text, mode: 'replace' })
-      return { drop: 'lane picked' }
+      if (e.text.trim() === shown(open).text.trim()) {
+        // The cursor ends at the box's end: fill has no way to place it.
+        await $.prompt.fill({ text: finish(open, lanes).text, mode: 'replace' })
+        return { drop: 'lane picked' }
+      }
+      // A box that is not the one shown was changed behind the picker: send it
+      // as it is, with a real `@` for any mark left in it.
+      e = { ...e, text: e.text.replaceAll(MARK, '@') }
     }
 
     const named = mentions(e.text, lanes)

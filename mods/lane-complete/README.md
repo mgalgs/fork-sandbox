@@ -6,9 +6,12 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
 
 ## What it does
 
-- `@` typed at a word start (start of the box, or after whitespace) is
-  swallowed and opens a picker in the band above the prompt. A mid-word `@`
-  (an email address) is left alone.
+- `@` typed at a word start (start of the box, or after whitespace) opens a
+  picker in the band above the prompt. A mid-word `@` (an email address) is
+  left alone. While the picker is open the box shows a full-width `＠` and what
+  you have typed after it (`＠al`). It is not an ASCII `@` because that opens
+  Claude Code's own menu over the picker; and the box must not be empty,
+  because Claude Code sends no Enter or Backspace to a mod for an empty one.
 - The characters you type next filter the list: prefix matches first, then
   substring matches. The list is live lanes (registered sessions), then lanes
   that only have a mailbox, then each of those qualified with each peer host
@@ -16,8 +19,9 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
 - Enter inserts the top match where the `@` was, followed by a space. It does
   not send the prompt. With no match, the `@` and what you typed are put back
   as plain text (also not sent).
-- A space or other non-lane character, or a cursor move, cancels: the `@` and
-  what you typed are put back as plain text.
+- A space or other non-lane character, or a cursor move, cancels: the `＠` and
+  what you typed become a plain `@` and text (and Claude Code's own menu may
+  open on it).
 - `@@`: a second `@` right after the first closes the picker and lets a single
   `@` through, so Claude Code's own agent/file menu opens as usual.
 - With no lanes known, `@` is not swallowed at all.
@@ -37,7 +41,7 @@ picker uses none of them; Enter reaches it as a submit.
 | --- | --- |
 | letters, digits, `-` `.` `:` | filter |
 | Enter | insert the top match (the band's `>` row); nothing is sent |
-| Backspace | trim the filter; on an empty filter, drop the `@` |
+| Backspace | trim the filter; on an empty filter, drop the `＠` |
 | `@` (on an empty filter) | `@@`: close, pass one `@` to the stock menu |
 | space or other punctuation, a cursor move | not a lane: cancel, keeping what was typed |
 

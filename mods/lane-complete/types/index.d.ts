@@ -2,7 +2,7 @@
 export type LanePicker = {
   /** Where the picked address goes: the cursor when the picker opened. */
   anchor: number
-  /** The box text the picker opened on; a different text means it is stale. */
+  /** The box text the picker opened on, without the `@` and filter it shows in the box; a box other than the one shown means it is stale. */
   text: string
   /** What the operator has typed since the swallowed `@`; Enter takes its best match. */
   filter: string

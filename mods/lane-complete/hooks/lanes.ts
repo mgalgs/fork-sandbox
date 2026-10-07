@@ -26,6 +26,8 @@ export type Step = {
   picker: LanePicker | null
   /** Set: answer the edit with this box and never call `next` (the key is ours). */
   box?: { text: string; cursor: number }
+  /** Set: pass the edit on to `next` as if typed into this box (the `@` of an `@@`). */
+  replay?: { text: string; cursor: number; start: number; end: number }
 }
 
 /** How many matches the band shows at once. */
@@ -88,82 +90,103 @@ function isWordStart(text: string, at: number): boolean {
   return at === 0 || /\s/.test(text.charAt(at - 1))
 }
 
-/** The box with the picker's choice at its anchor; one space after it unless one follows. */
-function accept(p: LanePicker, text: string, address: string) {
-  const at = Math.min(p.anchor, text.length)
-  const space = /\s/.test(text.charAt(at)) ? '' : ' '
-  return splice(text, at, `${address}${space}`)
-}
-
-/** The box with what the operator typed put in as plain text: `@` and the filter. */
-function literal(p: LanePicker, text: string, extra = '') {
-  return splice(text, Math.min(p.anchor, text.length), `@${p.filter}${extra}`)
+/** The box with the picker's choice at its anchor, in place of the `@` and filter; one space after it unless one follows. */
+function accept(p: LanePicker, address: string) {
+  const at = Math.min(p.anchor, p.text.length)
+  const space = /\s/.test(p.text.charAt(at)) ? '' : ' '
+  return splice(p.text, at, `${address}${space}`)
 }
 
 /**
- * The box an Enter pressed with the picker open leaves: the best match at the
- * anchor, or what was typed as plain text when nothing matches. The picker
- * swallowed the typed characters, so the submitted `text` has none of them;
- * the caller drops the submit and puts this box back (a submit also trims
- * the box's ends, which `finish` undoes where it can).
+ * What stands in the box for the `@` while the picker is open: a full-width
+ * commercial at, which looks like one but is not one to Claude Code's own
+ * `@` menu (an ASCII `@` in the box opens that menu over the picker).
  */
-export function finish(p: LanePicker, lanes: readonly Lane[], submitted: string) {
-  // A submit trims the box ("ask " arrives as "ask"), which would put the
-  // anchor past its end: the text the picker opened on is the truer base then.
-  const text = submitted.trim() === p.text.trim() ? p.text : submitted
+export const MARK = '\uFF20'
+
+/**
+ * The box while the picker is open: the mark and what was typed after it sit
+ * in the text at the anchor, so the box is never empty (Claude Code fires no
+ * submit and no Backspace edit for an empty one) and the operator sees what
+ * they typed. `p.text` is the box without them.
+ */
+export function shown(p: LanePicker) {
+  return splice(p.text, Math.min(p.anchor, p.text.length), `${MARK}${p.filter}`)
+}
+
+/** A box as `shown` made it, with a real `@` where the mark is: what a cancel leaves. */
+export function unmarked(p: LanePicker, text: string) {
+  const at = Math.min(p.anchor, text.length)
+  return text.charAt(at) === MARK ? `${text.slice(0, at)}@${text.slice(at + 1)}` : text
+}
+
+/**
+ * The box an Enter pressed with the picker open leaves: the best match in
+ * place of the `@` and filter, or with none the `@` and filter as plain text.
+ * The caller drops the submit and puts this box back.
+ */
+export function finish(p: LanePicker, lanes: readonly Lane[]) {
   const best = matchLanes(lanes, p.filter)[0]
-  return best === undefined ? literal(p, text) : accept(p, text, best.address)
+  return best === undefined ? { text: unmarked(p, shown(p).text), cursor: shown(p).cursor } : accept(p, best.address)
 }
 
 /**
  * One prompt.edit through the picker. `picker` is null while closed. A closed
  * picker opens on a swallowed word-start `@` (only when there are lanes to
- * pick: with none, the `@` goes on to the stock menu); an open one swallows
- * every edit until it closes.
+ * pick: with none, the `@` goes on to the stock menu), answering with the box
+ * that has the `@` in it; an open one swallows every edit until it closes.
  *
  * Only keys the editor takes as an edit reach prompt.edit: Enter, Tab, Esc and
  * the arrows Up/Down never do, so none of them is handled here. Enter arrives
  * as a prompt.submit and is answered by `finish`.
  */
 export function step(picker: LanePicker | null, lanes: readonly Lane[], e: Edit): Step {
-  // A picker opened on another text is stale (the box was cleared or changed
-  // behind it): forget it and treat this edit as one with no picker.
-  if (picker !== null && picker.text !== e.text) picker = null
+  // A picker whose box is not the one shown is stale (the box was cleared or
+  // changed behind it): forget it and treat this edit as one with no picker.
+  if (picker !== null && shown(picker).text !== e.text) picker = null
 
   if (picker === null) {
     const isAt = e.inputText === '@' && e.start === e.end && isWordStart(e.text, e.start)
     if (!isAt || lanes.length === 0) return { picker: null }
     const opened = { anchor: e.start, text: e.text, filter: '' }
-    return { picker: opened, box: { text: e.text, cursor: e.cursor } }
+    return { picker: opened, box: shown(opened) }
   }
 
   const key = e.key
   const name = key !== undefined && key.key.length > 1 ? key.key : undefined
   const isMod = key !== undefined && (key.ctrl === true || key.meta === true)
-  const keep = (next: LanePicker) => ({ picker: next, box: { text: e.text, cursor: e.cursor } })
-  const close = (box?: { text: string; cursor: number }): Step => ({
-    picker: null,
-    box: box ?? { text: e.text, cursor: e.cursor },
-  })
+  const open = (next: LanePicker): Step => ({ picker: next, box: shown(next) })
+  // Closed with the box as the edit leaves it, `@` and filter kept as plain text.
+  const close = (box: { text: string; cursor: number }): Step => ({ picker: null, box })
 
   // Backspace trims the filter; on an empty one it undoes the `@` itself.
   const isBackspace = name === 'backspace' || (name === undefined && e.inputText === '' && e.end > e.start && !isMod)
   if (isBackspace) {
-    if (picker.filter === '') return close()
-    return keep({ ...picker, filter: picker.filter.slice(0, -1) })
+    if (picker.filter === '') return close({ text: picker.text, cursor: Math.min(picker.anchor, picker.text.length) })
+    return open({ ...picker, filter: picker.filter.slice(0, -1) })
   }
 
-  // `@@`: a second `@` right after the swallowed one goes on to the stock menu.
-  if (e.inputText === '@' && picker.filter === '') return { picker: null }
+  // `@@`: a second `@` right after the swallowed one goes on to the stock
+  // menu, as the one `@` it would have been: the edit is replayed on the box
+  // without ours.
+  if (e.inputText === '@' && picker.filter === '') {
+    const at = Math.min(picker.anchor, picker.text.length)
+    return { picker: null, replay: { text: picker.text, cursor: at, start: at, end: at } }
+  }
 
   if (name === undefined && !isMod && FILTER_CHARS.test(e.inputText)) {
-    return keep({ ...picker, filter: picker.filter + e.inputText.toLowerCase() })
+    return open({ ...picker, filter: picker.filter + e.inputText.toLowerCase() })
   }
 
-  // Anything else (a space, punctuation, a paste of prose, an unknown key)
-  // is not a lane: give the operator back what they typed, as plain text.
-  if (name === undefined && !isMod && e.inputText !== '') return close(literal(picker, e.text, e.inputText))
-  return close(literal(picker, e.text))
+  // Anything else (a space, punctuation, a paste of prose, a cursor move, an
+  // unknown key) is not a lane: the `@` and what was typed stay as plain text,
+  // with the character typed after them.
+  if (name === undefined && !isMod && e.inputText !== '') {
+    const kept = unmarked(picker, e.text)
+    const text = kept.slice(0, e.start) + e.inputText + kept.slice(e.end)
+    return close({ text, cursor: e.start + e.inputText.length })
+  }
+  return close({ text: unmarked(picker, e.text), cursor: e.cursor })
 }
 
 /**
