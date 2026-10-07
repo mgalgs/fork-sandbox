@@ -265,7 +265,10 @@ cd ~/src/fork-sandbox
 ```
 
 Everything installs as symlinks back into the checkout, so upgrading is
-`git pull`.
+`git pull`. That is safe with runs in flight: a run executes a snapshot of
+the scripts it was launched from (see "How a run works"), so the checkout can
+move — a pull, a merge, a branch switch, even a move or delete — without
+changing what any running run does.
 
 A run clones its project out of `~/src` by default; keep projects elsewhere
 and add your own root(s) to `PROJECT_ROOTS` in
@@ -304,6 +307,25 @@ touched. In detail:
 4. **Read the branch.** It is fetched back into your repo. Review it like a
    pull request from a stranger — a `Makefile` or a `package.json` script in
    it runs on *your* host the moment you build.
+
+**A run executes a launch-time snapshot of its own scripts.** At launch, a
+local run copies the whole `scripts/` directory of the checkout it was
+launched from into `<run-dir>/scripts`, and everything the run executes from
+then on comes from that copy, at every leg: what `run.sh` sources, the sandbox
+wrapper and backend each leg is launched through, the formatter, the hooks
+staged into the sandbox, `--refresh-at` continuations, re-running `run.sh` in
+the run dir, and the run-log writer at the very end. The checkout's `pi-agent/` (the sandbox's
+pi configuration, which `agent-sandboxed` finds beside the scripts it runs from)
+is snapshotted to `<run-dir>/pi-agent` the same way. Inside the sandbox, the
+`~/.claude/scripts` farm's links into that checkout resolve to the snapshot
+too (it is bound read-only at the checkout's own path), so skills calling a
+helper get the launch-time version; links into *other* checkouts stay live.
+So the checkout is free to move while runs are in flight, and a run dir is
+self-sufficient: deleting the checkout does not break a refresh continuation
+or the run log. The operator commands you run from the host against a run dir
+— `status`, `say`, `stop`, `log` — are not part of the run and use the live
+checkout, with the run dir's file layout as their contract. (A `--k8s` pod run
+receives its own, smaller set of scripts; see [docs/kubernetes-runs.md](docs/kubernetes-runs.md).)
 
 Only committed work is fetched — a file the session edited but never
 committed is never brought into step 4; it stays behind in the clone,
