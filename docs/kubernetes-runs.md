@@ -2887,6 +2887,80 @@ anything is applied, with an error naming the key. Only the shape is checked,
 not whether the limit is big enough. The `LimitRange` beside it (per-container
 defaults) is not configurable.
 
+### The agent's container resources
+
+A pod's work-running container names no resources of its own, so it takes
+the `LimitRange` default: limit 1 cpu / 2Gi, request 250m / 512Mi. A seat
+running a large test suite can outgrow 2Gi and be OOMKilled. Four optional
+`k8s.env` keys set explicit resources on the container that runs the agent's
+work, and on it only — the egress-gate init container, the per-run
+claude-proxy pods and the postmaster are untouched, and the `LimitRange` and
+quota defaults do not change. Which container that is depends on the pod's
+shape:
+
+- **Single-leg (fixed-skeleton) pod:** the one container, named `agent`.
+- **Composed (`--run-dir`) pod:** the `leg` container, which runs every leg
+  (the claude/pi sessions and the test suites; see "Composed pipelines on
+  `--k8s`"). The `agent` container there is the pipeline walker; it gets no
+  explicit resources and keeps the `LimitRange` default, as every container
+  did before these keys existed.
+
+The keys are named `K8S_AGENT_*` in both shapes. There are no separate
+`K8S_LEG_*` keys: one set of keys means "the container that runs the agent's
+work", which is why the name reads oddly on a composed pod, where that
+container is called `leg`.
+
+| Key                        | Default                 | Shape                                    |
+| -------------------------- | ----------------------- | ---------------------------------------- |
+| `K8S_AGENT_REQUESTS_CPU`    | unset (see below: the limit, else `LimitRange` `250m`) | cpu quantity: `2`, `0.5`, `500m`    |
+| `K8S_AGENT_REQUESTS_MEMORY` | unset (see below: the limit, else `LimitRange` `512Mi`) | integer, optional suffix: `512Mi`, `6G` |
+| `K8S_AGENT_LIMITS_CPU`      | unset (`LimitRange`: `1`)    | cpu quantity                        |
+| `K8S_AGENT_LIMITS_MEMORY`   | unset (`LimitRange`: `2Gi`)  | integer, optional suffix            |
+
+Each key is independent: an unset key renders no field, so with none set
+both pod shapes are rendered exactly as before, and setting only
+`K8S_AGENT_LIMITS_MEMORY` renders only that limit. What the admitted pod
+gets for the field that was left out is not the same everywhere, though. The
+rendered YAML names no request, but Kubernetes defaults an unset request to
+the container's limit when the limit is set, before the `LimitRange` is
+consulted. So `K8S_AGENT_LIMITS_MEMORY=6Gi` on its own yields a `6Gi` memory
+request, not the `LimitRange` default `512Mi`, and likewise
+`K8S_AGENT_LIMITS_CPU` alone yields a cpu request equal to that limit. The
+`LimitRange` default request applies only when the limit is unset too. Set a
+request alongside every limit, as the worked example below does, unless you
+want the seat to reserve its whole limit. Because the keys live in
+`k8s.env`, they apply to every pod `submit` creates — including the seats the
+in-cluster postmaster launches, whose pod carries the same `k8s.env` (re-run
+`install --postmaster` after changing it; see
+[cluster-postmaster.md](cluster-postmaster.md)).
+
+A worked example for a memory-hungry seat:
+
+```
+K8S_AGENT_LIMITS_MEMORY=6Gi
+K8S_AGENT_REQUESTS_MEMORY=1Gi
+```
+
+Every value is checked before anything is applied, and a failure names the
+key: a malformed or zero quantity; a request above its limit; a limit above
+the `LimitRange` max (4 cpu / 8Gi), which would otherwise surface as a pod
+admission rejection at submit time; and a request above the `LimitRange`
+default limit while its own limit is unset (the pod would get a limit below
+its request). Memory takes integers only (`1536Mi`, not `1.5Gi`).
+
+The namespace quota has to leave room for seats at this size.
+`K8S_QUOTA_LIMITS_MEMORY` (default `40Gi`) counts the limits of every pod in
+the namespace: at `6Gi` per single-leg seat that fits six concurrent seats
+(a composed seat also holds the walker's `2Gi` default, so `8Gi` and five
+seats), less whatever the proxy and postmaster pods hold, and `K8S_QUOTA_REQUESTS_MEMORY`
+(default `20Gi`) bounds the requests the same way, and the request is what
+a seat reserves: with only a `6Gi` limit set the request is `6Gi` too, so
+three seats fit, not six, and the scheduler needs `6Gi` free on a node for
+each. Setting `K8S_AGENT_REQUESTS_MEMORY=1Gi` beside it keeps the request
+small. A seat that does not fit
+waits for room (below); raise the quota keys with `install` when panels
+outgrow it.
+
 ### A full quota is waited on
 
 When the quota has no room, `submit` waits instead of failing. Two refusals

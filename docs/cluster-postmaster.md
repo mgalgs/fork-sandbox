@@ -357,6 +357,15 @@ that needs more sets `K8S_QUOTA_PODS` in `k8s.env` and re-runs `install`; see
 submitted while the quota is full waits for room (`K8S_QUOTA_WAIT_SECONDS`)
 rather than failing.
 
+A seat's container that runs the agent's work takes the namespace
+`LimitRange` default (2Gi memory limit) unless `k8s.env` sets
+`K8S_AGENT_LIMITS_MEMORY` and its siblings. That is the single `agent`
+container of a fixed-skeleton seat and the `leg` container of a composed
+(`--run-dir`) seat; a composed seat's `agent` (walker) container keeps the
+default. The postmaster pod carries the same `k8s.env`, so the keys apply to
+the seats it launches once `install --postmaster` has been re-run; see "The
+agent's container resources" in [kubernetes-runs.md](kubernetes-runs.md).
+
 ## Storage
 
 Two PVCs back the pod. The data volume, `fork-sandbox-postmaster`, mounts at

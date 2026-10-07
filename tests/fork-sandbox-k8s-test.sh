@@ -1237,6 +1237,147 @@ else
     no "rendered Job sets automountServiceAccountToken: false" "not found in $submit_out"
 fi
 
+printf '\n== K8S_AGENT_* keys: explicit requests/limits on the agent container only ==\n'
+# Unset keys must leave the agent container exactly as it was (the namespace
+# LimitRange default applies); each key set adds only its own field.
+agent_container_of() { awk '/^        - name: agent$/ {on=1} on && /^          env:$/ {exit} on'; }
+agent_res_render() {
+    # agent_res_render CONFIG_DIR -> the submit --dry-run render on stdout
+    FORK_SANDBOX_CONFIG_DIR="$1" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-agent-res --model moonshotai/kimi-k3 \
+        "$proj_dir" "$handoff_file" 2>/dev/null
+}
+agent_res_cfg() {
+    # agent_res_cfg KEY=VAL... -> a new config dir: the base fixture plus those lines
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    { cat "$config_dir/k8s.env"; (( $# )) && printf '%s\n' "$@"; } > "$d/k8s.env"
+    install -m 600 "$config_dir/pi.env" "$d/pi.env"
+    printf '%s' "$d"
+}
+check "no K8S_AGENT_* keys set: the agent container has no resources stanza, exactly as before" \
+    '        - name: agent
+          image: registry.example/you/fork-sandbox:latest
+          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]' \
+    "$(agent_container_of < "$submit_out")"
+if grep -q '^ *resources:' "$submit_out"; then
+    no "no K8S_AGENT_* keys set: no container in the Job has a resources stanza" "$(grep -n 'resources:' "$submit_out")"
+else
+    ok "no K8S_AGENT_* keys set: no container in the Job has a resources stanza"
+fi
+
+agent_res_all_out="$(agent_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_CPU=500m \
+    K8S_AGENT_REQUESTS_MEMORY=1Gi K8S_AGENT_LIMITS_CPU=2 K8S_AGENT_LIMITS_MEMORY=6Gi)")"
+check "all four K8S_AGENT_* keys set render the full stanza on the agent container" \
+    '        - name: agent
+          image: registry.example/you/fork-sandbox:latest
+          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "6Gi"' \
+    "$(agent_container_of <<< "$agent_res_all_out")"
+check "the stanza is on the agent container only (egress-gate init container untouched)" \
+    "1" "$(grep -c '^ *resources:' <<< "$agent_res_all_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(printf '%s\n' "$agent_res_all_out" | yamllint - 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: submit --dry-run with all K8S_AGENT_* keys set"; else no "yamllint: submit --dry-run with all K8S_AGENT_* keys set" "$out"; fi
+fi
+
+# Each key alone adds exactly its one field, and nothing else.
+for agent_one in \
+    'K8S_AGENT_REQUESTS_CPU=500m|requests|cpu|500m' \
+    'K8S_AGENT_REQUESTS_MEMORY=1Gi|requests|memory|1Gi' \
+    'K8S_AGENT_LIMITS_CPU=2|limits|cpu|2' \
+    'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi'; do
+    IFS='|' read -r agent_one_kv agent_one_sect agent_one_field agent_one_val <<< "$agent_one"
+    check "${agent_one_kv%%=*} alone adds exactly that one field" \
+        "          resources:
+            $agent_one_sect:
+              $agent_one_field: \"$agent_one_val\"" \
+        "$(agent_container_of <<< "$(agent_res_render "$(agent_res_cfg "$agent_one_kv")")" | sed -n '4,$p')"
+done
+agent_res_empty_out="$(agent_res_render "$(agent_res_cfg K8S_AGENT_LIMITS_MEMORY= K8S_AGENT_REQUESTS_CPU=)")"
+check "keys set to the empty string count as unset" \
+    "$(agent_container_of < "$submit_out")" "$(agent_container_of <<< "$agent_res_empty_out")"
+
+# Everything outside the agent container's own stanza is unchanged.
+check "the rest of the Job renders identically with the keys set" \
+    "$(grep -v -e '^ *resources:$' -e '^ *requests:$' -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$agent_res_all_out")" \
+    "$(agent_res_render "$config_dir")"
+
+# The built-in LimitRange constants the early check uses must be the manifest's.
+check "the early limit check's ceiling is the LimitRange max in the manifest" \
+    "4 8Gi" "$(awk '/max:/ {on=1} on && /cpu:/ {gsub(/"/,"",$2); c=$2} on && /memory:/ {m=$2} END {print c, m}' "$repo_dir/manifests/k8s/00-namespace.yaml")"
+check "the K8S_AGENT_* validator names the same ceiling" \
+    "4 8Gi" "$(sed -n 's/^K8S_LIMITRANGE_MAX_CPU=\(.*\)$/\1/p;s/^K8S_LIMITRANGE_MAX_MEMORY=\(.*\)$/\1/p' "$k8s_sh" | paste -sd' ')"
+
+# Bad values fail before anything is applied, naming the key. Every case is
+# refused by both `install` (stubbed kubectl, empty call log) and
+# `submit --dry-run`.
+agent_bad_cases=(
+    'bad cpu|K8S_AGENT_REQUESTS_CPU=four|K8S_AGENT_REQUESTS_CPU|a Kubernetes cpu quantity'
+    'bad cpu suffix|K8S_AGENT_LIMITS_CPU=2Gi|K8S_AGENT_LIMITS_CPU|a Kubernetes cpu quantity'
+    'negative cpu|K8S_AGENT_LIMITS_CPU=-1|K8S_AGENT_LIMITS_CPU|a Kubernetes cpu quantity'
+    'zero cpu|K8S_AGENT_LIMITS_CPU=0|K8S_AGENT_LIMITS_CPU|a Kubernetes cpu quantity'
+    'yaml-injecting cpu|K8S_AGENT_REQUESTS_CPU=1: 2|K8S_AGENT_REQUESTS_CPU|a Kubernetes cpu quantity'
+    'bad memory|K8S_AGENT_LIMITS_MEMORY=lots|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
+    'GB is not a quantity|K8S_AGENT_LIMITS_MEMORY=6GB|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
+    'cpu unit on memory|K8S_AGENT_REQUESTS_MEMORY=500m|K8S_AGENT_REQUESTS_MEMORY|a Kubernetes memory quantity'
+    'zero memory|K8S_AGENT_REQUESTS_MEMORY=0|K8S_AGENT_REQUESTS_MEMORY|a Kubernetes memory quantity'
+    'quoted memory|K8S_AGENT_LIMITS_MEMORY="6Gi"|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
+    'CR in memory|K8S_AGENT_LIMITS_MEMORY=6Gi'$'\r''|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
+    'memory request above limit|K8S_AGENT_REQUESTS_MEMORY=4Gi K8S_AGENT_LIMITS_MEMORY=2Gi|K8S_AGENT_REQUESTS_MEMORY|is above K8S_AGENT_LIMITS_MEMORY'
+    'cpu request above limit, mixed units|K8S_AGENT_REQUESTS_CPU=2 K8S_AGENT_LIMITS_CPU=1500m|K8S_AGENT_REQUESTS_CPU|is above K8S_AGENT_LIMITS_CPU'
+    'memory request above limit, mixed units|K8S_AGENT_REQUESTS_MEMORY=3G K8S_AGENT_LIMITS_MEMORY=2Gi|K8S_AGENT_REQUESTS_MEMORY|is above K8S_AGENT_LIMITS_MEMORY'
+    'memory limit above the LimitRange max|K8S_AGENT_LIMITS_MEMORY=9Gi|K8S_AGENT_LIMITS_MEMORY|above the namespace LimitRange max'
+    'memory limit above max, decimal unit|K8S_AGENT_LIMITS_MEMORY=9G|K8S_AGENT_LIMITS_MEMORY|above the namespace LimitRange max'
+    'cpu limit above the LimitRange max|K8S_AGENT_LIMITS_CPU=5|K8S_AGENT_LIMITS_CPU|above the namespace LimitRange max'
+    'cpu limit above max, millicores|K8S_AGENT_LIMITS_CPU=4001m|K8S_AGENT_LIMITS_CPU|above the namespace LimitRange max'
+    'memory request alone above the default limit|K8S_AGENT_REQUESTS_MEMORY=4Gi|K8S_AGENT_REQUESTS_MEMORY|is above the LimitRange default limit'
+    'cpu request alone above the default limit|K8S_AGENT_REQUESTS_CPU=2|K8S_AGENT_REQUESTS_CPU|is above the LimitRange default limit'
+)
+for agent_bad in "${agent_bad_cases[@]}"; do
+    IFS='|' read -r agent_bad_label agent_bad_kvs agent_bad_key agent_bad_what <<< "$agent_bad"
+    read -r -a agent_bad_arr <<< "$agent_bad_kvs"
+    agent_bad_dir="$(agent_res_cfg "${agent_bad_arr[@]}")"
+    : > "$quota_kubectl_log"
+    refuses "$agent_bad_label ($agent_bad_kvs) is refused by install, naming $agent_bad_key" \
+        "Error: $agent_bad_key in " \
+        env PATH="$quota_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$agent_bad_dir" "$k8s_sh" install
+    refuses "$agent_bad_label: the error says why" \
+        "$agent_bad_what" \
+        env PATH="$quota_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$agent_bad_dir" "$k8s_sh" install
+    if [[ -s "$quota_kubectl_log" ]]; then
+        no "$agent_bad_label never reaches kubectl" "$(cat "$quota_kubectl_log")"
+    else
+        ok "$agent_bad_label never reaches kubectl"
+    fi
+    refuses "$agent_bad_label is refused by submit --dry-run too" \
+        "Error: $agent_bad_key in " \
+        env FORK_SANDBOX_CONFIG_DIR="$agent_bad_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-agent-res --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file"
+done
+
+# Boundary values the checks must accept: request equal to limit, limit
+# equal to the LimitRange max, a request within the default limit.
+for agent_ok_kvs in \
+    'K8S_AGENT_REQUESTS_MEMORY=2Gi K8S_AGENT_LIMITS_MEMORY=2048Mi' \
+    'K8S_AGENT_LIMITS_MEMORY=8Gi K8S_AGENT_LIMITS_CPU=4' \
+    'K8S_AGENT_LIMITS_CPU=4000m' \
+    'K8S_AGENT_REQUESTS_CPU=1000m' \
+    'K8S_AGENT_REQUESTS_MEMORY=2Gi' \
+    'K8S_AGENT_REQUESTS_MEMORY=6Gi K8S_AGENT_LIMITS_MEMORY=6Gi'; do
+    read -r -a agent_ok_arr <<< "$agent_ok_kvs"
+    if agent_res_render "$(agent_res_cfg "${agent_ok_arr[@]}")" | grep -q '^ *resources:'; then
+        ok "accepted: $agent_ok_kvs"
+    else
+        no "accepted: $agent_ok_kvs" "no resources stanza rendered"
+    fi
+done
+
 printf '\n== submit: --allow-namespace / --reach-probe flag parsing and validation ==\n'
 # --reach-probe requires --allow-namespace, and vice versa: a grant the gate
 # never exercises is not verified, and a probe with nothing to verify is
@@ -18398,6 +18539,50 @@ env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_badmail_wd/log" FORK_SANDBOX_CON
 check "storage: a refused real install exits 1" "1" "$?"
 check "storage: a refused real install applies nothing" "0" "$(cat "$pm_badmail_wd/log" 2>/dev/null | grep -c 'apply')"
 
+printf '\n== install --postmaster: K8S_AGENT_* keys reach a postmaster-launched seat ==\n'
+# The postmaster pod's own k8s.env IS the laptop's, shipped whole as a
+# ConfigMap, and a seat the pod launches reads it like a laptop run does. So
+# the keys need no plumbing of their own: this proves it end to end by
+# taking the k8s.env out of the rendered ConfigMap and rendering a seat's
+# pod spec from it.
+pm_ar_cfg="$(newdir)"; tmpdirs+=("$pm_ar_cfg")
+cp -r "$pm_cfg1"/. "$pm_ar_cfg"/
+chmod 600 "$pm_ar_cfg/deploy-key" "$pm_ar_cfg/pi.env"
+printf 'K8S_AGENT_REQUESTS_MEMORY=1Gi\nK8S_AGENT_LIMITS_MEMORY=6Gi\n' >> "$pm_ar_cfg/k8s.env"
+pm_ar_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_ar_log")")
+pm_ar_out="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_ar_log" FORK_SANDBOX_CONFIG_DIR="$pm_ar_cfg" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
+pm_ar_pod_cfg="$(newdir)"; tmpdirs+=("$pm_ar_pod_cfg")
+awk '/^  k8s\.env: \|$/ {on=1; next} on && /^    / {sub(/^    /, ""); print; next} on {exit}' \
+    <<< "$pm_ar_out" > "$pm_ar_pod_cfg/k8s.env"
+check "the postmaster ConfigMap's k8s.env carries the K8S_AGENT_* keys" \
+    "K8S_AGENT_REQUESTS_MEMORY=1Gi
+K8S_AGENT_LIMITS_MEMORY=6Gi" "$(grep '^K8S_AGENT_' "$pm_ar_pod_cfg/k8s.env")"
+install -m 600 "$pm_ar_cfg/pi.env" "$pm_ar_pod_cfg/pi.env"
+check "a seat rendered from the pod's k8s.env gets the stanza" \
+    '          resources:
+            requests:
+              memory: "1Gi"
+            limits:
+              memory: "6Gi"' \
+    "$(agent_container_of <<< "$(agent_res_render "$pm_ar_pod_cfg")" | sed -n '4,$p')"
+
+# A bad value is refused at install --postmaster, before anything is applied.
+pm_ar_bad="$(newdir)"; tmpdirs+=("$pm_ar_bad")
+cp -r "$pm_cfg1"/. "$pm_ar_bad"/
+chmod 600 "$pm_ar_bad/deploy-key" "$pm_ar_bad/pi.env"
+printf 'K8S_AGENT_LIMITS_MEMORY=64Gi\n' >> "$pm_ar_bad/k8s.env"
+pm_ar_bad_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_ar_bad_log")")
+refuses "install --postmaster refuses a K8S_AGENT_* limit above the LimitRange max" \
+    "Error: K8S_AGENT_LIMITS_MEMORY in " \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_ar_bad_log" FORK_SANDBOX_CONFIG_DIR="$pm_ar_bad" \
+    "$k8s_sh" install --postmaster
+if [[ -s "$pm_ar_bad_log" ]]; then
+    no "install --postmaster with a bad K8S_AGENT_* value never invokes kubectl" "$(cat "$pm_ar_bad_log")"
+else
+    ok "install --postmaster with a bad K8S_AGENT_* value never invokes kubectl"
+fi
+
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"
 pm_yaml="$repo_dir/manifests/k8s/40-postmaster.yaml"
@@ -20695,6 +20880,98 @@ if grep -q 'leg-loop.sh' "$split_out"; then
 else
     no "split: the ConfigMap ships leg-loop.sh" "not found in $split_out"
 fi
+
+printf '\n== K8S_AGENT_* keys on a composed pod: the leg container carries them, the walker none ==\n'
+# The keys mean "the container that runs the agent's work": the single
+# container of a legacy pod, the `leg` container of a composed one. The
+# composed `agent` container (the walker) names no resources and keeps the
+# namespace LimitRange default.
+container_named() {
+    # container_named NAME -> that container's block of a rendered Job on stdin
+    awk -v n="$1" '
+        /^      volumes:$/ {on=0}
+        /^        - name: / {on = ($0 == "        - name: " n)}
+        on'
+}
+comp_res_render() {
+    # comp_res_render CONFIG_DIR -> the composed submit --dry-run render on stdout
+    FORK_SANDBOX_CONFIG_DIR="$1" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-comp-agent-res --harness pi --model z-ai/glm-4.6 \
+        --run-dir "$comp_res_fixture" "$proj_dir" "$handoff_file" 2>/dev/null
+}
+comp_res_fixture="$(rd_make_fixture claude)"; tmpdirs+=("$comp_res_fixture")
+comp_res_base_out="$(comp_res_render "$config_dir")"
+if grep -q '^ *resources:' <<< "$comp_res_base_out"; then
+    no "composed pod, no K8S_AGENT_* keys: no container has a resources stanza" "$(grep -n 'resources:' <<< "$comp_res_base_out")"
+else
+    ok "composed pod, no K8S_AGENT_* keys: no container has a resources stanza"
+fi
+check "composed pod, no keys: the leg container's command is followed directly by env" \
+    '          command: ["bash", "/mnt/fork-sandbox/leg-loop.sh"]
+          env:' \
+    "$(container_named leg <<< "$comp_res_base_out" | sed -n '3,4p')"
+
+comp_res_all_out="$(comp_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_CPU=500m \
+    K8S_AGENT_REQUESTS_MEMORY=1Gi K8S_AGENT_LIMITS_CPU=2 K8S_AGENT_LIMITS_MEMORY=6Gi)")"
+check "composed pod, all four keys: the leg container carries the full stanza" \
+    '          command: ["bash", "/mnt/fork-sandbox/leg-loop.sh"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "6Gi"
+          env:' \
+    "$(container_named leg <<< "$comp_res_all_out" | sed -n '3,11p')"
+check "composed pod, all four keys: the agent (walker) container has no resources" \
+    "0" "$(container_named agent <<< "$comp_res_all_out" | grep -c 'resources:')"
+check "composed pod, all four keys: exactly one resources stanza in the Job" \
+    "1" "$(grep -c '^ *resources:' <<< "$comp_res_all_out")"
+check "composed pod: the rest of the Job renders identically with the keys set" \
+    "$comp_res_base_out" \
+    "$(grep -v -e '^ *resources:$' -e '^ *requests:$' -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$comp_res_all_out")"
+# The render is still valid YAML, and the stanza parses onto the leg container.
+if python3 -c 'import yaml' 2>/dev/null; then
+    comp_res_parsed="$(python3 -c '
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind") == "Job"]
+cs = {c["name"]: c for c in docs[0]["spec"]["template"]["spec"]["containers"]}
+print(cs["leg"].get("resources"))
+print(cs["agent"].get("resources"))' <<< "$comp_res_all_out")"
+    check "composed pod, all four keys: the stanza parses onto leg, and agent has none"         "{'requests': {'cpu': '500m', 'memory': '1Gi'}, 'limits': {'cpu': '2', 'memory': '6Gi'}}
+None" "$comp_res_parsed"
+fi
+# Each key alone adds exactly its one field to the leg container.
+for agent_one in \
+    'K8S_AGENT_REQUESTS_CPU=500m|requests|cpu|500m' \
+    'K8S_AGENT_REQUESTS_MEMORY=1Gi|requests|memory|1Gi' \
+    'K8S_AGENT_LIMITS_CPU=2|limits|cpu|2' \
+    'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi'; do
+    IFS='|' read -r agent_one_kv agent_one_sect agent_one_field agent_one_val <<< "$agent_one"
+    comp_one_out="$(comp_res_render "$(agent_res_cfg "$agent_one_kv")")"
+    check "composed pod: ${agent_one_kv%%=*} alone adds exactly that one field to the leg container" \
+        "          resources:
+            $agent_one_sect:
+              $agent_one_field: \"$agent_one_val\"" \
+        "$(container_named leg <<< "$comp_one_out" | sed -n '4,6p')"
+    check "composed pod: ${agent_one_kv%%=*} alone leaves the walker container as it was" \
+        "$(container_named agent <<< "$comp_res_base_out")" "$(container_named agent <<< "$comp_one_out")"
+done
+comp_res_empty_out="$(comp_res_render "$(agent_res_cfg K8S_AGENT_LIMITS_MEMORY= K8S_AGENT_REQUESTS_CPU=)")"
+check "composed pod: keys set to the empty string count as unset" \
+    "$comp_res_base_out" "$comp_res_empty_out"
+
+# Every bad value is refused for a composed submit too, before anything renders.
+for agent_bad in "${agent_bad_cases[@]}"; do
+    IFS='|' read -r agent_bad_label agent_bad_kvs agent_bad_key agent_bad_what <<< "$agent_bad"
+    read -r -a agent_bad_arr <<< "$agent_bad_kvs"
+    refuses "composed pod: $agent_bad_label ($agent_bad_kvs) is refused, naming $agent_bad_key" \
+        "Error: $agent_bad_key in " \
+        env FORK_SANDBOX_CONFIG_DIR="$(agent_res_cfg "${agent_bad_arr[@]}")" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-comp-agent-res --harness pi --model z-ai/glm-4.6 \
+        --run-dir "$comp_res_fixture" "$proj_dir" "$handoff_file"
+done
 
 printf '\n== composed pipeline on --k8s: the single-leg pod shape is untouched ==\n'
 # The split above must never leak into a single-leg (no --run-dir) pod:

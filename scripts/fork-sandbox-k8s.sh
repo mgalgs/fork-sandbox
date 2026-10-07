@@ -689,6 +689,39 @@
 #                         its per-run claude-proxy), so raise K8S_QUOTA_PODS
 #                         for concurrent claude runs. A malformed value is
 #                         refused by install before anything is applied.
+#   K8S_AGENT_REQUESTS_CPU=, K8S_AGENT_REQUESTS_MEMORY=,
+#   K8S_AGENT_LIMITS_CPU=, K8S_AGENT_LIMITS_MEMORY=
+#                         explicit resource requests and limits for the
+#                         container that runs the agent's work in every run
+#                         pod -- and so for every seat the in-cluster
+#                         postmaster launches, since the pod reads the same
+#                         k8s.env. That is the single `agent` container of
+#                         a fixed-skeleton pod, and the `leg` container of
+#                         a composed (--run-dir) pod; the composed pod's
+#                         `agent` container (the pipeline walker) gets no
+#                         resources and keeps the LimitRange default. Not
+#                         renamed K8S_LEG_*: one set of keys, one meaning.
+#                         Optional, each independent; unset (the default)
+#                         renders no field for it. With no key set the
+#                         namespace LimitRange default applies (limit 1
+#                         cpu / 2Gi, request 250m / 512Mi). An unset
+#                         request beside a set limit is NOT the LimitRange
+#                         default: Kubernetes copies the limit into the
+#                         request, so a lone LIMITS_MEMORY=6Gi reserves a
+#                         6Gi request; set a request alongside each limit.
+#                         The egress-gate init
+#                         container, the claude-proxy pods and the
+#                         postmaster are untouched. The cpu keys take a
+#                         Kubernetes cpu quantity (2, 0.5, 500m), the memory
+#                         keys an integer with an optional suffix (512Mi,
+#                         6Gi, 6G); zero is refused. Refused, naming the
+#                         key, before anything is applied: a malformed
+#                         value, a request above its limit, a limit above
+#                         the LimitRange max (4 cpu / 8Gi), a request above
+#                         the LimitRange default limit while its limit is
+#                         unset. The namespace quota must leave room for
+#                         concurrent seats at that size: see
+#                         K8S_QUOTA_LIMITS_MEMORY above.
 #   K8S_QUOTA_WAIT_SECONDS=
 #                         how long submit waits, in total, for room in
 #                         that quota when a create is refused ("exceeded
@@ -1030,6 +1063,19 @@ K8S_QUOTA_LIMITS_CPU="$(read_env_value "$k8s_env" K8S_QUOTA_LIMITS_CPU || true)"
 K8S_QUOTA_LIMITS_CPU="${K8S_QUOTA_LIMITS_CPU:-20}"
 K8S_QUOTA_LIMITS_MEMORY="$(read_env_value "$k8s_env" K8S_QUOTA_LIMITS_MEMORY || true)"
 K8S_QUOTA_LIMITS_MEMORY="${K8S_QUOTA_LIMITS_MEMORY:-40Gi}"
+# Optional explicit resources for the container that runs the legs (see the
+# header table). Unset means no field is rendered and the LimitRange default
+# applies. Validated below by k8s_validate_agent_resources.
+K8S_AGENT_REQUESTS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_CPU || true)"
+K8S_AGENT_REQUESTS_MEMORY="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_MEMORY || true)"
+K8S_AGENT_LIMITS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_LIMITS_CPU || true)"
+K8S_AGENT_LIMITS_MEMORY="$(read_env_value "$k8s_env" K8S_AGENT_LIMITS_MEMORY || true)"
+# The namespace LimitRange's numbers (manifests/k8s/00-namespace.yaml), for
+# the early checks on those keys; the test suite pins them to the manifest.
+K8S_LIMITRANGE_MAX_CPU=4
+K8S_LIMITRANGE_MAX_MEMORY=8Gi
+K8S_LIMITRANGE_DEFAULT_CPU=1
+K8S_LIMITRANGE_DEFAULT_MEMORY=2Gi
 GIT_USER_NAME="$(read_env_value "$k8s_env" GIT_USER_NAME || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-fork-sandbox agent}"
 GIT_USER_EMAIL="$(read_env_value "$k8s_env" GIT_USER_EMAIL || true)"
@@ -1079,6 +1125,95 @@ RUN_LABEL_VALUES=()
 # until submit finishes. Declared empty here so it is safe to read under
 # `set -u` even on a verb that never calls cmd_submit.
 K8S_LAST_SUBMIT_RUN_DIR=""
+
+# Quantity -> a comparable integer: millicores for cpu, bytes for memory.
+# Prints nothing for a value that is not a (positive) quantity of that kind.
+k8s_quantity_value() {
+    awk -v kind="$1" -v v="$2" 'BEGIN {
+        if (kind == "cpu") {
+            if (v ~ /^[0-9]+m$/) { sub(/m$/, "", v); n = v + 0 }
+            else if (v ~ /^[0-9]+(\.[0-9]+)?$/) { n = v * 1000 }
+            else exit
+        } else {
+            if (v !~ /^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$/) exit
+            s = v; sub(/^[0-9]+/, "", s); sub(/[^0-9].*$/, "", v)
+            split("Ki Mi Gi Ti Pi Ei k M G T P E", u, " ")
+            split("1024 1048576 1073741824 1099511627776 1125899906842624 1152921504606846976 1000 1000000 1000000000 1000000000000 1000000000000000 1000000000000000000", m, " ")
+            f = 1
+            for (i = 1; i <= 12; i++) if (u[i] == s) f = m[i]
+            n = v * f
+        }
+        if (n > 0) printf "%.0f", n
+    }'
+}
+
+# Validates K8S_AGENT_{REQUESTS,LIMITS}_{CPU,MEMORY}, all shape and
+# ordering checks, before anything is rendered or applied. Each value lands
+# in a YAML manifest with no quoting of its own, so the anchored shape check
+# is also what keeps a value from injecting YAML.
+k8s_validate_agent_resources() {
+    local kind key val what max_val def_val
+    for kind in cpu memory; do
+        for key in "K8S_AGENT_REQUESTS_${kind^^}" "K8S_AGENT_LIMITS_${kind^^}"; do
+            val="${!key}"
+            [[ -z "$val" ]] && continue
+            if [[ "$kind" == cpu ]]; then
+                what="a Kubernetes cpu quantity (2, 0.5 or 500m) greater than zero"
+            else
+                what="a Kubernetes memory quantity greater than zero: an integer with an optional binary or decimal suffix (512Mi, 6Gi, 6G)"
+            fi
+            if [[ -z "$(k8s_quantity_value "$kind" "$val")" ]]; then
+                echo "Error: $key in $k8s_env must be $what," >&2
+                echo "got '$val'." >&2
+                exit 1
+            fi
+        done
+        local req_key="K8S_AGENT_REQUESTS_${kind^^}" lim_key="K8S_AGENT_LIMITS_${kind^^}"
+        local req="${!req_key}" lim="${!lim_key}" req_n lim_n
+        if [[ "$kind" == cpu ]]; then
+            max_val="$K8S_LIMITRANGE_MAX_CPU"; def_val="$K8S_LIMITRANGE_DEFAULT_CPU"
+        else
+            max_val="$K8S_LIMITRANGE_MAX_MEMORY"; def_val="$K8S_LIMITRANGE_DEFAULT_MEMORY"
+        fi
+        req_n="$(k8s_quantity_value "$kind" "$req")"
+        lim_n="$(k8s_quantity_value "$kind" "$lim")"
+        if [[ -n "$lim_n" ]] && (( lim_n > $(k8s_quantity_value "$kind" "$max_val") )); then
+            echo "Error: $lim_key in $k8s_env is $lim, above the namespace LimitRange max" >&2
+            echo "of $max_val (manifests/k8s/00-namespace.yaml); the pod would be rejected at" >&2
+            echo "admission. Raise the LimitRange max there, or lower the key." >&2
+            exit 1
+        fi
+        if [[ -n "$req_n" && -n "$lim_n" ]] && (( req_n > lim_n )); then
+            echo "Error: $req_key in $k8s_env ($req) is above $lim_key ($lim);" >&2
+            echo "a request cannot exceed its limit." >&2
+            exit 1
+        fi
+        if [[ -n "$req_n" && -z "$lim_n" ]] \
+            && (( req_n > $(k8s_quantity_value "$kind" "$def_val") )); then
+            echo "Error: $req_key in $k8s_env ($req) is above the LimitRange default limit" >&2
+            echo "($def_val) that applies while $lim_key is unset; set $lim_key too." >&2
+            exit 1
+        fi
+    done
+}
+
+# The `resources:` lines for the container that runs the legs (leading
+# newline included, so it appends to the line before it), or nothing when no
+# K8S_AGENT_* key is set. Called on the single container of a legacy pod and
+# on the `leg` container of a composed one -- never on the composed `agent`
+# (walker) container.
+k8s_agent_resources_yaml() {
+    local req="" lim=""
+    [[ -n "$K8S_AGENT_REQUESTS_CPU" ]] && req+=$'\n'"              cpu: \"$K8S_AGENT_REQUESTS_CPU\""
+    [[ -n "$K8S_AGENT_REQUESTS_MEMORY" ]] && req+=$'\n'"              memory: \"$K8S_AGENT_REQUESTS_MEMORY\""
+    [[ -n "$K8S_AGENT_LIMITS_CPU" ]] && lim+=$'\n'"              cpu: \"$K8S_AGENT_LIMITS_CPU\""
+    [[ -n "$K8S_AGENT_LIMITS_MEMORY" ]] && lim+=$'\n'"              memory: \"$K8S_AGENT_LIMITS_MEMORY\""
+    [[ -z "$req$lim" ]] && return 0
+    printf '\n          resources:'
+    [[ -n "$req" ]] && printf '\n            requests:%s' "$req"
+    [[ -n "$lim" ]] && printf '\n            limits:%s' "$lim"
+    return 0
+}
 
 # check-grant needs none of the checks in this block (it renders no
 # manifest, spawns no run, and never reads any of these keys) except
@@ -1142,6 +1277,9 @@ if [[ "${1-}" != check-grant && ! "$K8S_QUOTA_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]];
     echo "'$K8S_QUOTA_WAIT_SECONDS'." >&2
     exit 1
 fi
+if [[ "${1-}" != check-grant ]]; then
+    k8s_validate_agent_resources
+fi
 
 # None of these keys feed check-grant's extracted validators (which read
 # only K8S_CLUSTER_DOMAIN, itself already shape-checked above by a regex
@@ -1157,6 +1295,8 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
         "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
         "$K8S_LEG_VOLUME_SIZE_LIMIT" \
+        "$K8S_AGENT_REQUESTS_CPU" "$K8S_AGENT_REQUESTS_MEMORY" \
+        "$K8S_AGENT_LIMITS_CPU" "$K8S_AGENT_LIMITS_MEMORY" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
         "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
@@ -6453,7 +6593,7 @@ CENV
               readOnly: true${thread_volume_mount}${attach_volume_mount}
         - name: leg
           image: $RUN_IMAGE
-          command: ["bash", "/mnt/fork-sandbox/leg-loop.sh"]
+          command: ["bash", "/mnt/fork-sandbox/leg-loop.sh"]$(k8s_agent_resources_yaml)
           env:
             - name: HOME
               value: /home/agent
@@ -6537,7 +6677,7 @@ VYAML
         containers_yaml="$(cat <<CYAML
         - name: agent
           image: $RUN_IMAGE
-          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]
+          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]$(k8s_agent_resources_yaml)
           env:
             - name: HOME
               value: /home/agent
