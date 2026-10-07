@@ -311,10 +311,10 @@ if (( JSON_OUT )); then
     jq -n --arg version "$CLAUDE_VERSION" --arg verified "$FS_CLAUDE_TOKEN_CONTRACT_VERIFIED" \
         --argjson checks "$(
             for i in "${!CHECK_KEYS[@]}"; do
-                jq -n --arg name "${CHECK_KEYS[$i]}" --arg label "${CHECK_LABELS[$i]}" \
+                jq -n --arg name "${CHECK_KEYS[$i]}" --arg check_label "${CHECK_LABELS[$i]}" \
                     --argjson ok "$([[ "${RESULT_OK[$i]}" == 1 ]] && echo true || echo false)" \
                     --arg reason "${RESULT_REASON[$i]}" \
-                    '{name: $name, label: $label, ok: $ok, reason: $reason}'
+                    '{name: $name, "label": $check_label, ok: $ok, reason: $reason}'
             done | jq -s '.'
         )" \
         '{claude_version: $version, contract_verified_version: $verified, checks: $checks}'

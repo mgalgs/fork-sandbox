@@ -678,8 +678,8 @@ this run will." \
     # tidy_prompt, built beside maintainer_sandbox_cmd/maintainer_prompt,
     # and tidy_timeout_secs, gated the same way) is at stake here -- not
     # the runner's own tidy_ended/tidy_detail/... locals, which are
-    # unconditional RUNNER-heredoc text present in every run.sh regardless
-    # of pipeline shape, the same way "rc=" or "mode=" are.
+    # unconditional fork-sandbox-runner.sh text present in every run.sh
+    # regardless of pipeline shape, the same way "rc=" or "mode=" are.
     check "R6.1: run.sh carries no launcher-emitted tidy_sandbox_cmd/tidy_prompt/tidy_timeout_secs state" "0" \
         "$(grep -cE '^(tidy_sandbox_cmd|tidy_prompt|tidy_timeout_secs)=' "$rd8/run.sh")"
     check "R5.1: summary.json's tidy key is absent, not present" \
@@ -796,6 +796,59 @@ if rdb1="$(run_stubbed --pipeline csonnet2-msonnet \
         "$(jq -r '.tidy.head_approved' "$rdb1/summary.json")" "$(cat "$rdb1/tidy-prompt-1.md")"
 else
     no "T-B1: a four-call accepted tidy run exits 0"
+fi
+
+# T-B1b: a --k8s pod run never runs the tidy leg. The exact same
+# accepted-tidy shape as T-B1 above, but re-run with fetch_back flipped to
+# 0 -- the seam a --k8s pod run's own preamble sets, which a local run
+# never exercises on its own. Driven the same way the preset suite's own
+# fetch_back=0 section does: generate a real run.sh the ordinary way
+# (fetch_back=1), then flip that one line and run the SAME script a
+# second time, exactly the shape a --k8s launch's preamble would have
+# generated it in the first place.
+tb1b_branch="sandbox-test-tidy-b1b-$$"
+prep_stub $'commit-file\ncommit-file\napproved\nsquash'
+if rdb1b="$(run_stubbed --pipeline csonnet2-msonnet --branch "$tb1b_branch")"; then
+    tmpdirs+=("$rdb1b")
+    check "T-B1b setup: the fetch_back=1 pass actually ran the tidy leg" \
+        "accepted" "$(jq -r '.ended' "$rdb1b/tidy.json" 2>/dev/null)"
+    sed -i 's/^fetch_back=1$/fetch_back=0/' "$rdb1b/run.sh"
+    # Undo the fetch_back=1 pass's own fetch and ref cleanup: a pod's
+    # run.sh always starts from a branch that has never reached
+    # origin_repo, which this suite's $proj stands in for.
+    git -C "$proj" branch -q -D "$tb1b_branch" 2>/dev/null || true
+    prep_stub $'commit-file\ncommit-file\napproved\nsquash'
+    # shellcheck disable=SC2034  # kept for a human rereading a failure, not asserted on
+    rerun_out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+        FAKE_SCRIPT="$script_file" FAKE_COMMIT_COUNT="$commit_count" \
+        FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        FS_LEG_RETRY_DELAYS="0 0" \
+        timeout 60 bash "$rdb1b/run.sh" 2>&1)"
+    rerun_rc=$?
+    check "T-B1b: fetch_back=0 makes exactly 3 calls, not 4 -- no tidy leg runs" \
+        "3" "$(cat "$count" 2>/dev/null)"
+    check "T-B1b: summary.txt records the tidy leg as skipped, with the pod reason" \
+        "tidy:      skipped (a --k8s pod run does not fetch back; the tidy-history leg's verification and publish are host-side only)" \
+        "$(grep '^tidy:' "$rdb1b/summary.txt")"
+    check "T-B1b: tidy.json records the skip, same as any other ineligible reason" \
+        "skipped" "$(jq -r '.ended' "$rdb1b/tidy.json" 2>/dev/null)"
+    check "T-B1b: tidy.json's detail names the pod reason" \
+        "a --k8s pod run does not fetch back; the tidy-history leg's verification and publish are host-side only" \
+        "$(jq -r '.detail' "$rdb1b/tidy.json" 2>/dev/null)"
+    if git -C "$proj" rev-parse --verify -q "$tb1b_branch" >/dev/null 2>&1; then
+        no "T-B1b: the branch never crosses into origin_repo on a --k8s pod run" \
+            "found $tb1b_branch in $proj (rc=$rerun_rc)"
+    else
+        ok "T-B1b: the branch never crosses into origin_repo on a --k8s pod run"
+    fi
+    if [[ -n "$(git -C "$proj" for-each-ref 'refs/fork-sandbox/tidy/*' 2>/dev/null)" ]]; then
+        no "T-B1b: no tidy holding ref is left in origin_repo on a --k8s pod run" \
+            "$(git -C "$proj" for-each-ref 'refs/fork-sandbox/tidy/*')"
+    else
+        ok "T-B1b: no tidy holding ref is left in origin_repo on a --k8s pod run"
+    fi
+else
+    no "T-B1b setup: the fetch_back=1 pass failed to launch"
 fi
 
 # T-B2 (R1.3): the tidy leg squashes but also edits the file afterward --

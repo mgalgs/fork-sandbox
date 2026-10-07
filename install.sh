@@ -332,6 +332,7 @@ PLUMBING=(
     fork-sandbox-k8s-egress-gate.sh
     fork-sandbox-k8s-entrypoint.sh
     fork-sandbox-k8s-inbox-write.sh
+    fork-sandbox-k8s-leg.sh
     fork-sandbox-k8s-outbox-extract.sh
     fork-sandbox-k8s-platform-generic
     fork-sandbox-k8s-review-loop.sh
@@ -344,6 +345,7 @@ PLUMBING=(
     fork-sandbox-postmaster-pod-init.sh
     fork-sandbox-preset-parse.py
     fork-sandbox-refresh.sh
+    fork-sandbox-runner.sh
     fork-sandbox-stop-guard.sh
     lane-mail-lib.sh          # sourced by lane-mail.sh, lane-mail-serve and fork-sandbox-mail.sh
     sandbox-backend-bwrap

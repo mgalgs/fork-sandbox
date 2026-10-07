@@ -189,6 +189,20 @@
 #                   clone from the image" in docs/kubernetes-runs.md). Real
 #                   runs never set this; a test cannot write to /opt, so it
 #                   points this at a fixture executable instead.
+#   RUN_DIR         runner mode: the absolute path (inside this pod) of a
+#                   run directory fork-sandbox-k8s.sh submit/run --run-dir
+#                   staged and pushed, holding run.sh and pipeline.json --
+#                   the SAME walker a local run's own run.sh executes, not
+#                   a second copy (see scripts/fork-sandbox-runner.sh).
+#                   When set, this script runs `bash "$RUN_DIR/run.sh"`
+#                   instead of the HARNESS-gated coding leg and
+#                   REVIEW_LOOP_CAP review loop below -- see the first arm
+#                   of the pi_rc=0 block. HARNESS/MODEL carry no leg of
+#                   their own in this mode (pipeline.json's own steps do);
+#                   they still arrive as plain record values, forwarded
+#                   unused except where this script reads pipeline.json
+#                   directly (model discovery, claude credential install).
+#                   Unset means today's legacy behaviour, unchanged.
 #
 
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
@@ -272,7 +286,18 @@ esac
 : "${ALLOW_UNLISTED_MODEL:=}"
 : "${PI_ARGS:=}"
 : "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
-if [[ "$HARNESS" == claude ]]; then
+: "${RUN_DIR:=}"
+if [[ -n "$RUN_DIR" ]]; then
+    if [[ "$RUN_DIR" != /* ]]; then
+        echo "Error: RUN_DIR must be an absolute path, got '$RUN_DIR'." >&2
+        exit 1
+    fi
+    # pipeline.json (and so whether this run needs CLAUDE_PROXY_BASE_URL at
+    # all) is not readable yet -- RUN_DIR's own emptyDir is mounted, but its
+    # contents arrive with every other input, after the wait below. See the
+    # RUN_DIR arm of the pi_rc=0 block for that check, deferred to there.
+    true
+elif [[ "$HARNESS" == claude ]]; then
     : "${CLAUDE_PROXY_BASE_URL:?CLAUDE_PROXY_BASE_URL must be set when HARNESS=claude}"
 fi
 : "${GIT_USER_NAME:=fork-sandbox agent}"
@@ -564,8 +589,8 @@ mounts_dir=/mnt/fork-sandbox
 # render_claude_configmap_keys in fork-sandbox-k8s.sh): sourced here, before
 # anything else, so fs_leg_error_retryable and fs_harness_error -- both used
 # by the claude coding leg's retry wrapper below -- are the exact same
-# functions the local runner (fork-sandbox.sh's RUNNER heredoc) uses, never
-# a second copy that could drift. Gated on HARNESS, not on the file's own
+# functions fork-sandbox-runner.sh uses, never a second copy that could
+# drift. Gated on HARNESS, not on the file's own
 # existence: cmd_submit already refuses to render this pod's ConfigMap at
 # all when fork-sandbox-lib.sh is unreadable on the host (see its own
 # `[[ -r "$lib_sh" ]]` check), so a --harness claude pod that reaches this
@@ -593,8 +618,14 @@ sentinel="$work_dir/.inputs-complete"
 fetched_marker="$work_dir/.fetched"
 run_complete="$work_dir/.run-complete"
 
-echo "fork-sandbox-k8s-entrypoint: creating $inbox_dir" >&2
-mkdir -p "$inbox_dir"
+if [[ -z "$RUN_DIR" ]]; then
+    echo "fork-sandbox-k8s-entrypoint: creating $inbox_dir" >&2
+    mkdir -p "$inbox_dir"
+fi
+# else: runner mode's inbox is staged by the launcher under RUN_DIR and
+# arrives with the rest of the run directory -- linked at this fixed path
+# once that push lands, below. Created here it would make RUN_DIR
+# non-empty before the push, which the pod-side extractor refuses.
 echo "fork-sandbox-k8s-entrypoint: creating $outbox_dir" >&2
 mkdir -p "$outbox_dir"
 
@@ -623,7 +654,15 @@ git init --quiet --bare "$repo_bare"
 # race that push against a nonexistent /work/repo.git and fail a healthy
 # run -- while a dead endpoint must still fail in seconds, well before
 # the INPUTS_TIMEOUT deadline below, not after the whole submit dance.
-if [[ -n "$MODEL_DISCOVERY" ]]; then
+if [[ -n "$RUN_DIR" ]]; then
+    # A runner-mode pod carries no single MODEL to discover against --
+    # every pipeline.json step and fix seat names its own, and distinct pi
+    # ids get their own per-id lookup, pod-side, once RUN_DIR's contents
+    # arrive and pipeline.json can actually be read (see the RUN_DIR arm
+    # of the pi_rc=0 block, discover_pipeline_pi_facts). These globals are
+    # never consumed in that path.
+    CTX=0; MAX_TOKENS=0; REVIEW_CTX=0; REVIEW_MAX_TOKENS=0; MODEL_CTX_SOURCE=""
+elif [[ -n "$MODEL_DISCOVERY" ]]; then
     discover_model_facts
 else
     # No discovery: either a legacy K8S_PROXY_UPSTREAM install (whose
@@ -693,6 +732,21 @@ until [[ -f "$sentinel" ]]; do
     sleep 1
 done
 
+if [[ -n "$RUN_DIR" ]]; then
+    # The push that just arrived (RUN_DIR's own emptyDir had to stay empty
+    # until now, see the mkdir this skipped above) already carries
+    # RUN_DIR/inbox, staged and populated by the launcher exactly as a
+    # local run's own inbox is. Link the fixed /work/inbox path to it so
+    # `say` and every other verb that reaches into a running pod at
+    # POD_INBOX_DIR keeps working unchanged.
+    if [[ ! -d "$RUN_DIR/inbox" ]]; then
+        echo "Error: RUN_DIR is set but $RUN_DIR/inbox is missing after the" >&2
+        echo "push. The launcher should have staged it; check the run" >&2
+        echo "directory it built." >&2
+        exit 1
+    fi
+    ln -s "$RUN_DIR/inbox" "$inbox_dir"
+fi
 
 # Only refs/heads/$BRANCH (and any --extra-ref branches, see EXTRA_REFS) was
 # ever pushed into this bare repo (cmd_submit pushes "HEAD:refs/heads/$branch"
@@ -1151,19 +1205,16 @@ append_archived_addenda() {
     } > "$2"
 }
 
-pi_rc=0
-if [[ "$HARNESS" == pi ]]; then
-    # REVIEW_MODEL, when set, is folded in up front so the review loop
-    # below never needs a second synthesize_pi_config call for a pi
-    # coding leg -- only a claude coding leg (which skips this branch
-    # entirely) still needs one, right before the loop runs.
-    synthesize_pi_config "$MODEL" "$REVIEW_MODEL" \
-        "$CTX" "$MAX_TOKENS" "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"
-
-    echo "fork-sandbox-k8s-entrypoint: running pi" >&2
-    run_pi_coding_leg || pi_rc=$?
-    echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc" >&2
-else
+# The claude credential install + ~/.claude.json trust write, shared by
+# the legacy HARNESS=claude arm below and the RUN_DIR arm just above it in
+# control flow (see the pi_rc=0 block): the ONLY part of that arm's own
+# setup a runner-mode run still needs pod-side. The inbox hook, the commit
+# guard and inbox-settings.json are deliberately NOT part of this
+# function -- in runner mode those are staged by the launcher under
+# $RUN_DIR/inbox already (fs_stage_inbox, run on the host), and installing
+# them again here would be a second, possibly-drifting copy of the same
+# files, not a fix for anything.
+claude_pod_credentials() {
     echo "fork-sandbox-k8s-entrypoint: installing the claude credential" >&2
     mkdir -p "$HOME/.claude"
     install -m 600 "$mounts_dir/claude-credentials.json" "$HOME/.claude/.credentials.json"
@@ -1176,6 +1227,216 @@ else
         hasTrustDialogAccepted: true,
         projects: { ($dir): { hasTrustDialogAccepted: true } },
     }' > "$HOME/.claude.json"
+}
+
+# discover_pipeline_pi_facts/synthesize_pi_config_list: the RUN_DIR arm's
+# counterpart to discover_model_facts/synthesize_pi_config above -- a
+# runner-mode run carries no single MODEL, so every DISTINCT pi model id
+# pipeline.json's steps and fix seats name (newline-separated in $1) gets
+# its own lookup against the same catalog fetch, one fetch for the whole
+# run rather than one per id. Applies the identical refusal rule
+# discover_model_facts documents at length: a guessed context length --
+# the id absent from the listing, the fetch itself failing, or an entry
+# with no usable max_model_len -- is an ERROR unless ALLOW_UNLISTED_MODEL=1,
+# in which case it is a warning naming the guess. Sets PIPELINE_PI_FACTS to
+# newline-separated "id ctx maxtok" triples, the listing's own spelling
+# when it differs case-only from the configured id, and PIPELINE_PI_REWRITE
+# to a JSON object {"configured-id": "listing-id", ...} with one entry per
+# id actually rewritten -- the map fork-sandbox-k8s-leg.sh's pi arm reads
+# back (written to /work/pi-model-map.json by the caller below) so each
+# leg sends the proxy the spelling models.json was synthesized under.
+# Never run when MODEL_DISCOVERY is unset: every id then gets the
+# pre-discovery constants 131072/32768, same as discover_model_facts' own
+# no-discovery branch -- and PIPELINE_PI_REWRITE stays empty, since no
+# listing was ever consulted.
+discover_pipeline_pi_facts() {
+    local ids="$1" url="$PROXY_BASE_URL/models" body="" probe_ids="" \
+        curl_rc=0 fetch_note="" id
+    PIPELINE_PI_FACTS=""
+    PIPELINE_PI_REWRITE="{}"
+    if [[ -z "$MODEL_DISCOVERY" ]]; then
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            PIPELINE_PI_FACTS+="$id 131072 32768"$'\n'
+        done <<< "$ids"
+        return 0
+    fi
+    body="$(curl -sS --max-time 20 "$url" 2>&1)" || curl_rc=$?
+    if (( curl_rc != 0 )); then
+        fetch_note="$body"
+        body=""
+    else
+        probe_ids="$(jq -r '.data[].id' <<<"$body" 2>/dev/null || true)"
+        if [[ -z "$probe_ids" ]]; then
+            fetch_note="it answered with no model list: ${body:0:400}"
+        fi
+    fi
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        local configured_id="$id" listed="" cand len why kind maxtok
+        while IFS= read -r cand; do
+            if [[ -n "$cand" && "${cand,,}" == "${id,,}" ]]; then listed="$cand"; break; fi
+        done <<< "$probe_ids"
+        if [[ -n "$listed" && "$listed" != "$id" ]]; then
+            echo "fork-sandbox-k8s-entrypoint: the listing spells model" \
+                "'$listed', not the configured '$id'; using the listing's" \
+                "spelling." >&2
+            id="$listed"
+            PIPELINE_PI_REWRITE="$(jq -c --arg from "$configured_id" --arg to "$id" \
+                '. + {($from): $to}' <<< "$PIPELINE_PI_REWRITE")"
+        fi
+        len="$(jq -r --arg m "$id" \
+            'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
+            <<<"$body" 2>/dev/null || true)"
+        if [[ ! "$len" =~ ^[0-9]+$ ]]; then
+            len=32768
+            if [[ -z "$probe_ids" ]]; then
+                kind=catalog
+                why="the endpoint's model catalog could not be read ($url: $fetch_note)"
+            elif ! printf '%s\n' "$probe_ids" | grep -qxF "$id"; then
+                kind=unlisted
+                why="the endpoint's listing does not contain that id"
+            else
+                kind=nolen
+                why="its entry in the listing carries no usable max_model_len"
+            fi
+            if [[ "$ALLOW_UNLISTED_MODEL" == 1 ]]; then
+                echo "Warning: the context length for '$id' is a GUESS of" >&2
+                echo "$len tokens -- $why. Continuing because" >&2
+                echo "ALLOW_UNLISTED_MODEL=1 permits a launch whose context" >&2
+                echo "had to be guessed." >&2
+            else
+                echo "Error: the context length for '$id' had to be" >&2
+                echo "guessed: $why." >&2
+                echo "K8S_ALLOW_UNLISTED_MODEL=1 in k8s.env permits a launch" >&2
+                echo "whose context had to be guessed." >&2
+                exit 1
+            fi
+            unset kind
+        fi
+        maxtok=32768
+        if (( len / 4 < maxtok )); then maxtok=$(( len / 4 )); fi
+        PIPELINE_PI_FACTS+="$id $len $maxtok"$'\n'
+    done <<< "$ids"
+}
+
+# Writes ~/.pi/agent/models.json with one entry per pi model id a
+# runner-mode run carries, each with its OWN context window from $1 (the
+# discover_pipeline_pi_facts "id ctx maxtok" lines) -- the runner-mode
+# counterpart to synthesize_pi_config above, which only ever handles one
+# or two ids sharing one pair of windows. $2 is the default model (the
+# first pi seat's own id in pipeline.json step order).
+synthesize_pi_config_list() {
+    local facts="$1" default_model="$2" id ctx maxtok
+    echo "fork-sandbox-k8s-entrypoint: synthesizing pi config for a runner-mode run" >&2
+    mkdir -p "$HOME/.pi/agent"
+    if [[ -f "$mounts_dir/pi-agent-settings.json" ]]; then
+        cp "$mounts_dir/pi-agent-settings.json" "$HOME/.pi/agent/settings.json"
+    fi
+    local models_json='[]'
+    while IFS=' ' read -r id ctx maxtok; do
+        [[ -n "$id" ]] || continue
+        models_json="$(jq -c -n --argjson prev "$models_json" --arg id "$id" \
+            --argjson ctx "$ctx" --argjson maxtok "$maxtok" \
+            '$prev + [{id: $id, name: ($id + " (proxy)"), reasoning: true,
+                input: ["text"], contextWindow: $ctx, maxTokens: $maxtok,
+                cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}}]')"
+    done <<< "$facts"
+    jq -n --arg base "$PROXY_BASE_URL" --argjson models "$models_json" '{
+        providers: {
+            proxy: { baseUrl: $base, api: "openai-completions", apiKey: "sandbox",
+                models: $models },
+        },
+    }' > "$HOME/.pi/agent/models.json"
+    local settings_base='{}'
+    if [[ -f "$HOME/.pi/agent/settings.json" ]]; then
+        settings_base="$(cat "$HOME/.pi/agent/settings.json")"
+    fi
+    if ! jq -n --argjson base "$settings_base" --arg model "$default_model" \
+        '$base * { defaultProvider: "proxy", defaultModel: $model }' \
+        > "$HOME/.pi/agent/settings.json.new"; then
+        echo "Error: pi-agent/settings.json is not valid JSON, so the generated" >&2
+        echo "model defaults cannot be merged into it." >&2
+        exit 1
+    fi
+    mv "$HOME/.pi/agent/settings.json.new" "$HOME/.pi/agent/settings.json"
+}
+
+pi_rc=0
+if [[ -n "$RUN_DIR" ]]; then
+    # The push landed everything .inputs-complete gates on, including
+    # RUN_DIR's own contents (see fork-sandbox-k8s.sh's --run-dir doc
+    # comment on cmd_submit) -- so run.sh and pipeline.json are readable
+    # by now, unlike at the RUN_DIR validation near the top of this
+    # script.
+    for f in "$RUN_DIR/run.sh" "$RUN_DIR/pipeline.json"; do
+        if [[ ! -r "$f" ]]; then
+            echo "Error: RUN_DIR is set but $f is missing or unreadable. The" >&2
+            echo "launcher should have staged it, and the push should have" >&2
+            echo "delivered it, before this run started." >&2
+            exit 1
+        fi
+    done
+    # The CLAUDE_PROXY_BASE_URL requirement deferred from the top of this
+    # script (see RUN_DIR's own doc comment there): pipeline.json is only
+    # readable now, after the push, so this is the first point this check
+    # can run.
+    pipeline_has_claude=0
+    if jq -e '
+        ([.steps[] | select(.harness == "claude")]
+         + [.steps[] | select(.fix != null and .fix.harness == "claude")])
+        | length > 0' "$RUN_DIR/pipeline.json" > /dev/null; then
+        pipeline_has_claude=1
+    fi
+    if (( pipeline_has_claude )); then
+        : "${CLAUDE_PROXY_BASE_URL:?must be set: a pipeline.json seat is claude}"
+    fi
+    pipeline_pi_models="$(jq -r '
+        [.steps[] | select(.harness == "pi") | .model] +
+        [.steps[] | select(.fix != null and .fix.harness == "pi") | .fix.model]
+        | unique | .[]' "$RUN_DIR/pipeline.json")"
+    if [[ -n "$pipeline_pi_models" ]]; then
+        echo "fork-sandbox-k8s-entrypoint: discovering pi model facts for a" \
+            "runner-mode run" >&2
+        discover_pipeline_pi_facts "$pipeline_pi_models"
+        default_pi_model="$(head -n1 <<< "$pipeline_pi_models")"
+        synthesize_pi_config_list "$PIPELINE_PI_FACTS" "$default_pi_model"
+        # fork-sandbox-k8s-leg.sh's pi arm reads this back under the
+        # SAME override variable, so the two always agree on where it
+        # lives: ${FORK_SANDBOX_K8S_PI_MODEL_MAP:-/work/pi-model-map.json}.
+        printf '%s\n' "$PIPELINE_PI_REWRITE" \
+            > "${FORK_SANDBOX_K8S_PI_MODEL_MAP:-/work/pi-model-map.json}"
+    fi
+    if (( pipeline_has_claude )); then
+        claude_pod_credentials
+    fi
+    # The entire leg walk -- code, review, fix, maintain, in whatever
+    # order pipeline.json names -- happens inside run.sh, through the
+    # SAME runner scripts/fork-sandbox-runner.sh (see its own header) a
+    # local run executes. Nothing else in this script runs a leg of its
+    # own in this mode: not the HARNESS-gated coding leg below, not the
+    # REVIEW_LOOP_CAP review loop further down (see its own RUN_DIR
+    # exclusion), not commit_uncommitted_work -- run.sh's own end-of-run
+    # check already covers it, and also saves any leftover work as a
+    # patch file (see fork-sandbox-runner.sh's own uncommitted-work
+    # check), since a pod's emptyDir has no backstop commit_uncommitted_
+    # work would otherwise be the only one to give it.
+    echo "fork-sandbox-k8s-entrypoint: running the shared runner" >&2
+    ( cd "$clone_dir" && bash "$RUN_DIR/run.sh" ) || pi_rc=$?
+    echo "fork-sandbox-k8s-entrypoint: runner exited $pi_rc" >&2
+elif [[ "$HARNESS" == pi ]]; then
+    # REVIEW_MODEL, when set, is folded in up front so the review loop
+    # below never needs a second synthesize_pi_config call for a pi
+    # coding leg -- only a claude coding leg (which skips this branch
+    # entirely) still needs one, right before the loop runs.
+    synthesize_pi_config "$MODEL" "$REVIEW_MODEL" \
+        "$CTX" "$MAX_TOKENS" "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"
+
+    echo "fork-sandbox-k8s-entrypoint: running pi" >&2
+    run_pi_coding_leg || pi_rc=$?
+    echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc" >&2
+else
+    claude_pod_credentials
 
     # The operator-inbox hook, exactly as a local claude run's --settings
     # installs it, so `fork-sandbox-k8s.sh say` addenda are delivered on
@@ -1312,7 +1573,7 @@ else
     # itself already had its one chance above, which is a different trigger
     # -- up to once per entry of FS_LEG_RETRY_DELAYS (default "30 120", a
     # test hook exactly like the local runner's own FS_LEG_RETRY_DELAYS --
-    # see fs_run_claude_leg_with_retry in fork-sandbox.sh's RUNNER heredoc).
+    # see fs_run_claude_leg_with_retry in fork-sandbox-runner.sh).
     # fs_leg_error_retryable and fs_harness_error are the exact same
     # functions that backstop uses, sourced from fork-sandbox-lib.sh above
     # unconditionally for HARNESS=claude (this whole block runs only in
@@ -1376,7 +1637,17 @@ else
     fi
 fi
 
-commit_uncommitted_work "coding leg"
+# Not run in RUN_DIR mode: run.sh's own end-of-run uncommitted check
+# (runner_in_sandbox, see fork-sandbox-runner.sh) already ran, inside
+# run.sh, before control returned here -- and it CHECKS and RECORDS
+# uncommitted work (saving it as a patch file, since a pod's emptyDir
+# has no other backstop), it never commits it, exactly like a local run.
+# Calling this here too would silently commit, under an agent-less
+# message, work the record just reported as left uncommitted -- a
+# divergence from local behaviour no local run has, not a fix.
+if [[ -z "$RUN_DIR" ]]; then
+    commit_uncommitted_work "coding leg"
+fi
 
 # The --review-loop pass, when this run carries one. Runs pod-side -- the
 # pod owns the clone, so a fresh review/fix session per iteration costs no
@@ -1387,7 +1658,13 @@ commit_uncommitted_work "coding leg"
 # review prompt and recorded in review-loop.json, not used to preempt the
 # loop. Only an unreadable branch head is this block's own call, since
 # review-loop.sh treats that as a hard failure rather than a graceful skip.
-if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
+# Not run in RUN_DIR mode either: a runner-mode pipeline that wants a
+# review/fix loop gets it from pipeline.json's own steps, walked inside
+# run.sh -- this is the legacy single-leg path's own loop, and RUN_DIR
+# should never carry a positive REVIEW_LOOP_CAP alongside it (the client
+# does not render both), but the guard is explicit here rather than
+# implicit in that absence.
+if [[ -z "$RUN_DIR" ]] && [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     coding_head="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
     if [[ -z "$coding_head" ]]; then
         echo "fork-sandbox-k8s-entrypoint: branch $BRANCH could not be read;" >&2

@@ -268,6 +268,11 @@ print_progress_line() {
         printf '%s  ?\n' "$fallback"
         return
     fi
+    # progress.json is collect's own pull-back on a composed --k8s run (or
+    # a live pod's push of the same file, on a design that later allows
+    # it) -- the same untrusted-stranger bytes the verdict readers
+    # elsewhere in this script already strip control characters from, so
+    # the rendered line gets the same treatment here.
     printf '%s' "$json" | jq -r --arg fallback "$fallback" '
         (.label // $fallback) as $label
         | (.state // "unknown") as $state
@@ -278,6 +283,7 @@ print_progress_line() {
                   else "" end)
            ] | join(" ")) as $steps
         | $label + "  " + $state + "  " + $steps' 2>/dev/null \
+        | tr -d '\000-\010\013-\037\177' \
         || printf '%s  ?\n' "$fallback"
 }
 
@@ -782,10 +788,22 @@ branch="$(run_env_get branch)"
 origin_repo="$(run_env_get origin_repo)"
 clone_dir="$(run_env_get clone_dir)"
 started_at="$(run_env_get started_at)"
+# Set only for a composed --k8s run (cmd_submit's one and only writer of
+# this key) -- see run_state()'s own use of it for why "cluster" changes
+# how a pid-less run dir is read.
+network="$(run_env_get network)"
 # Older runs recorded a tmux window instead of a session. Fall back to it so a
-# run launched before that change still reports where it went.
+# run launched before that change still reports where it went. Empty for a
+# composed --k8s run (network=cluster): it never starts a tmux session at
+# all, so there is no window/session key to fall back to either -- see
+# print_status_block's own use of network, below, for what prints instead.
 tmux_target="$(run_env_get session)"
 [[ -n "$tmux_target" ]] || tmux_target="$(run_env_get window)"
+# cmd_submit's own writer, the cluster-side equivalent of a tmux session
+# name: the Job/Pod label name, the one thing that actually exists for an
+# operator to look at. Empty on a run.env written before this field
+# existed.
+k8s_job_name="$(run_env_get k8s_job_name)"
 
 # Resolve every file this script may open, once, here at the top level, so a
 # tampered run directory is rejected before anything is printed. A file the
@@ -856,6 +874,28 @@ run_state() {
         return
     fi
     if ! pid="$(run_file_read pid 2>/dev/null)"; then
+        # A composed --k8s run never gets a pid file: its agent runs in a
+        # pod, not under this host's tmux, so there is no local process to
+        # record one for. Its run.env instead carries k8s_client_pid --
+        # the host-side client that submitted the pod and is waiting on
+        # it, recorded under a key fork-sandbox-stop.sh never reads, so it
+        # cannot be mistaken for a killable local runner (see that key's
+        # own writer, in fork-sandbox.sh, for why "pid" would be unsafe
+        # here). network=cluster is this shape's only tell -- a run dir
+        # that reaches this function at all already has a version=, and
+        # the only writer of version= that ever omits a pid file is this
+        # one.
+        if [[ "$network" == "cluster" ]]; then
+            local k8s_pid
+            k8s_pid="$(run_env_get k8s_client_pid)"
+            k8s_pid="${k8s_pid//[^0-9]/}"
+            if [[ -n "$k8s_pid" ]] && kill -0 "$k8s_pid" 2>/dev/null; then
+                printf 'running'
+            else
+                printf 'abandoned'
+            fi
+            return
+        fi
         printf 'starting'
         return
     fi
@@ -983,7 +1023,17 @@ print_status_block() {
     printf 'branch:   %s\n' "$branch"
     printf 'origin:   %s\n' "$origin_repo"
     printf 'clone:    %s\n' "$clone_dir"
-    printf 'tmux:     %s\n' "$tmux_target"
+    # A composed --k8s run (network=cluster) has no tmux session to name --
+    # see tmux_target's own comment, above, for why -- so this prints the
+    # cluster object an operator can actually look at instead of a session
+    # that was never started. Nothing at all for a run.env written before
+    # k8s_job_name existed: a made-up name would be no better than the
+    # false tmux claim this replaces.
+    if [[ "$network" == "cluster" ]]; then
+        [[ -n "$k8s_job_name" ]] && printf 'job:      %s\n' "$k8s_job_name"
+    else
+        printf 'tmux:     %s\n' "$tmux_target"
+    fi
     printf 'run dir:  %s\n' "$run_dir"
     printf 'commits:  %s\n' "$(commit_count_labelled)"
     printf 'events:   %s\n' "$(event_count)"
@@ -1020,15 +1070,28 @@ print_status_block() {
         printf 'last:     %s\n' "$last"
     fi
     if [[ "$state" == "abandoned" ]]; then
-        printf '\nThe runner process is gone and it never wrote an exit code.\n'
-        printf 'The tmux session was probably killed. Nothing was fetched.\n'
+        if [[ "$network" == "cluster" ]]; then
+            printf '\nThe host-side k8s client is gone and it never wrote an exit code.\n'
+            printf 'The pod may still be running. Collect it with:\n'
+            printf '  fork-sandbox-k8s.sh collect --run-dir %s --branch %s %s\n' \
+                "$run_dir" "$branch" "$origin_repo"
+            printf 'or remove it with: fork-sandbox-k8s.sh rm --branch %s\n' "$branch"
+        else
+            printf '\nThe runner process is gone and it never wrote an exit code.\n'
+            printf 'The tmux session was probably killed. Nothing was fetched.\n'
+        fi
     fi
 }
 
 print_tail_of_log() {
     if resolve_run_file sandbox.log 2>/dev/null && [[ -s "$RUN_FILE_PATH" ]]; then
         printf '\n-- sandbox wrapper messages --\n'
-        tail -n 20 -- "$RUN_FILE_PATH"
+        # sandbox.log is collect's own pull-back of a pod's wrapper
+        # messages on a composed --k8s run -- bytes from the same
+        # untrusted stranger the verdict readers above already strip
+        # control characters from. A local run's own wrapper never writes
+        # one either, so this costs nothing there.
+        tail -n 20 -- "$RUN_FILE_PATH" | tr -d '\000-\010\013-\037\177'
     fi
 }
 
@@ -1156,14 +1219,28 @@ case "$mode" in
         ;;
 
     log)
-        run_file_read sandbox.log || echo "(no sandbox log yet)"
+        # Resolved (and so symlink/non-regular-file refused) as a bare
+        # call, not piped: a `resolve_run_file` refusal calls `die`, which
+        # must stop this whole process, not just a forked pipeline stage
+        # the way piping `run_file_read` itself would. Only the actual
+        # read goes through `tr` -- sandbox.log is collect's own pull-back
+        # on a composed --k8s run, the same untrusted-stranger bytes the
+        # verdict readers already strip control characters from.
+        if resolve_run_file sandbox.log; then
+            cat -- "$RUN_FILE_PATH" | tr -d '\000-\010\013-\037\177'
+        else
+            echo "(no sandbox log yet)"
+        fi
         ;;
 
     status)
         print_status_block
         state="$(run_state)"
         if [[ "$state" == "done" || "$state" == "failed" ]]; then
-            if summary="$(run_file_read summary.txt 2>/dev/null)"; then
+            # summary.txt is collect's own pull-back on a composed --k8s
+            # run -- the same untrusted-stranger bytes the verdict readers
+            # above already strip control characters from.
+            if summary="$(run_file_read summary.txt 2>/dev/null | tr -d '\000-\010\013-\037\177')"; then
                 printf '\n%s\n' "$summary"
             fi
             if ! print_plan_report; then
@@ -1255,7 +1332,7 @@ case "$mode" in
                         flush_result_if_terminal_only "$EVENT_FILE_COUNT"
                         printf 'finished: %s, exit %s, after %s\n' \
                             "$state" "$(exit_code)" "$(elapsed_human)"
-                        if summary="$(run_file_read summary.txt 2>/dev/null)"; then
+                        if summary="$(run_file_read summary.txt 2>/dev/null | tr -d '\000-\010\013-\037\177')"; then
                             printf '%s\n' "$summary"
                         else
                             printf 'No summary was written, so the branch was probably never fetched.\n'
@@ -1274,7 +1351,14 @@ case "$mode" in
                         flush_result_if_terminal_only "$EVENT_FILE_COUNT"
                         printf 'abandoned: the runner is gone and wrote no exit code, after %s\n' \
                             "$(elapsed_human)"
-                        printf 'Nothing was fetched. The clone is still at %s\n' "$clone_dir"
+                        if [[ "$network" == "cluster" ]]; then
+                            printf 'The host-side k8s client is gone. The pod may still be running.\n'
+                            printf 'Collect it with: fork-sandbox-k8s.sh collect --run-dir %s --branch %s %s\n' \
+                                "$run_dir" "$branch" "$origin_repo"
+                            printf 'or remove it with: fork-sandbox-k8s.sh rm --branch %s\n' "$branch"
+                        else
+                            printf 'Nothing was fetched. The clone is still at %s\n' "$clone_dir"
+                        fi
                         print_tail_of_log
                     )"
                     printf '%s\n' "$block"

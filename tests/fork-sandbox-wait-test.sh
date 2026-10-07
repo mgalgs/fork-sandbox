@@ -216,11 +216,12 @@ printf '\n== static: --wait-timeout resolves timeout through FS_TIMEOUT ==\n'
 # $FS_TIMEOUT shim" check.
 # shellcheck disable=SC2016  # the shimmed form is meant literally, not expanded
 raw_timeout_hits="$(grep -nE '(^|[;&|(])[[:space:]]*timeout[[:space:]]' "$launcher" \
+    "$repo_dir/scripts/fork-sandbox-runner.sh" \
     | grep -vF -- '"$FS_TIMEOUT"' || true)"
 if [[ -z "$raw_timeout_hits" ]]; then
-    ok "fork-sandbox.sh: no bare 'timeout' command outside the \$FS_TIMEOUT shim"
+    ok "fork-sandbox.sh and fork-sandbox-runner.sh: no bare 'timeout' command outside the \$FS_TIMEOUT shim"
 else
-    no "fork-sandbox.sh: no bare 'timeout' command outside the \$FS_TIMEOUT shim" \
+    no "fork-sandbox.sh and fork-sandbox-runner.sh: no bare 'timeout' command outside the \$FS_TIMEOUT shim" \
         "$raw_timeout_hits"
 fi
 

@@ -1483,8 +1483,8 @@ fs_harness_error() {
 # minutes does not lift it, and claude already retries it internally. Case-
 # insensitive throughout, since the provider's own casing is not a contract.
 #
-# Shared by fork-sandbox.sh's own local runner (fs_run_claude_leg_with_retry,
-# in the RUNNER heredoc) and fork-sandbox-k8s-entrypoint.sh's simpler retry
+# Shared by fork-sandbox-runner.sh's own fs_run_claude_leg_with_retry and
+# fork-sandbox-k8s-entrypoint.sh's simpler retry
 # around the pod's claude coding leg -- one classifier, so the two paths can
 # never drift on which errors are worth restarting a leg over.
 fs_leg_error_retryable() {

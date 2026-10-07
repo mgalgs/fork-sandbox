@@ -540,9 +540,28 @@ refuses "--review-only over a code-only preset leaves nothing to run" \
     "drops the code step, and this pipeline has no review or maintain step left" \
     --preset fast3 --review-only --checkout HEAD
 
+# A fresh, maintain-less fixture, not "deep": "deep" is a 3-step
+# code/review/maintain preset, and a maintain step forces a preset onto
+# the composed path on --k8s (the legacy path's --k8s block cannot run a
+# maintainer tier -- see the dispatch section below). A composed preset's
+# own per-seat claude-args key has its own route (every seat's args ship
+# to the pod via pipeline.json/run.sh, same as a local composed run) and
+# is never refused, so "deep" proves nothing about this flag-shaped
+# refusal. A bare code-only preset with a claude-args key, staying legacy-
+# shaped either way, is what this test actually needs.
+cat > "$presets_dir/cargs-legacy.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    claude-args: --effort high
+pipeline:
+  - action: code
+    agent: coder
+EOF
 refuses "a preset's compiled values meet the --k8s refusals like flags do" \
     "--claude-args is not supported with --k8s" \
-    --preset deep --k8s
+    --preset cargs-legacy --k8s
 refuses "--codex-args is refused with --k8s" \
     "--codex-args is not supported with --k8s" \
     --harness codex --codex-args '-c model_reasoning_effort=high' --k8s
@@ -618,8 +637,35 @@ refuses "--harness is refused against a composed pipeline with more than one cod
     "composed pipeline; edit the preset or pick another" \
     --preset composed-2code --harness claude
 
-refuses "--k8s is refused against a composed pipeline preset" \
-    "does not support a composed pipeline preset ('composed')" \
+# A composed pipeline with every seat claude/pi, modeled and unsealed
+# now dispatches through the shared runner on --k8s instead of being
+# refused outright -- --dry-run's own project/handoff security
+# checks (fs_require_scratch_handoff/fs_require_project_root) run ahead
+# of the dry-run listing itself for --k8s, unlike a local dry-run, so
+# this needs a real fixture rather than run()'s "unused-project
+# unused-handoff" shorthand.
+k8s_dryrun_home="$(mktemp -d)"; tmpdirs+=("$k8s_dryrun_home")
+mkdir -p "$k8s_dryrun_home/src"
+k8s_dryrun_proj="$(mktemp -d "$k8s_dryrun_home/src/fs-preset-k8s-dryrun.XXXXXX")"
+(cd "$k8s_dryrun_proj" && git init -q && git config user.email t@fork-sandbox.invalid \
+    && git config user.name Tester && printf 'hi\n' > f.txt && git add f.txt \
+    && git commit -q -m init) >/dev/null 2>&1
+k8s_dryrun_handoff="$(mktemp /var/tmp/claude-scratch/fs-preset-k8s-dryrun-handoff.XXXXXX)"
+tmpdirs+=("$k8s_dryrun_handoff")
+printf 'do the task\n' > "$k8s_dryrun_handoff"
+
+k8s_composed_dryrun() {
+    local label="$1"; shift
+    local out
+    if out="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run "$@" \
+        "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>"$err")"; then
+        contains "$label: dry-run exits 0 and announces runner mode" "$out" "k8s=runner"
+    else
+        no "$label: dry-run exits 0 and announces runner mode" "$(cat "$err")"
+    fi
+}
+
+k8s_composed_dryrun "a composed pipeline preset dispatches through --k8s" \
     --preset composed --k8s
 run --preset composed --review-only --checkout HEAD >/dev/null 2>"$err" || true
 contains "--review-only accepts a preset whose remaining steps are several read-only steps" \
@@ -1759,11 +1805,10 @@ out="$("$launcher" --dry-run --pipeline chaiku-rsonnet-chaiku --refresh-at 0.5 \
 contains "a composed haiku step 1 refreshes against haiku's window" \
     "$out" "refresh_context_window=200000"
 
-# --refresh-at's continuation chain now follows every code and fix leg,
-# wherever it sits -- including the code leg that follows a plan step -- so
-# a plan-first pipeline no longer gets a "will not engage" launch warning
-# (removed entirely; every eligible leg refreshes the same way regardless
-# of pipeline shape).
+# --refresh-at's continuation chain follows every code and fix leg,
+# wherever it sits -- including the code leg that follows a plan step --
+# so a plan-first pipeline gets no "will not engage" launch warning: every
+# eligible leg refreshes the same way regardless of pipeline shape.
 "$launcher" --dry-run --pipeline pfable-csonnet --refresh-at 0.3 \
     unused-project unused-handoff >/dev/null 2>"$err"
 lacks "a plan-first --pipeline with --refresh-at warns of nothing" \
@@ -2154,7 +2199,13 @@ STUB
 # "--arg fix_harness" pair (scripts/fork-sandbox.sh has no other jq call
 # that names a $-arg "fix_harness") and only misbehaves when
 # FAKE_JQ_FAIL_LOOP_SAVE is set, so every other test in this file -- which
-# shares this same real_stub dir -- still gets the real jq.
+# shares this same real_stub dir -- still gets the real jq. A second,
+# independent switch, FAKE_JQ_FAIL_PROGRESS_WRITE, likewise recognizes only
+# progress_write's own filter by its unique `schema:1, "label":$run_label` pair
+# (fork-sandbox-runner.sh has no other jq call that builds that object) --
+# unlike the loop-json one, this one fails every matching call for the
+# whole run, since progress_write's own dedupe (not this stub) is what the
+# test downstream of it is checking.
 real_jq="$(command -v jq)"
 cat > "$real_stub/jq" <<STUB
 #!/usr/bin/env bash
@@ -2163,6 +2214,11 @@ if [[ "\${FAKE_JQ_FAIL_LOOP_SAVE:-}" == 1 ]]; then
     for a in "\$@"; do
         [[ "\$prev" == "--arg" && "\$a" == "fix_harness" ]] && exit 1
         prev="\$a"
+    done
+fi
+if [[ "\${FAKE_JQ_FAIL_PROGRESS_WRITE:-}" == 1 ]]; then
+    for a in "\$@"; do
+        [[ "\$a" == *'schema:1, "label":\$run_label'* ]] && exit 1
     done
 fi
 exec "$real_jq" "\$@"
@@ -2305,6 +2361,26 @@ if HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_
 else
     contains "--codex-args is refused on a non-codex harness" "$(cat "$err")" \
         "--codex-args passes flags to codex exec, which a claude run"
+fi
+
+printf '\n== run.sh is the preamble followed by fork-sandbox-runner.sh, verbatim ==\n'
+# There is exactly one pipeline walker: fork-sandbox.sh's launcher `cat`s
+# scripts/fork-sandbox-runner.sh onto every generated run.sh rather than
+# carrying its own copy. A byte comparison of the tail of a real run.sh
+# against the shipped file is the proof -- not a grep for a few symbols,
+# which could pass against a drifted copy.
+prep_stub 'noop'
+rd_runner_src="$(run_stubbed --branch "sandbox-test-runner-src-$$")" && tmpdirs+=("$rd_runner_src")
+if [[ -n "${rd_runner_src:-}" ]]; then
+    runner_lines="$(wc -l < "$repo_dir/scripts/fork-sandbox-runner.sh")"
+    if diff -u <(tail -n "$runner_lines" "$rd_runner_src/run.sh") "$repo_dir/scripts/fork-sandbox-runner.sh" \
+        > "$err"; then
+        ok "run.sh's tail is fork-sandbox-runner.sh's exact bytes"
+    else
+        no "run.sh's tail is fork-sandbox-runner.sh's exact bytes" "$(cat "$err")"
+    fi
+else
+    no "run.sh's tail is fork-sandbox-runner.sh's exact bytes" "run_stubbed found no run dir"
 fi
 
 # The generated command must leave '-' last: codex uses it to read the prompt
@@ -3251,6 +3327,62 @@ else
     no "the no-fix-record composed walk launch succeeds"
 fi
 
+printf '\n== fetch_back=0: stats read the clone directly, nothing crosses to origin ==\n'
+# A --k8s pod run's own preamble sets fetch_back=0 -- this is the seam a
+# local run never exercises on its own, so it is driven here by generating
+# a real run.sh the ordinary way (fetch_back=1, as every local run does),
+# then flipping that one line and running the SAME script a second time,
+# exactly the shape a --k8s launch's preamble would have generated it in
+# the first place. The "composed" preset (just above) gives step-2-loop.json
+# a genuine iteration to carry commits_added without a second fixture.
+fb_branch="sandbox-test-fetchback-$$"
+# Reuses the exact scripted sequence the "composed walk" test above already
+# proves works: step 2's review finds something, its fix commits, and the
+# rest of the walk clears -- only a step whose fix leg actually moved the
+# branch ever gets a non-null commits_added (see run_leg/cur_after's own
+# comments: a plain approval with nothing to fix never reads the head
+# again), so this is the one scripted shape that can exercise the backfill
+# this test is about.
+prep_stub $'commit\nfindings\ncommit\napproved\napproved'
+if rd_fb="$(run_stubbed --preset composed --branch "$fb_branch")"; then
+    tmpdirs+=("$rd_fb")
+    clone_dir_fb="$(jq -r '.clone_dir' "$rd_fb/summary.json" 2>/dev/null)"
+    base_sha_fb="$(jq -r '.base_sha' "$rd_fb/summary.json" 2>/dev/null)"
+    sed -i 's/^fetch_back=1$/fetch_back=0/' "$rd_fb/run.sh"
+    # Undo the fetch_back=1 pass's own fetch: a pod's run.sh always starts
+    # from a branch that has never reached origin_repo, which this
+    # suite's $proj stands in for.
+    git -C "$proj" branch -q -D "$fb_branch" 2>/dev/null || true
+    prep_stub $'commit\nfindings\ncommit\napproved\napproved'
+    # shellcheck disable=SC2034  # kept for a human rereading a failure, not asserted on
+    rerun_out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+        FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
+        FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        FS_LEG_RETRY_DELAYS="0 0" \
+        timeout 60 bash "$rd_fb/run.sh" 2>&1)"
+    rerun_rc=$?
+    expect_commits_fb="$( (cd "$clone_dir_fb" && git rev-list --count "$base_sha_fb..$fb_branch") \
+        2>/dev/null)"
+    if git -C "$proj" rev-parse --verify -q "$fb_branch" >/dev/null 2>&1; then
+        no "fetch_back=0: the branch never crosses into origin_repo" \
+            "found $fb_branch in $proj (rc=$rerun_rc)"
+    else
+        ok "fetch_back=0: the branch never crosses into origin_repo"
+    fi
+    check "fetch_back=0: summary.json's commits count the clone, not origin" \
+        "$expect_commits_fb" "$(jq -r '.commits' "$rd_fb/summary.json" 2>/dev/null)"
+    check "fetch_back=0: step-2-loop.json's commits_added is filled, not null" \
+        "false" "$(jq -r '.iterations[0].commits_added == null' "$rd_fb/step-2-loop.json" 2>/dev/null)"
+    if [[ -f "$rd_fb/git-status.txt" ]]; then
+        ok "fetch_back=0: the uncommitted-work check still ran (git-status.txt present)"
+    else
+        no "fetch_back=0: the uncommitted-work check still ran (git-status.txt present)" \
+            "missing (rc=$rerun_rc)"
+    fi
+else
+    no "fetch_back=0 rerun setup" "the fetch_back=1 pass failed to launch"
+fi
+
 printf '\n== the engine: a plan stage (--foreground, stubs) ==\n'
 
 cat > "$real_presets/plan-code-review.yaml" <<'EOF'
@@ -3474,8 +3606,12 @@ refuses "--review-only over a plan-containing preset is refused" \
     --preset plan-code-review --review-only
 refuses "a plan-only preset is refused" \
     "needs a 'code' step" --preset plan-only
-refuses "--k8s refuses a plan-containing preset" \
-    "does not support a composed pipeline preset" \
+# A plan step always makes a pipeline composed (never legacy-shaped), and
+# a composed --k8s run has no per-seat reason to refuse this one: its
+# plan step's seat (claude/opus) is unsealed and modeled, same as every
+# other step -- a plan step's seat is still a claude/pi seat, so the
+# composed dispatch holds for it exactly as any other step action.
+k8s_composed_dryrun "a plan-containing composed preset dispatches through --k8s" \
     --preset plan-code-review --k8s
 
 # A1b. cur_save's jq write is `... > "$f.part" && mv ... "$f.part" "$f"` --
@@ -3511,6 +3647,35 @@ if rd_jqfail="$(FAKE_JQ_FAIL_LOOP_SAVE=1 run_stubbed --preset jqfail \
     fi
 else
     no "jqfail launch succeeds"
+fi
+
+# A1c. progress_write (fork-sandbox-runner.sh) is also best-effort: forcing
+# every one of its own jq calls to fail for the whole run must neither fail
+# the run nor spam sandbox.log -- exactly one diagnostic line survives no
+# matter how many of its writes fail.
+cat > "$real_presets/pwfail.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+EOF
+prep_stub $'commit\napproved'
+if rd_pwfail="$(FAKE_JQ_FAIL_PROGRESS_WRITE=1 run_stubbed --preset pwfail \
+    --branch "sandbox-test-pwfail-$$")"; then
+    tmpdirs+=("$rd_pwfail")
+    ok "a run whose every progress.json write fails still exits 0 (run_stubbed demands it)"
+    check "the forced failure left no progress.json behind" \
+        "" "$(cat "$rd_pwfail/progress.json" 2>/dev/null)"
+    check "the forced failure is logged exactly once in sandbox.log" \
+        "1" "$(grep -c 'progress.json write failed' "$rd_pwfail/sandbox.log" 2>/dev/null)"
+else
+    no "pwfail launch succeeds"
 fi
 
 # A2. A bare --review-loop with no --review-model/--review-harness: the
@@ -3801,8 +3966,180 @@ else
 fi
 contains "the seat override fires for the moved seat" \
     "$(cat "$err_ep3")" "--harness overrides the code seat"
+
+# H. A missing fork-sandbox-runner.sh is refused by name, before any run
+# dir is created -- run.sh is generated by `cat`-ing that file's exact
+# bytes onto a host-computed preamble, so a broken install must fail loud
+# rather than ship a truncated run.sh.
+no_runner_scripts="$tmp/no-runner-scripts"
+cp -r "$repo_dir/scripts" "$no_runner_scripts"
+rm -f "$no_runner_scripts/fork-sandbox-runner.sh"
+no_runner_rundirs_before="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
+err_no_runner="$tmp/err-no-runner"
+if HOME="$launcher_home" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$no_runner_scripts/fork-sandbox.sh" --foreground \
+    "$proj" "$handoff" > /dev/null 2>"$err_no_runner"; then
+    no "a missing fork-sandbox-runner.sh is refused" "expected a refusal, got exit 0"
+else
+    contains "a missing fork-sandbox-runner.sh is refused, naming the file" \
+        "$(cat "$err_no_runner")" "fork-sandbox-runner.sh"
+fi
+no_runner_rundirs_after="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
+check "a missing fork-sandbox-runner.sh creates no run dir" \
+    "$no_runner_rundirs_before" "$no_runner_rundirs_after"
 lacks "the seat-override note does not claim the endpoint was dropped" \
     "$(cat "$err_ep3")" "endpoint"
+
+# I. Legacy (non-composed) --k8s shapes exec fork-sandbox-k8s.sh with
+# exactly the argv main produces, pinned here -- before any dispatch
+# change -- so a later commit that branches the --k8s block for composed
+# presets cannot silently alter the legacy argv it still has to build.
+# Reuses F's stubbed fork-sandbox-k8s.sh; --branch is passed explicitly so
+# the argv is deterministic (the flag's own default embeds a timestamp).
+err_legacy1="$tmp/err-legacy1"
+out_legacy1="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --harness pi --k8s \
+    --branch fixed-branch "$proj" "$handoff" 2>"$err_legacy1")"
+rc_legacy1=$?
+argv_legacy1="$(printf '%s\n' "$out_legacy1" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+check "--k8s --harness pi execs fork-sandbox-k8s.sh with exactly main's argv" \
+    "run --harness pi --branch fixed-branch $proj $handoff " \
+    "$argv_legacy1"
+(( rc_legacy1 == 0 )) || no "--k8s --harness pi exits 0" "rc=$rc_legacy1 err=$(cat "$err_legacy1")"
+
+err_legacy2="$tmp/err-legacy2"
+out_legacy2="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --harness pi --review-loop 2 \
+    --k8s --branch fixed-branch "$proj" "$handoff" 2>"$err_legacy2")"
+rc_legacy2=$?
+argv_legacy2="$(printf '%s\n' "$out_legacy2" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+check "--k8s --review-loop execs fork-sandbox-k8s.sh with exactly main's argv" \
+    "run --review-loop 2 --harness pi --branch fixed-branch $proj $handoff " \
+    "$argv_legacy2"
+(( rc_legacy2 == 0 )) || no "--k8s --review-loop exits 0" "rc=$rc_legacy2 err=$(cat "$err_legacy2")"
+
+err_legacy3="$tmp/err-legacy3"
+out_legacy3="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --harness claude --model opus \
+    --review-loop 2 --review-harness pi --review-model moonshotai/kimi-k3 \
+    --k8s --branch fixed-branch "$proj" "$handoff" 2>"$err_legacy3")"
+rc_legacy3=$?
+argv_legacy3="$(printf '%s\n' "$out_legacy3" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+check "--k8s claude+pi-review execs fork-sandbox-k8s.sh with exactly main's argv" \
+    "run --review-loop 2 --review-model moonshotai/kimi-k3 --model opus --harness claude --branch fixed-branch $proj $handoff " \
+    "$argv_legacy3"
+(( rc_legacy3 == 0 )) || no "--k8s claude+pi-review exits 0" "rc=$rc_legacy3 err=$(cat "$err_legacy3")"
+
+# The forwarded-flag tail: --timeout, --keep and --outbox-dir, which have
+# no composed-preset equivalent above, forward unchanged ahead of --model.
+legacy_outbox="$(mktemp -d)"; tmpdirs+=("$legacy_outbox")
+err_legacy4="$tmp/err-legacy4"
+out_legacy4="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --harness pi --model m \
+    --timeout 5 --keep --outbox-dir "$legacy_outbox" --k8s \
+    --branch fixed-branch "$proj" "$handoff" 2>"$err_legacy4")"
+rc_legacy4=$?
+argv_legacy4="$(printf '%s\n' "$out_legacy4" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+check "--k8s forwarded-flag tail execs fork-sandbox-k8s.sh with exactly main's argv" \
+    "run --timeout 5 --keep --outbox-dir $legacy_outbox --model m --harness pi --branch fixed-branch $proj $handoff " \
+    "$argv_legacy4"
+(( rc_legacy4 == 0 )) || no "--k8s forwarded-flag tail exits 0" "rc=$rc_legacy4 err=$(cat "$err_legacy4")"
+
+# J. A legacy-shaped preset (code -> review -> maintain, the fixed skeleton
+# preset_is_legacy_shaped recognizes) that the legacy --k8s path cannot
+# honour -- it has a maintain step, and the legacy path's own --k8s block
+# refuses --maintainer-loop/--maintainer-harness/--maintainer-model
+# outright, unconditionally -- must dispatch through the shared runner on
+# --k8s instead, exactly like a composed preset (section F's "race").
+# Reuses k8s_scripts (F) and real_presets (G).
+cat > "$real_presets/k8s-rd-maintain.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+# Also staged under $presets_dir (the plain refusal helpers' own env, see
+# run()), the same "second copy, not a symlink" shape composed-args-all
+# uses above.
+cp "$real_presets/k8s-rd-maintain.yaml" "$presets_dir/k8s-rd-maintain.yaml"
+stage_tmp_k8s_j="$(mktemp -d)"; tmpdirs+=("$stage_tmp_k8s_j")
+err_k8s_j="$tmp/err-k8s-j"
+out_k8s_j="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s_j" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset k8s-rd-maintain \
+    --k8s --branch fs-preset-test-rd-maintain "$proj" "$handoff" 2>"$err_k8s_j")"
+rc_k8s_j=$?
+argv_k8s_j="$(printf '%s\n' "$out_k8s_j" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+if (( rc_k8s_j == 0 )) && [[ "$argv_k8s_j" == *"--run-dir "* ]]; then
+    ok "a legacy-shaped preset with a maintain step dispatches through the shared runner (--run-dir) on --k8s"
+else
+    no "a legacy-shaped preset with a maintain step dispatches through the shared runner (--run-dir) on --k8s" \
+        "rc=$rc_k8s_j out=$(printf '%s' "$out_k8s_j" | head -3) err=$(head -3 "$err_k8s_j")"
+fi
+k8s_j_rundir="$(printf '%s\n' "$argv_k8s_j" | grep -o -- '--run-dir [^ ]*' | awk '{print $2}')"
+[[ -n "$k8s_j_rundir" ]] && tmpdirs+=("$k8s_j_rundir")
+
+# ...and a --maintainer-loop against that same preset is refused by name as
+# a composed pipeline (the shared coherence block, same message every other
+# composed preset gets, run()'s own --dry-run against placeholder project/
+# handoff paths, same as every other refusal test in this section), not the
+# legacy path's generic "--maintainer-loop is not yet supported with --k8s"
+# refusal -- proving it is treated as composed before the --k8s block ever
+# runs, not merely dispatched like one.
+refuses "--maintainer-loop against the legacy-shaped-with-maintain preset is refused as composed" \
+    "cannot be combined with preset" \
+    --preset k8s-rd-maintain --maintainer-loop 2 --k8s
+
+# Control: a legacy-shaped preset the legacy --k8s path CAN honour (code,
+# then review -- no maintain step) keeps exec'ing the legacy single-leg
+# argv, carrying --harness and no --run-dir, same as section G's "ep"
+# already proves for a bare code preset.
+cat > "$real_presets/k8s-rd-review-only.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: pi
+    model: z-ai/glm-4.6
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+EOF
+err_k8s_j2="$tmp/err-k8s-j2"
+out_k8s_j2="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s_j" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset k8s-rd-review-only \
+    --k8s --branch fs-preset-test-rd-review-only "$proj" "$handoff" 2>"$err_k8s_j2")"
+rc_k8s_j2=$?
+argv_k8s_j2="$(printf '%s\n' "$out_k8s_j2" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+if (( rc_k8s_j2 == 0 )) && [[ "$argv_k8s_j2" == *"--harness"* ]] \
+        && [[ "$argv_k8s_j2" != *"--run-dir"* ]]; then
+    ok "a legacy-shaped preset the legacy --k8s path CAN honour still execs the legacy single-leg argv"
+else
+    no "a legacy-shaped preset the legacy --k8s path CAN honour still execs the legacy single-leg argv" \
+        "rc=$rc_k8s_j2 out=$(printf '%s' "$out_k8s_j2" | head -3) err=$(head -3 "$err_k8s_j2")"
+fi
 
 # B. A fix seat of its own, with repeat: the review loop's fix legs run the
 # fix agent's model, twice per iteration.
@@ -4489,11 +4826,130 @@ else
     no "legacy-fix-self launch succeeds"
 fi
 
-# --k8s still has no route for a composed pipeline's per-seat arguments --
-# refused the same way any composed preset already is under --k8s.
-refuses "--k8s refuses a composed preset with per-seat arguments" \
-    "does not support a composed pipeline preset ('composed-cargs')" \
+# --k8s now dispatches a composed pipeline's per-seat arguments through
+# to the pod the same way it dispatches everything else about the step:
+# forwarded via pipeline.json's own claude-args/pi-args/codex-args keys
+# (fs_build_sandbox_cmd's pod branch splices $b_extra_args verbatim), not
+# through a command-line flag -- there was never a flag-vs-composed
+# conflict here to refuse, only the pre-existing blanket refusal this
+# round lifts.
+k8s_composed_dryrun "a composed preset with per-seat arguments dispatches through --k8s" \
     --preset composed-cargs --k8s
+
+# The composed/legacy-shape coherence block (above) now runs ahead of the
+# --k8s dispatch block, so a seat-override flag combined with both --k8s
+# and a composed preset is caught by its own specific message, not by
+# --k8s's generic "does not support a composed pipeline preset" refusal --
+# the two refusals would otherwise race and the less specific one would
+# win if the --k8s block ran first instead.
+refuses "--k8s + --review-loop against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --review-loop 2
+refuses "--k8s + --review-model against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --review-model moonshotai/kimi-k3
+refuses "--k8s + --review-harness against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --review-harness pi/moonshotai/kimi-k3
+refuses "--k8s + --maintainer-loop against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --maintainer-loop 2
+refuses "--k8s + --maintainer-model against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --maintainer-model moonshotai/kimi-k3
+refuses "--k8s + --maintainer-harness against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --maintainer-harness pi
+refuses "--k8s + --model against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --model opus
+refuses "--k8s + --harness against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --harness claude
+refuses "--k8s + --claude-args against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --claude-args '--effort high'
+refuses "--k8s + --pi-args against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --pi-args '--thinking low'
+refuses "--k8s + --codex-args against a composed preset names the flag" \
+    "cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --k8s --codex-args '-c model_reasoning_effort=high'
+refuses "--k8s + --session-state against a composed preset names the flag" \
+    "a composed step's seat has no transcript store" \
+    --preset composed-cargs --k8s --session-state "$composed_session_state_dir"
+
+# A composed shape --k8s cannot honor is refused by name at launch,
+# before any run directory exists -- composed-codex-step.yaml and
+# composed-codex-fix.yaml (above) already prove their LOCAL shapes launch;
+# --k8s is the only thing that refuses them.
+refuses "a composed step seated on codex is refused by name on --k8s" \
+    "seated on codex, which has no sandboxed path in the cluster" \
+    --preset composed-codex-step --k8s
+refuses "a composed step's fix seat on codex is refused by name on --k8s" \
+    "cannot run step 3's fix seat: it is seated on" \
+    --preset composed-codex-fix --k8s
+
+cat > "$presets_dir/composed-k8s-sealed.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: pi
+    model: vendor/sealed-model
+    network: sealed
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+accepts "a composed pipeline with a sealed (network: sealed) pi seat launches locally" \
+    --preset composed-k8s-sealed
+refuses "a sealed (pi-local) composed seat is refused by name on --k8s" \
+    "false claim there -- cluster isolation" \
+    --preset composed-k8s-sealed --k8s
+
+cat > "$presets_dir/composed-k8s-claude-nomodel.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+accepts "a composed pipeline with a model-less claude seat launches locally" \
+    --preset composed-k8s-claude-nomodel
+refuses "a model-less claude composed seat is refused by name on --k8s" \
+    "claude seat with no model -- the pod's entrypoint has no default" \
+    --preset composed-k8s-claude-nomodel --k8s
+
+# A model-less, non-sealed pi seat has no test here: the preset parser
+# itself already refuses one universally ("harness pi needs a model --
+# pi has no default of its own"), with no --k8s involved, so the --k8s
+# block's own "pi seat with no model" message (scripts/fork-sandbox.sh,
+# beside the claude one just above) has no constructible preset left to
+# reach it with -- see this commit's own message.
 
 printf '\n== progress.json: a live per-step status file ==\n'
 
@@ -4904,7 +5360,7 @@ extract_runner_fn() {
         $0 ~ "^" fn "\\(\\) \\{" { p = 1 }
         p { print }
         p && /^}$/ { exit }
-    ' "$launcher"
+    ' "$repo_dir/scripts/fork-sandbox-runner.sh"
 }
 extract_lib_fn() {
     awk -v fn="$1" '

@@ -519,6 +519,8 @@ inbox_write_sh="$repo_dir/scripts/fork-sandbox-k8s-inbox-write.sh"
 review_loop_sh="$repo_dir/scripts/fork-sandbox-k8s-review-loop.sh"
 outbox_extract_sh="$repo_dir/scripts/fork-sandbox-k8s-outbox-extract.sh"
 context_extract_sh="$repo_dir/scripts/fork-sandbox-k8s-context-extract.sh"
+runner_sh="$repo_dir/scripts/fork-sandbox-runner.sh"
+leg_sh="$repo_dir/scripts/fork-sandbox-k8s-leg.sh"
 
 # Sourced directly into this shell, not a subshell: ok()/no() below have to
 # reach the pass/fail counters this file reports at the end, and a subshell
@@ -537,7 +539,7 @@ printf '== shellcheck ==\n'
 if ! command -v shellcheck >/dev/null 2>&1; then
     printf '  SKIP  shellcheck not installed\n'
 else
-    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$service_ready_sh" "$inbox_write_sh" "$review_loop_sh" "$outbox_extract_sh" "$context_extract_sh"; do
+    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$service_ready_sh" "$inbox_write_sh" "$review_loop_sh" "$outbox_extract_sh" "$context_extract_sh" "$runner_sh" "$leg_sh"; do
         out="$(shellcheck "$f" 2>&1)"
         if [[ -z "$out" ]]; then ok "shellcheck: $(basename "$f")"; else no "shellcheck: $(basename "$f")" "$out"; fi
     done
@@ -7110,6 +7112,129 @@ if grep -qE '^OUTBOX_DIR=.+/resume-outbox-a$' "$resume_env_a" \
 else
     no "submit records OUTBOX_DIR and SUBMITTED_AT in run.env" "$(cat "$resume_env_a" 2>/dev/null)"
 fi
+# k8s_job_name: fork-sandbox-status.sh's own stand-in for a tmux session
+# name on a composed --k8s run dir (network=cluster), the same k8s_safe_name
+# derivation every management verb uses to find this run's Job/Pod.
+if grep -qxF 'k8s_job_name=fork-sandbox-agent-fs-k8s-test-resume-done' "$resume_env_a"; then
+    ok "submit records k8s_job_name in run.env"
+else
+    no "submit records k8s_job_name in run.env" "$(cat "$resume_env_a" 2>/dev/null)"
+fi
+# A composed (--run-dir) run with no --timeout: cmd_run sums the MAXIMUM
+# number of legs the runner can start for pipeline.json and multiplies by
+# the single-leg default (3600s), since the pod runs that many legs, not
+# one, before cmd_wait's own sentinel poll gives up -- see
+# fork-sandbox-k8s.sh's cmd_run. Every step here has no "fix" key at all,
+# but the runner still resolves a fix seat (repeat 1) for a FINDINGS
+# verdict either way, so a review/maintain step's own multiplier is
+# 1 + 1*(1+0) = 2 (harness pi throughout, so no refresh continuations):
+# code 1*1=1, review 3*2=6, maintain 2*2=4, total 11.
+rd_timeout_fixture="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rd-timeout.XXXXXX)"
+tmpdirs+=("$rd_timeout_fixture")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_timeout_fixture/run.sh"
+chmod +x "$rd_timeout_fixture/run.sh"
+printf '{"steps":[{"action":"code","harness":"pi","model":"z-ai/glm-4.6","repeat":1},{"action":"review","harness":"pi","model":"z-ai/glm-4.6","repeat":3},{"action":"maintain","harness":"pi","model":"z-ai/glm-4.6","repeat":2}]}' \
+    > "$rd_timeout_fixture/pipeline.json"
+rd_timeout_log="$(newdir)/kubectl.log"; rd_timeout_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$rd_timeout_log")" "$(dirname "$rd_timeout_out")")
+runstub_run "$rd_timeout_log" "$rd_timeout_out" \
+    --branch fs-k8s-test-rd-timeout-default --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_timeout_fixture" "$proj_dir" "$handoff_file" || true
+check "a composed run with no --timeout counts the implicit fix leg on every review/maintain iteration (1+6+4=11) times 3600s" \
+    "TIMEOUT=39600" "$(grep '^TIMEOUT=' "$rd_timeout_fixture/run.env")"
+
+# A step's own repeat is iterations, not legs: a fix seat on that step
+# reruns inside EVERY iteration, up to fix.repeat times. code repeat:1 (1
+# leg) + review repeat:1 with fix.repeat:5 (1 iteration * (1 review leg +
+# 5 fix legs) = 6 legs) = 7 legs, not the 2 a repeat-only sum would give.
+rd_timeout_fix_fixture="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rd-timeout-fix.XXXXXX)"
+tmpdirs+=("$rd_timeout_fix_fixture")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_timeout_fix_fixture/run.sh"
+chmod +x "$rd_timeout_fix_fixture/run.sh"
+printf '{"steps":[{"action":"code","harness":"pi","model":"z-ai/glm-4.6","repeat":1},{"action":"review","harness":"pi","model":"z-ai/glm-4.6","repeat":1,"fix":{"harness":"pi","model":"z-ai/glm-4.6","repeat":5}}]}' \
+    > "$rd_timeout_fix_fixture/pipeline.json"
+rd_timeout_fix_log="$(newdir)/kubectl.log"; rd_timeout_fix_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$rd_timeout_fix_log")" "$(dirname "$rd_timeout_fix_out")")
+runstub_run "$rd_timeout_fix_log" "$rd_timeout_fix_out" \
+    --branch fs-k8s-test-rd-timeout-fix-default --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_timeout_fix_fixture" "$proj_dir" "$handoff_file" || true
+check "a composed run's default timeout counts a fix seat's repeat inside every iteration (1+1*(1+5)=7) times 3600s" \
+    "TIMEOUT=25200" "$(grep '^TIMEOUT=' "$rd_timeout_fix_fixture/run.env")"
+
+# A claude seat refreshes by default (fs_refresh_resolve's own 0.5
+# default), so every code pass and every fix leg seated on claude gets up
+# to --refresh-max (default 6) further continuation legs budgeted too:
+# code 1*(1+6)=7, review 1*(1 + 1*(1+6))=8 (no "fix" key, so the implicit
+# fix seat inherits --harness claude same as the step itself), total 15.
+rd_timeout_claude_home="$(newdir)"; tmpdirs+=("$rd_timeout_claude_home")
+mkdir -p "$rd_timeout_claude_home/.claude"
+rd_timeout_claude_future_ms=$(( ($(date +%s) + 7200) * 1000 ))
+cat > "$rd_timeout_claude_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-timeout-token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $rd_timeout_claude_future_ms, "scopes": ["user:inference"]}}
+JSON
+rd_timeout_claude_fixture="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rd-timeout-claude.XXXXXX)"
+tmpdirs+=("$rd_timeout_claude_fixture")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_timeout_claude_fixture/run.sh"
+chmod +x "$rd_timeout_claude_fixture/run.sh"
+printf '{"steps":[{"action":"code","harness":"claude","model":"claude-sonnet-5","repeat":1},{"action":"review","harness":"claude","model":"claude-sonnet-5","repeat":1}]}' \
+    > "$rd_timeout_claude_fixture/pipeline.json"
+rd_timeout_claude_log="$(newdir)/kubectl.log"; rd_timeout_claude_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$rd_timeout_claude_log")" "$(dirname "$rd_timeout_claude_out")")
+HOME="$rd_timeout_claude_home" runstub_run "$rd_timeout_claude_log" "$rd_timeout_claude_out" \
+    --branch fs-k8s-test-rd-timeout-claude --harness claude --model claude-sonnet-5 \
+    --run-dir "$rd_timeout_claude_fixture" "$proj_dir" "$handoff_file" || true
+check "a composed claude run with no --timeout also budgets refresh continuations (7+8=15) times 3600s" \
+    "TIMEOUT=54000" "$(grep '^TIMEOUT=' "$rd_timeout_claude_fixture/run.env")"
+
+# --refresh-at 0 disables refresh outright, so the same pipeline falls
+# back to the plain fix-leg count: code 1*1=1, review 1*(1+1*1)=2, total 3.
+rd_timeout_norefresh_fixture="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rd-timeout-norefresh.XXXXXX)"
+tmpdirs+=("$rd_timeout_norefresh_fixture")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_timeout_norefresh_fixture/run.sh"
+chmod +x "$rd_timeout_norefresh_fixture/run.sh"
+printf '{"steps":[{"action":"code","harness":"claude","model":"claude-sonnet-5","repeat":1},{"action":"review","harness":"claude","model":"claude-sonnet-5","repeat":1}]}' \
+    > "$rd_timeout_norefresh_fixture/pipeline.json"
+rd_timeout_norefresh_log="$(newdir)/kubectl.log"; rd_timeout_norefresh_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$rd_timeout_norefresh_log")" "$(dirname "$rd_timeout_norefresh_out")")
+HOME="$rd_timeout_claude_home" runstub_run "$rd_timeout_norefresh_log" "$rd_timeout_norefresh_out" \
+    --branch fs-k8s-test-rd-timeout-norefresh --harness claude --model claude-sonnet-5 \
+    --refresh-at 0 --run-dir "$rd_timeout_norefresh_fixture" "$proj_dir" "$handoff_file" || true
+check "--refresh-at 0 drops the continuation budget from the composed default (1+2=3) times 3600s" \
+    "TIMEOUT=10800" "$(grep '^TIMEOUT=' "$rd_timeout_norefresh_fixture/run.env")"
+
+# --timeout still overrides the composed default when given, exactly as it
+# overrides the legacy single-leg default.
+rd_timeout_ov_fixture="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rd-timeout-ov.XXXXXX)"
+tmpdirs+=("$rd_timeout_ov_fixture")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_timeout_ov_fixture/run.sh"
+chmod +x "$rd_timeout_ov_fixture/run.sh"
+printf '{"steps":[{"action":"code","harness":"pi","model":"z-ai/glm-4.6","repeat":1},{"action":"review","harness":"pi","model":"z-ai/glm-4.6","repeat":3},{"action":"maintain","harness":"pi","model":"z-ai/glm-4.6","repeat":2}]}' \
+    > "$rd_timeout_ov_fixture/pipeline.json"
+rd_timeout_ov_log="$(newdir)/kubectl.log"; rd_timeout_ov_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$rd_timeout_ov_log")" "$(dirname "$rd_timeout_ov_out")")
+runstub_run "$rd_timeout_ov_log" "$rd_timeout_ov_out" \
+    --branch fs-k8s-test-rd-timeout-override --harness pi --model z-ai/glm-4.6 \
+    --timeout 555 --run-dir "$rd_timeout_ov_fixture" "$proj_dir" "$handoff_file" || true
+check "--timeout still overrides the composed default when given" \
+    "TIMEOUT=555" "$(grep '^TIMEOUT=' "$rd_timeout_ov_fixture/run.env")"
+
+# A legacy (no --run-dir) run with no --timeout is unchanged: one leg,
+# 3600s, same as before this round.
+rd_timeout_legacy_log="$(newdir)/kubectl.log"; rd_timeout_legacy_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$rd_timeout_legacy_log")" "$(dirname "$rd_timeout_legacy_out")")
+runstub_run "$rd_timeout_legacy_log" "$rd_timeout_legacy_out" \
+    --branch fs-k8s-test-legacy-timeout-default --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || true
+rd_timeout_legacy_rd="$(sed -n 's/^  run dir:  *//p' "$rd_timeout_legacy_out" | head -1)"
+if [[ -n "$rd_timeout_legacy_rd" ]]; then
+    tmpdirs+=("$rd_timeout_legacy_rd")
+    check "a legacy (no --run-dir) run with no --timeout still defaults to 3600s" \
+        "TIMEOUT=3600" "$(grep '^TIMEOUT=' "$rd_timeout_legacy_rd/run.env")"
+else
+    no "a legacy (no --run-dir) run with no --timeout still defaults to 3600s" \
+        "$(cat "$rd_timeout_legacy_out")"
+fi
+
 resume_log_a="$(newdir)/kubectl.log"; resume_out_a="$(dirname "$resume_log_a")/out.txt"
 tmpdirs+=("$(dirname "$resume_log_a")")
 rc=0
@@ -8511,6 +8636,19 @@ case " $* " in
         fi
         [[ -n "${K8S_STUB_SESSION_STDERR:-}" ]] && printf '%s' "$K8S_STUB_SESSION_STDERR" >&2
         exit "${K8S_STUB_SESSION_RC:-1}" ;;
+    *" -C ${K8S_STUB_RUN_DIR_PULL_PATH:-/__no-run-dir-pull__} ."*)
+        # A RUNNER=1 run's own directory pull (cmd_collect): serve
+        # K8S_STUB_RUN_DIR_PULL_SRC's contents whenever it is set,
+        # independently of the exit status, same trick as every other
+        # pull above. Matched on the exact --run-dir path the test gave
+        # collect (K8S_STUB_RUN_DIR_PULL_PATH), since that path is the
+        # pod's own mount point too (the emptyDir is mounted at the run
+        # directory's own absolute host path) and so is never a fixed
+        # /work/* constant the way outbox/session-store are.
+        if [[ -n "${K8S_STUB_RUN_DIR_PULL_SRC:-}" ]]; then
+            ( cd "$K8S_STUB_RUN_DIR_PULL_SRC" && tar cf - . ) || true
+        fi
+        exit "${K8S_STUB_RUN_DIR_PULL_RC:-0}" ;;
     *" delete "*) exit 0 ;;
 esac
 exit 0
@@ -9189,6 +9327,31 @@ else
         "summary=$(cat "$refresh_sum_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$refresh_sum_out")"
 fi
 
+# Security (item 8 of the live-cluster-run review): a refresh.json holding
+# TWO JSON documents, both shaped to pass the select filter, makes a bare
+# `jq -ce 'select(...)'` print one line per matching document -- a
+# two-line result that used to fail the `--argjson refresh_block` step
+# below and fall through to a bare `|| rm -f summary.json`, deleting the
+# client's own just-written branch/origin_repo/commits/exit_code and
+# leaving only whichever pod object the merge further down happened to
+# keep. The single-object rule already used for summary.json's own pod
+# pull closes this the same way here: treated as unusable (same as
+# missing or garbage), never as a reason to lose the rest of the record.
+printf '%s\n' '{"ended":"cap","continuations":[]}' '{"ended":"approved","continuations":[{"leg":9,"exit":0}]}' \
+    > "$refresh_sum_work/refresh.json"
+if refresh_sum_case twodoc 100000 "$refresh_sum_work" \
+    && [[ -s "$refresh_sum_rd/summary.json" ]] \
+    && [[ "$(jq -r '.branch' "$refresh_sum_rd/summary.json")" == fs-k8s-test-collect-refresh-summary ]] \
+    && [[ "$(jq -r '.exit_code' "$refresh_sum_rd/summary.json")" == 0 ]] \
+    && [[ "$(jq -r 'has("refresh") or has("continuations")' "$refresh_sum_rd/summary.json")" == false ]] \
+    && grep -q 'no usable refresh.json' "$refresh_sum_out"; then
+    ok "collect: a two-document refresh.json never deletes the host's own summary.json facts"
+else
+    no "collect: a two-document refresh.json never deletes the host's own summary.json facts" \
+        "summary=$(cat "$refresh_sum_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$refresh_sum_out")"
+fi
+rm -f -- "$refresh_sum_work/refresh.json"
+
 printf '\n== fetch-back sets the branch upstream (k8s path) ==\n'
 # The same rule fork-sandbox.sh's own local runner applies on the k8s path
 # (see tests/fork-sandbox-upstream-test.sh for fs_resolve_upstream/
@@ -9845,6 +10008,24 @@ else
     no "hard-link archive: nothing is extracted" "$of_hl_dest exists"
 fi
 
+# FIFO: the pull-back direction's own version of the collect hang -- a
+# pod that packs a FIFO named task-meta.json into its run dir must not get
+# it recreated on the host by this extractor.
+of_fifo_src="$(newdir)"; tmpdirs+=("$of_fifo_src")
+mkfifo "$of_fifo_src/task-meta.json"
+of_fifo_parent="$(newdir)"; tmpdirs+=("$of_fifo_parent")
+of_fifo_tar="$of_fifo_parent/fifo.tar"
+tar cf "$of_fifo_tar" -C "$of_fifo_src" .
+of_fifo_dest="$of_fifo_parent/fifo_dest"
+refuses "a FIFO entry is refused" \
+    "contains a non-regular-file entry" \
+    "$outbox_extract_sh" "$of_fifo_tar" "$of_fifo_dest"
+if [[ ! -e "$of_fifo_dest" ]]; then
+    ok "FIFO archive: nothing is extracted"
+else
+    no "FIFO archive: nothing is extracted" "$of_fifo_dest exists"
+fi
+
 # oversized: refused on the streaming byte-size cap, before tar -tvf is
 # even run over it.
 of_big_src="$(newdir)"; tmpdirs+=("$of_big_src")
@@ -10240,6 +10421,24 @@ else
     no "hard-link archive: nothing is extracted" "$cf_hl_dest exists"
 fi
 
+# FIFO: not a link at all, but still not a regular file or directory --
+# recreated on the host by collect's cp -rn, a FIFO named task-meta.json
+# then hangs the first reader with no timeout that opens it.
+cf_fifo_src="$(newdir)"; tmpdirs+=("$cf_fifo_src")
+mkfifo "$cf_fifo_src/task-meta.json"
+cf_fifo_parent="$(newdir)"; tmpdirs+=("$cf_fifo_parent")
+cf_fifo_tar="$cf_fifo_parent/fifo.tar"
+tar cf "$cf_fifo_tar" -C "$cf_fifo_src" .
+cf_fifo_dest="$cf_fifo_parent/fifo_dest"
+refuses "a FIFO entry is refused" \
+    "contains a non-regular-file entry" \
+    "$context_extract_sh" "$cf_fifo_dest" 100000000 < "$cf_fifo_tar"
+if [[ ! -e "$cf_fifo_dest" ]]; then
+    ok "FIFO archive: nothing is extracted"
+else
+    no "FIFO archive: nothing is extracted" "$cf_fifo_dest exists"
+fi
+
 # oversized: refused on the spooled byte-size cap, before tar -tvf is even
 # run over it.
 cf_big_src="$(newdir)"; tmpdirs+=("$cf_big_src")
@@ -10306,6 +10505,77 @@ if [[ ! -e "$cf_clamp_dest" ]]; then
 else
     no "clamped-to-literal archive: nothing is extracted" "$cf_clamp_dest exists"
 fi
+
+# A sparse member defeats the spooled byte-size cap entirely: GNU tar
+# stores a sparse file's holes compactly, so a tiny archive (`--sparse`)
+# holding one multi-TiB sparse member spools under any reasonable
+# MAX_BYTES and lists with the ordinary `-` type bit the allowlist above
+# already accepts. Extraction would otherwise recreate that file at its
+# full logical size -- a host read of it later (read_env_value's line
+# scan, a bare `head -n 1`) then never returns. Must be refused from the
+# member's DECLARED size (tar -tvf's own size column), not the archive's
+# own byte count, and must run in well under a second -- it allocates
+# nothing the size it is guarding against.
+cf_sparse_src="$(newdir)"; tmpdirs+=("$cf_sparse_src")
+truncate -s 1T "$cf_sparse_src/huge.bin"
+cf_sparse_parent="$(newdir)"; tmpdirs+=("$cf_sparse_parent")
+cf_sparse_tar="$cf_sparse_parent/sparse.tar"
+tar --sparse -cf "$cf_sparse_tar" -C "$cf_sparse_src" .
+rm -f "$cf_sparse_src/huge.bin"
+cf_sparse_dest="$cf_sparse_parent/sparse_dest"
+cf_sparse_start="$(date +%s)"
+refuses "a sparse member's declared size is refused, not just the archive's own bytes" \
+    "entries declare" \
+    "$context_extract_sh" "$cf_sparse_dest" 100000000 < "$cf_sparse_tar"
+cf_sparse_elapsed=$(( $(date +%s) - cf_sparse_start ))
+if (( cf_sparse_elapsed < 10 )); then
+    ok "the sparse-member refusal runs in seconds, not however long a 1 TiB walk would take"
+else
+    no "the sparse-member refusal runs in seconds, not however long a 1 TiB walk would take" \
+        "took ${cf_sparse_elapsed}s"
+fi
+if [[ ! -e "$cf_sparse_dest" ]]; then
+    ok "sparse-member archive: nothing is extracted"
+else
+    no "sparse-member archive: nothing is extracted" "$cf_sparse_dest exists"
+fi
+
+# A many-small-entries archive is refused on entry COUNT, before the
+# per-entry type/path loops ever walk it -- independent of total byte
+# size (every entry here is empty) and of FS_EXTRACT_MAX_ENTRIES's
+# default, which the test pins low so the fixture itself stays cheap to
+# build.
+cf_many_parent="$(newdir)"; tmpdirs+=("$cf_many_parent")
+cf_many_tar="$cf_many_parent/many.tar"
+python3 -c '
+import tarfile, io
+tf = tarfile.open("'"$cf_many_tar"'", "w")
+for i in range(50):
+    info = tarfile.TarInfo(name="f%d" % i)
+    info.size = 0
+    tf.addfile(info, io.BytesIO(b""))
+tf.close()
+'
+cf_many_dest="$cf_many_parent/many_dest"
+refuses "an archive over the entry-count cap is refused" \
+    "entries, over the" \
+    env FS_EXTRACT_MAX_ENTRIES=10 "$context_extract_sh" "$cf_many_dest" 100000000 < "$cf_many_tar"
+if [[ ! -e "$cf_many_dest" ]]; then
+    ok "over-entry-count archive: nothing is extracted"
+else
+    no "over-entry-count archive: nothing is extracted" "$cf_many_dest exists"
+fi
+# The same archive under a cap that admits its entry count still extracts
+# -- confirms the cap compares against the actual count, not a hidden
+# always-refuse.
+if env FS_EXTRACT_MAX_ENTRIES=1000 "$context_extract_sh" "$cf_many_dest" 100000000 < "$cf_many_tar" \
+        >/tmp/fs-k8s-ctx-many.err 2>&1 \
+    && [[ -e "$cf_many_dest/f0" ]]; then
+    ok "the same archive extracts under an entry-count cap that admits it"
+else
+    no "the same archive extracts under an entry-count cap that admits it" "$(cat /tmp/fs-k8s-ctx-many.err)"
+fi
+rm -f /tmp/fs-k8s-ctx-many.err
 rm -rf -- "$cf_clamp_src" "$cf_clamp_parent"
 
 # git disables the ext:: transport by default, so a push or fetch built
@@ -12066,6 +12336,13 @@ fi
 # is anchored on the unindented "fi" that closes it (every "fi" for a
 # block nested inside it is itself indented).
 claude_block="$(sed -n '/^pi_rc=0$/,/^fi$/p' "$entrypoint_sh")"
+# The block's own first arm now reads $RUN_DIR (the RUN_DIR/runner-mode
+# arm, added alongside fork-sandbox-runner.sh) and its claude arm now
+# calls claude_pod_credentials() instead of inlining the credential
+# install -- both defined above pi_rc=0, so outside this sed range.
+# ": ${RUN_DIR:=}" covers the first; claude_pod_credentials_fn below
+# supplies the second, for every harness here that reaches the claude arm.
+claude_pod_credentials_fn="$(sed -n '/^claude_pod_credentials() {$/,/^}$/p' "$entrypoint_sh")"
 claude_block_file="$(newdir)/claude-block.sh"; tmpdirs+=("$(dirname "$claude_block_file")")
 if [[ -n "$claude_block" ]]; then
     # source "$mounts_dir/lib.sh" first, exactly as the real entrypoint does
@@ -12075,7 +12352,9 @@ if [[ -n "$claude_block" ]]; then
     # functions a real pod gets, not a second copy. claude_block_run below
     # stages a real copy of fork-sandbox-lib.sh at $mounts/lib.sh.
     printf '%s\n' 'set -euo pipefail' \
+        ': "${RUN_DIR:=}"' \
         'source "$mounts_dir/lib.sh"' \
+        "$claude_pod_credentials_fn" \
         "$claude_block" \
         'printf "CLAUDE_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$claude_block_file"
     ok "the claude coding-leg block (pi_rc=0..fi) is isolable in the entrypoint"
@@ -12089,7 +12368,7 @@ fi
 # shell snippet run to pre-seed $CLAUDE_BLOCK_HOME or $CLAUDE_BLOCK_STORE
 # before the block runs (empty for none), $4 = FS_LEG_RETRY_DELAYS
 # (defaults to "0 0" so a retry test finishes in milliseconds, the same
-# test hook fork-sandbox.sh's own RUNNER heredoc honors). Sets
+# test hook fork-sandbox-runner.sh itself honors). Sets
 # CLAUDE_BLOCK_HOME/_STORE/_CLONE/_RECORD/_OUT/_PI_RC/_CALLS after running.
 claude_block_run() {
     local stub_dir mounts work home store clone record marker
@@ -12430,7 +12709,8 @@ printf '\n== entrypoint: claude continuation legs (--refresh-at, pod side) ==\n'
 refresh_ep_fns="$(sed -n '/^claude_hook_leg() {/,/^}/p;/^run_claude_continuations() {/,/^}/p' \
     "$entrypoint_sh")"
 refresh_block_file="$(newdir)/refresh-block.sh"; tmpdirs+=("$(dirname "$refresh_block_file")")
-printf '%s\n' 'set -euo pipefail' "$refresh_ep_fns" "$claude_block" \
+printf '%s\n' 'set -euo pipefail' ': "${RUN_DIR:=}"' "$refresh_ep_fns" \
+    "$claude_pod_credentials_fn" "$claude_block" \
     'printf "CLAUDE_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$refresh_block_file"
 # $1 threshold ("" = refresh off), $2 legs that write a hand-off, $3 legs that
 # exit 1, $4 REFRESH_MAX, $5 RESUME_SESSION. Sets RB_WORK/_REC/_CALLS/_OUT/_RC.
@@ -12537,7 +12817,8 @@ fi
 refresh_cfg_probe() {
     local ep_copy
     ep_copy="$(newdir)/probe.sh"; tmpdirs+=("$(dirname "$ep_copy")")
-    printf '%s\n' 'set -euo pipefail' "$refresh_ep_fns" "$claude_block" > "$ep_copy"
+    printf '%s\n' 'set -euo pipefail' ': "${RUN_DIR:=}"' "$refresh_ep_fns" \
+        "$claude_pod_credentials_fn" "$claude_block" > "$ep_copy"
     printf '%s' "$ep_copy"
 }
 refresh_cfg_stub_dir="$(newdir)"; tmpdirs+=("$refresh_cfg_stub_dir")
@@ -13786,6 +14067,19 @@ else
     no "--image accepts a localhost:PORT ref" "$(cat /tmp/fs-k8s-test-localhost-image.err)"
 fi
 rm -f /tmp/fs-k8s-test-localhost-image.err
+
+printf '\n== no jq variable named after a jq keyword ==\n'
+# jq 1.7 and older reject `$label` (and every other keyword) as a variable
+# name, while newer jq accepts it, so a host test run stays green while the
+# same program fails in an image with an older jq.
+jq_keyword_args="$(grep -rnE -- \
+    '--arg(json)? +(label|and|or|not|if|then|elif|else|end|as|def|reduce|foreach|try|catch|import|include|__loc__) ' \
+    "$repo_dir/scripts" 2>/dev/null || true)"
+if [[ -z "$jq_keyword_args" ]]; then
+    ok "no script binds a jq variable named after a jq keyword"
+else
+    no "no script binds a jq variable named after a jq keyword" "$jq_keyword_args"
+fi
 
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # Guards the public-repo leak rule (see the fork-sandbox-k8s.sh header): no
@@ -18065,6 +18359,1999 @@ for rule in "/events/list" "/resourcequotas/get"; do
         fi
     done
 done
+
+printf '\n== fork-sandbox-k8s.sh --run-dir (runner mode) ==\n'
+# --run-dir wires through submit/run's own validation, Job rendering and
+# push, and through the entrypoint's RUN_DIR arm -- all driven by a run
+# directory built BY HAND here (a stub run.sh plus a hand-written
+# pipeline.json), not through the real launcher: the launcher's own
+# --k8s dispatch (fs_compile_run_steps/fs_stage_inbox/
+# fs_render_leg_prompts/fs_emit_run_sh_preamble with pod values, the leg
+# wrapper, seat resolution, refusals) is covered separately below, by
+# the "stubbed pod walk" section, which drives a real staged run
+# directory instead of this section's hand-built one.
+rd_make_fixture() {
+    local mix="$1" dir
+    dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdfix.XXXXXX)"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/run.sh"
+    chmod +x "$dir/run.sh"
+    case "$mix" in
+        pi) printf '{"steps":[{"action":"code","harness":"pi","model":"z-ai/glm-4.6"}]}' > "$dir/pipeline.json" ;;
+        claude) printf '{"steps":[{"action":"maintain","harness":"claude","model":"sonnet"}]}' > "$dir/pipeline.json" ;;
+    esac
+    printf '%s' "$dir"
+}
+
+# --run-dir's own validation, all via --dry-run -- a refusal here runs
+# before any run dir is created/mktemp'd and before any kubectl call, so
+# none of these need a stub.
+rd_valid1="$(rd_make_fixture pi)"; tmpdirs+=("$rd_valid1")
+rd_symlink="$(newdir)/rd-symlink"; tmpdirs+=("$(dirname "$rd_symlink")")
+ln -s "$rd_valid1" "$rd_symlink"
+refuses "submit --run-dir naming a symlink is refused" \
+    "is a symlink" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-symlink --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_symlink" "$proj_dir" "$handoff_file"
+
+rd_outside="$(mktemp -d)"; tmpdirs+=("$rd_outside")
+refuses "submit --run-dir outside the scratch forks root is refused" \
+    "must name a directory under" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-outside --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_outside" "$proj_dir" "$handoff_file"
+
+refuses "submit --run-dir on a missing directory is refused" \
+    "does not exist" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-missing --harness pi --model z-ai/glm-4.6 \
+    --run-dir /var/tmp/claude-scratch/forks/fs-k8s-test-rd-missing-xyz \
+    "$proj_dir" "$handoff_file"
+
+rd_no_runsh="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rd-norunsh.XXXXXX)"; tmpdirs+=("$rd_no_runsh")
+printf '{"steps":[]}' > "$rd_no_runsh/pipeline.json"
+refuses "submit --run-dir with no run.sh is refused" \
+    "has no run.sh" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-norunsh --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_no_runsh" "$proj_dir" "$handoff_file"
+
+rd_no_pipeline="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rd-nopipe.XXXXXX)"; tmpdirs+=("$rd_no_pipeline")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_no_pipeline/run.sh"
+refuses "submit --run-dir with no pipeline.json is refused" \
+    "has no pipeline.json" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-nopipe --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_no_pipeline" "$proj_dir" "$handoff_file"
+
+# The dry-run manifest mounts an emptyDir at the run dir's own
+# path and sets RUN_DIR -- and the claude token Secret/proxy/env are
+# rendered from pipeline.json's OWN seats (any step or fix harness
+# claude), not from --harness, which runner mode does not use the way a
+# single-leg run does.
+rd_pi_dry="$(rd_make_fixture pi)"; tmpdirs+=("$rd_pi_dry")
+rd_pi_dry_out="$(newdir)/rd-pi-dry.yaml"; tmpdirs+=("$(dirname "$rd_pi_dry_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-pi-dry --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_pi_dry" "$proj_dir" "$handoff_file" \
+    > "$rd_pi_dry_out" 2>/tmp/fs-k8s-test-rd-pi-dry.err; then
+    ok "submit --dry-run --run-dir (all-pi pipeline.json) exits 0"
+else
+    no "submit --dry-run --run-dir (all-pi pipeline.json) exits 0" "$(cat /tmp/fs-k8s-test-rd-pi-dry.err)"
+fi
+rm -f /tmp/fs-k8s-test-rd-pi-dry.err
+if grep -qF "mountPath: $rd_pi_dry" "$rd_pi_dry_out" && grep -q 'name: RUN_DIR' "$rd_pi_dry_out" \
+    && grep -qF "value: \"$rd_pi_dry\"" "$rd_pi_dry_out"; then
+    ok "submit --dry-run --run-dir mounts an emptyDir at the run dir's own path and sets RUN_DIR"
+else
+    no "submit --dry-run --run-dir mounts an emptyDir at the run dir's own path and sets RUN_DIR" \
+        "not found in $rd_pi_dry_out"
+fi
+if grep -q 'claude-token' "$rd_pi_dry_out"; then
+    no "submit --dry-run --run-dir with an all-pi pipeline.json creates no claude token Secret" \
+        "found in $rd_pi_dry_out"
+else
+    ok "submit --dry-run --run-dir with an all-pi pipeline.json creates no claude token Secret"
+fi
+
+rd_claude_dry="$(rd_make_fixture claude)"; tmpdirs+=("$rd_claude_dry")
+rd_claude_dry_out="$(newdir)/rd-claude-dry.yaml"; tmpdirs+=("$(dirname "$rd_claude_dry_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-claude-dry --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_claude_dry" "$proj_dir" "$handoff_file" \
+    > "$rd_claude_dry_out" 2>/tmp/fs-k8s-test-rd-claude-dry.err; then
+    ok "submit --dry-run --run-dir (a claude seat in pipeline.json, --harness pi) exits 0"
+else
+    no "submit --dry-run --run-dir (a claude seat in pipeline.json, --harness pi) exits 0" \
+        "$(cat /tmp/fs-k8s-test-rd-claude-dry.err)"
+fi
+rm -f /tmp/fs-k8s-test-rd-claude-dry.err
+if grep -q 'claude-token' "$rd_claude_dry_out" && grep -q 'CLAUDE_PROXY_BASE_URL' "$rd_claude_dry_out"; then
+    ok "submit --dry-run --run-dir with any claude seat in pipeline.json creates the claude token Secret and CLAUDE_PROXY_BASE_URL, even with --harness pi"
+else
+    no "submit --dry-run --run-dir with any claude seat in pipeline.json creates the claude token Secret and CLAUDE_PROXY_BASE_URL, even with --harness pi" \
+        "not found in $rd_claude_dry_out"
+fi
+
+# Unlike an ordinary --dry-run (which creates nothing of its own), a
+# --dry-run --run-dir must NOT remove DIR: validate_run_dir_flag's own
+# check (run.sh + pipeline.json present) is exactly the shape every live
+# composed run directory has too, staged or already collected, and this
+# process never created DIR -- so it is never this invocation's to
+# delete. A --dry-run against an operator's own live run dir, to preview
+# the manifest it would render, must leave that run dir alone.
+rd_dry_survives="$(rd_make_fixture pi)"; tmpdirs+=("$rd_dry_survives")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rd-survives --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_dry_survives" "$proj_dir" "$handoff_file" >/dev/null 2>&1
+if [[ -d "$rd_dry_survives" ]] && [[ -f "$rd_dry_survives/run.sh" ]]; then
+    ok "submit --dry-run --run-dir never deletes a run dir it did not create"
+else
+    no "submit --dry-run --run-dir never deletes a run dir it did not create" \
+        "gone or emptied: $rd_dry_survives"
+fi
+
+# A real install's own shape: the launcher's k8s_runner_mode review-skill
+# staging copies whatever absolute path $HOME/.claude/skills/code-review-
+# portable resolves to, and on a machine where that path is itself a
+# symlink (an install.sh-managed skills farm, the ordinary case), `cp -a`
+# preserves the symlink rather than the directory it points at --
+# k8s_spool_dir_entries then had no `-h` and tarred a link entry, which
+# the pod's context-extract.sh correctly refused, killing every live
+# composed --k8s run that carried the review skill. Proved with a real
+# submit (stubbed git+kubectl only) against a run dir built exactly that
+# way, feeding the kubectl stub's captured push stream into the REAL
+# context-extract.sh to confirm the archive is accepted and the skill
+# landed as a real file, not a link entry.
+rdkit_dir="$(rd_make_fixture pi)"; tmpdirs+=("$rdkit_dir")
+rdkit_real_skill="$(newdir)"; tmpdirs+=("$rdkit_real_skill")
+printf '# code-review-portable\n' > "$rdkit_real_skill/SKILL.md"
+mkdir -p "$rdkit_dir/skills"
+ln -s "$rdkit_real_skill" "$rdkit_dir/skills/code-review-portable"
+rdkit_git="$(newdir)/git"; tmpdirs+=("$(dirname "$rdkit_git")")
+cat > "$rdkit_git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+chmod +x "$rdkit_git"
+rdkit_tar="$(newdir)/rdkit-push.tar"; tmpdirs+=("$(dirname "$rdkit_tar")")
+rdkit_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$rdkit_kubectl")")
+cat > "$rdkit_kubectl" <<STUB
+#!/usr/bin/env bash
+verb=""; for arg in "\$@"; do case "\$arg" in apply|wait|exec|get) verb="\$arg" ;; esac; done
+case "\$verb" in
+    apply|wait) cat >/dev/null ;;
+    get) printf 'stub-pod\n' ;;
+    exec)
+        if [[ " \$* " == *" $rdkit_dir "* ]]; then
+            cat > "$rdkit_tar"
+        else
+            cat >/dev/null
+        fi
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$rdkit_kubectl"
+rdkit_out="$(newdir)/rdkit-submit-out.txt"; tmpdirs+=("$(dirname "$rdkit_out")")
+if PATH="$(dirname "$rdkit_git"):$(dirname "$rdkit_kubectl"):$PATH" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+        --branch fs-k8s-test-rdkit --harness pi --model z-ai/glm-4.6 \
+        --run-dir "$rdkit_dir" "$proj_dir" "$handoff_file" \
+        > "$rdkit_out" 2>&1; then
+    ok "submit --run-dir pushes cleanly when the run dir carries a symlinked agent kit"
+else
+    no "submit --run-dir pushes cleanly when the run dir carries a symlinked agent kit" \
+        "$(cat "$rdkit_out")"
+fi
+rdkit_dest="$(newdir)/rdkit-dest"; tmpdirs+=("$(dirname "$rdkit_dest")")
+rdkit_extract_err="$(newdir)/rdkit-extract.err"; tmpdirs+=("$(dirname "$rdkit_extract_err")")
+if [[ -s "$rdkit_tar" ]] && "$context_extract_sh" "$rdkit_dest" 100000000 \
+        < "$rdkit_tar" > /dev/null 2>"$rdkit_extract_err"; then
+    ok "the captured push archive is accepted by context-extract.sh (no link entry)"
+else
+    no "the captured push archive is accepted by context-extract.sh (no link entry)" \
+        "$(cat "$rdkit_extract_err" 2>/dev/null)"
+fi
+if [[ -f "$rdkit_dest/skills/code-review-portable/SKILL.md" ]] \
+        && [[ ! -L "$rdkit_dest/skills/code-review-portable" ]]; then
+    ok "the agent kit lands in the pod as a real file, not a symlink"
+else
+    no "the agent kit lands in the pod as a real file, not a symlink" \
+        "$(find "$rdkit_dest" 2>&1)"
+fi
+
+# A failure host-side, before any cluster object exists, does NOT remove
+# a caller-supplied --run-dir -- this process never created it, so it is
+# never this invocation's to delete, matching --dry-run's own promise
+# above. An ordinary (no --run-dir) mktemp'd run dir is a different case,
+# untouched here, and still removed on exactly this kind of host-side
+# failure (see the trap's own comment). The run-dir tar's own over-cap
+# check (k8s_spool_dir_entries runs well before the first kubectl apply,
+# under the trap that still names "$run_dir") is the simplest
+# deterministic way to land a host-side failure without any kubectl stub
+# at all.
+rd29_dir="$(rd_make_fixture pi)"; tmpdirs+=("$rd29_dir")
+truncate -s 257M "$rd29_dir/oversized.bin"
+rd29_out="$(newdir)/rd29-out.txt"; tmpdirs+=("$(dirname "$rd29_out")")
+rd29_rc=0
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-rd29 --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd29_dir" "$proj_dir" "$handoff_file" > "$rd29_out" 2>&1 || rd29_rc=$?
+if (( rd29_rc != 0 )) && [[ -d "$rd29_dir" ]] && [[ -f "$rd29_dir/run.sh" ]]; then
+    ok "submit --run-dir never deletes a run dir it did not create, even on a host-side failure"
+else
+    no "submit --run-dir never deletes a run dir it did not create, even on a host-side failure" \
+        "rc=$rd29_rc dir_exists=$([[ -d "$rd29_dir" ]] && echo yes || echo no) out=$(cat "$rd29_out")"
+fi
+
+# A real submit (stubbed git+kubectl, reusing the same combo `run`
+# drives elsewhere in this file) against an all-pi fixture. git's own
+# stub no-ops the ext:: push entirely (see its header
+# above), so the repository push itself never reaches kubectl; what IS
+# observable here is (a) run.env in the directory ITSELF (no fresh
+# mktemp'd sibling), carrying RUNNER=1, and (b) handoff.md/
+# handoff-original.md landing in that same directory, and (c) the run-dir
+# push (context-extract.sh ... context) appearing in the kubectl log
+# before the final .inputs-complete touch.
+rdlive_dir="$(rd_make_fixture pi)"; tmpdirs+=("$rdlive_dir")
+rdlive_log="$(newdir)/kubectl.log"; rdlive_out="$(newdir)/rdlive-out.txt"
+tmpdirs+=("$(dirname "$rdlive_log")" "$(dirname "$rdlive_out")")
+rdlive_before="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
+if HOME="$k8s_test_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rdlive_log" \
+    K8S_STUB_BASE_SHA="$(git -C "$proj_dir" rev-parse HEAD)" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rdlive --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rdlive_dir" "$proj_dir" "$handoff_file" > "$rdlive_out" 2>&1; then
+    ok "submit --run-dir (valid, live) exits 0"
+else
+    no "submit --run-dir (valid, live) exits 0" "$(cat "$rdlive_out")"
+fi
+rdlive_after="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
+check "submit --run-dir creates no fresh mktemp'd run directory" "$rdlive_before" "$rdlive_after"
+if [[ -f "$rdlive_dir/run.env" ]] && grep -qx 'RUNNER=1' "$rdlive_dir/run.env"; then
+    ok "submit --run-dir writes run.env with RUNNER=1 into the staged directory itself"
+else
+    no "submit --run-dir writes run.env with RUNNER=1 into the staged directory itself" \
+        "$(cat "$rdlive_dir/run.env" 2>/dev/null)"
+fi
+# Submit never writes handoff.md itself in runner mode -- the real
+# launcher's own --k8s dispatch (not yet built when this fixture was
+# written by hand, and still the only caller --run-dir ever has in
+# practice) renders its own implement prompt there before submit ever
+# runs, and submit overwriting it with this command's own legacy-shaped
+# rendering would feed the pod's first leg the wrong prompt.
+# handoff-original.md (the raw, unrendered file) is still archived, since
+# nothing else writes it.
+if [[ ! -f "$rdlive_dir/handoff.md" ]] && [[ -f "$rdlive_dir/handoff-original.md" ]]; then
+    ok "submit --run-dir writes handoff-original.md but never clobbers handoff.md"
+else
+    no "submit --run-dir writes handoff-original.md but never clobbers handoff.md" \
+        "$(find "$rdlive_dir" -maxdepth 1 2>/dev/null)"
+fi
+
+# The other half of that: a run dir that already carries a handoff.md (as the
+# real launcher's dispatch always stages before calling submit) keeps its
+# exact bytes -- this is the prompt the pod's first leg actually reads,
+# and it must survive byte-for-byte, not be re-rendered by this command's
+# own legacy-shaped prompt composer.
+rd_preseeded="$(rd_make_fixture pi)"; tmpdirs+=("$rd_preseeded")
+printf 'LAUNCHER-STAGED-HANDOFF-SENTINEL-c4e9\n' > "$rd_preseeded/handoff.md"
+rd_preseeded_before="$(cat "$rd_preseeded/handoff.md")"
+rd_preseeded_out="$(newdir)/rd-preseeded-out.txt"; tmpdirs+=("$(dirname "$rd_preseeded_out")")
+if HOME="$k8s_test_home" PATH="$runstub_dir:$PATH" \
+    K8S_STUB_BASE_SHA="$(git -C "$proj_dir" rev-parse HEAD)" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rd-preseeded --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_preseeded" "$proj_dir" "$handoff_file" > "$rd_preseeded_out" 2>&1; then
+    ok "submit --run-dir (pre-seeded handoff.md) exits 0"
+else
+    no "submit --run-dir (pre-seeded handoff.md) exits 0" "$(cat "$rd_preseeded_out")"
+fi
+check "submit --run-dir never overwrites a pre-staged handoff.md" \
+    "$rd_preseeded_before" "$(cat "$rd_preseeded/handoff.md" 2>/dev/null)"
+rdlive_push_line="$(grep -n 'context-extract.sh' "$rdlive_log" | grep -F "$rdlive_dir" | head -1 | cut -d: -f1)"
+rdlive_complete_line="$(grep -n '.inputs-complete' "$rdlive_log" | head -1 | cut -d: -f1)"
+if [[ -n "$rdlive_push_line" ]] && [[ -n "$rdlive_complete_line" ]] \
+    && (( rdlive_push_line < rdlive_complete_line )); then
+    ok "submit --run-dir pushes the run directory before the .inputs-complete sentinel"
+else
+    no "submit --run-dir pushes the run directory before the .inputs-complete sentinel" \
+        "push_line=$rdlive_push_line complete_line=$rdlive_complete_line log=$(cat "$rdlive_log")"
+fi
+
+# The launcher's own run.env (version=, run_dir=, clone_dir=,
+# started_at=, model=, network=, ... -- see fork-sandbox.sh's write just
+# above its k8s_runner_mode exec) is staged in the run directory BEFORE
+# submit ever runs, for a composed --k8s launch; this fixture stands in
+# for that write by hand, the same way rd_preseeded above stands in for
+# the launcher's own handoff.md. Submit must APPEND its own keys (RUNNER=1
+# and the rest), never truncate: a truncating `>` would silently erase
+# version= and every other launcher key, which is exactly what left a
+# collected composed run's run.env with no version= at all and made
+# fork-sandbox-status.sh refuse the whole directory as "not a
+# fork-sandbox run directory".
+# network= is deliberately absent from this fixture: the real launcher
+# never prints it for a composed k8s run (see that writer's own comment),
+# leaving cmd_submit's own "cluster" line as the only one a reader ever
+# sees -- so this fixture matches what the launcher actually writes, not
+# a hypothetical disagreement.
+rd_launcher_env="$(rd_make_fixture pi)"; tmpdirs+=("$rd_launcher_env")
+printf 'version=1\nrun_dir=%s\norigin_repo=%s\nclone_dir=/fake/clone\nbranch=fs-k8s-test-rd-launcher-env\nharness=claude\nmodel=opus\nstarted_at=1700000000\n' \
+    "$rd_launcher_env" "$proj_dir" > "$rd_launcher_env/run.env"
+rd_launcher_env_out="$(newdir)/rd-launcher-env-out.txt"; tmpdirs+=("$(dirname "$rd_launcher_env_out")")
+if HOME="$k8s_test_home" PATH="$runstub_dir:$PATH" \
+    K8S_STUB_BASE_SHA="$(git -C "$proj_dir" rev-parse HEAD)" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rd-launcher-env --harness pi --model z-ai/glm-4.6 \
+    --run-dir "$rd_launcher_env" "$proj_dir" "$handoff_file" > "$rd_launcher_env_out" 2>&1; then
+    ok "submit --run-dir over a pre-staged launcher run.env exits 0"
+else
+    no "submit --run-dir over a pre-staged launcher run.env exits 0" "$(cat "$rd_launcher_env_out")"
+fi
+if grep -qx 'version=1' "$rd_launcher_env/run.env" 2>/dev/null; then
+    ok "submit --run-dir preserves the launcher's version= key rather than truncating it away"
+else
+    no "submit --run-dir preserves the launcher's version= key rather than truncating it away" \
+        "$(cat "$rd_launcher_env/run.env" 2>/dev/null)"
+fi
+if grep -qx 'run_dir='"$rd_launcher_env" "$rd_launcher_env/run.env" 2>/dev/null \
+    && grep -qx 'started_at=1700000000' "$rd_launcher_env/run.env" 2>/dev/null; then
+    ok "submit --run-dir preserves the launcher's other local-shape keys (run_dir=, started_at=)"
+else
+    no "submit --run-dir preserves the launcher's other local-shape keys (run_dir=, started_at=)" \
+        "$(cat "$rd_launcher_env/run.env" 2>/dev/null)"
+fi
+if grep -qx 'RUNNER=1' "$rd_launcher_env/run.env" 2>/dev/null; then
+    ok "submit --run-dir still appends its own RUNNER=1 key alongside the launcher's"
+else
+    no "submit --run-dir still appends its own RUNNER=1 key alongside the launcher's" \
+        "$(cat "$rd_launcher_env/run.env" 2>/dev/null)"
+fi
+# network: absent from the launcher's own write (see that writer's own
+# comment), so submit's "cluster" line -- always, regardless of this
+# run's --network knob -- is the only one a reader ever sees, with no
+# first-match race against an earlier, disagreeing writer.
+if [[ "$(grep -c '^network=' "$rd_launcher_env/run.env" 2>/dev/null)" == 1 ]] \
+    && grep -qx 'network=cluster' "$rd_launcher_env/run.env" 2>/dev/null; then
+    ok "submit --run-dir's network=cluster is the one and only network= line"
+else
+    no "submit --run-dir's network=cluster is the one and only network= line" \
+        "$(cat "$rd_launcher_env/run.env" 2>/dev/null)"
+fi
+
+printf '\n== fork-sandbox-k8s.sh collect: RUNNER=1 run-directory pull-back and summary merge ==\n'
+# cmd_collect's own RUNNER=1 branch (added this session, right after the
+# session-store pull): pull the pod's whole run directory into a staging
+# copy, no-clobber it up into the host's run dir, and for run.env carry
+# over only the four fields the runner ever rewrites in place (cost=,
+# model=, outbox_bytes=, outbox_max_bytes=; fork-sandbox-runner.sh) --
+# never the whole pulled file, since it sits on an emptyDir every leg in
+# the pod can write to. Also merge the pod's own summary.json with the
+# client's, client keys winning on overlap.
+rdcol_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol.XXXXXX)"; tmpdirs+=("$rdcol_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$proj_dir" > "$rdcol_run_dir/run.env"
+
+rdcol_pod_dir="$(newdir)"; tmpdirs+=("$rdcol_pod_dir")
+printf '{"total_cost_usd":0.5,"commits":9,"exit_code":42}' > "$rdcol_pod_dir/summary.json"
+printf '{"ended":"approved","iterations":[]}' > "$rdcol_pod_dir/step-2-loop.json"
+# The pod's own run.env: the same file the host staged, with cost= added
+# in place by the runner at end of run (fork-sandbox-runner.sh) -- the
+# one field that must land on the host -- plus a PROJECT= line and an
+# out-of-range outbox_bytes= a compromised leg could have planted on the
+# shared emptyDir, which must NOT make it to the host.
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\ncost=0.5000\nPROJECT=/tmp/evil-project\noutbox_bytes=not-a-number\n' \
+    > "$rdcol_pod_dir/run.env"
+
+rdcol_log="$(newdir)/kubectl.log"; rdcol_out="$(newdir)/rdcol-out.txt"
+tmpdirs+=("$(dirname "$rdcol_log")" "$(dirname "$rdcol_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol_pod_dir" \
+    collectstub_collect "$rdcol_log" "$rdcol_out" \
+    --branch fs-k8s-test-rdcol --run-dir "$rdcol_run_dir" "$proj_dir"; then
+    ok "collect of a RUNNER=1 run exits 0"
+else
+    no "collect of a RUNNER=1 run exits 0" "$(cat "$rdcol_out")"
+fi
+if [[ -f "$rdcol_run_dir/step-2-loop.json" ]] \
+    && [[ "$(jq -r '.ended' "$rdcol_run_dir/step-2-loop.json" 2>/dev/null)" == approved ]]; then
+    ok "collect pulls the pod's own runner records (step-2-loop.json) into the host run dir"
+else
+    no "collect pulls the pod's own runner records (step-2-loop.json) into the host run dir" \
+        "$(find "$rdcol_run_dir" 2>/dev/null)"
+fi
+if [[ -s "$rdcol_run_dir/summary.json" ]]; then
+    rdcol_merged_cost="$(jq -r '.total_cost_usd' "$rdcol_run_dir/summary.json" 2>/dev/null)"
+    rdcol_merged_exit="$(jq -r '.exit_code' "$rdcol_run_dir/summary.json" 2>/dev/null)"
+    rdcol_merged_commits="$(jq -r '.commits' "$rdcol_run_dir/summary.json" 2>/dev/null)"
+    if [[ "$rdcol_merged_cost" == "0.5" ]] && [[ "$rdcol_merged_exit" == "0" ]] && [[ "$rdcol_merged_commits" == "0" ]]; then
+        ok "collect merges the pod's summary.json with the client's own, client keys winning on overlap"
+    else
+        no "collect merges the pod's summary.json with the client's own, client keys winning on overlap" \
+            "cost=$rdcol_merged_cost exit=$rdcol_merged_exit commits=$rdcol_merged_commits"
+    fi
+else
+    no "collect merges the pod's summary.json with the client's own, client keys winning on overlap" \
+        "no summary.json at $rdcol_run_dir"
+fi
+if grep -qx 'RUNNER=1' "$rdcol_run_dir/run.env" 2>/dev/null; then
+    ok "collect's run-directory pull keeps the RUNNER=1 marker in run.env"
+else
+    no "collect's run-directory pull keeps the RUNNER=1 marker in run.env" "missing or changed"
+fi
+if grep -qx 'cost=0.5000' "$rdcol_run_dir/run.env" 2>/dev/null; then
+    ok "collect's run-directory pull lands the pod's runner-rewritten run.env (cost=)"
+else
+    no "collect's run-directory pull lands the pod's runner-rewritten run.env (cost=)" \
+        "$(cat "$rdcol_run_dir/run.env" 2>/dev/null)"
+fi
+if grep -qx "PROJECT=$proj_dir" "$rdcol_run_dir/run.env" 2>/dev/null \
+    && ! grep -q 'evil-project' "$rdcol_run_dir/run.env" 2>/dev/null; then
+    ok "collect's run.env merge does not trust a PROJECT= line planted in the pod's copy"
+else
+    no "collect's run.env merge does not trust a PROJECT= line planted in the pod's copy" \
+        "$(cat "$rdcol_run_dir/run.env" 2>/dev/null)"
+fi
+if ! grep -q '^outbox_bytes=' "$rdcol_run_dir/run.env" 2>/dev/null; then
+    ok "collect's run.env merge rejects a non-numeric outbox_bytes= from the pod's copy"
+else
+    no "collect's run.env merge rejects a non-numeric outbox_bytes= from the pod's copy" \
+        "$(cat "$rdcol_run_dir/run.env" 2>/dev/null)"
+fi
+
+# Symmetrically: no pod summary.json pulled -> the client's own
+# write stands alone, unmerged.
+rdcol2_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol2.XXXXXX)"; tmpdirs+=("$rdcol2_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol2_run_dir/run.env"
+rdcol2_log="$(newdir)/kubectl.log"; rdcol2_out="$(newdir)/rdcol2-out.txt"
+tmpdirs+=("$(dirname "$rdcol2_log")" "$(dirname "$rdcol2_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_RC=1 \
+    K8S_STUB_RUN_DIR_PULL_PATH="$rdcol2_run_dir" \
+    collectstub_collect "$rdcol2_log" "$rdcol2_out" \
+    --branch fs-k8s-test-rdcol2 --run-dir "$rdcol2_run_dir" "$proj_dir"; then
+    if [[ -s "$rdcol2_run_dir/summary.json" ]] && jq -e . "$rdcol2_run_dir/summary.json" >/dev/null 2>&1; then
+        ok "collect writes the client's own summary.json alone when no pod run-directory pull succeeds"
+    else
+        no "collect writes the client's own summary.json alone when no pod run-directory pull succeeds" \
+            "$(cat "$rdcol2_run_dir/summary.json" 2>/dev/null)"
+    fi
+else
+    no "collect writes the client's own summary.json alone when no pod run-directory pull succeeds" \
+        "$(cat "$rdcol2_out")"
+fi
+# Security: the pod's run directory sits on an emptyDir every leg can
+# write to, so a leg can plant any file by name -- exit-code, pid and
+# task-meta.json (when the host never gave one) are exactly the files a
+# later reader would trust as the host's own if they landed. None of
+# these are in the copy-back allowlist, so none land, even though they
+# sit right alongside summary.json and step-2-loop.json (which DO land,
+# proven above) in the very same pod directory.
+rdcol3_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol3.XXXXXX)"; tmpdirs+=("$rdcol3_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol3_run_dir/run.env"
+rdcol3_pod_dir="$(newdir)"; tmpdirs+=("$rdcol3_pod_dir")
+printf '{"total_cost_usd":0.1}' > "$rdcol3_pod_dir/summary.json"
+printf '99\n' > "$rdcol3_pod_dir/exit-code"
+printf '12345\n' > "$rdcol3_pod_dir/pid"
+printf '{"planted":true}\n' > "$rdcol3_pod_dir/task-meta.json"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$rdcol3_pod_dir/run.sh"
+rdcol3_log="$(newdir)/kubectl.log"; rdcol3_out="$(newdir)/rdcol3-out.txt"
+tmpdirs+=("$(dirname "$rdcol3_log")" "$(dirname "$rdcol3_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol3_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol3_pod_dir" \
+    collectstub_collect "$rdcol3_log" "$rdcol3_out" \
+    --branch fs-k8s-test-rdcol3 --run-dir "$rdcol3_run_dir" "$proj_dir"; then
+    ok "collect of a run with planted non-allowlisted files exits 0"
+else
+    no "collect of a run with planted non-allowlisted files exits 0" "$(cat "$rdcol3_out")"
+fi
+for rdcol3_name in pid task-meta.json run.sh; do
+    if [[ ! -e "$rdcol3_run_dir/$rdcol3_name" ]]; then
+        ok "collect never copies a planted $rdcol3_name (outside the allowlist)"
+    else
+        no "collect never copies a planted $rdcol3_name (outside the allowlist)" \
+            "$(cat "$rdcol3_run_dir/$rdcol3_name" 2>/dev/null)"
+    fi
+done
+# exit-code is the one exception, and a deliberate one (see item 1/3 of
+# the live-cluster-run review): collect now writes it itself, from the
+# trustworthy /work/.run-complete sentinel (agent_exit_code), the same
+# file fork-sandbox-status.sh's run_state() needs to call a composed k8s
+# run "done"/"failed" rather than "starting" forever. The planted "99" in
+# the pod's own copy must never win -- collect's own host-derived value
+# (0, from K8S_STUB_RUN_COMPLETE) does.
+if [[ "$(cat "$rdcol3_run_dir/exit-code" 2>/dev/null)" == "0" ]]; then
+    ok "collect writes its own trustworthy exit-code, never a planted one from the pod's copy"
+else
+    no "collect writes its own trustworthy exit-code, never a planted one from the pod's copy" \
+        "$(cat "$rdcol3_run_dir/exit-code" 2>/dev/null)"
+fi
+
+# Security: a pod summary.json holding TWO JSON documents, not one --
+# the shape that let a planted second document's branch/origin_repo/
+# commits/exit_code completely replace the client's own write, since
+# `jq -s '.[0] * .[1]'` slurped the pod's two documents ahead of the
+# client's single one and merged the pod against itself.
+rdcol4_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol4.XXXXXX)"; tmpdirs+=("$rdcol4_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol4_run_dir/run.env"
+rdcol4_pod_dir="$(newdir)"; tmpdirs+=("$rdcol4_pod_dir")
+printf '{"branch":"evil","origin_repo":"/evil","commits":99,"exit_code":0}\n{"total_cost_usd":0.1}\n' \
+    > "$rdcol4_pod_dir/summary.json"
+rdcol4_log="$(newdir)/kubectl.log"; rdcol4_out="$(newdir)/rdcol4-out.txt"
+tmpdirs+=("$(dirname "$rdcol4_log")" "$(dirname "$rdcol4_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol4_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol4_pod_dir" \
+    collectstub_collect "$rdcol4_log" "$rdcol4_out" \
+    --branch fs-k8s-test-rdcol4 --run-dir "$rdcol4_run_dir" "$proj_dir"; then
+    ok "collect of a run with a two-document pod summary.json exits 0"
+else
+    no "collect of a run with a two-document pod summary.json exits 0" "$(cat "$rdcol4_out")"
+fi
+rdcol4_branch="$(jq -r '.branch' "$rdcol4_run_dir/summary.json" 2>/dev/null)"
+rdcol4_origin="$(jq -r '.origin_repo' "$rdcol4_run_dir/summary.json" 2>/dev/null)"
+rdcol4_commits="$(jq -r '.commits' "$rdcol4_run_dir/summary.json" 2>/dev/null)"
+if [[ "$rdcol4_branch" == "fs-k8s-test-rdcol4" ]] && [[ "$rdcol4_origin" != "/evil" ]] \
+    && [[ "$rdcol4_commits" == "0" ]]; then
+    ok "a two-document pod summary.json never displaces the client's own branch/origin_repo/commits"
+else
+    no "a two-document pod summary.json never displaces the client's own branch/origin_repo/commits" \
+        "branch=$rdcol4_branch origin=$rdcol4_origin commits=$rdcol4_commits"
+fi
+
+# Security: a single, well-formed pod summary.json that sets a host-owned
+# key the client has no occasion to set at all on this run (session_id,
+# with no --session-state) -- the allowlist, not merge order, is what
+# stops this, since a key absent from the client's own object survives
+# `*` untouched regardless of which side is "first" or "second".
+rdcol5_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol5.XXXXXX)"; tmpdirs+=("$rdcol5_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol5_run_dir/run.env"
+rdcol5_pod_dir="$(newdir)"; tmpdirs+=("$rdcol5_pod_dir")
+printf '{"session_id":"forged-session","total_cost_usd":0.2}' > "$rdcol5_pod_dir/summary.json"
+rdcol5_log="$(newdir)/kubectl.log"; rdcol5_out="$(newdir)/rdcol5-out.txt"
+tmpdirs+=("$(dirname "$rdcol5_log")" "$(dirname "$rdcol5_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol5_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol5_pod_dir" \
+    collectstub_collect "$rdcol5_log" "$rdcol5_out" \
+    --branch fs-k8s-test-rdcol5 --run-dir "$rdcol5_run_dir" "$proj_dir"; then
+    ok "collect of a run with a pod-set session_id exits 0"
+else
+    no "collect of a run with a pod-set session_id exits 0" "$(cat "$rdcol5_out")"
+fi
+rdcol5_session_id="$(jq -r 'has("session_id")' "$rdcol5_run_dir/summary.json" 2>/dev/null)"
+rdcol5_cost="$(jq -r '.total_cost_usd' "$rdcol5_run_dir/summary.json" 2>/dev/null)"
+if [[ "$rdcol5_session_id" == "false" ]] && [[ "$rdcol5_cost" == "0.2" ]]; then
+    ok "a pod-set session_id with no --session-state on this run never lands in summary.json"
+else
+    no "a pod-set session_id with no --session-state on this run never lands in summary.json" \
+        "has_session_id=$rdcol5_session_id cost=$rdcol5_cost"
+fi
+
+# A pod that saved a leftover-work patch (see the runner section below):
+# collect must bring uncommitted.patch back as an allowlisted artifact,
+# and the merged summary.json must keep the pod's own uncommitted_patch:
+# true claim once the patch actually landed.
+rdcol6_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol6.XXXXXX)"; tmpdirs+=("$rdcol6_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol6_run_dir/run.env"
+rdcol6_pod_dir="$(newdir)"; tmpdirs+=("$rdcol6_pod_dir")
+printf '{"total_cost_usd":0.1,"uncommitted_patch":true}' > "$rdcol6_pod_dir/summary.json"
+printf 'diff --git a/x b/x\nfake patch body\n' > "$rdcol6_pod_dir/uncommitted.patch"
+rdcol6_log="$(newdir)/kubectl.log"; rdcol6_out="$(newdir)/rdcol6-out.txt"
+tmpdirs+=("$(dirname "$rdcol6_log")" "$(dirname "$rdcol6_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol6_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol6_pod_dir" \
+    collectstub_collect "$rdcol6_log" "$rdcol6_out" \
+    --branch fs-k8s-test-rdcol6 --run-dir "$rdcol6_run_dir" "$proj_dir"; then
+    ok "collect of a run with an under-cap uncommitted.patch exits 0"
+else
+    no "collect of a run with an under-cap uncommitted.patch exits 0" "$(cat "$rdcol6_out")"
+fi
+if diff -q "$rdcol6_pod_dir/uncommitted.patch" "$rdcol6_run_dir/uncommitted.patch" >/dev/null 2>&1; then
+    ok "collect brings an under-cap uncommitted.patch back into the run dir"
+else
+    no "collect brings an under-cap uncommitted.patch back into the run dir" \
+        "$(find "$rdcol6_run_dir" 2>/dev/null)"
+fi
+rdcol6_claim="$(jq -r '.uncommitted_patch' "$rdcol6_run_dir/summary.json" 2>/dev/null)"
+if [[ "$rdcol6_claim" == "true" ]]; then
+    ok "summary.json keeps uncommitted_patch: true once the patch actually landed"
+else
+    no "summary.json keeps uncommitted_patch: true once the patch actually landed" \
+        "uncommitted_patch=$rdcol6_claim"
+fi
+
+# Same claim, but the patch is over collect's 16 MiB per-file cap: it must
+# not land, and the summary's uncommitted_patch claim must be downgraded
+# to false rather than asserting recoverable work that never arrived.
+rdcol7_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol7.XXXXXX)"; tmpdirs+=("$rdcol7_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol7_run_dir/run.env"
+rdcol7_pod_dir="$(newdir)"; tmpdirs+=("$rdcol7_pod_dir")
+printf '{"total_cost_usd":0.1,"uncommitted_patch":true}' > "$rdcol7_pod_dir/summary.json"
+truncate -s 17M "$rdcol7_pod_dir/uncommitted.patch"
+rdcol7_log="$(newdir)/kubectl.log"; rdcol7_out="$(newdir)/rdcol7-out.txt"
+tmpdirs+=("$(dirname "$rdcol7_log")" "$(dirname "$rdcol7_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol7_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol7_pod_dir" \
+    collectstub_collect "$rdcol7_log" "$rdcol7_out" \
+    --branch fs-k8s-test-rdcol7 --run-dir "$rdcol7_run_dir" "$proj_dir"; then
+    ok "collect of a run with an over-cap uncommitted.patch exits 0"
+else
+    no "collect of a run with an over-cap uncommitted.patch exits 0" "$(cat "$rdcol7_out")"
+fi
+if [[ ! -e "$rdcol7_run_dir/uncommitted.patch" ]]; then
+    ok "collect never copies an over-cap uncommitted.patch into the run dir"
+else
+    no "collect never copies an over-cap uncommitted.patch into the run dir" \
+        "$("$FS_STAT" -c '%s' -- "$rdcol7_run_dir/uncommitted.patch" 2>/dev/null)"
+fi
+rdcol7_claim="$(jq -r '.uncommitted_patch' "$rdcol7_run_dir/summary.json" 2>/dev/null)"
+if [[ "$rdcol7_claim" == "false" ]]; then
+    ok "summary.json downgrades uncommitted_patch to false when the patch is dropped for being over cap"
+else
+    no "summary.json downgrades uncommitted_patch to false when the patch is dropped for being over cap" \
+        "uncommitted_patch=$rdcol7_claim"
+fi
+
+# The 16 MiB per-file cap applies to every allowlisted copy-back name, not
+# only uncommitted.patch -- an oversized sandbox.log must not land either.
+rdcol8_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol8.XXXXXX)"; tmpdirs+=("$rdcol8_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol8_run_dir/run.env"
+rdcol8_pod_dir="$(newdir)"; tmpdirs+=("$rdcol8_pod_dir")
+printf '{"total_cost_usd":0.1}' > "$rdcol8_pod_dir/summary.json"
+truncate -s 17M "$rdcol8_pod_dir/sandbox.log"
+rdcol8_log="$(newdir)/kubectl.log"; rdcol8_out="$(newdir)/rdcol8-out.txt"
+tmpdirs+=("$(dirname "$rdcol8_log")" "$(dirname "$rdcol8_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol8_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol8_pod_dir" \
+    collectstub_collect "$rdcol8_log" "$rdcol8_out" \
+    --branch fs-k8s-test-rdcol8 --run-dir "$rdcol8_run_dir" "$proj_dir"; then
+    ok "collect of a run with an over-cap allowlisted file exits 0"
+else
+    no "collect of a run with an over-cap allowlisted file exits 0" "$(cat "$rdcol8_out")"
+fi
+if [[ ! -e "$rdcol8_run_dir/sandbox.log" ]]; then
+    ok "collect never copies an over-cap sandbox.log, even though the name is allowlisted"
+else
+    no "collect never copies an over-cap sandbox.log, even though the name is allowlisted" \
+        "$("$FS_STAT" -c '%s' -- "$rdcol8_run_dir/sandbox.log" 2>/dev/null)"
+fi
+
+# Security (item 6 of the live-cluster-run review): an oversized pod
+# summary.json must be refused by its own byte size, BEFORE `jq -s` ever
+# reads it -- `jq -s` slurps the whole file to build the array it counts
+# (see cmd_collect's own comment on why it needs the count, not just the
+# parse), so sizing it after that point is too late. A real attack used
+# 200 MB; this fixture only needs to clear FS_POD_SUMMARY_MAX_BYTES (1
+# MiB), not reproduce the actual size, to prove the cap fires -- and it
+# must do so in well under a second, not however long parsing several
+# hundred MB of repeated JSON tokens would take.
+rdcol9_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol9.XXXXXX)"; tmpdirs+=("$rdcol9_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol9_run_dir/run.env"
+rdcol9_pod_dir="$(newdir)"; tmpdirs+=("$rdcol9_pod_dir")
+python3 -c '
+import sys
+with open(sys.argv[1], "w") as f:
+    f.write("[")
+    f.write(",".join(["0"] * (2 * 1024 * 1024)))
+    f.write("]")
+' "$rdcol9_pod_dir/summary.json"
+rdcol9_log="$(newdir)/kubectl.log"; rdcol9_out="$(newdir)/rdcol9-out.txt"
+tmpdirs+=("$(dirname "$rdcol9_log")" "$(dirname "$rdcol9_out")")
+rdcol9_start="$(date +%s)"
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol9_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol9_pod_dir" \
+    collectstub_collect "$rdcol9_log" "$rdcol9_out" \
+    --branch fs-k8s-test-rdcol9 --run-dir "$rdcol9_run_dir" "$proj_dir"; then
+    ok "collect of a run with an over-cap pod summary.json exits 0"
+else
+    no "collect of a run with an over-cap pod summary.json exits 0" "$(cat "$rdcol9_out")"
+fi
+rdcol9_elapsed=$(( $(date +%s) - rdcol9_start ))
+if (( rdcol9_elapsed < 10 )); then
+    ok "the over-cap pod summary.json refusal runs in seconds"
+else
+    no "the over-cap pod summary.json refusal runs in seconds" "took ${rdcol9_elapsed}s"
+fi
+if grep -q 'summary.json is over the' "$rdcol9_out"; then
+    ok "collect warns that the pod's summary.json is over the byte cap"
+else
+    no "collect warns that the pod's summary.json is over the byte cap" "$(cat "$rdcol9_out")"
+fi
+if [[ -s "$rdcol9_run_dir/summary.json" ]] \
+    && [[ "$(jq -r '.branch' "$rdcol9_run_dir/summary.json" 2>/dev/null)" == fs-k8s-test-rdcol9 ]]; then
+    ok "collect's own summary.json still stands when the pod's own is refused for size"
+else
+    no "collect's own summary.json still stands when the pod's own is refused for size" \
+        "$(cat "$rdcol9_run_dir/summary.json" 2>/dev/null)"
+fi
+
+# Security (item 11 of the live-cluster-run review): a pod-reported
+# cost_usd of 1e1000 is a legal-looking JSON number token that parses to
+# a non-finite double -- jq passes it through unchanged (it never
+# normalizes a literal it does not touch, so it survives as the literal
+# text 1E+1000), and it is only downstream, in Python's json module, that
+# it becomes the bareword Infinity, which is not valid JSON and corrupts
+# sandbox-runs.jsonl. Reject it at collect, the host's one choke point
+# for pod-reported numbers, rather than relying solely on the run-log
+# writer's own defenses.
+rdcol10_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcol10.XXXXXX)"; tmpdirs+=("$rdcol10_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcol10_run_dir/run.env"
+rdcol10_pod_dir="$(newdir)"; tmpdirs+=("$rdcol10_pod_dir")
+printf '{"cost_usd":1e1000,"total_cost_usd":0.25}' > "$rdcol10_pod_dir/summary.json"
+rdcol10_log="$(newdir)/kubectl.log"; rdcol10_out="$(newdir)/rdcol10-out.txt"
+tmpdirs+=("$(dirname "$rdcol10_log")" "$(dirname "$rdcol10_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcol10_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcol10_pod_dir" \
+    collectstub_collect "$rdcol10_log" "$rdcol10_out" \
+    --branch fs-k8s-test-rdcol10 --run-dir "$rdcol10_run_dir" "$proj_dir"; then
+    ok "collect of a run with a non-finite pod cost_usd exits 0"
+else
+    no "collect of a run with a non-finite pod cost_usd exits 0" "$(cat "$rdcol10_out")"
+fi
+if [[ -s "$rdcol10_run_dir/summary.json" ]] && python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    text = f.read()
+assert "Infinity" not in text and "NaN" not in text, "non-finite bareword leaked into summary.json: " + text
+doc = json.loads(text)
+assert doc.get("cost_usd") is None, "cost_usd was not sanitized: " + repr(doc.get("cost_usd"))
+assert doc.get("total_cost_usd") == 0.25, "total_cost_usd was wrongly touched: " + repr(doc.get("total_cost_usd"))
+' "$rdcol10_run_dir/summary.json" 2>/tmp/fs-k8s-rdcol10.err; then
+    ok "collect nulls out a non-finite pod-reported cost_usd rather than passing it through"
+else
+    no "collect nulls out a non-finite pod-reported cost_usd rather than passing it through" \
+        "$(cat "$rdcol10_run_dir/summary.json" 2>/dev/null) $(cat /tmp/fs-k8s-rdcol10.err 2>/dev/null)"
+fi
+rm -f /tmp/fs-k8s-rdcol10.err
+
+printf '\n== fork-sandbox-k8s.sh collect + fork-sandbox-status.sh: a composed run shaped like a real cluster run ==\n'
+# Items 1-4, 9 and 10 of the live-cluster-run review, all against one
+# fixture shaped like the real thing: a host run.env carrying BOTH
+# writers' keys (the launcher's version=/run_dir=/started_at=, and
+# submit's RUNNER=1/mode=/BRANCH=/PROJECT=), and a pod run-directory pull
+# whose summary.txt still claims "fetched: NO -- the work is in the
+# clone only" (fetch_back=0 is always true in-pod) and plants a
+# review-loop.json/maintainer-loop.json/tidy.json/run.env model= a
+# compromised leg could use to forge its own history or dodge
+# attribution. Invented paths throughout -- no host-specific names.
+# fork-sandbox-status.sh requires RUN_DIR_PREFIX (claude-fork-sandbox.*),
+# unlike cmd_collect, which accepts any directory -- so this fixture,
+# tested through both, needs the real prefix the other rdcol* fixtures
+# above do not.
+rdlive2_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.rdlive2.XXXXXX)"; tmpdirs+=("$rdlive2_run_dir")
+rdlive2_branch=fs-k8s-test-rdlive2
+printf 'version=1\nrun_dir=%s\norigin_repo=%s\nclone_dir=/fake/clone\nbranch=%s\nharness=claude\nmodel=sonnet\nstarted_at=1700000000\nRUNNER=1\nmode=run\nnetwork=cluster\nBRANCH=%s\nPROJECT=%s\nrefresh_at=0.5\nrefresh_max=6\nrefresh_threshold_tokens=500000\n' \
+    "$rdlive2_run_dir" "$proj_dir" "$rdlive2_branch" "$rdlive2_branch" "$proj_dir" \
+    > "$rdlive2_run_dir/run.env"
+# Host-staged, like run.sh/scripts/ and handoff.md: a composed run's
+# pipeline.json is always there before submit ever runs. Carries a
+# maintain step, same as the real cluster run's own
+# csonnet-rsonnet1-msonnet1 preset, so the tidy.json gate below (which
+# mirrors a local run's own tidy_has_maintain_step check) takes the
+# branch this fixture means to exercise.
+printf '{"steps":[{"action":"code","harness":"claude","model":"sonnet"},{"action":"review","harness":"claude","model":"sonnet"},{"action":"maintain","harness":"claude","model":"sonnet"}]}' \
+    > "$rdlive2_run_dir/pipeline.json"
+
+rdlive2_pod_dir="$(newdir)"; tmpdirs+=("$rdlive2_pod_dir")
+printf '{"ended":"approved","iterations":[{"i":1,"findings":0}]}' > "$rdlive2_pod_dir/step-2-loop.json"
+printf '{"ended":"approved","iterations":[{"i":1,"findings":0}]}' > "$rdlive2_pod_dir/step-3-loop.json"
+printf 'verdict one\n' > "$rdlive2_pod_dir/s2-review-verdict-1.md"
+printf 'verdict two\n' > "$rdlive2_pod_dir/s3-maintain-verdict-1.md"
+printf '{"schema":1,"label":"rdlive2","spec":"csonnet-rsonnet1-msonnet1","state":"done","updated":1700000100,"steps":[{"action":"code","state":"done","i":1,"cap":1},{"action":"review","state":"done","i":1,"cap":1},{"action":"maintain","state":"done","i":1,"cap":1}]}' \
+    > "$rdlive2_pod_dir/progress.json"
+# A pod leg can plant any of these by name -- the exact forgery risk the
+# copy-back allowlist and the model carry-over exist to deny.
+printf '{"ended":"approved","detail":"forged by a compromised leg","iterations":[]}' \
+    > "$rdlive2_pod_dir/review-loop.json"
+printf '{"ended":"approved","detail":"forged by a compromised leg","iterations":[]}' \
+    > "$rdlive2_pod_dir/maintainer-loop.json"
+printf '{"ended":"approved","detail":"forged: this leg claims tidy ran and passed","head_approved":"deadbeef"}' \
+    > "$rdlive2_pod_dir/tidy.json"
+printf 'RUNNER=1\nharness=claude\nmodel=not-the-real-model\ncost=0.251411\noutbox_bytes=214\noutbox_max_bytes=67108864\n' \
+    > "$rdlive2_pod_dir/run.env"
+printf '{"cost_usd":0.131824,"total_cost_usd":0.251411,"usage":{"input_tokens":8,"output_tokens":879},"refresh":"none","continuations":[],"tidy":{"ended":"skipped","detail":"a --k8s pod run does not fetch back"}}' \
+    > "$rdlive2_pod_dir/summary.json"
+# The pod's own prose, unconditionally claiming the work never left the
+# clone -- fork-sandbox-runner.sh's own fetch_back is always 0 in a pod,
+# so this is what every composed k8s run's pulled-back summary.txt says,
+# whether or not the host's own fetch, moments later, actually lands it.
+{
+    printf '== fork-sandbox summary ==\n'
+    printf 'branch:    %s\n' "$rdlive2_branch"
+    printf 'mode:      run\n'
+    printf 'origin:    %s\n' "$proj_dir"
+    printf 'clone:     /work/clone\n'
+    printf 'exit:      0\n'
+    printf 'commits:   1\n'
+    printf 'cost:      $0.131824\n'
+    printf 'tidy:      skipped (a --k8s pod run does not fetch back)\n'
+    printf 'total:     $0.251411  (the session and every review-, maintainer-, tidy- or continuation leg)\n'
+    printf 'fetched:   NO -- the work is in the clone only\n'
+    printf '\nabc1234 a commit message\n'
+    printf '\n greet.sh | 2 ++\n'
+    printf '\nNothing landed in %s. Whatever the session wrote is still\n' "$proj_dir"
+    printf 'in the clone at /work/clone\n'
+} > "$rdlive2_pod_dir/summary.txt"
+
+rdlive2_log="$(newdir)/kubectl.log"; rdlive2_out="$(newdir)/rdlive2-out.txt"
+tmpdirs+=("$(dirname "$rdlive2_log")" "$(dirname "$rdlive2_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_FETCH_REF=1 \
+    K8S_STUB_RUN_DIR_PULL_PATH="$rdlive2_run_dir" K8S_STUB_RUN_DIR_PULL_SRC="$rdlive2_pod_dir" \
+    collectstub_collect "$rdlive2_log" "$rdlive2_out" \
+    --branch "$rdlive2_branch" --run-dir "$rdlive2_run_dir" "$proj_dir"; then
+    ok "collect over a live-cluster-shaped pod run directory exits 0"
+else
+    no "collect over a live-cluster-shaped pod run directory exits 0" "$(cat "$rdlive2_out")"
+fi
+if ! grep -q 'No such file or directory' "$rdlive2_out" && ! grep -q 'no usable refresh.json' "$rdlive2_out"; then
+    ok "item 4: runner-mode collect never looks for the legacy evidence/refresh.json and never warns about it"
+else
+    no "item 4: runner-mode collect never looks for the legacy evidence/refresh.json and never warns about it" \
+        "$(cat "$rdlive2_out")"
+fi
+if [[ -s "$rdlive2_run_dir/summary.json" ]] \
+    && [[ "$(jq -r '.refresh' "$rdlive2_run_dir/summary.json" 2>/dev/null)" == none ]] \
+    && [[ "$(jq -r '.continuations | length' "$rdlive2_run_dir/summary.json" 2>/dev/null)" == 0 ]]; then
+    ok "item 4: the pod's own refresh/continuations facts still reach summary.json"
+else
+    no "item 4: the pod's own refresh/continuations facts still reach summary.json" \
+        "$(cat "$rdlive2_run_dir/summary.json" 2>/dev/null)"
+fi
+if [[ "$(cat "$rdlive2_run_dir/exit-code" 2>/dev/null)" == "0" ]]; then
+    ok "item 1/3: collect writes a host-owned exit-code file for a composed k8s run"
+else
+    no "item 1/3: collect writes a host-owned exit-code file for a composed k8s run" \
+        "$(cat "$rdlive2_run_dir/exit-code" 2>/dev/null; echo NOFILE)"
+fi
+if [[ -s "$rdlive2_run_dir/progress.json" ]] \
+    && [[ "$(jq -r '.state' "$rdlive2_run_dir/progress.json" 2>/dev/null)" == "done" ]]; then
+    ok "item 3: progress.json comes back and is readable after collect"
+else
+    no "item 3: progress.json comes back and is readable after collect" \
+        "$(cat "$rdlive2_run_dir/progress.json" 2>/dev/null; echo NOFILE)"
+fi
+if [[ "$(jq -r '.ended' "$rdlive2_run_dir/tidy.json" 2>/dev/null)" == skipped ]] \
+    && ! grep -q forged "$rdlive2_run_dir/tidy.json" 2>/dev/null; then
+    ok "item 10: tidy.json is the host's own skip record, not the pod's forged one"
+else
+    no "item 10: tidy.json is the host's own skip record, not the pod's forged one" \
+        "$(cat "$rdlive2_run_dir/tidy.json" 2>/dev/null)"
+fi
+if [[ ! -e "$rdlive2_run_dir/review-loop.json" ]] && [[ ! -e "$rdlive2_run_dir/maintainer-loop.json" ]]; then
+    ok "item 10: review-loop.json/maintainer-loop.json are never taken from the pod's copy"
+else
+    no "item 10: review-loop.json/maintainer-loop.json are never taken from the pod's copy" \
+        "$(find "$rdlive2_run_dir" -maxdepth 1 -name '*-loop.json' 2>/dev/null)"
+fi
+if [[ "$(grep -m1 '^model=' "$rdlive2_run_dir/run.env" 2>/dev/null)" == model=sonnet ]]; then
+    ok "item 9: model is taken from the host's own seat resolution, not the pod's run.env"
+else
+    no "item 9: model is taken from the host's own seat resolution, not the pod's run.env" \
+        "$(cat "$rdlive2_run_dir/run.env" 2>/dev/null)"
+fi
+if [[ -s "$rdlive2_run_dir/summary.txt" ]] \
+    && ! grep -q '/work/clone' "$rdlive2_run_dir/summary.txt" \
+    && ! grep -q 'Nothing landed' "$rdlive2_run_dir/summary.txt" \
+    && grep -q "fetched:   yes. Branch $rdlive2_branch is now in $proj_dir" "$rdlive2_run_dir/summary.txt" \
+    && grep -qF "run dir:   $rdlive2_run_dir" "$rdlive2_run_dir/summary.txt"; then
+    ok "item 2: summary.txt states the host's own facts, not the pod's clone-only claim"
+else
+    no "item 2: summary.txt states the host's own facts, not the pod's clone-only claim" \
+        "$(cat "$rdlive2_run_dir/summary.txt" 2>/dev/null)"
+fi
+
+# fork-sandbox-status.sh against the resulting host run directory: the
+# acceptance bar for items 1-4 is that this script works on it at all,
+# the same way it does for a local composed run, rather than dying with
+# "has no run.env; it is not a fork-sandbox run directory".
+status_sh="$repo_dir/scripts/fork-sandbox-status.sh"
+rdlive2_status_default="$("$status_sh" "$rdlive2_run_dir" 2>&1)" || true
+if ! grep -q 'is not a fork-sandbox run directory' <<< "$rdlive2_status_default" \
+    && grep -q "branch:   $rdlive2_branch" <<< "$rdlive2_status_default" \
+    && grep -q 'state:    done' <<< "$rdlive2_status_default"; then
+    ok "status (default view) works on the composed k8s run dir, state done"
+else
+    no "status (default view) works on the composed k8s run dir, state done" "$rdlive2_status_default"
+fi
+rdlive2_status_result="$("$status_sh" --result "$rdlive2_run_dir" 2>&1)" || true
+if ! grep -q 'is not a fork-sandbox run directory' <<< "$rdlive2_status_result"; then
+    ok "status --result works on the composed k8s run dir"
+else
+    no "status --result works on the composed k8s run dir" "$rdlive2_status_result"
+fi
+rdlive2_status_json="$("$status_sh" --json "$rdlive2_run_dir" 2>&1)" || true
+if [[ "$(jq -r '.branch' <<< "$rdlive2_status_json" 2>/dev/null)" == "$rdlive2_branch" ]] \
+    && [[ "$(jq -r '.origin_repo' <<< "$rdlive2_status_json" 2>/dev/null)" == "$proj_dir" ]] \
+    && [[ "$(jq -r '.exit_code' <<< "$rdlive2_status_json" 2>/dev/null)" == "0" ]]; then
+    ok "status --json works on the composed k8s run dir and reports the host's own facts"
+else
+    no "status --json works on the composed k8s run dir and reports the host's own facts" "$rdlive2_status_json"
+fi
+
+printf '\n== fork-sandbox-runner.sh: a pod leg'"'"'s uncommitted work is saved as a patch, never committed ==\n'
+# The entrypoint skips commit_uncommitted_work in RUN_DIR (runner) mode --
+# run.sh's own end-of-run check already covers the clone, and it must
+# CHECK and RECORD uncommitted work, never commit it, exactly like a
+# local run. But a pod's emptyDir goes away with the pod, so a leg killed
+# or crashed with dirty work needs this patch as its only backstop. Extracted
+# (by line range, not a function name -- this code sits at the runner's
+# top level, not inside one) rather than run through the full pod walk:
+# the walk's own stub harness always commits, so it cannot leave the
+# clone dirty, and building a second full walk just to get a dirty tree
+# would be a lot of infrastructure to prove five lines of git plumbing.
+uwp_block="$(sed -n '/^uncommitted_bind_flags=()$/,/rm -f "\$run_dir\/uncommitted\.patch"$/p' "$runner_sh")
+fi"
+uwp_clone="$(newdir)"; tmpdirs+=("$uwp_clone")
+git init -q "$uwp_clone"
+git -C "$uwp_clone" config user.email t@fork-sandbox.invalid
+git -C "$uwp_clone" config user.name Tester
+printf 'line1\n' > "$uwp_clone/tracked.txt"
+git -C "$uwp_clone" add tracked.txt
+git -C "$uwp_clone" commit -q -m init
+printf 'line1\nline2 modified\n' > "$uwp_clone/tracked.txt"
+printf 'new file content\n' > "$uwp_clone/untracked.txt"
+uwp_run_dir="$(newdir)"; tmpdirs+=("$uwp_run_dir")
+uwp_script="$(newdir)/uwp.sh"; tmpdirs+=("$(dirname "$uwp_script")")
+printf '%s\n' \
+    'set -euo pipefail' \
+    'FS_TIMEOUT=timeout' \
+    'fs_alternates=()' \
+    'runner_in_sandbox=1' \
+    "clone_dir=\"$uwp_clone\"" \
+    "run_dir=\"$uwp_run_dir\"" \
+    "$uwp_block" > "$uwp_script"
+uwp_err="$(newdir)/uwp.err"; tmpdirs+=("$(dirname "$uwp_err")")
+if bash "$uwp_script" 2>"$uwp_err"; then
+    ok "the uncommitted-work patch block runs cleanly against a dirty clone"
+else
+    no "the uncommitted-work patch block runs cleanly against a dirty clone" "$(cat "$uwp_err")"
+fi
+if [[ -s "$uwp_run_dir/uncommitted.patch" ]]; then
+    ok "a pod leg with uncommitted work writes uncommitted.patch"
+else
+    no "a pod leg with uncommitted work writes uncommitted.patch" "$(find "$uwp_run_dir" 2>&1)"
+fi
+if grep -q 'tracked.txt' "$uwp_run_dir/uncommitted.patch" 2>/dev/null \
+    && grep -q 'untracked.txt' "$uwp_run_dir/uncommitted.patch" 2>/dev/null; then
+    ok "uncommitted.patch carries both the tracked change and the untracked file"
+else
+    no "uncommitted.patch carries both the tracked change and the untracked file" \
+        "$(cat "$uwp_run_dir/uncommitted.patch" 2>/dev/null)"
+fi
+# Never commits the work -- same local behaviour as a plain run's own
+# check -- and leaves the clone's own index unstaged behind it.
+if ! git -C "$uwp_clone" status --porcelain 2>/dev/null | grep -q '^[MARCD]' \
+    && [[ -n "$(git -C "$uwp_clone" status --porcelain 2>/dev/null)" ]]; then
+    ok "the patch block never commits the work and leaves the clone's index unstaged"
+else
+    no "the patch block never commits the work and leaves the clone's index unstaged" \
+        "$(git -C "$uwp_clone" status --porcelain 2>/dev/null)"
+fi
+# Applying the patch to a clean checkout of the same commit reproduces
+# both files -- proof the patch is not merely well-formed, but actually
+# restores the leftover work.
+uwp_apply_clone="$(newdir)"; tmpdirs+=("$uwp_apply_clone")
+git clone -q "$uwp_clone" "$uwp_apply_clone"
+if git -C "$uwp_apply_clone" apply "$uwp_run_dir/uncommitted.patch" 2>"$uwp_err" \
+    && [[ "$(cat "$uwp_apply_clone/tracked.txt")" == $'line1\nline2 modified' ]] \
+    && [[ "$(cat "$uwp_apply_clone/untracked.txt")" == "new file content" ]]; then
+    ok "uncommitted.patch applies cleanly and restores the leftover work"
+else
+    no "uncommitted.patch applies cleanly and restores the leftover work" "$(cat "$uwp_err")"
+fi
+
+# This falls out of the same code with no change: cmd_resume re-attaches
+# through k8s_run_tail, which always calls cmd_collect with the SAME
+# --run-dir (see k8s_run_tail's own header) -- the RUNNER=1 pull-back
+# above is exercised identically whether collect is reached via `run`,
+# `resume` or directly, so it is not re-tested separately here.
+
+printf '\n== fork-sandbox-k8s-entrypoint.sh: RUN_DIR arm (runner mode) ==\n'
+# Extend the existing pi_rc=0..fi extraction (claude_block, above) with
+# the three functions this session added just above it
+# (claude_pod_credentials/discover_pipeline_pi_facts/
+# synthesize_pi_config_list) -- they are called FROM the RUN_DIR arm but
+# defined before the sed range claude_block already captures, so without
+# them the RUN_DIR arm would fail with "command not found" the moment any
+# seat triggers one.
+rd_funcs="$(sed -n '/^claude_pod_credentials() {$/,/^}$/p; /^discover_pipeline_pi_facts() {$/,/^}$/p; /^synthesize_pi_config_list() {$/,/^}$/p' "$entrypoint_sh")"
+rd_block_file="$(newdir)/rd-block.sh"; tmpdirs+=("$(dirname "$rd_block_file")")
+if [[ -n "$rd_funcs" ]] && [[ -n "$claude_block" ]]; then
+    # source "$mounts_dir/lib.sh" first, same as claude_block_file above --
+    # rd_block_run below stages a real copy of fork-sandbox-lib.sh there.
+    printf '%s\n' 'set -euo pipefail' \
+        'source "$mounts_dir/lib.sh"' \
+        "$rd_funcs" \
+        "$claude_block" \
+        'printf "RD_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$rd_block_file"
+    ok "the RUN_DIR arm's own helper functions are isolable alongside pi_rc=0..fi"
+else
+    no "the RUN_DIR arm's own helper functions are isolable alongside pi_rc=0..fi" \
+        "rd_funcs empty or claude_block empty/missing"
+fi
+
+# $1 = pipeline.json mix (pi|claude|mixed), $2 = run.sh body (appended
+# after a #!/usr/bin/env bash line), $3 = extra env assignments (eval'd
+# before running, for MODEL_DISCOVERY-style overrides). Sets RD_BLOCK_*
+# after running; RD_BLOCK_CALLS is empty unless claude/pi/curl were
+# invoked DIRECTLY by the arm itself (only run.sh may call them, and this
+# fixture's run.sh never does), proving the arm runs no leg of its own.
+rd_block_run() {
+    local mix="$1" runsh_body="$2" extra="${3:-}"
+    local rund mounts work home clone stub_dir calls_file out
+    local RD_MODEL_DISCOVERY=""
+    rund="$(newdir)"; tmpdirs+=("$rund")
+    mounts="$(newdir)"; tmpdirs+=("$mounts")
+    work="$(newdir)"; tmpdirs+=("$work")
+    home="$(newdir)"; tmpdirs+=("$home")
+    clone="$work/clone"
+    mkdir -p "$work/inbox" "$clone"
+    printf '%s\n' '#!/usr/bin/env bash' "$runsh_body" > "$rund/run.sh"
+    chmod +x "$rund/run.sh"
+    case "$mix" in
+        pi) printf '{"steps":[{"action":"code","harness":"pi","model":"rd-pi-model"}]}' > "$rund/pipeline.json" ;;
+        claude) printf '{"steps":[{"action":"maintain","harness":"claude","model":"sonnet"}]}' > "$rund/pipeline.json" ;;
+        mixed) printf '{"steps":[{"action":"code","harness":"pi","model":"rd-pi-model-a"},{"action":"maintain","harness":"claude","model":"sonnet","fix":null},{"action":"review","harness":"pi","model":"rd-pi-model-b"}]}' > "$rund/pipeline.json" ;;
+    esac
+    printf '{}' > "$mounts/claude-credentials.json"
+    cp "$repo_dir/scripts/fork-sandbox-lib.sh" "$mounts/lib.sh"
+    stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
+    calls_file="$stub_dir/.calls"; : > "$calls_file"
+    printf '#!/usr/bin/env bash\necho "claude $*" >> "%s"\nexit 1\n' "$calls_file" > "$stub_dir/claude"
+    printf '#!/usr/bin/env bash\necho "pi $*" >> "%s"\nexit 1\n' "$calls_file" > "$stub_dir/pi"
+    printf '#!/usr/bin/env bash\necho "curl $*" >> "%s"\nexit 1\n' "$calls_file" > "$stub_dir/curl"
+    chmod +x "$stub_dir/claude" "$stub_dir/pi" "$stub_dir/curl"
+    if [[ -n "$extra" ]]; then eval "$extra"; fi
+    out="$(PATH="$stub_dir:$PATH" HOME="$home" TMPDIR="$work" \
+        RUN_DIR="$rund" HARNESS=pi MODEL="" MODEL_DISCOVERY="$RD_MODEL_DISCOVERY" ALLOW_UNLISTED_MODEL="" \
+        PROXY_BASE_URL="http://fs-k8s-test-proxy.invalid" \
+        CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" \
+        mounts_dir="$mounts" work_dir="$work" clone_dir="$clone" inbox_dir="$work/inbox" \
+        FORK_SANDBOX_K8S_PI_MODEL_MAP="$work/pi-model-map.json" \
+        SESSION_HARNESS_STORE=0 RESUME_SESSION="" \
+        bash "$rd_block_file" 2>&1)"
+    RD_BLOCK_RUN_DIR="$rund"
+    RD_BLOCK_CLONE="$clone"
+    RD_BLOCK_HOME="$home"
+    RD_BLOCK_OUT="$out"
+    RD_BLOCK_PI_RC="$(grep -o 'RD_BLOCK_PI_RC=.*' <<<"$out" | tail -1 | cut -d= -f2)"
+    RD_BLOCK_CALLS="$(cat "$calls_file" 2>/dev/null)"
+    RD_BLOCK_PI_MODEL_MAP="$work/pi-model-map.json"
+}
+
+rd_block_run pi 'pwd > "$RUN_DIR/.cwd"; exit 7'
+check "RUN_DIR arm: pi_rc equals run.sh's own exit code" "7" "$RD_BLOCK_PI_RC"
+check "RUN_DIR arm: run.sh runs with the clone as cwd" \
+    "$RD_BLOCK_CLONE" "$(cat "$RD_BLOCK_RUN_DIR/.cwd" 2>/dev/null)"
+if [[ ! -e "$RD_BLOCK_HOME/.claude/.credentials.json" ]]; then
+    ok "RUN_DIR arm: an all-pi pipeline.json installs no claude credential"
+else
+    no "RUN_DIR arm: an all-pi pipeline.json installs no claude credential" "$RD_BLOCK_OUT"
+fi
+check "RUN_DIR arm: claude/pi/curl are never invoked directly by the arm itself" "" "$RD_BLOCK_CALLS"
+
+rd_block_run claude 'exit 0'
+if [[ -f "$RD_BLOCK_HOME/.claude/.credentials.json" ]] && [[ -f "$RD_BLOCK_HOME/.claude.json" ]]; then
+    ok "RUN_DIR arm: a claude seat in pipeline.json installs the claude credential and trust file"
+else
+    no "RUN_DIR arm: a claude seat in pipeline.json installs the claude credential and trust file" \
+        "$(find "$RD_BLOCK_HOME" 2>/dev/null) $RD_BLOCK_OUT"
+fi
+check "RUN_DIR arm: claude/pi/curl are never invoked directly by the arm itself (claude seat)" "" "$RD_BLOCK_CALLS"
+
+rd_block_run mixed 'exit 0'
+if [[ -f "$RD_BLOCK_HOME/.pi/agent/models.json" ]]; then
+    rd_mixed_model_count="$(jq '.providers.proxy.models | length' "$RD_BLOCK_HOME/.pi/agent/models.json" 2>/dev/null)"
+    rd_mixed_default="$(jq -r '.providers.proxy.baseUrl' "$RD_BLOCK_HOME/.pi/agent/models.json" 2>/dev/null)"
+    if [[ "$rd_mixed_model_count" == "2" ]] && [[ "$rd_mixed_default" == "http://fs-k8s-test-proxy.invalid" ]]; then
+        ok "RUN_DIR arm: a mixed pipeline.json writes models.json listing every distinct pi model"
+    else
+        no "RUN_DIR arm: a mixed pipeline.json writes models.json listing every distinct pi model" \
+            "count=$rd_mixed_model_count baseUrl=$rd_mixed_default"
+    fi
+else
+    no "RUN_DIR arm: a mixed pipeline.json writes models.json listing every distinct pi model" \
+        "no models.json at $RD_BLOCK_HOME/.pi/agent -- $RD_BLOCK_OUT"
+fi
+if [[ -f "$RD_BLOCK_HOME/.claude/.credentials.json" ]]; then
+    ok "RUN_DIR arm: a mixed pipeline.json also installs the claude credential"
+else
+    no "RUN_DIR arm: a mixed pipeline.json also installs the claude credential" "$RD_BLOCK_OUT"
+fi
+if [[ -f "$RD_BLOCK_PI_MODEL_MAP" ]] && [[ "$(jq -c . < "$RD_BLOCK_PI_MODEL_MAP" 2>/dev/null)" == "{}" ]]; then
+    ok "RUN_DIR arm: a mixed pipeline.json with no discovery writes an empty pi-model-map.json"
+else
+    no "RUN_DIR arm: a mixed pipeline.json with no discovery writes an empty pi-model-map.json" \
+        "$(cat "$RD_BLOCK_PI_MODEL_MAP" 2>/dev/null) -- $RD_BLOCK_OUT"
+fi
+
+# The listing-spelling rewrite (pi-model-map.json, consumed by
+# fork-sandbox-k8s-leg.sh's pi arm): with discovery on and the proxy's
+# catalog spelling one of the two configured ids differently by case
+# only, the RUN_DIR arm must record that rewrite in pi-model-map.json so
+# a later leg sending the CONFIGURED id still resolves to the model
+# models.json was synthesized under.
+rd_block_run mixed 'exit 0' '
+    printf "%s\n" "#!/usr/bin/env bash" "cat <<JSON" \
+        "{\"data\":[{\"id\":\"RD-PI-MODEL-A\",\"max_model_len\":131072},{\"id\":\"rd-pi-model-b\",\"max_model_len\":131072}]}" \
+        "JSON" > "$stub_dir/curl"
+    chmod +x "$stub_dir/curl"
+    RD_MODEL_DISCOVERY=1
+'
+if [[ -f "$RD_BLOCK_PI_MODEL_MAP" ]] \
+    && [[ "$(jq -r '.["rd-pi-model-a"] // empty' "$RD_BLOCK_PI_MODEL_MAP" 2>/dev/null)" == "RD-PI-MODEL-A" ]] \
+    && [[ "$(jq -r '.["rd-pi-model-b"] // "absent"' "$RD_BLOCK_PI_MODEL_MAP" 2>/dev/null)" == "absent" ]]; then
+    ok "RUN_DIR arm: a case-only listing-spelling rewrite is recorded in pi-model-map.json"
+else
+    no "RUN_DIR arm: a case-only listing-spelling rewrite is recorded in pi-model-map.json" \
+        "$(cat "$RD_BLOCK_PI_MODEL_MAP" 2>/dev/null) -- $RD_BLOCK_OUT"
+fi
+
+# The RUN_DIR/inbox symlink block (just above the pi_rc=0..fi span, so
+# outside claude_block's own sed range): extracted on its own, since the
+# plain if/fi pattern it shares with several OTHER RUN_DIR checks in this
+# file makes a blanket "/^if \[\[ -n "\$RUN_DIR" \]\]; then\$/,/^fi\$/p"
+# ambiguous -- anchored instead on this block's own unique comment line.
+rd_symlink_block="$(sed -n '/# The push that just arrived/,/^fi$/p' "$entrypoint_sh")"
+if [[ -n "$rd_symlink_block" ]]; then
+    ok "the RUN_DIR/inbox symlink block is isolable in the entrypoint"
+else
+    no "the RUN_DIR/inbox symlink block is isolable in the entrypoint" "block not found"
+fi
+
+rd_sym_work="$(newdir)"; tmpdirs+=("$rd_sym_work")
+rd_sym_rund="$(newdir)"; tmpdirs+=("$rd_sym_rund")
+mkdir -p "$rd_sym_rund/inbox"
+printf 'if [[ -n "$RUN_DIR" ]]; then\n%s\n' "$rd_symlink_block" > "$rd_sym_work/sym-block.sh"
+RD_SYM_OUT="$(RUN_DIR="$rd_sym_rund" inbox_dir="$rd_sym_work/inbox" bash -c 'set -euo pipefail; source "$1"' _ "$rd_sym_work/sym-block.sh" 2>&1)"
+if [[ -L "$rd_sym_work/inbox" ]] && [[ "$(readlink "$rd_sym_work/inbox")" == "$rd_sym_rund/inbox" ]]; then
+    ok "RUN_DIR set, RUN_DIR/inbox present: /work/inbox becomes a symlink to it"
+else
+    no "RUN_DIR set, RUN_DIR/inbox present: /work/inbox becomes a symlink to it" "$RD_SYM_OUT"
+fi
+
+rd_sym_work2="$(newdir)"; tmpdirs+=("$rd_sym_work2")
+rd_sym_rund2="$(newdir)"; tmpdirs+=("$rd_sym_rund2")
+# No $rd_sym_rund2/inbox this time -- the launcher's own staging never ran.
+RD_SYM_RC=0
+RUN_DIR="$rd_sym_rund2" inbox_dir="$rd_sym_work2/inbox" \
+    bash -c 'set -euo pipefail; source "$1"' _ "$rd_sym_work/sym-block.sh" \
+    >"$rd_sym_work2/out.txt" 2>&1 || RD_SYM_RC=$?
+if (( RD_SYM_RC != 0 )) && grep -q 'is missing after the' "$rd_sym_work2/out.txt"; then
+    ok "RUN_DIR set, RUN_DIR/inbox missing: refused by name"
+else
+    no "RUN_DIR set, RUN_DIR/inbox missing: refused by name" "rc=$RD_SYM_RC $(cat "$rd_sym_work2/out.txt")"
+fi
+
+printf '\n== fork-sandbox-k8s-leg.sh: pod leg wrapper ==\n'
+# claude-sandboxed/pi-sandboxed's pod counterpart: a thin,
+# unconfined translation from --harness/--model/--clone/extra-args into
+# the right argv and env, exec'd so the exit code and stdio are the
+# harness's own.
+leg_stub_dir="$(newdir)"; tmpdirs+=("$leg_stub_dir")
+leg_record="$leg_stub_dir/.record"
+cat > "$leg_stub_dir/claude" <<'STUB'
+#!/usr/bin/env bash
+{
+    printf 'argv:%s\n' "$*"
+    printf 'cwd:%s\n' "$PWD"
+    printf 'env:ANTHROPIC_BASE_URL=%s\n' "${ANTHROPIC_BASE_URL:-}"
+    printf 'env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=%s\n' "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-}"
+    printf 'env:DISABLE_AUTOUPDATER=%s\n' "${DISABLE_AUTOUPDATER:-}"
+    printf 'env:BASH_MAX_TIMEOUT_MS=%s\n' "${BASH_MAX_TIMEOUT_MS:-}"
+    printf 'env:TERM=%s\n' "${TERM:-}"
+    printf 'env:FORK_SANDBOX_STOP_GUARD_STATE=%s\n' "${FORK_SANDBOX_STOP_GUARD_STATE:-}"
+    printf 'env:FORK_SANDBOX_NUDGE_MARKER=%s\n' "${FORK_SANDBOX_NUDGE_MARKER:-}"
+    printf 'env:FORK_SANDBOX_INBOX_SEEN=%s\n' "${FORK_SANDBOX_INBOX_SEEN:-}"
+    printf 'stdin:%s\n' "$(cat)"
+} > "$LEG_RECORD"
+exit "${LEG_STUB_RC:-0}"
+STUB
+cat > "$leg_stub_dir/pi" <<'STUB'
+#!/usr/bin/env bash
+{
+    printf 'argv:%s\n' "$*"
+    printf 'cwd:%s\n' "$PWD"
+    printf 'stdin:%s\n' "$(cat)"
+} > "$LEG_RECORD"
+exit "${LEG_STUB_RC:-0}"
+STUB
+chmod +x "$leg_stub_dir/claude" "$leg_stub_dir/pi"
+
+leg_clone="$(newdir)"; tmpdirs+=("$leg_clone")
+leg_run() {
+    rm -f "$leg_record"
+    PATH="$leg_stub_dir:$PATH" LEG_RECORD="$leg_record" "$@" <<<'leg prompt'
+}
+
+# claude leg -- fixed flags, model alias, cwd, passthrough args,
+# stdin, exit code.
+leg_rc=0
+CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" LEG_STUB_RC=3 \
+    leg_run "$leg_sh" --harness claude --model opus --clone "$leg_clone" \
+    -- --settings /work/inbox/.settings.json || leg_rc=$?
+check "leg wrapper (claude): exit code is the harness's own" "3" "$leg_rc"
+leg_out="$(cat "$leg_record" 2>/dev/null)"
+if grep -qF -- '--dangerously-skip-permissions --print --verbose --output-format stream-json --model opus[1m] --include-hook-events --settings /work/inbox/.settings.json' <<<"$leg_out"; then
+    ok "leg wrapper (claude): fixed flags, aliased model and passthrough args, in order"
+else
+    no "leg wrapper (claude): fixed flags, aliased model and passthrough args, in order" "$leg_out"
+fi
+check "leg wrapper (claude): runs with the clone as cwd" \
+    "cwd:$leg_clone" "$(grep '^cwd:' "$leg_record")"
+check "leg wrapper: the prompt arrives on the harness's own stdin" \
+    "stdin:leg prompt" "$(grep '^stdin:' "$leg_record")"
+if grep -q '^env:ANTHROPIC_BASE_URL=http://fs-k8s-test-claude-proxy.invalid$' "$leg_record" \
+    && grep -q '^env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1$' "$leg_record" \
+    && grep -q '^env:DISABLE_AUTOUPDATER=1$' "$leg_record" \
+    && grep -q '^env:BASH_MAX_TIMEOUT_MS=3600000$' "$leg_record" \
+    && grep -q '^env:TERM=dumb$' "$leg_record" \
+    && grep -q '^env:FORK_SANDBOX_STOP_GUARD_STATE=.*stop-guard-refusals$' "$leg_record" \
+    && grep -q '^env:FORK_SANDBOX_NUDGE_MARKER=.*/nudged$' "$leg_record" \
+    && grep -q '^env:FORK_SANDBOX_INBOX_SEEN=.*/inbox-seen$' "$leg_record"; then
+    ok "leg wrapper (claude): env matches run_claude_attempt's own"
+else
+    no "leg wrapper (claude): env matches run_claude_attempt's own" "$leg_out"
+fi
+
+# A model with no [1m] alias is passed through bare.
+CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" \
+    leg_run "$leg_sh" --harness claude --model claude-haiku-4-5 --clone "$leg_clone" --
+check "leg wrapper (claude): a non-alias model id is not rewritten" \
+    "yes" "$(grep -qF -- '--model claude-haiku-4-5 ' "$leg_record" && echo yes || echo no)"
+
+# pi leg -- fixed flags/order, no model map file present (no rewrite).
+CLAUDE_PROXY_BASE_URL="" FORK_SANDBOX_K8S_PI_MODEL_MAP=/nonexistent-map.json \
+    leg_run "$leg_sh" --harness pi --model z-ai/glm-4.6 --clone "$leg_clone" \
+    -- --session-dir /work/session-store
+if grep -qF 'argv:--provider proxy --model z-ai/glm-4.6 --mode json -p --session-dir /work/session-store' "$leg_record"; then
+    ok "leg wrapper (pi): fixed flags/order and passthrough args, no model map present"
+else
+    no "leg wrapper (pi): fixed flags/order and passthrough args, no model map present" "$(cat "$leg_record")"
+fi
+
+# The model-map rewrite: a configured id that the proxy's own catalog
+# lists under a different spelling.
+leg_map="$(newdir)/pi-model-map.json"; tmpdirs+=("$(dirname "$leg_map")")
+printf '{"z-ai/glm-4.6": "Z-AI/GLM-4.6"}' > "$leg_map"
+FORK_SANDBOX_K8S_PI_MODEL_MAP="$leg_map" \
+    leg_run "$leg_sh" --harness pi --model z-ai/glm-4.6 --clone "$leg_clone" --
+check "leg wrapper (pi): the model-map rewrite applies when the configured id has an entry" \
+    "yes" "$(grep -qF -- '--model Z-AI/GLM-4.6 ' "$leg_record" && echo yes || echo no)"
+# An id with no entry in the map is passed through unchanged.
+FORK_SANDBOX_K8S_PI_MODEL_MAP="$leg_map" \
+    leg_run "$leg_sh" --harness pi --model some-other/model --clone "$leg_clone" --
+check "leg wrapper (pi): an id absent from the model map is passed through unchanged" \
+    "yes" "$(grep -qF -- '--model some-other/model ' "$leg_record" && echo yes || echo no)"
+
+# Refusals, by name.
+refuses "leg wrapper: an unknown --harness is refused by name" \
+    "codex" env PATH="$leg_stub_dir:$PATH" "$leg_sh" --harness codex --model m --clone "$leg_clone" --
+refuses "leg wrapper: a claude leg with no CLAUDE_PROXY_BASE_URL is refused by name" \
+    "CLAUDE_PROXY_BASE_URL" \
+    env PATH="$leg_stub_dir:$PATH" CLAUDE_PROXY_BASE_URL= \
+    "$leg_sh" --harness claude --model opus --clone "$leg_clone" --
+
+# The fixed claude flag SET matches the entrypoint's own
+# single-leg invocation (run_claude_attempt's claude_argv) literally --
+# a textual check, not a live comparison, since the two scripts build the
+# array in different source locations but must still agree on what a
+# plain claude coding leg always carries.
+leg_fixed_flags=(--dangerously-skip-permissions --print --verbose --output-format stream-json --include-hook-events)
+leg_flags_ok=true
+for flag in "${leg_fixed_flags[@]}"; do
+    grep -qF -- "$flag" "$leg_sh" || leg_flags_ok=false
+    grep -qF -- "$flag" "$entrypoint_sh" || leg_flags_ok=false
+done
+if [[ "$leg_flags_ok" == true ]]; then
+    ok "leg wrapper (claude) carries the same fixed flags as the entrypoint's single-leg path"
+else
+    no "leg wrapper (claude) carries the same fixed flags as the entrypoint's single-leg path" \
+        "one or more of: ${leg_fixed_flags[*]}"
+fi
+
+printf '\n== composed pipeline on --k8s: the stubbed pod walk ==\n'
+# The brief's own milestone: code -> review(FINDINGS) -> fix ->
+# review(APPROVED) -> maintain, through the REAL fork-sandbox-runner.sh and
+# the REAL fork-sandbox-k8s-leg.sh, driven from a run directory the REAL
+# launcher (scripts/fork-sandbox.sh) staged -- only fork-sandbox-k8s.sh
+# itself is stubbed, the one piece this test cannot drive for real (a live
+# cluster). Deliberately narrower than the plan's own "pod walk test"
+# section in one respect: it does not also run a local (non-k8s) copy of
+# the same preset to diff against. The preset suite's own "composed walk"
+# test (fork-sandbox-preset-test.sh) already proves the identical 4-step
+# code/review/review/maintain shape end to end locally, with every field
+# this test checks here; stubbing a SECOND, pi-capable local harness in
+# THIS file just to re-derive the same proof would be infrastructure for
+# its own sake, not a check this branch actually needs. What this test adds
+# that nothing else does: the pod side, for real -- the runner body
+# executed through the leg wrapper inside the entrypoint's RUN_DIR arm,
+# wired to a run directory the real dispatch staged.
+
+walk_presets_dir="$(newdir)"; tmpdirs+=("$walk_presets_dir")
+cat > "$walk_presets_dir/walk.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: pi
+    model: rd-walk-pi-model
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+
+walk_home="$(newdir)"; tmpdirs+=("$walk_home")
+mkdir -p "$walk_home/src"
+walk_proj="$(HOME="$walk_home" new_src_project)"; tmpdirs+=("$walk_proj")
+walk_base_sha="$(git -C "$walk_proj" rev-parse HEAD)"
+# A directory, not the mktemp file directly: cleanup() only rm -rf's
+# directories, so a bare file handed to tmpdirs would never be removed.
+walk_handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-test-walk-handoff.XXXXXX)"
+tmpdirs+=("$walk_handoff_dir")
+walk_handoff="$walk_handoff_dir/handoff.md"
+printf 'do the walk task\n' > "$walk_handoff"
+walk_config_dir="$(newdir)"; tmpdirs+=("$walk_config_dir")
+
+# The one piece of real cluster machinery this test cannot drive: the k8s
+# client itself. Stubbed the same way fork-sandbox-preset-test.sh's own
+# legacy-argv pin tests stub it -- a whole copy of scripts/ with
+# fork-sandbox-k8s.sh replaced, since the launcher's own
+# `exec "$script_dir/fork-sandbox-k8s.sh"` is an absolute, install-relative
+# path, never a PATH lookup.
+walk_scripts="$(newdir)/scripts-copy"
+cp -r "$repo_dir/scripts" "$walk_scripts"
+printf '#!/usr/bin/env bash\nprintf "k8s-stub %%s\\n" "$*"\n' > "$walk_scripts/fork-sandbox-k8s.sh"
+chmod +x "$walk_scripts/fork-sandbox-k8s.sh"
+
+# A --k8s composed dispatch stages its own copy of
+# every script the pod's run.sh needs beside itself -- missing one is
+# refused by name before any run directory is created (the same shape as
+# the runner-source check beside it, scripts/fork-sandbox.sh:5758).
+walk_missing_scripts="$(newdir)/scripts-missing-leg"
+cp -r "$walk_scripts" "$walk_missing_scripts"
+rm -f "$walk_missing_scripts/fork-sandbox-k8s-leg.sh"
+walk_missing_rundirs_before="$(find "$k8s_test_forks_root" -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
+walk_missing_out="$(newdir)/missing-leg-out.txt"
+if HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+    FORK_SANDBOX_PRESETS_DIR="$walk_presets_dir" \
+    "$walk_missing_scripts/fork-sandbox.sh" --preset walk --k8s \
+    "$walk_proj" "$walk_handoff" > "$walk_missing_out" 2>&1; then
+    no "a --k8s composed dispatch missing a staged pod script is refused by name" \
+        "$(cat "$walk_missing_out")"
+elif grep -q 'fork-sandbox-k8s-leg.sh is missing' "$walk_missing_out"; then
+    ok "a --k8s composed dispatch missing a staged pod script is refused by name"
+else
+    no "a --k8s composed dispatch missing a staged pod script is refused by name" \
+        "$(cat "$walk_missing_out")"
+fi
+walk_missing_rundirs_after="$(find "$k8s_test_forks_root" -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
+check "...and creates no run directory" \
+    "$walk_missing_rundirs_before" "$walk_missing_rundirs_after"
+
+# A fixture claude credential and a real copy of the lib, for the pod side's
+# claude_pod_credentials and rd_block_file's own `source "$mounts_dir/lib.sh"`.
+walk_mounts="$(newdir)"; tmpdirs+=("$walk_mounts")
+printf '{}' > "$walk_mounts/claude-credentials.json"
+cp "$repo_dir/scripts/fork-sandbox-lib.sh" "$walk_mounts/lib.sh"
+
+# A single scripted claude/pi stub, standing in for both harness binaries
+# fork-sandbox-k8s-leg.sh execs (the leg wrapper has already cd'ed into the
+# clone, so $PWD IS the clone -- no argv-sniffing needed, unlike the local
+# claude-sandboxed stub fork-sandbox-preset-test.sh uses). Same scripted
+# vocabulary (commit/findings/approved/fail), same verdict-filename
+# extraction from the prompt, as that stub -- just without the parts that
+# exist only to find the clone dir in a locally-wrapped harness's argv.
+walk_stub_bin="$(newdir)"; tmpdirs+=("$walk_stub_bin")
+cat > "$walk_stub_bin/claude" <<'STUB'
+#!/usr/bin/env bash
+clone_dir="$PWD"
+prompt="$(cat)"
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_ARGV_LOG"
+action="$(sed -n "${n}p" "$FAKE_SCRIPT" 2>/dev/null)"
+verdict_name="$(printf '%s\n' "$prompt" | sed -nE 's#.*\.git/(s[0-9]+-verdict\.md|maintainer-verdict\.md).*#\1#p' | head -1)"
+[[ -n "$verdict_name" ]] || verdict_name=review-verdict.md
+case "$action" in
+commit)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "stub leg $n"
+    ;;
+findings)
+    printf 'FINDINGS\n\nfile.txt:1 the stub found a problem\n' > "$clone_dir/.git/$verdict_name"
+    ;;
+approved)
+    printf 'APPROVED\n\nChecked: everything.\n' > "$clone_dir/.git/$verdict_name"
+    ;;
+fail)
+    printf 'stub: scripted failure on call %s\n' "$n" >&2
+    exit 1
+    ;;
+esac
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+cp "$walk_stub_bin/claude" "$walk_stub_bin/pi"
+chmod +x "$walk_stub_bin/claude" "$walk_stub_bin/pi"
+
+# $1 = FORK_SANDBOX_K8S_WORK_DIR override, $2 = branch, $3 = scripted
+# action sequence file. Stages a run directory through the real launcher
+# and prints it. The stub k8s.sh's own argv line is left in $WALK_STAGE_OUT
+# for the caller to assert on.
+walk_dispatch() {
+    local pod_work="$1" branch="$2"
+    WALK_STAGE_OUT="$(newdir)/stage-out.txt"; tmpdirs+=("$(dirname "$WALK_STAGE_OUT")")
+    HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+        FORK_SANDBOX_PRESETS_DIR="$walk_presets_dir" \
+        FORK_SANDBOX_K8S_WORK_DIR="$pod_work" \
+        "$walk_scripts/fork-sandbox.sh" --preset walk --k8s --branch "$branch" \
+        "$walk_proj" "$walk_handoff" > "$WALK_STAGE_OUT" 2>&1
+    WALK_RUN_DIR="$(grep -o -- '--run-dir [^ ]*' "$WALK_STAGE_OUT" | head -1 | awk '{print $2}')"
+    [[ -n "$WALK_RUN_DIR" ]] && tmpdirs+=("$WALK_RUN_DIR")
+}
+
+# Same as walk_dispatch, but forwards every extra arg straight through to
+# the launcher after --branch, ahead of the project/handoff positionals --
+# for proving the cluster-only flags (--timeout, --keep, --outbox-dir,
+# --endpoint, --image, --allow-namespace, --reach-probe, --context-secret)
+# reach the stub k8s.sh on a COMPOSED --k8s dispatch exactly as they do on
+# a legacy one, rather than being refused by the launcher's own "only apply
+# with --k8s" gate before ever getting there (the bug this round fixes --
+# see scripts/fork-sandbox.sh's k8s_runner_mode exclusion on that gate).
+walk_dispatch_flags() {
+    local pod_work="$1" branch="$2"; shift 2
+    WALK_STAGE_OUT="$(newdir)/stage-out-flags.txt"; tmpdirs+=("$(dirname "$WALK_STAGE_OUT")")
+    HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+        FORK_SANDBOX_PRESETS_DIR="$walk_presets_dir" \
+        FORK_SANDBOX_K8S_WORK_DIR="$pod_work" \
+        "$walk_scripts/fork-sandbox.sh" --preset walk --k8s --branch "$branch" "$@" \
+        "$walk_proj" "$walk_handoff" > "$WALK_STAGE_OUT" 2>&1
+    WALK_RUN_DIR="$(grep -o -- '--run-dir [^ ]*' "$WALK_STAGE_OUT" | head -1 | awk '{print $2}')"
+    [[ -n "$WALK_RUN_DIR" ]] && tmpdirs+=("$WALK_RUN_DIR")
+}
+
+walk_flags_pod_work="$(newdir)"; tmpdirs+=("$walk_flags_pod_work")
+walk_flags_outbox_dir="$(newdir)"; tmpdirs+=("$walk_flags_outbox_dir")
+walk_flags_branch="fs-k8s-test-walk-flags-$$"
+if walk_dispatch_flags "$walk_flags_pod_work" "$walk_flags_branch" \
+    --timeout 111 --keep --outbox-dir "$walk_flags_outbox_dir" \
+    --endpoint llm --image registry.example/you/fork-sandbox:latest \
+    --allow-namespace preview:8080 --reach-probe preview.svc.cluster.local:8080 \
+    --context-secret preview-ctx; then
+    ok "a composed --k8s dispatch accepts every cluster-only flag at once"
+else
+    no "a composed --k8s dispatch accepts every cluster-only flag at once" \
+        "$(cat "$WALK_STAGE_OUT")"
+fi
+if [[ "$(cat "$WALK_STAGE_OUT")" == *"run --run-dir "*" --timeout 111"*" --keep"*" --endpoint llm"*" --image registry.example/you/fork-sandbox:latest"*" --outbox-dir $walk_flags_outbox_dir"*" --context-secret preview-ctx"*" --allow-namespace preview:8080"*" --reach-probe preview.svc.cluster.local:8080"* ]]; then
+    ok "every cluster-only flag reaches the stub k8s.sh's argv on the composed path"
+else
+    no "every cluster-only flag reaches the stub k8s.sh's argv on the composed path" \
+        "$(cat "$WALK_STAGE_OUT")"
+fi
+# One refusal still applies on the composed path exactly as on the legacy
+# one: --context-secret and --context-ro both populate /work/context, so
+# the combination is refused before anything is created, regardless of
+# which --k8s shape is in play.
+walk_flags_cr_dir="$(newdir)"; tmpdirs+=("$walk_flags_cr_dir")
+walk_flags_refusal_out="$(newdir)/refusal-out.txt"; tmpdirs+=("$(dirname "$walk_flags_refusal_out")")
+if HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+    FORK_SANDBOX_PRESETS_DIR="$walk_presets_dir" \
+    FORK_SANDBOX_K8S_WORK_DIR="$(newdir)" \
+    "$walk_scripts/fork-sandbox.sh" --preset walk --k8s \
+    --branch "fs-k8s-test-walk-flags-refusal-$$" \
+    --context-secret preview-ctx --context-ro "$walk_flags_cr_dir" \
+    "$walk_proj" "$walk_handoff" > "$walk_flags_refusal_out" 2>&1; then
+    no "a composed --k8s dispatch still refuses --context-secret with --context-ro" \
+        "$(cat "$walk_flags_refusal_out")"
+elif grep -q 'cannot be combined' "$walk_flags_refusal_out"; then
+    ok "a composed --k8s dispatch still refuses --context-secret with --context-ro"
+else
+    no "a composed --k8s dispatch still refuses --context-secret with --context-ro" \
+        "$(cat "$walk_flags_refusal_out")"
+fi
+
+walk_pod_work="$(newdir)"; tmpdirs+=("$walk_pod_work")
+walk_branch="fs-k8s-test-walk-$$"
+if walk_dispatch "$walk_pod_work" "$walk_branch"; then
+    ok "a composed --k8s dispatch stages a run directory and dispatches through the stub k8s client"
+else
+    no "a composed --k8s dispatch stages a run directory and dispatches through the stub k8s client" \
+        "$(cat "$WALK_STAGE_OUT")"
+fi
+walk_run_dir="$WALK_RUN_DIR"
+if [[ -n "$walk_run_dir" && -d "$walk_run_dir" ]]; then
+    ok "the stub k8s client is invoked with --run-dir"
+else
+    no "the stub k8s client is invoked with --run-dir" "$(cat "$WALK_STAGE_OUT")"
+fi
+if [[ ! -e "$walk_run_dir/clone" ]]; then
+    ok "the staged run directory holds no host-side clone"
+else
+    no "the staged run directory holds no host-side clone" "$(find "$walk_run_dir/clone" 2>/dev/null)"
+fi
+check "pipeline.json carries all 4 steps" "4" \
+    "$(jq -r '.steps | length' "$walk_run_dir/pipeline.json" 2>/dev/null)"
+check "step 1 is the claude code seat" "claude sonnet" \
+    "$(jq -r '.steps[0] | "\(.harness) \(.model)"' "$walk_run_dir/pipeline.json" 2>/dev/null)"
+check "step 3 is the pi review seat" "pi rd-walk-pi-model" \
+    "$(jq -r '.steps[2] | "\(.harness) \(.model)"' "$walk_run_dir/pipeline.json" 2>/dev/null)"
+check "step 4 is the pi maintain seat" "pi rd-walk-pi-model" \
+    "$(jq -r '.steps[3] | "\(.harness) \(.model)"' "$walk_run_dir/pipeline.json" 2>/dev/null)"
+for walk_pod_script in fork-sandbox-lib.sh fork-sandbox-refresh.sh \
+    fork-sandbox-format.sh fork-sandbox-k8s-leg.sh; do
+    if [[ -r "$walk_run_dir/scripts/$walk_pod_script" ]]; then
+        ok "the staged run directory carries scripts/$walk_pod_script"
+    else
+        no "the staged run directory carries scripts/$walk_pod_script" "missing"
+    fi
+done
+if grep -q '^fetch_back=0$' "$walk_run_dir/run.sh" && grep -q '^runner_in_sandbox=1$' "$walk_run_dir/run.sh"; then
+    ok "run.sh's preamble sets the pod seams (fetch_back=0, runner_in_sandbox=1)"
+else
+    no "run.sh's preamble sets the pod seams (fetch_back=0, runner_in_sandbox=1)" \
+        "$(grep -E '^(fetch_back|runner_in_sandbox)=' "$walk_run_dir/run.sh")"
+fi
+check "run.sh's preamble points clone_dir at the pod work dir override" \
+    "clone_dir=$walk_pod_work/clone" "$(grep '^clone_dir=' "$walk_run_dir/run.sh")"
+if grep -qF "$walk_run_dir/scripts/fork-sandbox-k8s-leg.sh --harness claude --model sonnet --clone $walk_pod_work/clone --" "$walk_run_dir/run.sh" \
+    && grep -qF "$walk_run_dir/scripts/fork-sandbox-k8s-leg.sh --harness pi --model rd-walk-pi-model --clone $walk_pod_work/clone --" "$walk_run_dir/run.sh"; then
+    ok "run.sh's sandbox_cmd entries exec the pod leg wrapper per seat"
+else
+    no "run.sh's sandbox_cmd entries exec the pod leg wrapper per seat" \
+        "$(grep -F "fork-sandbox-k8s-leg.sh" "$walk_run_dir/run.sh")"
+fi
+# The preamble's top-level harness=/formatter=/usage_source= previously
+# carried the phantom "impl" seat's own values (k8s mode defaults harness to "pi"
+# when no --harness was given, which a composed preset never does) rather
+# than step 1's real claude seat -- fs_run_claude_leg_with_retry and the
+# cost/usage readers below read these bare names, not "s1_*", for step 1's
+# own pass 1, so a real claude step 1 silently lost its transient-error
+# retries and its cost/usage went unrecorded. Proven here on the staged
+# run.sh, before the walk below ever runs, the same way the seat lines
+# just above are.
+check "run.sh's preamble names step 1's real seat, not the phantom impl one (harness=)" \
+    "harness=claude" "$(grep '^harness=' "$walk_run_dir/run.sh")"
+check "run.sh's preamble names step 1's real seat, not the phantom impl one (usage_source=)" \
+    "usage_source=claude" "$(grep '^usage_source=' "$walk_run_dir/run.sh")"
+check "run.sh's preamble names step 1's real seat, not the phantom impl one (formatter=)" \
+    "formatter=$walk_run_dir/scripts/fork-sandbox-format.sh" \
+    "$(grep '^formatter=' "$walk_run_dir/run.sh")"
+# fs_stage_inbox's own gate (the one that installs the hook, the stop
+# guard and the settings files) names only the legacy harness scalars,
+# which a composed --k8s run's $harness never matches (it is forced to
+# "pi", same phantom-seat gap as above) -- so a composed --k8s run with a
+# real claude seat previously staged no inbox at all, and every claude leg's
+# own sandbox_cmd below carried no --settings, meaning no addendum
+# delivery, no Stop-hook "cannot end with an addendum unread" guarantee,
+# and no commit guard. Proven here: the code step (s1, editing), the
+# self-review step (s2, read-only) and its fix seat (s2fix, editing) are
+# all claude. Checked per seat's own s<K>_sandbox_cmd/s<K>fix_sandbox_cmd
+# array line, not "anywhere in run.sh": a grep for each settings path
+# anywhere in the file would still pass if the files were swapped onto the
+# wrong seats (code getting the read-only file, self-review getting the
+# editing one), since both path strings would still appear SOMEWHERE in
+# run.sh either way. The maintain seat gets the same per-seat proof,
+# dispatch-only, in the code->maintain check further below -- this
+# pipeline's own maintain step runs on pi, which never carries --settings
+# at all, so it cannot stand in for that case.
+walk_s1_cmd_line="$(grep '^s1_sandbox_cmd=' "$walk_run_dir/run.sh")"
+if [[ "$walk_s1_cmd_line" == *"$walk_run_dir/inbox/.settings.json"* ]] \
+        && [[ "$walk_s1_cmd_line" != *".settings-readonly.json"* ]]; then
+    ok "the code (s1) claude seat's sandbox_cmd carries --settings (the editing file)"
+else
+    no "the code (s1) claude seat's sandbox_cmd carries --settings (the editing file)" \
+        "$walk_s1_cmd_line"
+fi
+walk_s2_cmd_line="$(grep '^s2_sandbox_cmd=' "$walk_run_dir/run.sh")"
+if [[ "$walk_s2_cmd_line" == *"$walk_run_dir/inbox/.settings-readonly.json"* ]] \
+        && [[ "$walk_s2_cmd_line" != *'/.settings.json'* ]]; then
+    ok "the self-review (s2) claude seat's sandbox_cmd carries --settings (the read-only file)"
+else
+    no "the self-review (s2) claude seat's sandbox_cmd carries --settings (the read-only file)" \
+        "$walk_s2_cmd_line"
+fi
+# The self-review step's own fix seat (s2fix, claude -- this walk's script
+# answers "findings" at self-review, so it really runs, third in the argv
+# log below) is a fix seat, not a review/maintain one, so it must carry the
+# EDITING file, the opposite of s2 just above.
+walk_s2fix_cmd_line="$(grep '^s2fix_sandbox_cmd=' "$walk_run_dir/run.sh")"
+if [[ "$walk_s2fix_cmd_line" == *"$walk_run_dir/inbox/.settings.json"* ]] \
+        && [[ "$walk_s2fix_cmd_line" != *".settings-readonly.json"* ]]; then
+    ok "the self-review's fix (s2fix) claude seat's sandbox_cmd carries --settings (the editing file)"
+else
+    no "the self-review's fix (s2fix) claude seat's sandbox_cmd carries --settings (the editing file)" \
+        "$walk_s2fix_cmd_line"
+fi
+if [[ -r "$walk_run_dir/inbox/.inbox-hook.sh" && -r "$walk_run_dir/inbox/.stop-guard.sh" ]]; then
+    ok "the staged inbox carries the addendum hook and the stop guard for the composed claude seat"
+else
+    no "the staged inbox carries the addendum hook and the stop guard for the composed claude seat" \
+        "$(ls "$walk_run_dir/inbox" 2>/dev/null)"
+fi
+
+# The pod side, built by hand: a fresh clone of the same project at the
+# branch the dispatch above named, plus the outbox/inbox directories
+# FORK_SANDBOX_K8S_WORK_DIR pointed run.sh's own preamble at.
+mkdir -p "$walk_pod_work/outbox" "$walk_pod_work/inbox"
+git clone -q "$walk_proj" "$walk_pod_work/clone"
+git -C "$walk_pod_work/clone" checkout -q -b "$walk_branch" "$walk_base_sha"
+
+walk_count="$(mktemp)"; tmpdirs+=("$walk_count")
+walk_argv_log="$(mktemp)"; tmpdirs+=("$walk_argv_log")
+walk_script_file="$(mktemp)"; tmpdirs+=("$walk_script_file")
+printf 'commit\nfindings\ncommit\napproved\napproved\n' > "$walk_script_file"
+walk_pod_home="$(newdir)"; tmpdirs+=("$walk_pod_home")
+
+# Runs the extracted RUN_DIR arm (rd_block_file, built above alongside the
+# other RUN_DIR-arm tests) against a REAL staged run directory, rather than
+# rd_block_run's own synthetic one-liner pipeline.json/run.sh -- this is the
+# one thing that makes this a walk of the real runner and leg wrapper,
+# instead of another unit test of the entrypoint glue alone.
+walk_arm_out="$(PATH="$walk_stub_bin:$PATH" HOME="$walk_pod_home" \
+    RUN_DIR="$walk_run_dir" HARNESS=claude MODEL=sonnet MODEL_DISCOVERY="" ALLOW_UNLISTED_MODEL="" \
+    PROXY_BASE_URL="http://fs-k8s-test-walk-proxy.invalid" \
+    CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+    mounts_dir="$walk_mounts" work_dir="$walk_pod_work" clone_dir="$walk_pod_work/clone" \
+    inbox_dir="$walk_pod_work/inbox" \
+    FORK_SANDBOX_K8S_PI_MODEL_MAP="$walk_pod_work/pi-model-map.json" \
+    SESSION_HARNESS_STORE=0 RESUME_SESSION="" \
+    FAKE_COUNT_FILE="$walk_count" FAKE_ARGV_LOG="$walk_argv_log" FAKE_SCRIPT="$walk_script_file" \
+    FS_LEG_RETRY_DELAYS="0 0" \
+    bash "$rd_block_file" 2>&1)"
+walk_pi_rc="$(grep -o 'RD_BLOCK_PI_RC=.*' <<<"$walk_arm_out" | tail -1 | cut -d= -f2)"
+if [[ "$walk_pi_rc" == "0" ]]; then
+    ok "the pod walk's run.sh exits 0"
+else
+    no "the pod walk's run.sh exits 0" "rc=$walk_pi_rc out=$walk_arm_out"
+fi
+check "the pod walk makes exactly 5 leg calls -- no sixth (tidy) call" \
+    "5" "$(cat "$walk_count" 2>/dev/null)"
+if [[ "$(sed -n '1p' "$walk_argv_log" | cut -d' ' -f1)" == claude ]] \
+    && [[ "$(sed -n '2p' "$walk_argv_log" | cut -d' ' -f1)" == claude ]] \
+    && [[ "$(sed -n '3p' "$walk_argv_log" | cut -d' ' -f1)" == claude ]] \
+    && [[ "$(sed -n '4p' "$walk_argv_log" | cut -d' ' -f1)" == pi ]] \
+    && [[ "$(sed -n '5p' "$walk_argv_log" | cut -d' ' -f1)" == pi ]]; then
+    ok "the pod walk runs code/self-review/fix on claude then review/maintain on pi, in order"
+else
+    no "the pod walk runs code/self-review/fix on claude then review/maintain on pi, in order" \
+        "$(cat "$walk_argv_log")"
+fi
+if grep -q -- '--model rd-walk-pi-model' "$walk_argv_log"; then
+    ok "the pi legs carry the configured model id"
+else
+    no "the pi legs carry the configured model id" "$(cat "$walk_argv_log")"
+fi
+if [[ -s "$walk_run_dir/step-2-loop.json" && -s "$walk_run_dir/step-3-loop.json" \
+    && -s "$walk_run_dir/step-4-loop.json" && -s "$walk_run_dir/progress.json" ]]; then
+    ok "the pod walk writes step-indexed loop records and progress.json"
+else
+    no "the pod walk writes step-indexed loop records and progress.json" \
+        "$(find "$walk_run_dir" -maxdepth 1 -type f 2>/dev/null)"
+fi
+check "progress.json shows every step done" "done,done,done,done" \
+    "$(jq -r '[.steps[].state] | join(",")' "$walk_run_dir/progress.json" 2>/dev/null)"
+check "progress.json's maintain step ended approved" "approved" \
+    "$(jq -r '.steps[3].ended' "$walk_run_dir/progress.json" 2>/dev/null)"
+if grep -qF 'a --k8s pod run does not fetch back' "$walk_run_dir/summary.txt" 2>/dev/null; then
+    ok "summary.txt records the pod's tidy skip reason"
+else
+    no "summary.txt records the pod's tidy skip reason" "$(cat "$walk_run_dir/summary.txt" 2>/dev/null)"
+fi
+if ! git -C "$walk_proj" for-each-ref 'refs/fork-sandbox/tidy/*' | grep -q .; then
+    ok "the pod walk never runs the tidy leg or touches origin's tidy refs"
+else
+    no "the pod walk never runs the tidy leg or touches origin's tidy refs" \
+        "$(git -C "$walk_proj" for-each-ref 'refs/fork-sandbox/tidy/*')"
+fi
+
+# A plan-first preset: the run.sh preamble's harness=/model=/usage_source=/
+# formatter=/pi_session_dir= must name the CODE step's seat, never bare
+# step 1 -- step 1 is the plan leg here, on both harness orders, so a
+# fix keyed on literal "s1_*" would silently apply the wrong seat's
+# retry/cost/usage wiring to the coding leg (claude losing its
+# transient-error retries and cost/usage accounting when it is the code
+# seat, or a pi code seat's own model/session-dir plumbing going to the
+# plan seat's instead). Dispatch-only: this inspects the staged run.sh
+# the real launcher writes, through the same stub k8s client as the main
+# walk above, with no pod execution needed to prove the preamble names
+# the right seat.
+walk_pf_presets_dir="$(newdir)"; tmpdirs+=("$walk_pf_presets_dir")
+cat > "$walk_pf_presets_dir/walk-pf-pc.yaml" <<'EOF'
+agents:
+  planner:
+    harness: pi
+    model: rd-walk-pi-model
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+EOF
+cat > "$walk_pf_presets_dir/walk-pf-cp.yaml" <<'EOF'
+agents:
+  planner:
+    harness: claude
+    model: sonnet
+  coder:
+    harness: pi
+    model: rd-walk-pi-model
+pipeline:
+  - action: plan
+    agent: planner
+  - action: code
+    agent: coder
+EOF
+
+walk_pf_dispatch() {
+    local preset="$1" pod_work="$2" branch="$3"
+    local out; out="$(newdir)/pf-stage-out.txt"; tmpdirs+=("$(dirname "$out")")
+    HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+        FORK_SANDBOX_PRESETS_DIR="$walk_pf_presets_dir" \
+        FORK_SANDBOX_K8S_WORK_DIR="$pod_work" \
+        "$walk_scripts/fork-sandbox.sh" --preset "$preset" --k8s --branch "$branch" \
+        "$walk_proj" "$walk_handoff" > "$out" 2>&1
+    WALK_PF_RUN_DIR="$(grep -o -- '--run-dir [^ ]*' "$out" | head -1 | awk '{print $2}')"
+    [[ -n "$WALK_PF_RUN_DIR" ]] && tmpdirs+=("$WALK_PF_RUN_DIR")
+    WALK_PF_OUT="$out"
+}
+
+walk_pf_pod_work1="$(newdir)"; tmpdirs+=("$walk_pf_pod_work1")
+if walk_pf_dispatch walk-pf-pc "$walk_pf_pod_work1" "fs-k8s-test-walk-pf-pc-$$" \
+        && [[ -n "$WALK_PF_RUN_DIR" ]]; then
+    check "plan(pi)->code(claude): run.sh preamble names the code seat, not the plan seat (harness=)" \
+        "harness=claude" "$(grep '^harness=' "$WALK_PF_RUN_DIR/run.sh")"
+    check "plan(pi)->code(claude): run.sh preamble names the code seat, not the plan seat (model=)" \
+        "model=sonnet" "$(grep '^model=' "$WALK_PF_RUN_DIR/run.sh")"
+    check "plan(pi)->code(claude): run.sh preamble names the code seat, not the plan seat (usage_source=)" \
+        "usage_source=claude" "$(grep '^usage_source=' "$WALK_PF_RUN_DIR/run.sh")"
+else
+    no "plan(pi)->code(claude) dispatch stages a run directory" "$(cat "$WALK_PF_OUT" 2>/dev/null)"
+fi
+
+walk_pf_pod_work2="$(newdir)"; tmpdirs+=("$walk_pf_pod_work2")
+if walk_pf_dispatch walk-pf-cp "$walk_pf_pod_work2" "fs-k8s-test-walk-pf-cp-$$" \
+        && [[ -n "$WALK_PF_RUN_DIR" ]]; then
+    check "plan(claude)->code(pi): run.sh preamble names the code seat, not the plan seat (harness=)" \
+        "harness=pi" "$(grep '^harness=' "$WALK_PF_RUN_DIR/run.sh")"
+    check "plan(claude)->code(pi): run.sh preamble names the code seat, not the plan seat (model=)" \
+        "model=rd-walk-pi-model" "$(grep '^model=' "$WALK_PF_RUN_DIR/run.sh")"
+    check "plan(claude)->code(pi): run.sh preamble names the code seat, not the plan seat (usage_source=)" \
+        "usage_source=pi" "$(grep '^usage_source=' "$WALK_PF_RUN_DIR/run.sh")"
+    if grep -q '^pi_session_dir=.*pi-session' "$WALK_PF_RUN_DIR/run.sh"; then
+        ok "plan(claude)->code(pi): run.sh preamble carries the code seat's own pi_session_dir, not empty"
+    else
+        no "plan(claude)->code(pi): run.sh preamble carries the code seat's own pi_session_dir, not empty" \
+            "$(grep '^pi_session_dir=' "$WALK_PF_RUN_DIR/run.sh")"
+    fi
+else
+    no "plan(claude)->code(pi) dispatch stages a run directory" "$(cat "$WALK_PF_OUT" 2>/dev/null)"
+fi
+
+# A maintain step's own per-seat settings file, the half of the handoff's
+# "code and fix seats get the editing file, review and maintain seats get
+# the read-only one" requirement the main walk above cannot prove: its own
+# maintain step runs on pi, which never carries --settings at all, editing
+# or read-only, so a swapped file there would pass silently. A bare
+# code->maintain pipeline (no review step -- docs/presets.md: "A maintain
+# step without a review step is valid") on one claude agent puts a real
+# claude seat on the maintain action itself, plus the fix seat every
+# review/maintain step gets built unconditionally at stage time
+# (scripts/fork-sandbox.sh's "preset_step_action[$preset_k] != code"
+# build, regardless of whether a fix round ever runs) -- so both read-only
+# and editing claude seats are provable from the staged run.sh alone, no
+# pod execution needed, the same way the plan-first dispatch above proves
+# the preamble without running a leg.
+walk_seat_presets_dir="$(newdir)"; tmpdirs+=("$walk_seat_presets_dir")
+cat > "$walk_seat_presets_dir/walk-seat.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: code
+    agent: coder
+  - action: maintain
+    repeat: 1
+    agent: coder
+EOF
+walk_seat_pod_work="$(newdir)"; tmpdirs+=("$walk_seat_pod_work")
+walk_seat_out="$(newdir)/seat-stage-out.txt"; tmpdirs+=("$(dirname "$walk_seat_out")")
+HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+    FORK_SANDBOX_PRESETS_DIR="$walk_seat_presets_dir" \
+    FORK_SANDBOX_K8S_WORK_DIR="$walk_seat_pod_work" \
+    "$walk_scripts/fork-sandbox.sh" --preset walk-seat --k8s \
+    --branch "fs-k8s-test-walk-seat-$$" \
+    "$walk_proj" "$walk_handoff" > "$walk_seat_out" 2>&1
+WALK_SEAT_RUN_DIR="$(grep -o -- '--run-dir [^ ]*' "$walk_seat_out" | head -1 | awk '{print $2}')"
+[[ -n "$WALK_SEAT_RUN_DIR" ]] && tmpdirs+=("$WALK_SEAT_RUN_DIR")
+if [[ -n "$WALK_SEAT_RUN_DIR" ]]; then
+    walk_seat_s2_cmd_line="$(grep '^s2_sandbox_cmd=' "$WALK_SEAT_RUN_DIR/run.sh")"
+    if [[ "$walk_seat_s2_cmd_line" == *"$WALK_SEAT_RUN_DIR/inbox/.settings-readonly.json"* ]] \
+            && [[ "$walk_seat_s2_cmd_line" != *'/.settings.json'* ]]; then
+        ok "code->maintain: the maintain (s2) claude seat's sandbox_cmd carries --settings (the read-only file)"
+    else
+        no "code->maintain: the maintain (s2) claude seat's sandbox_cmd carries --settings (the read-only file)" \
+            "$walk_seat_s2_cmd_line"
+    fi
+    walk_seat_s2fix_cmd_line="$(grep '^s2fix_sandbox_cmd=' "$WALK_SEAT_RUN_DIR/run.sh")"
+    if [[ "$walk_seat_s2fix_cmd_line" == *"$WALK_SEAT_RUN_DIR/inbox/.settings.json"* ]] \
+            && [[ "$walk_seat_s2fix_cmd_line" != *".settings-readonly.json"* ]]; then
+        ok "code->maintain: the maintain step's fix (s2fix) claude seat's sandbox_cmd carries --settings (the editing file)"
+    else
+        no "code->maintain: the maintain step's fix (s2fix) claude seat's sandbox_cmd carries --settings (the editing file)" \
+            "$walk_seat_s2fix_cmd_line"
+    fi
+else
+    no "code->maintain dispatch stages a run directory" "$(cat "$walk_seat_out" 2>/dev/null)"
+fi
+
+printf '\n== composed pipeline on --k8s: collect lands the pod walk'"'"'s records ==\n'
+walk_pod_copy="$(newdir)"; tmpdirs+=("$walk_pod_copy")
+cp -r "$walk_run_dir/." "$walk_pod_copy/"
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$walk_proj" > "$walk_run_dir/run.env"
+rm -f "$walk_run_dir/step-2-loop.json" "$walk_run_dir/step-3-loop.json" \
+    "$walk_run_dir/step-4-loop.json" "$walk_run_dir/progress.json"
+walk_collect_log="$(newdir)/kubectl.log"; walk_collect_out="$(newdir)/collect-out.txt"
+tmpdirs+=("$(dirname "$walk_collect_log")" "$(dirname "$walk_collect_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_BASE_SHA="$walk_base_sha" \
+    K8S_STUB_RUN_DIR_PULL_PATH="$walk_run_dir" K8S_STUB_RUN_DIR_PULL_SRC="$walk_pod_copy" \
+    collectstub_collect "$walk_collect_log" "$walk_collect_out" \
+    --branch "$walk_branch" --run-dir "$walk_run_dir" "$walk_proj"; then
+    ok "collect of the pod walk's run directory exits 0"
+else
+    no "collect of the pod walk's run directory exits 0" "$(cat "$walk_collect_out")"
+fi
+if [[ -s "$walk_run_dir/step-2-loop.json" && -s "$walk_run_dir/step-3-loop.json" \
+    && -s "$walk_run_dir/step-4-loop.json" && -s "$walk_run_dir/progress.json" ]]; then
+    ok "collect lands the pod walk's step records and progress.json in the host run dir"
+else
+    no "collect lands the pod walk's step records and progress.json in the host run dir" \
+        "$(find "$walk_run_dir" -maxdepth 1 -type f 2>/dev/null)"
+fi
+
+# Every other pull in cmd_collect (outbox, evidence, session-store) warns by
+# name when it fails; the run-directory copy-back loop used to swallow a
+# per-file `cp` failure with `2>/dev/null || true`, so an artifact that
+# failed to land this way -- a transient I/O error, a host /tmp exhausted
+# mid-collect -- left no trace of why. Forced here with a dangling symlink
+# at the HOST's own "$run_dir/progress.json": `-e` follows a symlink and so
+# reports false for one that dangles, same as "absent" to the copy-back
+# loop's own guard, but `cp` itself refuses to write through it ("not
+# writing through dangling symlink") -- a failure confined to this one
+# destination, with the pod's own copy (and every other artifact's)
+# completely untouched, unlike a permission bit on the pod-side source,
+# which would also abort the surrounding `tar` pull-back pipeline (and so
+# everything else in the SAME pull) rather than just this one file.
+walk_unreadable_run_dir="$(newdir)"; tmpdirs+=("$walk_unreadable_run_dir")
+cp -r "$walk_run_dir/." "$walk_unreadable_run_dir/"
+rm -f "$walk_unreadable_run_dir/progress.json"
+ln -s /nonexistent-fs-k8s-test-path/progress.json "$walk_unreadable_run_dir/progress.json"
+walk_unreadable_log="$(newdir)/kubectl.log"; walk_unreadable_out="$(newdir)/collect-out.txt"
+tmpdirs+=("$(dirname "$walk_unreadable_log")" "$(dirname "$walk_unreadable_out")")
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_BASE_SHA="$walk_base_sha" \
+    K8S_STUB_RUN_DIR_PULL_PATH="$walk_unreadable_run_dir" K8S_STUB_RUN_DIR_PULL_SRC="$walk_pod_copy" \
+    collectstub_collect "$walk_unreadable_log" "$walk_unreadable_out" \
+    --branch "$walk_branch" --run-dir "$walk_unreadable_run_dir" "$walk_proj"
+if grep -q 'could not copy progress.json back from pod' "$walk_unreadable_out"; then
+    ok "a copy-back failure for one allowlisted artifact is reported by name, not swallowed"
+else
+    no "a copy-back failure for one allowlisted artifact is reported by name, not swallowed" \
+        "$(cat "$walk_unreadable_out")"
+fi
+if [[ -s "$walk_unreadable_run_dir/step-2-loop.json" && -s "$walk_unreadable_run_dir/sandbox.log" ]]; then
+    ok "...and every other allowlisted artifact still lands despite that one failure"
+else
+    no "...and every other allowlisted artifact still lands despite that one failure" \
+        "$(find "$walk_unreadable_run_dir" -maxdepth 1 -type f 2>/dev/null)"
+fi
+
+printf '\n== composed pipeline on --k8s: a mid-walk harness failure still lands partial records ==\n'
+# The kill half: a leg that fails outright (as a killed pod's last
+# leg would) rather than committing or leaving a verdict. A second, fresh
+# dispatch and a second, fresh pod clone -- the first walk's clone already
+# carries the fix leg's commit, which a short scripted sequence here has no
+# use for.
+walk2_pod_work="$(newdir)"; tmpdirs+=("$walk2_pod_work")
+walk2_branch="fs-k8s-test-walk-fail-$$"
+if walk_dispatch "$walk2_pod_work" "$walk2_branch"; then
+    ok "a second composed --k8s dispatch (for the kill-half test) stages successfully"
+else
+    no "a second composed --k8s dispatch (for the kill-half test) stages successfully" \
+        "$(cat "$WALK_STAGE_OUT")"
+fi
+walk2_run_dir="$WALK_RUN_DIR"
+
+mkdir -p "$walk2_pod_work/outbox" "$walk2_pod_work/inbox"
+git clone -q "$walk_proj" "$walk2_pod_work/clone"
+git -C "$walk2_pod_work/clone" checkout -q -b "$walk2_branch" "$walk_base_sha"
+
+walk2_count="$(mktemp)"; tmpdirs+=("$walk2_count")
+walk2_argv_log="$(mktemp)"; tmpdirs+=("$walk2_argv_log")
+walk2_script_file="$(mktemp)"; tmpdirs+=("$walk2_script_file")
+printf 'commit\nfail\n' > "$walk2_script_file"
+walk2_pod_home="$(newdir)"; tmpdirs+=("$walk2_pod_home")
+
+walk2_arm_out="$(PATH="$walk_stub_bin:$PATH" HOME="$walk2_pod_home" \
+    RUN_DIR="$walk2_run_dir" HARNESS=claude MODEL=sonnet MODEL_DISCOVERY="" ALLOW_UNLISTED_MODEL="" \
+    PROXY_BASE_URL="http://fs-k8s-test-walk-proxy.invalid" \
+    CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+    mounts_dir="$walk_mounts" work_dir="$walk2_pod_work" clone_dir="$walk2_pod_work/clone" \
+    inbox_dir="$walk2_pod_work/inbox" \
+    FORK_SANDBOX_K8S_PI_MODEL_MAP="$walk2_pod_work/pi-model-map.json" \
+    SESSION_HARNESS_STORE=0 RESUME_SESSION="" \
+    FAKE_COUNT_FILE="$walk2_count" FAKE_ARGV_LOG="$walk2_argv_log" FAKE_SCRIPT="$walk2_script_file" \
+    FS_LEG_RETRY_DELAYS="0 0" \
+    bash "$rd_block_file" 2>&1)"
+walk2_pi_rc="$(grep -o 'RD_BLOCK_PI_RC=.*' <<<"$walk2_arm_out" | tail -1 | cut -d= -f2)"
+if [[ -n "$walk2_pi_rc" ]]; then
+    ok "the pod walk's run.sh still exits cleanly after an interior step fails"
+else
+    no "the pod walk's run.sh still exits cleanly after an interior step fails" \
+        "rc=$walk2_pi_rc out=$walk2_arm_out"
+fi
+# A harness-error on an interior step does not fail the PROCESS's own exit
+# code (run_step_count's walker keeps walking later steps regardless --
+# see progress_any_step_failed's own comment in fork-sandbox-runner.sh for
+# why the run's recorded state tracks this independently of $rc); it is
+# progress.json's own state fields that must show it, both per-step and
+# overall.
+check "progress.json shows the failed review step as failed, not done" \
+    "failed" "$(jq -r '.steps[1].state' "$walk2_run_dir/progress.json" 2>/dev/null)"
+check "progress.json's overall state is failed" \
+    "failed" "$(jq -r '.state' "$walk2_run_dir/progress.json" 2>/dev/null)"
+
+walk2_pod_copy="$(newdir)"; tmpdirs+=("$walk2_pod_copy")
+cp -r "$walk2_run_dir/." "$walk2_pod_copy/"
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$walk_proj" > "$walk2_run_dir/run.env"
+rm -f "$walk2_run_dir/progress.json"
+walk2_collect_log="$(newdir)/kubectl.log"; walk2_collect_out="$(newdir)/collect2-out.txt"
+tmpdirs+=("$(dirname "$walk2_collect_log")" "$(dirname "$walk2_collect_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_BASE_SHA="$walk_base_sha" \
+    K8S_STUB_RUN_DIR_PULL_PATH="$walk2_run_dir" K8S_STUB_RUN_DIR_PULL_SRC="$walk2_pod_copy" \
+    collectstub_collect "$walk2_collect_log" "$walk2_collect_out" \
+    --branch "$walk2_branch" --run-dir "$walk2_run_dir" "$walk_proj"; then
+    ok "collect still lands a killed pod walk's partial records"
+else
+    no "collect still lands a killed pod walk's partial records" "$(cat "$walk2_collect_out")"
+fi
+check "collect lands the failed run's progress.json too" \
+    "failed" "$(jq -r '.steps[1].state' "$walk2_run_dir/progress.json" 2>/dev/null)"
+
+printf '\n== fork-sandbox-k8s-inbox-write.sh: writes through RUN_DIR'"'"'s own inbox symlink ==\n'
+# `say` always writes to the fixed /work/inbox path (POD_INBOX_DIR); in
+# runner mode that path is a symlink to $RUN_DIR/inbox (just proven
+# above). inbox-write.sh itself is agnostic to that -- a plain path on
+# disk -- so this proves the write really does land in the symlink's
+# TARGET, not merely that the symlink exists.
+rd15_target="$(newdir)"; tmpdirs+=("$rd15_target")
+rd15_link_parent="$(newdir)"; tmpdirs+=("$rd15_link_parent")
+ln -s "$rd15_target" "$rd15_link_parent/inbox"
+printf 'addendum via symlink\n' | "$inbox_write_sh" 1700000000 "$rd15_link_parent/inbox" >/dev/null
+rd15_landed="$(find "$rd15_target" -maxdepth 1 -type f 2>/dev/null | head -1)"
+if [[ -n "$rd15_landed" ]] && grep -q 'addendum via symlink' "$rd15_landed"; then
+    ok "inbox-write.sh writes through a symlinked inbox directory into its real target"
+else
+    no "inbox-write.sh writes through a symlinked inbox directory into its real target" \
+        "$(find "$rd15_target" "$rd15_link_parent" 2>/dev/null)"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

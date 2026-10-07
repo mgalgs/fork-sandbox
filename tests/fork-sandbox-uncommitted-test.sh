@@ -72,15 +72,27 @@ printf '== pin: no host-side git command targets the clone ==\n'
 # clone as -C's argument or as a bare `cd` target -- see fork-sandbox.sh's
 # own header comment (the fetch-back's "Nothing below runs git inside the
 # clone") for why that distinction is load-bearing, not stylistic.
+#
+# One deliberate exception: fork-sandbox-runner.sh's own runner_in_sandbox=1
+# branch (a --k8s pod run), where this runner IS already running unconfined
+# relative to the clone -- there is no separate sandbox backend left to
+# hand it to. Those lines (the status check, and the save-as-a-patch
+# block for a pod leg's uncommitted work) each carry their own comment
+# naming them as the allowed exception; excluded here by that same text
+# so a NEW host-side git
+# call against the clone still fails this pin.
 # shellcheck disable=SC2016  # the pattern is literal source text to grep for, not to expand
-if grep -qE -- '-C "\$clone_dir"|cd "\$clone_dir"' "$repo_dir/scripts/fork-sandbox.sh" \
-    "$repo_dir/scripts/fork-sandbox-lib.sh"; then
+if grep -nE -- '-C "\$clone_dir"|cd "\$clone_dir"' "$repo_dir/scripts/fork-sandbox.sh" \
+    "$repo_dir/scripts/fork-sandbox-lib.sh" "$repo_dir/scripts/fork-sandbox-runner.sh" \
+    | grep -v -F 'the one allowed exception' | grep -q .; then
     # shellcheck disable=SC2016
-    no "fork-sandbox.sh and fork-sandbox-lib.sh run no git directly against the clone" \
+    no "fork-sandbox.sh, fork-sandbox-lib.sh and fork-sandbox-runner.sh run no git directly against the clone" \
         "$(grep -nE -- '-C "\$clone_dir"|cd "\$clone_dir"' \
-            "$repo_dir/scripts/fork-sandbox.sh" "$repo_dir/scripts/fork-sandbox-lib.sh")"
+            "$repo_dir/scripts/fork-sandbox.sh" "$repo_dir/scripts/fork-sandbox-lib.sh" \
+            "$repo_dir/scripts/fork-sandbox-runner.sh" \
+            | grep -v -F 'the one allowed exception')"
 else
-    ok "fork-sandbox.sh and fork-sandbox-lib.sh run no git directly against the clone"
+    ok "fork-sandbox.sh, fork-sandbox-lib.sh and fork-sandbox-runner.sh run no git directly against the clone"
 fi
 
 launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
@@ -254,6 +266,35 @@ if [[ -n "$rd_dirty" ]]; then
     contains "the uncommitted-work check's backend invocation binds the clone's alternates" \
         "--bind-ro
 $proj_objects_real" "$(cat "$status_argv" 2>/dev/null)"
+
+    # runner_in_sandbox=1 (a --k8s pod run): the same clone's dirty state,
+    # found without ever asking the sandbox backend -- a pod leg already
+    # ran unconfined relative to the clone, so there is no backend left to
+    # hand it to (see fork-sandbox-runner.sh's own comment at this seam).
+    # Flipped and re-run in place, the way --k8s's pod preamble would have
+    # generated it in the first place; status_argv is cleared first so its
+    # emptiness after the rerun is this test's own signal, not a stale read
+    # of the first (runner_in_sandbox=0) pass above.
+    sed -i 's/^runner_in_sandbox=0$/runner_in_sandbox=1/' "$rd_dirty/run.sh"
+    rm -f "$status_argv"
+    # shellcheck disable=SC2034  # kept for a human rereading a failure, not asserted on
+    rerun_out="$(HOME="$launcher_home" PATH="$stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+        FORK_SANDBOX_BACKEND=fake-run FIXTURE_STATUS_ARGV="$status_argv" \
+        timeout 60 bash "$rd_dirty/run.sh" 2>&1)"
+    rerun_rc=$?
+    if [[ -s "$status_argv" ]]; then
+        no "runner_in_sandbox=1: the sandbox backend is never asked for the uncommitted check" \
+            "rc=$rerun_rc argv=$(cat "$status_argv")"
+    else
+        ok "runner_in_sandbox=1: the sandbox backend is never asked for the uncommitted check"
+    fi
+    check "runner_in_sandbox=1: uncommitted_files is still counted correctly" \
+        "2" "$(jq -r '.uncommitted_files' "$rd_dirty/summary.json" 2>/dev/null)"
+    if [[ -f "$rd_dirty/git-status.txt" ]]; then
+        ok "runner_in_sandbox=1: git-status.txt is still written"
+    else
+        no "runner_in_sandbox=1: git-status.txt is still written" "missing (rc=$rerun_rc)"
+    fi
 else
     no "a dirty run produced a run directory" "run_real failed"
 fi

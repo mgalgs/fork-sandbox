@@ -7,7 +7,7 @@
 #                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR | --context-secret NAME]
-#                            [--thread-dir DIR] [--attach-dir DIR]
+#                            [--thread-dir DIR] [--attach-dir DIR] [--run-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--extra-ref NAME=SHA]...
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
@@ -22,7 +22,7 @@
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR | --context-secret NAME]
-#                            [--thread-dir DIR] [--attach-dir DIR]
+#                            [--thread-dir DIR] [--attach-dir DIR] [--run-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--extra-ref NAME=SHA]...
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
@@ -390,6 +390,42 @@
 # named by --thread-dir/--attach-dir is never written back, so an agent
 # writing into its own /thread or /attachments only ever harms its own view
 # of it.
+#
+# --run-dir DIR (submit, run): runner mode -- DIR is a run directory the
+# launcher (fork-sandbox.sh's --k8s dispatch) already staged, holding
+# run.sh and pipeline.json, and this run's job is to execute it rather than
+# the usual single HARNESS/MODEL leg. Validated: an existing, non-symlink
+# directory under the scratch forks root holding both run.sh and
+# pipeline.json (fs_validate_scratch_dir plus the two-file check), refused
+# by name otherwise. No run directory is created when this is given --
+# DIR itself becomes run_dir, mktemp is skipped, and run.env is written
+# into it (RUNNER=1, alongside the usual keys) instead of a fresh
+# mktemp'd directory. The whole of DIR -- run.sh, pipeline.json, scripts/,
+# inbox/, any step prompts -- is mounted into the agent container as an
+# emptyDir at DIR's own absolute path (RUN_DIR in its env) and pushed in
+# after the repository push, before the .inputs-complete sentinel -- see
+# the entrypoint's own RUN_DIR handling for what it does once RUN_DIR is
+# set. handoff.md is NOT written into DIR here -- the launcher already
+# rendered its own implement prompt there before this command ran, and
+# this command's own rendering exists only to size the context archive, so
+# writing it over the launcher's file would feed the pod's first leg the
+# wrong prompt (see the handoff.md/handoff-original.md split below, where
+# runner mode's divergence from the ordinary single-leg case is spelled
+# out). handoff-original.md is still written, but only if the launcher did
+# not already leave one; continuation-prompt-header.md joins it when
+# refresh is enabled, since --k8s runner mode's own prompt rendering does
+# not reach this far (see docs/kubernetes-runs.md's composed-pipelines
+# section). The claude token Secret, per-run claude proxy and
+# CLAUDE_PROXY_BASE_URL env are created when ANY seat (step or fix) in
+# pipeline.json is claude, not only when --harness is -- harness/model
+# mean nothing in runner mode; the forwarded --harness/--model instead
+# become plain HARNESS/MODEL record keys in run.env, read back by resume,
+# collect and the fleet status line. --dry-run with --run-dir prints the
+# manifests and removes DIR, the same "no trace of a dry run" rule as
+# ordinary submit. On collect, a RUNNER=1 run.env means pulling the pod's
+# whole run dir back (step-<K>-loop.json, progress.json, events, the
+# runner's own summary.json) and merging it with this client's summary
+# rather than writing a lone single-leg one -- see cmd_collect.
 #
 # --pi-args ARGS (submit, run): extra arguments, verbatim, for the pod's
 # pi coding-leg invocation -- e.g. "--thinking low" for a persona whose
@@ -4193,10 +4229,10 @@ k8s_refuse_dir_links() {
     return 0
 }
 
-# Shared by --thread-dir and --attach-dir: packs DIR's top-level entries
-# (including dotfiles) into TAR as child members named ./<entry>, never
-# as `.` itself -- see fork-sandbox-k8s-context-extract.sh's own
-# pre-existing-DEST_DIR comment for the pod-side EPERM that avoids.
+# Shared by --thread-dir, --attach-dir and --run-dir: packs DIR's
+# top-level entries (including dotfiles) into TAR as child members named
+# ./<entry>, never as `.` itself -- see fork-sandbox-k8s-context-extract.sh's
+# own pre-existing-DEST_DIR comment for the pod-side EPERM that avoids.
 # Entries are enumerated with a bash glob rather than find(1): this
 # spool runs on the host, which may be macOS, and BSD find has no
 # -printf. The `./` prefix keeps a name starting with `-` from being
@@ -4208,6 +4244,17 @@ k8s_refuse_dir_links() {
 # the host's real ARG_MAX and batches accordingly. Batching starts from
 # the same empty archive the zero-entries case below creates, so the
 # archive-size cap the caller checks stays the actual limit.
+#
+# `-h` dereferences symlinks into the real file (or directory) they point
+# at, rather than archiving a link entry -- fork-sandbox-k8s-context-
+# extract.sh refuses a link entry outright on the pod side (that guard
+# stays; it is what makes a hostile or confused push safe). A staged
+# --run-dir, unlike --thread-dir/--attach-dir, is never pre-checked for
+# symlinks before reaching here (its own agent-kit skill directories are
+# routinely symlinks on an installed machine), so without `-h` every live
+# composed --k8s run would tar a link entry and the pod would then refuse
+# the whole push. --thread-dir/--attach-dir already refuse a symlinked
+# tree before calling this function, so `-h` is a no-op for them.
 k8s_spool_dir_entries() {
     local dir="$1" tar_out="$2"
     local -a entries=()
@@ -4223,7 +4270,7 @@ k8s_spool_dir_entries() {
     # tar refuses to create an archive with no members at all.
     tar cf "$tar_out" -T /dev/null
     if (( ${#entries[@]} > 0 )); then
-        printf '%s\0' "${entries[@]}" | xargs -0 tar rf "$tar_out" -C "$dir" --
+        printf '%s\0' "${entries[@]}" | xargs -0 tar rhf "$tar_out" -C "$dir" --
     fi
 }
 
@@ -4438,6 +4485,52 @@ validate_context_ro_dir() {
         exit 1
     fi
     printf '%s\n' "$context_ro_real"
+}
+
+# --run-dir's own validate: the resolved real path must sit under
+# /var/tmp/claude-scratch/forks/ (the same root ordinary submit creates a
+# run dir under, via mktemp just below) -- a symlink there is refused for
+# the same reason --context-ro's is, and so is anything that is not
+# already an existing directory holding both run.sh and pipeline.json: a
+# --run-dir submit never creates a run dir, it executes one the launcher
+# already staged, so a directory missing either file could only mean a
+# caller that built it by hand or interrupted partway through staging,
+# either of which should fail loud here rather than produce a Job with no
+# runner to execute or no pipeline to describe it. Prints the resolved
+# real path on success, exactly like validate_context_ro_dir above.
+validate_run_dir_flag() {
+    local run_dir_flag="$1" run_dir_real
+    if [[ -L "$run_dir_flag" ]]; then
+        echo "Error: --run-dir '$run_dir_flag' is a symlink. Name the directory" >&2
+        echo "itself: a symlink checked here and resolved later is a different" >&2
+        echo "directory from the one that gets used." >&2
+        exit 1
+    fi
+    run_dir_real="$("$FS_REALPATH" -m "$run_dir_flag")"
+    fs_reject_unsafe_chars "$run_dir_real" || exit 1
+    if [[ "$run_dir_real" != "$FS_SCRATCH_ROOT"/forks/* ]]; then
+        echo "Error: --run-dir must name a directory under" >&2
+        echo "/var/tmp/claude-scratch/forks/ — got '$run_dir_real'. That is" >&2
+        echo "the root every run directory, staged or mktemp'd, lives under." >&2
+        exit 1
+    fi
+    if [[ ! -d "$run_dir_real" ]]; then
+        echo "Error: --run-dir directory '$run_dir_real' does not exist. It must" >&2
+        echo "already hold run.sh and pipeline.json, staged by the launcher." >&2
+        exit 1
+    fi
+    if [[ ! -f "$run_dir_real/run.sh" ]]; then
+        echo "Error: --run-dir directory '$run_dir_real' has no run.sh. It must" >&2
+        echo "already hold run.sh and pipeline.json, staged by the launcher." >&2
+        exit 1
+    fi
+    if [[ ! -f "$run_dir_real/pipeline.json" ]]; then
+        echo "Error: --run-dir directory '$run_dir_real' has no pipeline.json." >&2
+        echo "It must already hold run.sh and pipeline.json, staged by the" >&2
+        echo "launcher." >&2
+        exit 1
+    fi
+    printf '%s\n' "$run_dir_real"
 }
 
 # --context-secret's name check, shared by check-grant and submit (no
@@ -4781,7 +4874,7 @@ cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
-    local thread_dir="" attach_dir="" image_flag=""
+    local thread_dir="" attach_dir="" image_flag="" run_dir_flag=""
     # Recorded in run.env for `resume` only; submit itself acts on none.
     local outbox_dir="" keep=false run_timeout=3600
     local session_state="" resume_session="" session_id_arg=""
@@ -4813,6 +4906,7 @@ cmd_submit() {
             --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; shift 2 ;;
             --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
             --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
+            --run-dir) run_dir_flag="${2:?--run-dir requires a directory}"; shift 2 ;;
             --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
             --resume-session) resume_session="${2:?--resume-session requires a session id}"; shift 2 ;;
             --session-id) session_id_arg="${2:?--session-id requires a session id}"; shift 2 ;;
@@ -4837,6 +4931,31 @@ cmd_submit() {
             exit 1
             ;;
     esac
+
+    # runner mode: a pre-staged run dir, executed rather than built here.
+    # pipeline_has_claude/pipeline_pi_models read pipeline.json's own seats
+    # (every step and every step's fix seat) rather than --harness/--model,
+    # which runner mode does not use the way a single-leg run does -- see
+    # --run-dir's own doc comment above for the whole shape. Computed
+    # here, early, rather than down among the other optional-directory
+    # checks below: the claude-credential gate just below this already
+    # reads pipeline_has_claude, under set -u, so it must exist (0/"" when
+    # --run-dir was not given) before that point, not merely before the
+    # Job is rendered.
+    local pipeline_has_claude=0 pipeline_pi_models=""
+    if [[ -n "$run_dir_flag" ]]; then
+        run_dir_flag="$(validate_run_dir_flag "$run_dir_flag")" || exit 1
+        if jq -e '
+            ([.steps[] | select(.harness == "claude")]
+             + [.steps[] | select(.fix != null and .fix.harness == "claude")])
+            | length > 0' "$run_dir_flag/pipeline.json" > /dev/null 2>&1; then
+            pipeline_has_claude=1
+        fi
+        pipeline_pi_models="$(jq -r '
+            [.steps[] | select(.harness == "pi") | .model] +
+            [.steps[] | select(.fix != null and .fix.harness == "pi") | .fix.model]
+            | unique | .[]' "$run_dir_flag/pipeline.json" 2>/dev/null)"
+    fi
 
     # --task-meta never enters the pod -- it is written straight to a file
     # in the run directory, where sandbox-run-log.py's `record` (invoked by
@@ -5165,7 +5284,7 @@ cmd_submit() {
             exit 1
         fi
     fi
-    if [[ "$harness" == claude ]]; then
+    if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         local claude_credentials_config
         claude_credentials_config="$(read_env_value "$claude_env" CLAUDE_CREDENTIALS || true)"
         if [[ -n "$claude_credentials_flag" ]]; then
@@ -5710,9 +5829,15 @@ cmd_submit() {
 
     # The egress-gate initContainer's own proxy probe: the shared pi proxy
     # for a pi run, this run's own per-run proxy for a claude run -- see
-    # the Job env below, which is what actually needs this value.
+    # the Job env below, which is what actually needs this value. A runner
+    # mode (--run-dir) pipeline with both kinds of seat probes the per-run
+    # claude proxy too -- the NEWER of the two services, more likely to
+    # reveal a startup race than the long-lived shared proxy -- since this
+    # is only a readiness heuristic, not the egress boundary itself (the
+    # NetworkPolicy is that).
     local egress_proxy_host="fork-sandbox-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
-    [[ "$harness" == claude ]] && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
+    [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]] \
+        && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
 
     # The fork-sandbox/owner label plus this run's free-form labels --
     # resolved once here, ahead of both the claude-proxy template
@@ -5778,7 +5903,7 @@ cmd_submit() {
     # __RUN_NAME__ is this run's own $safe_name, the same object-name
     # component the agent Job and its ConfigMap use.
     local claude_proxy_rendered=""
-    if [[ "$harness" == claude ]]; then
+    if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         local claude_proxy_template
         claude_proxy_template="$(dirname "$script_dir")/manifests/k8s/31-claude-proxy.yaml"
         if [[ ! -f "$claude_proxy_template" ]]; then
@@ -5833,7 +5958,7 @@ cmd_submit() {
     # below, so an empty string here changes nothing about the no-claude
     # render.
     local claude_configmap_keys=""
-    if [[ "$harness" == claude ]]; then
+    if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         [[ -x "$inbox_hook_sh" ]] \
             || { echo "Error: $inbox_hook_sh is missing or not executable." >&2; exit 1; }
         [[ -x "$stop_guard_sh" ]] \
@@ -5867,12 +5992,12 @@ cmd_submit() {
         review_loop_env=$'\n'"$(render_review_loop_env "$review_loop_cap" "$base_sha")"
     fi
 
-    # CLAUDE_PROXY_BASE_URL, for --harness claude only -- the per-run
-    # proxy Service a claude coding leg needs; a pi coding leg talks to
-    # the shared proxy via PROXY_BASE_URL instead, set unconditionally
-    # above.
+    # CLAUDE_PROXY_BASE_URL, for --harness claude or any claude seat in
+    # pipeline.json -- the per-run proxy Service a claude leg needs; a pi
+    # leg talks to the shared proxy via PROXY_BASE_URL instead, set
+    # unconditionally above.
     local claude_env=""
-    if [[ "$harness" == claude ]]; then
+    if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         claude_env=$'\n'"$(cat <<CENV
             - name: CLAUDE_PROXY_BASE_URL
               value: "http://$safe_name-claude-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN:8080"
@@ -6043,7 +6168,8 @@ KEYS
     # cannot guess wrong. See the MODEL_DISCOVERY entry in
     # fork-sandbox-k8s-entrypoint.sh's env header.
     local model_discovery_env=""
-    if [[ -n "$proxy_endpoint" && ( "$harness" == pi || $review_loop_cap -gt 0 ) ]]; then
+    if [[ -n "$proxy_endpoint" \
+        && ( "$harness" == pi || $review_loop_cap -gt 0 || -n "$pipeline_pi_models" ) ]]; then
         model_discovery_env=$'\n'"$(cat <<CENV
             - name: MODEL_DISCOVERY
               value: "1"
@@ -6101,6 +6227,31 @@ CENV
         attach_volume=$'\n'"$(cat <<CENV
         - name: attachments
           emptyDir: {}
+CENV
+)"
+    fi
+    # Runner mode's own emptyDir, mounted at the run dir's own absolute
+    # host path rather than a fixed pod-side constant like /thread or
+    # /attachments above -- every path baked into run.sh (prompts,
+    # handoff.md, the inbox, every *_sandbox_cmd array) was generated
+    # against that exact path, so moving it would mean rewriting run.sh
+    # instead of just mounting it where it already expects to be. RUN_DIR
+    # carries the same path into the entrypoint's own env.
+    local run_dir_volume_mount="" run_dir_volume="" run_dir_env=""
+    if [[ -n "$run_dir_flag" ]]; then
+        run_dir_volume_mount=$'\n'"$(cat <<CENV
+            - name: run
+              mountPath: $run_dir_flag
+CENV
+)"
+        run_dir_volume=$'\n'"$(cat <<CENV
+        - name: run
+          emptyDir: {}
+CENV
+)"
+        run_dir_env=$'\n'"$(cat <<CENV
+            - name: RUN_DIR
+              value: "$run_dir_flag"
 CENV
 )"
     fi
@@ -6258,7 +6409,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -6273,7 +6424,7 @@ spec:
             - name: tmp
               mountPath: /tmp
             - name: home
-              mountPath: /home/agent${thread_volume_mount}${attach_volume_mount}${context_secret_volume_mount}
+              mountPath: /home/agent${thread_volume_mount}${attach_volume_mount}${context_secret_volume_mount}${run_dir_volume_mount}
       volumes:
         - name: scripts
           configMap:
@@ -6293,17 +6444,26 @@ spec:
         - name: tmp
           emptyDir: {}
         - name: home
-          emptyDir: {}${thread_volume}${attach_volume}${context_secret_volume}${services_volumes}
+          emptyDir: {}${thread_volume}${attach_volume}${context_secret_volume}${services_volumes}${run_dir_volume}
 EOF
 )"
     rendered="${grant_rendered}${claude_proxy_rendered}${job_rendered}"
 
     if [[ "$dry_run" == true ]]; then
         printf '%s\n' "$rendered"
-        if [[ "$harness" == claude ]]; then
+        if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
             printf '# (dry-run) would create Secret %s-claude-token here, holding the operator access token -- not shown.\n' \
                 "$safe_name"
         fi
+        # Unlike an ordinary (no --run-dir) dry-run, which creates nothing
+        # of its own to clean up before this point, a --run-dir dry-run
+        # must NOT remove DIR: validate_run_dir_flag above only confirms
+        # DIR holds run.sh and pipeline.json, a shape every live composed
+        # run directory has too, staged or already collected -- this
+        # process never created DIR, so it is never this invocation's to
+        # delete, dry-run or not: --run-dir does not always name a
+        # just-staged, throwaway directory, and a --dry-run against an
+        # operator's own live run dir must not destroy it.
         exit 0
     fi
 
@@ -6336,26 +6496,42 @@ EOF
     # below dies on a missing parent, under set -euo pipefail, after every
     # validation above has already passed.
     mkdir -p /var/tmp/claude-scratch/forks
-    local run_dir
-    run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+    local run_dir run_dir_created_here
+    if [[ -n "$run_dir_flag" ]]; then
+        # Runner mode: DIR was already staged (validate_run_dir_flag above
+        # already confirmed it exists and holds run.sh/pipeline.json), so
+        # it becomes run_dir as-is -- no mktemp, nothing new created here.
+        # run_dir_created_here stays false: every trap below that removes
+        # run_dir on a host-side failure must not touch a directory this
+        # process never created -- the same shape of live run directory
+        # --dry-run above never deletes either.
+        run_dir="$run_dir_flag"
+        run_dir_created_here=false
+    else
+        run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+        run_dir_created_here=true
+    fi
     fs_reject_unsafe_chars "$run_dir"
 
     # Removed on any failure between here and the first cluster object,
     # mirroring fork-sandbox.sh's own local launcher, which removes ITS
     # run dir when fs_make_clone fails so a bad branch name does not leave
-    # an empty directory behind. A submit that dies validating something
-    # host-side (the context archive's size cap below, a spool failure)
-    # never reaches the cluster at all -- no Job, no Secret, nothing for
-    # "the orchestrator after review" or an operator's `rm --branch` to
-    # find -- so the join key this directory exists to be has nothing to
-    # join to, and would otherwise leak forever. Disarmed just before the
-    # first kubectl create/apply below: from that point on, a cluster
-    # object may already exist, and this directory is what cmd_collect's
-    # own record call needs to read back, exactly like every run that
-    # does reach the cluster. Also covers the session store's own tar, in
-    # case it was already spooled above (the session cap check runs before
-    # run_dir exists, so its own trap could not yet reference run_dir too).
-    trap 'rm -f -- "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+    # an empty directory behind -- but ONLY when run_dir_created_here is
+    # true. A submit that dies validating something host-side (the
+    # context archive's size cap below, a spool failure) never reaches
+    # the cluster at all -- no Job, no Secret, nothing for "the
+    # orchestrator after review" or an operator's `rm --branch` to find --
+    # so a freshly mktemp'd run dir's join key has nothing to join to, and
+    # would otherwise leak forever. A caller-supplied --run-dir is never
+    # this invocation's to delete, on any outcome: the same reasoning
+    # --dry-run above follows. Disarmed just before the first kubectl
+    # create/apply below: from that point on, a cluster object may already
+    # exist, and this directory is what cmd_collect's own record call
+    # needs to read back, exactly like every run that does reach the
+    # cluster. Also covers the session store's own tar, in case it was
+    # already spooled above (the session cap check runs before run_dir
+    # exists, so its own trap could not yet reference run_dir too).
+    trap 'rm -f -- "${K8S_SUBMIT_SESSION_TAR:-}"; [[ "$run_dir_created_here" == true ]] && rm -rf -- "$run_dir"' EXIT
 
     # Printed as soon as the directory exists, not only once submit
     # finishes: a submit that dies below at the repository push or any
@@ -6403,8 +6579,32 @@ EOF
     # receives the ConfigMap form with exactly one trailing newline.
     # Written now rather than left for cmd_collect to read later: the
     # caller may edit or remove the original while the run is in flight.
-    printf '%s' "$rendered_handoff" > "$run_dir/handoff.md"
-    cp -- "$handoff_file" "$run_dir/handoff-original.md"
+    #
+    # Runner mode (--run-dir) never writes handoff.md here: the launcher
+    # already rendered its own implement prompt to $run_dir/handoff.md
+    # before this submit ever ran (the composed preamble's own handoff=
+    # points at it), and this $rendered_handoff is this command's
+    # legacy-shaped rendering of the SAME raw file, built above purely to
+    # size the context archive -- overwriting the launcher's file with it
+    # would feed the pod's first leg the wrong prompt. handoff-original.md
+    # is still useful in runner mode (the operator's raw file, archived),
+    # so it is written, but only if the launcher did not already leave one.
+    if [[ -z "$run_dir_flag" ]]; then
+        printf '%s' "$rendered_handoff" > "$run_dir/handoff.md"
+        cp -- "$handoff_file" "$run_dir/handoff-original.md"
+    elif [[ ! -e "$run_dir/handoff-original.md" ]]; then
+        cp -- "$handoff_file" "$run_dir/handoff-original.md"
+    fi
+    # Runner mode's own third archived copy: $continuation_header (just
+    # above) is already exactly the preamble a --refresh-at continuation
+    # leg re-sends, including the pod-only context/services sections
+    # fs_render_leg_prompts (the launcher's own prompt renderer, which
+    # never reaches this far -- see docs/kubernetes-runs.md) has no way to
+    # know about, so this is written here rather than by whoever staged
+    # the rest of run_dir.
+    if [[ -n "$run_dir_flag" && "$refresh_enabled" == 1 ]]; then
+        printf '%s' "$continuation_header" > "$run_dir/continuation-prompt-header.md"
+    fi
 
     # run.env: the same fallback shape a local run's own run.env offers
     # sandbox-run-log.py when summary.json (written by cmd_collect, once
@@ -6427,10 +6627,33 @@ EOF
     # though it were.
     local outbox_dir_recorded=""
     [[ -n "$outbox_dir" ]] && outbox_dir_recorded="$("$FS_REALPATH" -m -- "$outbox_dir")"
+    # Runner mode (--run-dir) reaches this with the launcher's OWN run.env
+    # already written at that same path -- version=, run_dir=, clone_dir=,
+    # started_at= and the rest fork-sandbox-status.sh needs to accept a
+    # composed k8s run's host directory at all (see that writer's own
+    # comment). APPEND to it rather than truncate: `>` here would silently
+    # erase every one of those keys, exactly the bug that left a collected
+    # run's run.env with no version= at all. A standalone submit (no
+    # --run-dir) still gets a fresh file -- there is nothing to preserve.
+    # The few keys below that both writers print (branch, origin_repo,
+    # harness, model) end up duplicated; read_env_value/run_env_get take
+    # the FIRST match, so the launcher's own value (printed first, since
+    # its write always runs before this one) wins for those, which is fine
+    # since both sides resolve them from the same seat. `network` is NOT
+    # duplicated -- the launcher's writer skips it in k8s_runner_mode
+    # precisely so this line, the only writer of it, decides.
+    local run_env_redirect=">"
+    [[ -n "$run_dir_flag" ]] && run_env_redirect=">>"
     {
         printf 'mode=run\n'
         printf 'harness=%s\n' "$harness"
         printf 'network=cluster\n'
+        # Read back by fork-sandbox-status.sh in place of a tmux session
+        # name, which a cluster run never has: this is the Job/Pod label
+        # name (k8s_safe_name, the same derivation every management verb
+        # uses to find this run's objects), the one thing that actually
+        # exists for an operator to look at.
+        printf 'k8s_job_name=%s\n' "$safe_name"
         printf 'model=%s\n' "$model"
         printf 'image=%s\n' "$RUN_IMAGE"
         printf 'image_source=%s\n' "$RUN_IMAGE_SOURCE"
@@ -6462,7 +6685,8 @@ EOF
         # then.
         printf 'UPSTREAM=%s\n' "$upstream"
         printf 'UPSTREAM_REASON=%s\n' "$upstream_reason"
-        if [[ "$harness" == claude ]]; then
+        [[ -n "$run_dir_flag" ]] && printf 'RUNNER=1\n'
+        if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
             printf 'claude_credentials_source=%s\n' "${claude_credentials_override:-default}"
             printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
             # Read back by cmd_wait (via --run-dir, from k8s_run_tail or a
@@ -6493,7 +6717,13 @@ EOF
             printf 'refresh_max=%s\n' "$refresh_max"
             printf 'refresh_threshold_tokens=%s\n' "$refresh_threshold_tokens"
         fi
-    } > "$run_dir/run.env"
+    } > "$run_dir/run.env.submit-part"
+    if [[ "$run_env_redirect" == ">>" ]]; then
+        cat -- "$run_dir/run.env.submit-part" >> "$run_dir/run.env"
+        rm -f -- "$run_dir/run.env.submit-part"
+    else
+        mv -f -- "$run_dir/run.env.submit-part" "$run_dir/run.env"
+    fi
 
     K8S_LAST_SUBMIT_RUN_DIR="$run_dir"
 
@@ -6507,6 +6737,7 @@ EOF
     K8S_SUBMIT_CONTEXT_TAR=""
     K8S_SUBMIT_THREAD_TAR=""
     K8S_SUBMIT_ATTACH_TAR=""
+    K8S_SUBMIT_RUN_DIR_TAR=""
     if [[ -n "$context_ro" ]]; then
         context_tar="$(mktemp)"
         K8S_SUBMIT_CONTEXT_TAR="$context_tar"
@@ -6515,7 +6746,7 @@ EOF
         # trap -- so this one covers both: a tar/stat failure or an
         # over-cap archive here is still before any cluster object, and
         # must still take run_dir with it.
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"; [[ "$run_dir_created_here" == true ]] && rm -rf -- "$run_dir"' EXIT
         tar cf "$context_tar" -C "$context_ro" .
         context_size="$("$FS_STAT" -c '%s' -- "$context_tar")"
         if (( context_size > CONTEXT_MAX_BYTES )); then
@@ -6540,7 +6771,7 @@ EOF
     if [[ -n "$thread_dir" ]]; then
         thread_tar="$(mktemp)"
         K8S_SUBMIT_THREAD_TAR="$thread_tar"
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"; [[ "$run_dir_created_here" == true ]] && rm -rf -- "$run_dir"' EXIT
         k8s_spool_dir_entries "$thread_dir" "$thread_tar"
         thread_size="$("$FS_STAT" -c '%s' -- "$thread_tar")"
         if (( thread_size > CONTEXT_MAX_BYTES )); then
@@ -6554,12 +6785,33 @@ EOF
     if [[ -n "$attach_dir" ]]; then
         attach_tar="$(mktemp)"
         K8S_SUBMIT_ATTACH_TAR="$attach_tar"
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"; [[ "$run_dir_created_here" == true ]] && rm -rf -- "$run_dir"' EXIT
         k8s_spool_dir_entries "$attach_dir" "$attach_tar"
         attach_size="$("$FS_STAT" -c '%s' -- "$attach_tar")"
         if (( attach_size > CONTEXT_MAX_BYTES )); then
             echo "Error: --attach-dir directory '$attach_dir' tars to" >&2
             echo "$attach_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
+            echo "(256 MiB) cap." >&2
+            exit 1
+        fi
+    fi
+
+    # Runner mode's own push: same shape as thread/attach above (a
+    # pre-existing emptyDir, so k8s_spool_dir_entries packs the directory's
+    # top-level entries, never `.` itself), same CONTEXT_MAX_BYTES cap --
+    # run.sh plus fork-sandbox-runner.sh/fork-sandbox-lib.sh/
+    # fork-sandbox-refresh.sh/fork-sandbox-format.sh/the leg wrapper plus
+    # every prompt file is well under it.
+    local run_dir_tar="" run_dir_tar_size=""
+    if [[ -n "$run_dir_flag" ]]; then
+        run_dir_tar="$(mktemp)"
+        K8S_SUBMIT_RUN_DIR_TAR="$run_dir_tar"
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"; [[ "$run_dir_created_here" == true ]] && rm -rf -- "$run_dir"' EXIT
+        k8s_spool_dir_entries "$run_dir_flag" "$run_dir_tar"
+        run_dir_tar_size="$("$FS_STAT" -c '%s' -- "$run_dir_tar")"
+        if (( run_dir_tar_size > CONTEXT_MAX_BYTES )); then
+            echo "Error: --run-dir directory '$run_dir_flag' tars to" >&2
+            echo "$run_dir_tar_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
             echo "(256 MiB) cap." >&2
             exit 1
         fi
@@ -6638,7 +6890,7 @@ EOF
     K8S_SUBMIT_SAFE_NAME="$safe_name"
     K8S_SUBMIT_BRANCH="$branch"
     trap '
-        rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"
+        rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"
         kubectl delete job,pod,service,secret,configmap,networkpolicy \
             -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
         echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster" >&2
@@ -6652,7 +6904,7 @@ EOF
         printf '%s\n' "$grant_rendered" | kubectl apply -f -
     fi
 
-    if [[ "$harness" == claude ]]; then
+    if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         # The per-run Secret carrying the REAL operator access token, read
         # by the per-run proxy below -- created here, as the LAST step
         # before any cluster object for this run exists, so that every
@@ -6676,7 +6928,7 @@ EOF
         # pre-sized context archive, if this run has one.
         # K8S_SUBMIT_SAFE_NAME/K8S_SUBMIT_BRANCH are already set, above.
         trap '
-            rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"
+            rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"
             kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-claude-token" --ignore-not-found >&2
             kubectl delete job,pod,service,secret,configmap,networkpolicy \
                 -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
@@ -6855,6 +7107,16 @@ EOF
         kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_SESSION_DIR" "$CONTEXT_MAX_BYTES" context < "$session_tar"
         rm -f -- "$session_tar"
+    fi
+
+    # Runner mode's own push, after the repository and every other input --
+    # the entrypoint's RUN_DIR handling waits on .inputs-complete exactly
+    # like the single-leg path does, so this has to land before it.
+    if [[ -n "$run_dir_flag" ]]; then
+        echo "fork-sandbox-k8s: pushing the run directory ($run_dir_flag) to pod $pod_name" >&2
+        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+            "$run_dir_flag" "$CONTEXT_MAX_BYTES" context < "$run_dir_tar"
+        rm -f -- "$run_dir_tar"
     fi
 
     kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
@@ -7635,6 +7897,16 @@ cmd_wait() {
 # writing to its own output cannot fill the host's disk.
 FS_RUN_EVIDENCE_MAX_BYTES=$((64 * 1024 * 1024))
 
+# The byte cap on a single pulled summary.json before it is ever handed to
+# `jq -s` (which slurps the whole file into memory to count documents --
+# see cmd_collect's own comment on why it needs the count, not just the
+# parse). summary.json is always a small, flat record -- a few KB even with
+# a long retries/continuations history -- so this is generous headroom, not
+# a tuned limit: a pod that writes a 200 MB `summary.json` (a bare array
+# repeated enough times) must be refused before `jq -s` ever reads it, not
+# after it has already bloated to multiple GB of RSS parsing it.
+FS_POD_SUMMARY_MAX_BYTES=$((1024 * 1024))
+
 # Files the pod's ENTRYPOINT writes into /work/outbox, not the agent: its
 # own harness metadata, for the host's bookkeeping. The zero-harvest check
 # in cmd_collect below decides whether "the outbox is empty of anything the
@@ -7872,16 +8144,35 @@ cmd_collect() {
     # fingerprint that makes a bare number unreadable).
     if [[ -f "$outbox_dest/.fork-sandbox-model" ]]; then
         local model_record model_facts="" model_line
-        model_record="$(head -n 1 -- "$outbox_dest/.fork-sandbox-model")"
+        # Bounded with head -c ahead of the line reads below, on top of
+        # (not instead of) the extractor's own total-size cap over the
+        # whole outbox archive: a `head -n 1` or line-at-a-time `read`
+        # loop has no cap of its own, and this file is small structured
+        # metadata (a model id plus a few key=value lines) that never
+        # legitimately approaches even this bound, so it costs nothing
+        # real here and closes the "every read of a pod-written file on
+        # the host must also be bounded" requirement for this one
+        # directly, rather than resting solely on the extractor upstream.
+        model_record="$(head -c 65536 -- "$outbox_dest/.fork-sandbox-model" | head -n 1)"
         while IFS= read -r model_line || [[ -n "$model_line" ]]; do
             case "$model_line" in
                 context=*) model_facts+="${model_facts:+, }$model_line" ;;
                 max_tokens=*) model_facts+="${model_facts:+, }$model_line" ;;
                 context_source=*) model_facts+="${model_facts:+, }$model_line" ;;
             esac
-        done < <(tail -n +2 -- "$outbox_dest/.fork-sandbox-model")
+        done < <(head -c 65536 -- "$outbox_dest/.fork-sandbox-model" | tail -n +2)
         if [[ -n "$model_record" ]]; then
-            echo "fork-sandbox-k8s: model: $model_record${model_facts:+ ($model_facts)}" >&2
+            # $model_record and $model_facts are pod-controlled bytes (the
+            # outbox's own untrusted content), printed straight to the
+            # operator's terminal here the same way fork-sandbox-status.sh's
+            # verdict/log/summary readers are -- stripped of control bytes
+            # for the same reason: an escape sequence (OSC 52 clipboard
+            # write, among others) surviving this echo reaches both a real
+            # terminal and any orchestrating agent session reading this
+            # script's stderr, making it a prompt-injection channel too.
+            printf 'fork-sandbox-k8s: model: %s%s\n' \
+                "$model_record" "${model_facts:+ ($model_facts)}" \
+                | tr -d '\000-\010\013-\037\177' >&2
         fi
     fi
     rm -f -- "$outbox_tar"
@@ -8084,12 +8375,344 @@ cmd_collect() {
         [[ -n "$session_pull_tmp" && -e "$session_pull_tmp" ]] && rm -rf -- "$session_pull_tmp"
     fi
 
+    # Runner mode (RUNNER=1 in run.env, written by a --run-dir submit --
+    # see its own doc comment above cmd_submit): the pod walked a
+    # pre-staged pipeline through the shared runner rather than running a
+    # single HARNESS/MODEL leg, and everything that walk produced --
+    # step-<K>-loop.json, progress.json, every events*.jsonl, sandbox.log,
+    # verdicts and the runner's own summary.json -- lives in the pod's
+    # own copy of this same run directory (mounted at $run_dir's own
+    # absolute path, per --run-dir's emptyDir), not under /work/outbox or
+    # /work (the evidence pull above pulls transcripts, not these).
+    # Pulled into a FRESH staging directory, never straight into
+    # $run_dir: the shared extractor refuses to extract into a directory
+    # that already exists and is non-empty, and $run_dir always already
+    # holds the host-written files (run.sh, pipeline.json, run.env,
+    # scripts/, inbox/, any staged skill) that must survive this collect
+    # untouched. Only an allowlist of named artifacts is then copied up
+    # into $run_dir from the staging copy (see the loop below) -- the
+    # pod's copy sits on an emptyDir every leg in the pod could write to,
+    # so a blind copy of everything the pod has would let a leg plant any
+    # file the host lacks by name, exit-code and pid among them.
+    #
+    # Best-effort, like the outbox and evidence pulls above: a failure
+    # here must not cost the branch fetch that follows, and never touches
+    # this function's exit code. The pod's own summary.json is read out
+    # of the staging copy explicitly, into run_dir_pod_summary, BEFORE the
+    # allowlisted copy below would otherwise leave it sitting unread in
+    # $run_dir/summary.json: the client's own summary.json write further
+    # down truncates that file, so reading it after would be too late.
+    # See that write, below, for the merge this feeds (client keys win on
+    # overlap; the pod's summary.json stands alone when no summary.json
+    # was pulled).
+    local runner_mode="" run_dir_pod_summary=""
+    if [[ -n "$run_dir" ]]; then
+        runner_mode="$(read_env_value "$run_dir/run.env" RUNNER || true)"
+    fi
+    if [[ "$runner_mode" == 1 ]]; then
+        local run_dir_pull_ok=true
+        local run_dir_pull_tar run_dir_pull_err run_dir_pull_rc=0 run_dir_pull_tmp=""
+        run_dir_pull_tar="$(mktemp)"
+        run_dir_pull_err="$(mktemp)"
+        kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C "$run_dir" . 2> "$run_dir_pull_err" \
+                | head -c "$((CONTEXT_MAX_BYTES + 1))" > "$run_dir_pull_tar" \
+                || run_dir_pull_rc=$?
+        # Same size-check-before-exit-status ordering as the outbox and
+        # session-store pulls above, for the identical reason: an
+        # over-cap directory makes head -c exit early, kubectl then dies
+        # of EPIPE and the pipeline is non-zero under pipefail -- that IS
+        # the over-cap case, not a read failure.
+        if (( $("$FS_STAT" -c '%s' -- "$run_dir_pull_tar") > CONTEXT_MAX_BYTES )); then
+            echo "fork-sandbox-k8s: warning: pod $pod_name's run directory is over the $CONTEXT_MAX_BYTES byte cap; refusing to pull its runner records back." >&2
+            run_dir_pull_ok=false
+        elif (( run_dir_pull_rc != 0 )); then
+            echo "fork-sandbox-k8s: warning: could not read the run directory from pod $pod_name; no runner records pulled back." >&2
+            fs_report_captured_stderr "kubectl exec into pod $pod_name (run directory read)" "$run_dir_pull_err"
+            run_dir_pull_ok=false
+        fi
+        rm -f -- "$run_dir_pull_err"
+
+        if [[ "$run_dir_pull_ok" == true ]] && ! run_dir_pull_tmp="$(mktemp -d)"; then
+            echo "fork-sandbox-k8s: warning: could not create a staging directory for the run directory pull; no runner records pulled back." >&2
+            run_dir_pull_ok=false
+        fi
+        if [[ "$run_dir_pull_ok" == true ]] \
+            && ! "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$run_dir_pull_tar" "$run_dir_pull_tmp" "$CONTEXT_MAX_BYTES"; then
+            echo "fork-sandbox-k8s: warning: could not extract the run directory tarball; no runner records pulled back." >&2
+            run_dir_pull_ok=false
+        fi
+        rm -f -- "$run_dir_pull_tar"
+
+        if [[ "$run_dir_pull_ok" == true ]]; then
+            if [[ -s "$run_dir_pull_tmp/summary.json" ]]; then
+                # A pod leg can write summary.json more than once -- two
+                # JSON documents concatenated, not one -- and `jq -c .`
+                # with no -s processes each document separately, printing
+                # one line apiece. The merge below slurps this value with
+                # `jq -s`, so two documents here would slurp as the pod's
+                # OWN two objects ahead of the client's single object, and
+                # ".[0] * .[1]" would merge the pod's two against each
+                # other, never reaching the client's write at all -- by
+                # experiment, a planted second document completely
+                # replaced the client's branch/origin_repo/commits/
+                # exit_code. Require exactly one JSON value, and that it
+                # is an object; `jq -s '.'` here only counts documents, it
+                # is never itself fed into the merge.
+                #
+                # Sized BEFORE that slurp, not after: `jq -s` reads the
+                # whole file into memory to build the array it counts, so
+                # the cap has to gate the read itself, the same discipline
+                # every other pod pull in this function already applies
+                # (outbox, evidence, session store, this very directory).
+                # A legitimate summary.json is a few KB; refusing anything
+                # over FS_POD_SUMMARY_MAX_BYTES costs nothing real and
+                # stops a planted multi-hundred-MB file from ever reaching
+                # jq at all.
+                local run_dir_pod_summary_size
+                run_dir_pod_summary_size="$("$FS_STAT" -c '%s' -- "$run_dir_pull_tmp/summary.json" 2>/dev/null || echo -1)"
+                if (( run_dir_pod_summary_size >= 0 && run_dir_pod_summary_size <= FS_POD_SUMMARY_MAX_BYTES )); then
+                    local run_dir_pod_summary_docs
+                    run_dir_pod_summary_docs="$(jq -s '.' < "$run_dir_pull_tmp/summary.json" 2>/dev/null)"
+                    if [[ "$(printf '%s' "$run_dir_pod_summary_docs" | jq 'length' 2>/dev/null)" == 1 ]] \
+                            && [[ "$(printf '%s' "$run_dir_pod_summary_docs" | jq -r '.[0] | type' 2>/dev/null)" == object ]]; then
+                        # Allowlist, not the whole object, even once it is
+                        # confirmed to be exactly one object: every host-known
+                        # fact the client's own write below sets itself
+                        # (branch, origin_repo, commits, exit_code, run_dir/
+                        # clone_dir/base_sha, started_at/ended_at/
+                        # duration_seconds, session_id, harness/model/network/
+                        # image) must come from the host, never the pod. The
+                        # client wins on overlap further down regardless, but
+                        # a key the client has no occasion to set at all
+                        # (session_id, on a run with no --session-state) would
+                        # otherwise pass through from the pod completely
+                        # unchallenged. Only fields the pod's own in-process
+                        # runner computes and nothing else can -- cost, usage,
+                        # retries, the uncommitted-work check -- are let
+                        # through. tidy and tidy_has_maintain_step are
+                        # deliberately NOT in this list, unlike every other
+                        # field the runner's own summary.json carries: the
+                        # host already knows, unconditionally, that a --k8s
+                        # pod run never runs the tidy-history leg (see the
+                        # tidy.json write further below), so a pod claiming
+                        # {"tidy":{"ended":"accepted"}} would otherwise pass
+                        # straight through into the host's summary.json with
+                        # nothing there to collide with and override it --
+                        # the client's own write never sets a "tidy" key
+                        # itself, so "the client wins on overlap" above gives
+                        # this one no protection at all. The host sets both
+                        # keys itself, from tidy.json, alongside the merge
+                        # below. Every numeric leaf is also bounded (walk
+                        # below): a pod that reports cost_usd as 1e1000
+                        # parses as a legal-looking but non-finite JSON
+                        # number, and that survives an ordinary jq pass
+                        # unchanged (jq preserves a number literal it never
+                        # touches) -- it is only downstream, in Python's json
+                        # module, that it becomes the bareword Infinity, not
+                        # valid JSON. Null out anything non-finite or
+                        # absurdly large here, at the host's one choke point
+                        # for pod-reported numbers, rather than relying
+                        # solely on sandbox-run-log.py's own defenses.
+                        run_dir_pod_summary="$(printf '%s' "$run_dir_pod_summary_docs" | jq -c '
+                            .[0]
+                            | {cost_usd, total_cost_usd, usage, usage_source, leg_retries,
+                               implement_retries, uncommitted_files, uncommitted_files_list,
+                               uncommitted_patch,
+                               continuations, leg_refreshes, outbox_bytes, outbox_max_bytes,
+                               author_email, author_email_unexpected, authorship_normalized,
+                               agent_kit, harness_error, end_reason,
+                               steps, refresh, report_from}
+                            | with_entries(select(.value != null))
+                            | walk(if type == "number" and ((isnan or isinfinite) or . > 1e15 or . < -1e15)
+                                   then null else . end)
+                        ' 2>/dev/null)"
+                    fi
+                else
+                    echo "fork-sandbox-k8s: warning: pod $pod_name's summary.json is over the $FS_POD_SUMMARY_MAX_BYTES byte cap; ignoring it." >&2
+                fi
+            fi
+            # The pod's copy of the run directory sits on an emptyDir every
+            # leg in the pod can write to -- unlike a local run, which
+            # never shares its filesystem with the sandboxed agent -- so a
+            # leg can plant any file by name: task-meta.json (when the
+            # host never gave one), exit-code, pid (this run's own, still
+            # live), or any file this function itself is about to write.
+            # Blindly copying the whole directory would let any of those
+            # land, so copy back only the named artifacts a local composed
+            # run leaves that the host actually needs --
+            # fork-sandbox-status.sh's own resolve_run_file allowlist
+            # (what the status/run-log readers consume), minus every name
+            # the host already owns and writes itself (run.env, pid,
+            # exit-code, handoff.md, pipeline.json -- never taken from the
+            # pod), plus progress.json (read directly, not through that
+            # helper, but the same discipline). summary.json is deliberately
+            # excluded: it is read into run_dir_pod_summary above and
+            # merged into the client's own write further down, not copied
+            # as a file. review-loop.json and maintainer-loop.json are
+            # ALSO excluded, deliberately: those are the legacy single-leg
+            # loop record names, and a composed run (runner mode) only
+            # ever writes the step-numbered step-<K>-loop.json shape
+            # matched below, legacy maintain presets on --k8s included (see
+            # the s<K>-review-verdict-N.md/s<K>-maintain-verdict-N.md
+            # patterns further down, which is what those presets' verdicts
+            # are actually named under the runner). A pod leg has no
+            # legitimate reason to ever write review-loop.json or
+            # maintainer-loop.json in runner mode, so letting either
+            # through would only ever be a forged loop history landing on
+            # the host as if it were real. tidy.json is excluded for a
+            # different reason: the host already knows, unconditionally,
+            # that a --k8s pod run never runs the tidy-history leg (see
+            # this function's own tidy.json write further below), so there
+            # is never a real one on the pod worth taking either. Each
+            # candidate that IS copied must be a regular file -- not a
+            # symlink, FIFO or anything else no regular run ever leaves --
+            # under the size cap below, and lands only as a flat
+            # "$run_dir/<name>" (never a subdirectory, so this can never
+            # plant anything under inbox/, scripts/ or clone/).
+            local run_dir_pull_cap=$((16 * 1024 * 1024))
+            local run_dir_pull_entry run_dir_pull_name run_dir_pull_size run_dir_pull_cp_err
+            while IFS= read -r -d '' run_dir_pull_entry; do
+                run_dir_pull_name="${run_dir_pull_entry##*/}"
+                case "$run_dir_pull_name" in
+                    progress.json|summary.txt|sandbox.log|plan.md| \
+                    events.jsonl|uncommitted.patch) ;;
+                    step-[0-9]*-loop.json)
+                        [[ "$run_dir_pull_name" =~ ^step-[0-9]+-loop\.json$ ]] || continue ;;
+                    events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl|events-code-[0-9]*.jsonl|events-continuation-[0-9]*.jsonl|events-tidy-[0-9]*.jsonl)
+                        [[ "$run_dir_pull_name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation|tidy)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] || continue ;;
+                    events-s[0-9]*-*.jsonl)
+                        [[ "$run_dir_pull_name" =~ ^events-s[0-9]+-(code|review|maintain|fix|plan|tidy)-[0-9]+(-p[0-9]+)?(-continuation-[0-9]+)?\.jsonl$ ]] || continue ;;
+                    review-verdict-[0-9]*.md)
+                        [[ "$run_dir_pull_name" =~ ^review-verdict-[0-9]+\.md$ ]] || continue ;;
+                    maintainer-verdict-[0-9]*.md)
+                        [[ "$run_dir_pull_name" =~ ^maintainer-verdict-[0-9]+\.md$ ]] || continue ;;
+                    s[0-9]*-*-verdict-[0-9]*.md)
+                        [[ "$run_dir_pull_name" =~ ^s[0-9]+-(review|maintain)-verdict-[0-9]+\.md$ ]] || continue ;;
+                    *) continue ;;
+                esac
+                [[ -f "$run_dir_pull_entry" && ! -L "$run_dir_pull_entry" ]] || continue
+                [[ -e "$run_dir/$run_dir_pull_name" ]] && continue
+                run_dir_pull_size="$("$FS_STAT" -c '%s' -- "$run_dir_pull_entry" 2>/dev/null || echo -1)"
+                (( run_dir_pull_size >= 0 && run_dir_pull_size <= run_dir_pull_cap )) || continue
+                # Every other pull in this function (outbox, evidence,
+                # session-store) warns by name on failure; this one used to
+                # swallow it silently (`2>/dev/null || true`), the one way a
+                # copy that fails on a live cluster -- a transient I/O
+                # error, a host /tmp exhausted mid-collect -- could leave an
+                # artifact missing with no trace of why. Capture and report
+                # it the same way its siblings do.
+                if ! run_dir_pull_cp_err="$(cp -- "$run_dir_pull_entry" "$run_dir/$run_dir_pull_name" 2>&1)"; then
+                    echo "fork-sandbox-k8s: warning: could not copy $run_dir_pull_name back from pod $pod_name's run directory: $run_dir_pull_cp_err" >&2
+                fi
+            done < <(find "$run_dir_pull_tmp" -mindepth 1 -maxdepth 1 -print0)
+
+            # The pod's summary.json can claim uncommitted_patch: true while
+            # the loop above just skipped uncommitted.patch for being over
+            # run_dir_pull_cap (it only ever grows with the leftover work's
+            # own size, unlike every other artifact here) -- leaving a
+            # client-side summary asserting recoverable work that never
+            # landed. Downgrade the claim to what is actually sitting in
+            # run_dir now, so a reader never sees uncommitted_patch: true
+            # for a patch it cannot read.
+            if [[ -n "$run_dir_pod_summary" ]]; then
+                local run_dir_pull_patch_landed=false
+                [[ -s "$run_dir/uncommitted.patch" && -f "$run_dir/uncommitted.patch" && ! -L "$run_dir/uncommitted.patch" ]] \
+                    && run_dir_pull_patch_landed=true
+                run_dir_pod_summary="$(printf '%s' "$run_dir_pod_summary" | jq -c --argjson landed "$run_dir_pull_patch_landed" '
+                    if has("uncommitted_patch") then .uncommitted_patch = (.uncommitted_patch and $landed) else . end
+                ' 2>/dev/null)"
+            fi
+
+            # run.env is the one exception to "copy back only named
+            # artifacts": the pod's copy started as the same file submit
+            # staged, and the runner rewrites exactly four fields in place
+            # (cost=, model=, outbox_bytes=, outbox_max_bytes=; see
+            # fork-sandbox-runner.sh), which the loop above skips entirely
+            # (run.env is host-owned). Trusting the WHOLE pulled file
+            # would let a leg plant any other key (PROJECT, OUTBOX_DIR,
+            # BRANCH, ...) and steer a later resume or collect, so only
+            # those four fields are carried over, each validated and each
+            # replacing its line the same way the runner itself does.
+            #
+            # model is excluded from that carry-over entirely, unlike the
+            # other three: it feeds the postmaster's X-AI-Model header, and
+            # the host's own seat resolution -- whatever the launcher's own
+            # run.env write and cmd_submit's write above it already printed
+            # for model=, including empty for a model-less pi-local seat
+            # that only discovers its model once the pod starts -- is
+            # authoritative even then. Falling back to the pod's
+            # self-reported value on an empty host line would let a
+            # compromised pod plant an arbitrary valid-looking model id
+            # into that header for exactly the run where the host has no
+            # value of its own to defend against it; an unreported model
+            # for that seat type is the honest answer, not a borrowed one.
+            if [[ -s "$run_dir_pull_tmp/run.env" ]]; then
+                local pod_env_key pod_env_val
+                for pod_env_key in cost outbox_bytes outbox_max_bytes; do
+                    pod_env_val="$(read_env_value "$run_dir_pull_tmp/run.env" "$pod_env_key" || true)"
+                    [[ -n "$pod_env_val" ]] || continue
+                    case "$pod_env_key" in
+                        cost)
+                            [[ "$pod_env_val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || continue
+                            ;;
+                        outbox_bytes|outbox_max_bytes)
+                            [[ "$pod_env_val" =~ ^[0-9]+$ ]] || continue
+                            ;;
+                    esac
+                    if [[ -s "$run_dir/run.env" ]] \
+                        && grep -v "^${pod_env_key}=" "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
+                        printf '%s=%s\n' "$pod_env_key" "$pod_env_val" >> "$run_dir/run.env.part"
+                        mv -f -- "$run_dir/run.env.part" "$run_dir/run.env"
+                    else
+                        rm -f -- "$run_dir/run.env.part"
+                    fi
+                done
+            fi
+
+            # tidy.json: the host's own record, not the pod's (see the
+            # exclusion from the copy-back allowlist above). A --k8s pod
+            # run never runs the tidy-history leg -- fetch-back is the
+            # host's own job, after collect, so there is nothing for an
+            # in-pod tidy leg to verify or publish against -- and that is
+            # true of every composed k8s run, not a fact the pod gets to
+            # report on. Written only if nothing else already wrote one
+            # (a standalone re-collect of an already-finalized run leaves
+            # an earlier one standing), and only for a pipeline that has a
+            # maintain step at all -- the same gate a local composed run's
+            # own tidy.json write uses (see fork-sandbox-runner.sh's
+            # summary.txt comment on tidy_has_maintain_step), so a
+            # read-only or code-and-review-only composed k8s run reads
+            # exactly as its local counterpart would: no tidy.json at all,
+            # not a skip record for a leg that was never going to run.
+            if [[ ! -e "$run_dir/tidy.json" ]] \
+                && [[ -s "$run_dir/pipeline.json" ]] \
+                && [[ "$(jq '[.steps[]? | select(.action == "maintain")] | length > 0' \
+                    "$run_dir/pipeline.json" 2>/dev/null)" == true ]]; then
+                if jq -n '{ended: "skipped", detail: "a --k8s pod run does not fetch back; the tidy-history leg'"'"'s verification and publish are host-side only", head_approved: null, head_after: null, exit: null, cost_usd: null, usage: null, retries: [], clone_restored: null}' \
+                    > "$run_dir/tidy.json.part" 2>/dev/null; then
+                    mv -f -- "$run_dir/tidy.json.part" "$run_dir/tidy.json"
+                else
+                    rm -f -- "$run_dir/tidy.json.part"
+                fi
+            fi
+        fi
+        [[ -n "$run_dir_pull_tmp" && -e "$run_dir_pull_tmp" ]] && rm -rf -- "$run_dir_pull_tmp"
+    fi
+
     # The agent's own exit code, from the sentinel the entrypoint writes
     # after the agent exits. Read here rather than taken from a caller so
     # the zero-harvest check below works for a standalone collect the same
     # as for run. Absent or non-numeric -- a run still going, a pod that
     # died early -- simply does not satisfy the check's "agent exited 0"
     # term, rather than being guessed.
+    #
+    # Unlike model (see the run.env carry-over's own comment above), this
+    # value is taken from the pod without a host-side alternative to
+    # prefer: no seat resolution on the host ever produces an exit code
+    # ahead of time, so /work/.run-complete, written by the entrypoint
+    # rather than the agent itself, is the only source there has ever
+    # been for it. Narrowed to digits-only above guards against it being
+    # anything other than a plain exit code.
     local agent_exit_code
     agent_exit_code="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/.run-complete 2>/dev/null || true)"
     [[ "$agent_exit_code" =~ ^[0-9]+$ ]] || agent_exit_code=""
@@ -8224,19 +8847,74 @@ cmd_collect() {
         # enabled with no usable record leaves both keys ABSENT (a warning,
         # not "none": the run was set to refresh and we cannot say whether
         # it did). The pod records no per-continuation cost or usage.
+        #
+        # Runner mode (RUNNER=1) skips this whole block: the runner tracks
+        # refresh itself, in-process, and already reports it through
+        # summary.json's own refresh/continuations/leg_refreshes keys --
+        # part of the allowlist run_dir_pod_summary reduces the pod's
+        # summary.json to above, merged into this write further down.
+        # evidence/refresh.json is the LEGACY single-leg shape's own
+        # record (fork-sandbox-refresh.sh, run outside the runner); a
+        # composed/runner pod never writes it, so looking for it here
+        # finds nothing but a stale file left by `rm -f` above and prints
+        # a warning about a run that was never missing anything. Leaving
+        # run_log_refresh_block at '{}' below means `+ $refresh_block`
+        # contributes no keys at all, so the merge further down (pod
+        # summary * this write, this write winning on overlap) leaves the
+        # pod's own refresh/continuations/leg_refreshes standing rather
+        # than overwriting them with the disabled-shaped default.
         local run_log_refresh_block='{"refresh":"none","continuations":[]}'
-        local run_log_refresh_tokens run_log_refresh_json
+        local run_log_refresh_tokens run_log_refresh_json run_log_refresh_docs
         run_log_refresh_tokens="$(read_env_value "$run_dir/run.env" refresh_threshold_tokens || true)"
-        if [[ -n "$run_log_refresh_tokens" ]]; then
-            if run_log_refresh_json="$(jq -ce 'select((.ended | type == "string") and (.continuations | type == "array")) | {refresh: .ended, continuations: [.continuations[] | {leg, exit, handoff, handoff_stale}]}' < "$evidence_dir/refresh.json" 2>/dev/null)" \
-                && [[ -n "$run_log_refresh_json" ]]; then
+        if [[ "$runner_mode" == 1 ]]; then
+            run_log_refresh_block='{}'
+        elif [[ -n "$run_log_refresh_tokens" ]]; then
+            # The same single-JSON-value discipline summary.json's own pod
+            # read already applies (see run_dir_pod_summary_docs above): a
+            # refresh.json holding two concatenated documents makes a bare
+            # `jq -ce 'select(...)'` print one line per matching document,
+            # and a two-line result fails --argjson below, which used to
+            # fall through to `|| rm -f summary.json` and delete the
+            # client's own just-written facts (branch, origin_repo,
+            # commits, exit_code, base_sha) -- see this function's own
+            # write further down, which no longer has a bare `|| rm -f` at
+            # all for exactly this reason. Slurp and require exactly one
+            # object before ever applying the select/reshape.
+            # `|| true`: this script runs under `set -e`, and a bare
+            # assignment's command substitution is NOT exempt from it the
+            # way an `if`/`&&` condition is -- a missing refresh.json
+            # makes the `<` redirection itself fail, which would
+            # otherwise abort this whole function (and print the
+            # redirection's own "No such file or directory" to the
+            # real stderr, past the `2>/dev/null` that only covers jq's
+            # own stderr, not the shell's).
+            run_log_refresh_docs="$(jq -s '.' < "$evidence_dir/refresh.json" 2>/dev/null)" || true
+            if [[ "$(printf '%s' "$run_log_refresh_docs" | jq 'length' 2>/dev/null)" == 1 ]] \
+                    && [[ "$(printf '%s' "$run_log_refresh_docs" | jq -r '.[0] | type' 2>/dev/null)" == object ]] \
+                    && run_log_refresh_json="$(printf '%s' "$run_log_refresh_docs" | jq -ce '.[0] | select((.ended | type == "string") and (.continuations | type == "array")) | {refresh: .ended, continuations: [.continuations[] | {leg, exit, handoff, handoff_stale}]}' 2>/dev/null)" \
+                    && [[ -n "$run_log_refresh_json" ]]; then
                 run_log_refresh_block="$run_log_refresh_json"
             else
                 run_log_refresh_block='{}'
                 echo "fork-sandbox-k8s: warning: this run had --refresh-at enabled but no usable refresh.json came back from the pod; summary.json carries no refresh or continuations keys." >&2
             fi
         fi
-        jq -n \
+        # tidy, like fetched/run_dir below, is a host-known fact, never the
+        # pod's: a --k8s pod run never runs the tidy-history leg (see the
+        # tidy.json write above), so the same maintain-step check that
+        # gates that write gates this too, and the value comes from the
+        # file this function itself just wrote (or left from an earlier
+        # collect), never from run_dir_pod_summary's allowlist -- "tidy"
+        # and "tidy_has_maintain_step" are deliberately absent from that
+        # allowlist for exactly this reason.
+        local run_log_tidy_has_maintain=false run_log_tidy_json=null
+        if [[ -s "$run_dir/pipeline.json" ]] \
+            && [[ "$(jq '[.steps[]? | select(.action == "maintain")] | length > 0' \
+                "$run_dir/pipeline.json" 2>/dev/null)" == true ]]; then
+            run_log_tidy_has_maintain=true
+            [[ -s "$run_dir/tidy.json" ]] && run_log_tidy_json="$(cat -- "$run_dir/tidy.json")"
+        fi
+        if jq -n \
             --arg mode "run" \
             --arg harness "$run_log_harness" \
             --arg network "cluster" \
@@ -8245,14 +8923,18 @@ cmd_collect() {
             --arg image_source "$run_log_image_source" \
             --arg branch "$branch" \
             --arg origin_repo "$origin_repo" \
+            --arg run_dir "$run_dir" \
             --arg base_sha "$base_sha" \
             --argjson exit_code "${agent_exit_code:-null}" \
+            --argjson fetched true \
             --arg commits "$run_log_commits" \
             --arg claude_credentials_source "$run_log_claude_source" \
             --arg claude_credentials_via "$run_log_claude_via" \
             --arg session_state "$pull_session_state" \
             --arg session_id "$run_log_session_id" \
             --argjson refresh_block "$run_log_refresh_block" \
+            --argjson tidy_has_maintain_step "$run_log_tidy_has_maintain" \
+            --argjson tidy "$run_log_tidy_json" \
             '{
                 mode: $mode,
                 harness: $harness,
@@ -8262,8 +8944,10 @@ cmd_collect() {
                 image_source: $image_source,
                 branch: $branch,
                 origin_repo: $origin_repo,
+                run_dir: $run_dir,
                 base_sha: (if $base_sha == "" then null else $base_sha end),
                 exit_code: $exit_code,
+                fetched: $fetched,
                 commits: (if $commits == "" then null else ($commits | tonumber) end),
             }
             + (if $claude_credentials_via == "" then {} else {
@@ -8274,10 +8958,116 @@ cmd_collect() {
                 session_state: $session_state,
                 session_id: (if $session_id == "" then null else $session_id end),
             } end)
-            + $refresh_block' > "$run_dir/summary.json" 2>/dev/null \
-            || rm -f "$run_dir/summary.json"
+            + (if $tidy_has_maintain_step then {tidy: $tidy} else {} end)
+            + $refresh_block' > "$run_dir/summary.json.part" 2>/dev/null; then
+            mv -f -- "$run_dir/summary.json.part" "$run_dir/summary.json"
+        else
+            rm -f -- "$run_dir/summary.json.part"
+        fi
+
+        # A runner-mode run's own summary.json (captured into
+        # run_dir_pod_summary above, already reduced to one validated
+        # object and an allowlist of pod-only keys, BEFORE the write just
+        # above could truncate it) carries the runner's own accounting --
+        # cost, usage, retries, the uncommitted-work check -- that this
+        # client cannot see from outside the pod. Merged with `*` so the
+        # client's own write above wins on any overlapping key regardless
+        # (none of the allowlisted keys should ever collide with what the
+        # client writes, but this is not the only thing standing between
+        # the pod and the client's own fields). When no pod summary.json
+        # was pulled, or it did not pass the single-object check above,
+        # the client's write stands alone, unchanged -- this block simply
+        # has nothing to do.
+        if [[ -n "$run_dir_pod_summary" ]]; then
+            if [[ -s "$run_dir/summary.json" ]]; then
+                local run_dir_summary_merged
+                if run_dir_summary_merged="$(jq -s '.[0] * .[1]' \
+                    <(printf '%s' "$run_dir_pod_summary") "$run_dir/summary.json" 2>/dev/null)" \
+                    && [[ -n "$run_dir_summary_merged" ]]; then
+                    printf '%s' "$run_dir_summary_merged" > "$run_dir/summary.json"
+                fi
+            else
+                printf '%s' "$run_dir_pod_summary" > "$run_dir/summary.json"
+            fi
+        fi
+
+        # summary.txt is the pod's own prose, pulled back verbatim above
+        # (it is on the copy-back allowlist). It is written by a runner
+        # that always runs with fetch_back=0 (see fork-sandbox.sh's own
+        # comment on that seam), so it unconditionally describes its own
+        # clone as the only place the work landed -- "fetched: NO -- the
+        # work is in the clone only", a pod path (/work/clone) as if it
+        # were meaningful on the host, and a closing "Nothing landed in
+        # <origin>" paragraph -- even on a run whose branch this very
+        # collect just fetched into origin_repo moments ago. Patch the
+        # three places that claim that, in place, with what the host
+        # itself just established (zero_commits, from the base/after sha
+        # compare above); everything else in the file -- cost, review/
+        # maintainer loop lines, the diffstat, warnings -- is left exactly
+        # as the pod wrote it. Only for a runner-mode pull: a standalone
+        # collect with no run_dir, or a legacy --k8s run, never pulls a
+        # summary.txt back in the first place.
+        if [[ "$runner_mode" == 1 && -s "$run_dir/summary.txt" && ! -L "$run_dir/summary.txt" ]]; then
+            local summary_txt_fetched_line summary_txt_landed_1 summary_txt_landed_2
+            if [[ "$zero_commits" == true ]]; then
+                summary_txt_fetched_line="fetched:   nothing landed -- the session made no commits beyond its starting point."
+                summary_txt_landed_1="No commits landed in $origin_repo for branch $branch."
+                summary_txt_landed_2=""
+            else
+                summary_txt_fetched_line="fetched:   yes. Branch $branch is now in $origin_repo"
+                summary_txt_landed_1="Review the branch before you build it. It is agent-written code,"
+                summary_txt_landed_2="and a Makefile or package.json script in it runs on the host."
+            fi
+            if awk -v fetched_line="$summary_txt_fetched_line" \
+                -v para1="$summary_txt_landed_1" \
+                -v para2="$summary_txt_landed_2" \
+                -v run_dir="$run_dir" '
+                BEGIN { skip_next = 0 }
+                skip_next { skip_next = 0; next }
+                /^clone:/ { print "run dir:   " run_dir; next }
+                /^fetched:/ { print fetched_line; next }
+                /^Nothing landed in / {
+                    print para1
+                    if (para2 != "") print para2
+                    skip_next = 1
+                    next
+                }
+                { print }
+            ' "$run_dir/summary.txt" > "$run_dir/summary.txt.part" 2>/dev/null; then
+                mv -f -- "$run_dir/summary.txt.part" "$run_dir/summary.txt"
+            else
+                rm -f -- "$run_dir/summary.txt.part"
+            fi
+        fi
 
         fs_record_run_log "$run_dir"
+
+        # fork-sandbox-status.sh's run_state() calls a run "done"/"failed" by
+        # the presence of $run_dir/exit-code, the same file a local run's own
+        # runner writes the moment it finishes -- a composed k8s run has no
+        # local process and so never gets one any other way, and without it
+        # every collected run reads as "starting" forever. Written host-side,
+        # from the same sentinel the zero-harvest check below already trusts,
+        # never taken from the pod directly (an exit-code file in the pod's
+        # own run_dir copy is excluded from the copy-back allowlist above for
+        # exactly this reason).
+        #
+        # Written LAST, after cmd_fetch above and after the summary.json/
+        # summary.txt finalization just above this, not the moment
+        # agent_exit_code is known: exit-code's presence is what a
+        # --monitor-terminal poll or `fork-sandbox stop` use to decide the
+        # run is over, and a reader that saw it the instant it existed, ahead
+        # of the fetch landing the branch or the summary correction running,
+        # would print the pod's still-uncorrected "nothing landed" account
+        # for a branch that (by the time exit-code appears now) has already
+        # landed. Only for a run that has one: a run still going (no
+        # --run-dir collect reaches here from k8s_run_tail only once the
+        # wait is over) always has agent_exit_code set by this point, so an
+        # empty value here means a standalone collect against a pod whose
+        # agent never finished, which must not fabricate a done/failed state.
+        if [[ -n "$agent_exit_code" && ! -e "$run_dir/exit-code" ]]; then
+            printf '%s\n' "$agent_exit_code" > "$run_dir/exit-code" 2>/dev/null || true
+        fi
     fi
 
     # A zero-harvest run is not a success: the agent exited 0, the fetch
@@ -8479,10 +9269,10 @@ cmd_resume() {
 # their logic. The only new logic in this function is the phase sequence
 # itself and the final completion line.
 cmd_run() {
-    local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
+    local dry_run=false keep=false timeout="" timeout_given=false branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" context_secret="" harness="" review_model="" endpoint=""
     local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
-    local thread_dir="" attach_dir="" image_flag=""
+    local thread_dir="" attach_dir="" image_flag="" run_dir_flag=""
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
@@ -8490,7 +9280,7 @@ cmd_run() {
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --keep) keep=true; shift ;;
-            --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
+            --timeout) timeout="${2:?--timeout requires a number of seconds}"; timeout_given=true; shift 2 ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
@@ -8508,6 +9298,7 @@ cmd_run() {
             --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; shift 2 ;;
             --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
             --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
+            --run-dir) run_dir_flag="${2:?--run-dir requires a directory}"; shift 2 ;;
             --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
             --resume-session) resume_session="${2:?--resume-session requires a session id}"; shift 2 ;;
             --session-id) session_id_arg="${2:?--session-id requires a session id}"; shift 2 ;;
@@ -8553,9 +9344,73 @@ cmd_run() {
         echo "names." >&2
         exit 1
     fi
-    if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
-        echo "Error: --timeout must be a whole number of seconds, got '$timeout'." >&2
-        exit 1
+    if [[ "$timeout_given" == true ]]; then
+        if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+            echo "Error: --timeout must be a whole number of seconds, got '$timeout'." >&2
+            exit 1
+        fi
+    else
+        # No --timeout: 3600s (one hour, matching the entrypoint's own
+        # RUN_TTL default) is sized for a single leg, which is all a
+        # legacy (no --run-dir) run ever has. A composed run staged a
+        # pipeline.json needs the MAXIMUM number of legs the runner can
+        # start for it, not just its steps' own repeat caps, or cmd_wait
+        # (and the claude-proxy keeper it runs alongside -- see
+        # k8s_claude_keeper_start) gives up on a pipeline that is still
+        # working its way through later legs:
+        #   - a review/maintain step's repeat is iterations, not legs --
+        #     each one runs a fix leg on a FINDINGS verdict, and the
+        #     runner resolves a fix seat (repeat 1, on the run's own
+        #     implement harness/model) even when pipeline.json's step has
+        #     no "fix" key at all, so the multiplier is always
+        #     1 + (fix.repeat // 1), never 1 + (fix.repeat // 0).
+        #   - a code step's own passes, and every fix pass above, each
+        #     open their own --refresh-at continuation chain when that
+        #     leg's harness is claude and refresh is enabled -- on by
+        #     default for a claude leg (see fs_refresh_resolve) -- adding
+        #     up to --refresh-max (default 6) further legs apiece.
+        # See docs/kubernetes-runs.md for the rationale.
+        timeout=3600
+        if [[ -n "$run_dir_flag" ]]; then
+            local timeout_run_dir_real timeout_step_repeats timeout_impl_harness \
+                timeout_refresh_at timeout_refresh_enabled timeout_refresh_max
+            timeout_run_dir_real="$(validate_run_dir_flag "$run_dir_flag")" || exit 1
+            # The same fallback harness a fix seat with no harness of its
+            # own resolves to at run time (the runner's bare $harness,
+            # read from run.env, which cmd_submit always sets from this
+            # same --harness flag -- never from pipeline.json).
+            timeout_impl_harness="${harness:-pi}"
+            timeout_refresh_at="0"
+            if [[ "$refresh_at_given" == true ]]; then
+                timeout_refresh_at="$refresh_at_arg"
+            elif [[ "$timeout_impl_harness" == claude ]]; then
+                timeout_refresh_at="0.5"
+            fi
+            timeout_refresh_enabled=0
+            awk -v v="$timeout_refresh_at" 'BEGIN{exit !(v>0)}' 2>/dev/null \
+                && timeout_refresh_enabled=1
+            timeout_refresh_max=6
+            [[ "$refresh_max_arg" =~ ^[0-9]+$ ]] && timeout_refresh_max="$refresh_max_arg"
+            timeout_step_repeats="$(jq \
+                --argjson enabled "$timeout_refresh_enabled" \
+                --argjson max "$timeout_refresh_max" \
+                --arg impl "$timeout_impl_harness" \
+                '[.steps[] |
+                    ((.fix.repeat // 1)) as $fix_repeat |
+                    ((.fix.harness // $impl)) as $fix_harness |
+                    (.repeat // 1) *
+                    (if .action == "code" then
+                        1 + (if $enabled == 1 and .harness == "claude" then $max else 0 end)
+                     elif .action == "review" or .action == "maintain" then
+                        1 + $fix_repeat *
+                            (1 + (if $enabled == 1 and $fix_harness == "claude" then $max else 0 end))
+                     else 1 end)
+                ] | add // 0' \
+                "$timeout_run_dir_real/pipeline.json" 2>/dev/null)"
+            if [[ "$timeout_step_repeats" =~ ^[0-9]+$ ]] && (( timeout_step_repeats > 0 )); then
+                timeout=$(( timeout_step_repeats * 3600 ))
+            fi
+        fi
     fi
 
     # Resolved here, before anything is created, so a bad --outbox-max is
@@ -8598,6 +9453,7 @@ cmd_run() {
     [[ -n "$context_secret" ]] && submit_argv+=(--context-secret "$context_secret")
     [[ -n "$thread_dir" ]] && submit_argv+=(--thread-dir "$thread_dir")
     [[ -n "$attach_dir" ]] && submit_argv+=(--attach-dir "$attach_dir")
+    [[ -n "$run_dir_flag" ]] && submit_argv+=(--run-dir "$run_dir_flag")
     # Forwarded unchanged, like --pi-args above: cmd_submit re-runs
     # fs_validate_session_flags itself before anything is created.
     [[ -n "$session_state" ]] && submit_argv+=(--session-state "$session_state")

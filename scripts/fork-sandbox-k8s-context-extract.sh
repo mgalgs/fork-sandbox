@@ -21,8 +21,9 @@
 #      sizeLimit of its own, so nothing else bounds this spool.
 #   2. List every entry (`tar -tvf`) BEFORE extracting anything, and reject
 #      the whole archive -- no partial extraction -- if any entry is an
-#      absolute path, contains a `..` path component, or is a symlink or
-#      hard link of any kind.
+#      absolute path, contains a `..` path component, or is anything other
+#      than a regular file or a directory (a symlink or hard link of any
+#      kind, a FIFO, a device node, or a socket).
 #   3. Only then extract, into a freshly created directory (or an
 #      existing, EMPTY one -- an emptyDir volume the pod spec already
 #      mounted there, for a --thread-dir/--attach-dir push), stripping
@@ -157,11 +158,74 @@ fi
 # per line and nothing else. (A name containing a literal newline would
 # still be ambiguous, but GNU tar escapes control characters in listings,
 # so it cannot smuggle a line break through here.)
+#
+# Allowlisted by type, not blocklisted: only a regular file (`-`) or a
+# directory (`d`) passes. Everything else is refused, including shapes a
+# blocklist would miss -- a FIFO (`p`) extracted into the run dir and then
+# read by a host-side tool with no timeout (`cp -rn` recreates it, and the
+# first read blocks forever) is exactly as dangerous as the symlink/hard
+# link case this already caught, and a device node or socket entry has no
+# legitimate reason to be in a pushed directory either.
 tar -tvf "$tar_file" > "$tvf_out"
+
+# The listing is capped by entry COUNT before anything else walks it: a
+# many-small-files archive (zero-byte members cost nothing to store, so a
+# confused or adversarial pod can pack in as many as it likes) costs real
+# wall-clock time to process even when every per-entry check below passes
+# -- in the type/path loops here, and in whatever copies the result
+# afterward. A plain `wc -l`, once, is the one fork this guard costs
+# regardless of archive shape.
+tvf_lines="$(wc -l < "$tvf_out")"
+max_entries="${FS_EXTRACT_MAX_ENTRIES:-20000}"
+if [ "$tvf_lines" -gt "$max_entries" ]; then
+    echo "$label: $tvf_lines entries, over the $max_entries entry cap;" >&2
+    echo "refusing the whole archive." >&2
+    exit 1
+fi
+
+# A sparse member defeats the byte-cap check above entirely: GNU tar
+# stores a sparse file's holes compactly, so a ~10 KB archive holding one
+# multi-TiB sparse member still spools under any reasonable MAX_BYTES, and
+# `tar -tvf` lists it with an ordinary `-` (regular file) type bit -- it
+# passes the type allowlist below like any other file. Extraction then
+# recreates the hole-and-data layout at its full logical size (sparse
+# detection on extract is automatic; this script's own `tar -xf` needs no
+# flag for it), landing a file whose APPARENT size is whatever the pod
+# claimed, on a destination filesystem that may well honour it as a real
+# sparse file -- and a host reader that later does an unbounded read of
+# that file (a bare `cat`, a `head -n 1` that has to scan to the first
+# newline, `read_env_value`'s own line scan) then blocks for as long as it
+# takes to walk that many bytes, which for a claimed multi-TiB size is
+# effectively forever. `tar -tvf`'s size column (the third
+# whitespace-separated field: mode, owner/group, size, date, time, name --
+# stable regardless of spaces in the name, which only ever appear after
+# the fifth field) carries the member's real, undecimated logical size
+# regardless of how compactly the archive stores it (verified against GNU
+# tar directly: a 10 KB `--sparse` archive of a 1 TiB hole still lists
+# that member at 1099511627776), so summing it across every entry and
+# refusing the whole archive over MAX_BYTES closes this before a single
+# byte is extracted -- the same "list before extract" discipline the
+# link/path checks below already apply, extended to size.
+# awk compares and formats the sum itself: some awks print a large sum as
+# 1.09951e+12, which a shell `-gt` rejects, and the cap would then be
+# silently skipped.
+total_size="$(awk '{ sum += $3 } END { printf "%.0f", sum }' "$tvf_out")"
+if awk -v max="$max_bytes" '{ sum += $3 } END { exit !(sum > max) }' "$tvf_out"; then
+    echo "$label: entries declare $total_size bytes total (not the archive's" >&2
+    echo "own size), over the $max_bytes byte cap; refusing the whole archive." >&2
+    exit 1
+fi
+
 while IFS= read -r line; do
     case "$line" in
+        -*|d*)
+            ;;
         l*|h*)
             echo "$label: contains a link entry; refusing the whole archive." >&2
+            exit 1
+            ;;
+        *)
+            echo "$label: contains a non-regular-file entry; refusing the whole archive." >&2
             exit 1
             ;;
     esac

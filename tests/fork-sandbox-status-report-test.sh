@@ -1055,4 +1055,160 @@ out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
 [[ "$out" == *"continuation account"* ]] \
     || { echo "--monitor-terminal did not flush the code leg's own continuation result: $out"; exit 1; }
 
-echo "68 passed, 0 failed"
+# Security: every file collect brings back from a --k8s pod is input from
+# a stranger, including bytes this script prints straight to a terminal
+# (an OSC 52 clipboard-write sequence went through the progress label
+# intact, by experiment -- the same channel feeds orchestrating agent
+# sessions too, so it is a prompt-injection vector as well). Verdict files
+# already strip control characters (see the review-verdict checks above);
+# these prove the same treatment reaches --log, the tail of sandbox.log,
+# the default view's summary.txt, and --session --progress's rendered
+# line.
+# The fix strips control BYTES, not the printable text an escape sequence
+# carries alongside them -- "]52;c;...==" (the OSC payload, minus its ESC
+# prefix and BEL terminator) is expected to remain; only the ESC/BEL bytes
+# that make it an actual escape sequence to a terminal must be gone.
+new_run_dir
+printf 'startup ok\n\033]52;c;ZXZpbA==\007\ninjected\n' > "$rd_new/sandbox.log"
+out="$("$status" --log "$rd_new" 2>&1)"
+[[ "$out" == *"startup ok"* && "$out" == *"injected"* ]] \
+    || { echo "--log dropped ordinary sandbox.log content: $out"; exit 1; }
+[[ "$out" != *$'\033'* && "$out" != *$'\007'* ]] \
+    || { echo "--log let a control sequence through to the terminal: $(printf '%q' "$out")"; exit 1; }
+
+# print_tail_of_log in the default view only fires for "failed" or
+# "abandoned" (a "done" run's default view never shows the log tail).
+printf '1\n' > "$rd_new/exit-code"
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == *"startup ok"* && "$out" == *"injected"* ]] \
+    || { echo "default status dropped ordinary sandbox.log content: $out"; exit 1; }
+[[ "$out" != *$'\033'* && "$out" != *$'\007'* ]] \
+    || { echo "default status let a control sequence through via print_tail_of_log: $(printf '%q' "$out")"; exit 1; }
+
+new_run_dir
+printf '0\n' > "$rd_new/exit-code"
+printf 'ordinary summary line\n\033]52;c;ZXZpbA==\007\nmore summary\n' > "$rd_new/summary.txt"
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == *"ordinary summary line"* && "$out" == *"more summary"* ]] \
+    || { echo "default status dropped ordinary summary.txt content: $out"; exit 1; }
+[[ "$out" != *$'\033'* && "$out" != *$'\007'* ]] \
+    || { echo "default status let a control sequence through via summary.txt: $(printf '%q' "$out")"; exit 1; }
+
+# --session --progress's rendered line: label/state/action all come
+# through a jq -r pipeline straight to stdout.
+progress_session_root="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status-progress.XXXXXX)"
+run_dirs+=("$progress_session_root")
+new_run_dir
+printf '{"schema":1,"label":"evil\\u001b]52;c;ZXZpbA==\\u0007","state":"running","updated":%s,"steps":[]}\n' \
+    "$(date +%s)" > "$rd_new/progress.json"
+mkdir -p "$progress_session_root/sess1"
+ln -s "$rd_new" "$progress_session_root/sess1/$(basename "$rd_new")"
+out="$(FORK_SANDBOX_BY_SESSION_DIR="$progress_session_root" "$status" --progress --session sess1 2>&1)"
+[[ "$out" == *"evil"* ]] \
+    || { echo "--progress dropped the ordinary label text: $out"; exit 1; }
+[[ "$out" != *$'\033'* && "$out" != *$'\007'* ]] \
+    || { echo "--progress let a control sequence through via the label: $(printf '%q' "$out")"; exit 1; }
+
+# 7. A composed --k8s run dir (network=cluster) never gets a local pid
+# file: its agent runs in a pod, not under this host's tmux. Without a
+# k8s-aware liveness signal, run_state() would read "starting" forever,
+# and once started_at is more than a minute old --monitor-terminal would
+# tell the operator the run never started and to relaunch it -- wrong,
+# and a duplicate-launch hazard, for a pod that is in fact still running.
+# k8s_client_pid (this test's own pid, standing in for the host-side
+# client that is still waiting on the pod) must read as "running" instead.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-live
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$$
+EOF
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    running"* ]] \
+    || { echo "a live composed k8s run was not read as running: $out"; exit 1; }
+out="$("$status" --result "$rd_new" 2>&1)"
+[[ "$out" == *"still running"* ]] \
+    || { echo "--result read a live composed k8s run as anything but running: $out"; exit 1; }
+out="$(timeout 5 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$out" != *"never started"* ]] \
+    || { echo "monitor-terminal falsely reported a live composed k8s run as never started: $out"; exit 1; }
+
+# 7b. The same shape, once the host-side client is gone: "abandoned", not
+# stuck as "starting" forever, and the abandoned message names the k8s
+# remedies (fork-sandbox-k8s.sh collect/rm) rather than the tmux/clone
+# wording a local run's own abandoned message carries -- wrong here, since
+# a composed k8s run's clone_dir is a pod path (/work/clone), never a host
+# path to point an operator at.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-dead
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$dead_pid
+EOF
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    abandoned"* ]] \
+    || { echo "a dead composed k8s run was not read as abandoned: $out"; exit 1; }
+[[ "$out" == *"fork-sandbox-k8s.sh collect --run-dir "* ]] \
+    || { echo "abandoned k8s run did not name the collect remedy: $out"; exit 1; }
+[[ "$out" == *"--branch test-k8s-dead /tmp/origin"* ]] \
+    || { echo "abandoned k8s run's collect remedy named the wrong branch/project: $out"; exit 1; }
+[[ "$out" == *"fork-sandbox-k8s.sh rm --branch test-k8s-dead"* ]] \
+    || { echo "abandoned k8s run did not name the rm remedy: $out"; exit 1; }
+[[ "$out" != *"tmux session"* ]] \
+    || { echo "abandoned k8s run used the local-run tmux wording: $out"; exit 1; }
+out="$(timeout 10 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$out" == *"abandoned: the runner is gone and wrote no exit code"* ]] \
+    || { echo "monitor-terminal did not report the abandoned composed k8s run: $out"; exit 1; }
+[[ "$out" == *"fork-sandbox-k8s.sh collect --run-dir "* ]] \
+    || { echo "monitor-terminal's abandoned block did not name the collect remedy: $out"; exit 1; }
+
+# 8. The default status block's own "tmux:" line, for a composed --k8s run
+# dir (network=cluster): no tmux session was ever started for one (see
+# fork-sandbox.sh's own run.env writer, which skips `session=` in
+# k8s_runner_mode), so printing it anyway -- naming a session that does not
+# exist -- is a flat lie. cmd_submit's own k8s_job_name, the Job/Pod label
+# an operator can actually act on, takes its place.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-job
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$$
+k8s_job_name=fork-sandbox-agent-test-k8s-job
+EOF
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == *"job:      fork-sandbox-agent-test-k8s-job"* ]] \
+    || { echo "a composed k8s run dir's status did not print its job name: $out"; exit 1; }
+[[ "$out" != *"tmux:"* ]] \
+    || { echo "a composed k8s run dir's status still printed a tmux line: $out"; exit 1; }
+
+# 8b. A run.env written before k8s_job_name existed: no job name to print,
+# but still no false tmux claim either -- an absent line beats a made-up one.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-nojobname
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$$
+EOF
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" != *"tmux:"* ]] \
+    || { echo "a composed k8s run dir with no recorded job name still printed a tmux line: $out"; exit 1; }
+[[ "$out" != *"job:"* ]] \
+    || { echo "a composed k8s run dir with no recorded job name printed a job line anyway: $out"; exit 1; }
+
+echo "88 passed, 0 failed"

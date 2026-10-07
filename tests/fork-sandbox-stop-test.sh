@@ -406,6 +406,36 @@ fi
 contains "k8s run: names fork-sandbox-k8s.sh rm" "fork-sandbox-k8s.sh rm" "$out_k8s"
 check "k8s run: no exit-code written" "0" "$([[ -e "$rd_k8s/exit-code" ]] && echo 1 || echo 0)"
 
+# -- composed k8s run, still live: the exact shape a composed --k8s run's
+# run.env carries while its pod is running -- network=cluster plus
+# k8s_client_pid (the host-side client fork-sandbox-status.sh's
+# run_state() reads as this run's liveness signal; see that script's own
+# comment on why it is not named `pid`). No pid file exists here, the
+# shape this verb refuses only this verb's own machinery would ever read
+# as "still starting" otherwise. Confirms the refusal above holds for a
+# genuinely live run too, not just a stale/dead fixture, and that this
+# new key is never read as something to signal or kill.
+rd_k8s_live="$(new_run_dir)"
+cat > "$rd_k8s_live/run.env" <<EOF
+version=1
+branch=fs-stop-k8s-live
+origin_repo=/tmp/nonexistent-origin
+clone_dir=/work/clone
+base_sha=0000000000000000000000000000000000000000
+network=cluster
+k8s_client_pid=$$
+session=cc-sbx-fs-stop-k8s-live
+EOF
+out_k8s_live="$(HOME="$launcher_home" "$stop" "$rd_k8s_live" 2>&1)"; rc_k8s_live=$?
+if (( rc_k8s_live != 0 )); then
+    ok "composed k8s run, live: refused (non-zero exit)"
+else
+    no "composed k8s run, live: refused (non-zero exit)" "exited 0: $out_k8s_live"
+fi
+contains "composed k8s run, live: names fork-sandbox-k8s.sh rm" "fork-sandbox-k8s.sh rm" "$out_k8s_live"
+check "composed k8s run, live: no exit-code written" "0" \
+    "$([[ -e "$rd_k8s_live/exit-code" ]] && echo 1 || echo 0)"
+
 # -- runner-dead salvage: a fake run dir with a dead pid and no exit-code,
 # pointed at a real origin repo and a real clone that holds one unpushed
 # commit on the run's branch. The stop verb must fetch it back, remove
@@ -1316,8 +1346,8 @@ fi
 # -- branch-removal path with a real origin+clone (zero commits removed).
 # Coverage-only, same caveat as above: "kept" is already proven by the
 # salvage/timeout tests, but "removed" was never proven through the stop
-# verb's own complete_run_host_side -- only through the RUNNER's own
-# teardown, a different code path, in the first section of this file.
+# verb's own complete_run_host_side -- only through fork-sandbox-runner.sh's
+# own teardown, a different code path, in the first section of this file.
 zero_origin="$(new_project)"; tmpdirs+=("$zero_origin")
 zero_base_sha="$(cd "$zero_origin" && git rev-parse HEAD)"
 zero_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-zero-clone.XXXXXX)"

@@ -244,6 +244,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import statistics
@@ -335,8 +336,32 @@ def epoch_iso(epoch):
     )
 
 
+def _sanitize_non_finite(obj):
+    # A pod-reported number can survive summary.json as something that
+    # LOOKS like a legal JSON number -- 1e1000 parses to a plain Python
+    # float, since jq itself never normalizes a literal it does not
+    # touch -- but is not finite. json.dumps below would otherwise emit
+    # it as the bareword Infinity/-Infinity/NaN, which is not valid JSON
+    # and breaks every reader of sandbox-runs.jsonl that expects one.
+    # Recurse through the whole record once, here, rather than trust every
+    # call site to have already caught this upstream.
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_non_finite(v) for v in obj]
+    return obj
+
+
 def append(rec):
-    line = json.dumps(rec, separators=(",", ":"))
+    rec = _sanitize_non_finite(rec)
+    # allow_nan=False turns a non-finite value that slipped past the
+    # sanitizer above (a bug, not an expected path) into a loud exception
+    # here rather than a quietly-written line of invalid JSON -- the
+    # record is lost either way, but the loud failure cannot be mistaken
+    # for a healthy append the way a malformed line on disk can.
+    line = json.dumps(rec, separators=(",", ":"), allow_nan=False)
     # A fresh machine has no ~/.claude yet -- the other archive writes in
     # cmd_record happen to create it as a side effect when they run, but
     # each of those is conditional (no preset.json, no handoff.md, no
