@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { matchLanes, mentions, parseLanes, step } from '../hooks/lanes'
+import { finish, matchLanes, mentions, parseLanes, step } from '../hooks/lanes'
 import type { Edit, Lane } from '../hooks/lanes'
 import type { LanePicker } from '../types'
 
@@ -12,9 +12,13 @@ const answered = (stdout: string) => ({
   value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
 })
 
-/** The prompt box as the engine's editor keeps it, driven one key at a time. */
-function composer($: any) {
-  const box = { text: '', cursor: 0 }
+/**
+ * The prompt box as the engine's editor keeps it, driven one key at a time.
+ * Only keys that arrive as edits go through prompt.edit; Enter is a submit.
+ */
+function composer($: any, on: On) {
+  const box = shared
+  Object.assign(box, { text: '', cursor: 0 })
   const send = async (edit: Partial<Edit> & { inputText: string }) => {
     const r = await $.prompt.edit({
       text: box.text,
@@ -36,9 +40,19 @@ function composer($: any) {
       return last
     },
     press: (name: string) => send({ key: { key: name }, inputText: '' }),
+    // Enter: a submit of the box. A dropped one leaves the box as the hook filled it.
+    enter: async () => {
+      const text = box.text
+      const r = await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+      if (r.drop === undefined) Object.assign(box, { text: '', cursor: 0 })
+      return { ...r, box: { ...box } }
+    },
     backspace: () => send({ key: { key: 'backspace' }, inputText: '', start: Math.max(box.cursor - 1, 0) }),
   }
 }
+
+// The box prompt.fill writes: registered in started(), before the test's first call on `$`.
+const shared = { text: '', cursor: 0 }
 
 async function started($: any, on: On, stdout = LIST) {
   mock.clock(on)
@@ -49,6 +63,12 @@ async function started($: any, on: On, stdout = LIST) {
     cursor: e.start + e.inputText.length,
   }))
   on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
+  // `replace` puts the text in with the cursor at its end.
+  on('prompt.fill', (_, e) => {
+    shared.text = e.mode === 'replace' ? e.text : shared.text + e.text
+    shared.cursor = shared.text.length
+    return { isFilled: true, text: shared.text, cursor: shared.cursor }
+  })
   // The engine draws nothing in the band when no plugin does.
   on('ui.render', () => ({ type: 'Box', props: {}, children: [] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -68,21 +88,20 @@ async function band($: any) {
 
 test('@ at the start of the box is swallowed and opens the picker', async ($, on) => {
   await started($, on)
-  const c = composer($)
+  const c = composer($, on)
   expect(await c.type('@')).toEqual({ text: '', cursor: 0 })
   expect((await band($))?.head).toContain('lane @')
 })
 
 test('@ after whitespace opens the picker; mid-word @ is an email and passes through', async ($, on) => {
   await started($, on)
-  const c = composer($)
+  const c = composer($, on)
   await c.type('hi ')
   await c.type('@')
   expect(c.box.text).toBe('hi ')
   expect(await band($)).toBeDefined()
-  await c.press('escape')
 
-  const m = composer($)
+  const m = composer($, on)
   await m.type('me')
   expect(await m.type('@')).toEqual({ text: 'me@', cursor: 3 })
   expect(await band($)).toBeUndefined()
@@ -90,48 +109,65 @@ test('@ after whitespace opens the picker; mid-word @ is an email and passes thr
 
 test('@@ passes a single @ through and closes the picker', async ($, on) => {
   await started($, on)
-  const c = composer($)
+  const c = composer($, on)
   await c.type('@')
   expect(await c.type('@')).toEqual({ text: '@', cursor: 1 })
   expect(await band($)).toBeUndefined()
 })
 
-test('typing filters and Enter inserts @<lane> at the cursor', async ($, on) => {
+test('typing filters and Enter inserts @<lane> at the cursor, sending nothing', async ($, on) => {
   await started($, on)
-  const c = composer($)
+  const c = composer($, on)
   await c.type('ask ')
   await c.type('@')
   await c.type('b')
   await c.type('E')
   expect(await band($)).toMatchObject({ rows: ['> @beta', '@beta:hostone'] })
-  expect(await c.press('return')).toEqual({ text: 'ask @beta ', cursor: 10 })
+  const r = await c.enter()
+  expect(r.drop).toBeDefined()
+  expect(r.box).toEqual({ text: 'ask @beta ', cursor: 10 })
   expect(await band($)).toBeUndefined()
 })
 
-test('Tab inserts too, and the cross-host form is @<lane>:<host>', async ($, on) => {
+test('Enter keeps the text after the @ and a lane in the middle of a sentence', async ($, on) => {
   await started($, on)
-  const c = composer($)
+  const c = composer($, on)
+  await c.type('ask ')
   await c.type('@')
   await c.type('alpha:')
-  expect((await c.press('tab')).text).toBe('@alpha:hostone ')
+  expect((await c.enter()).box.text).toBe('ask @alpha:hostone ')
+
+  // With the picker closed, Enter is an ordinary submit that names the lane.
+  await c.type('now')
+  const sent = await c.enter()
+  expect(sent.drop).toBeUndefined()
+  expect(sent.text).toBe('ask @alpha:hostone now')
+  expect(sent.context?.[0]).toContain('@alpha:hostone')
 })
 
-test('Esc inserts a literal @ (and what was typed after it)', async ($, on) => {
+test('Enter with no match gives back the @ and what was typed, and sends nothing', async ($, on) => {
   await started($, on)
-  const c = composer($)
+  const c = composer($, on)
+  await c.type('hi ')
   await c.type('@')
-  expect(await c.press('escape')).toEqual({ text: '@', cursor: 1 })
-  expect(await band($)).toBeUndefined()
+  await c.type('zzz')
+  const r = await c.enter()
+  expect(r.drop).toBeDefined()
+  expect(r.box).toEqual({ text: 'hi @zzz', cursor: 7 })
+})
 
-  const d = composer($)
-  await d.type('@')
-  await d.type('al')
-  expect((await d.press('escape')).text).toBe('@al')
+test('a space cancels the picker and keeps the @ and what was typed', async ($, on) => {
+  await started($, on)
+  const c = composer($, on)
+  await c.type('@')
+  await c.type('al')
+  expect(await c.type(' ')).toEqual({ text: '@al ', cursor: 4 })
+  expect(await band($)).toBeUndefined()
 })
 
 test('with no lanes the @ goes on to the stock menu', async ($, on) => {
   await started($, on, '')
-  const c = composer($)
+  const c = composer($, on)
   expect(await c.type('@')).toEqual({ text: '@', cursor: 1 })
   expect(await band($)).toBeUndefined()
 })
@@ -152,13 +188,11 @@ test('the submit context names a mentioned lane and the text is untouched', asyn
 
 test('the band lists the matches for the typed filter, best first', async ($, on) => {
   await started($, on)
-  const c = composer($)
+  const c = composer($, on)
   await c.type('@')
   expect((await band($))?.rows).toEqual(['> @alpha', '@beta', '@alpha:hostone', '@beta:hostone'])
   await c.type('b')
   expect((await band($))?.rows).toEqual(['> @beta', '@beta:hostone'])
-  await c.press('down')
-  expect((await band($))?.rows).toEqual(['@beta', '> @beta:hostone'])
 })
 
 // The picker itself, edit by edit, with no engine: the cases a real terminal
@@ -176,13 +210,13 @@ test('matchLanes puts prefix matches before substring matches', () => {
 })
 
 test('a pasted word fills the filter; a pasted sentence is given back literally', () => {
-  const p: LanePicker = { anchor: 0, text: '', filter: '', index: 0 }
+  const p: LanePicker = { anchor: 0, text: '', filter: '' }
   expect(step(p, lanes, e({ inputText: 'alp' })).picker).toMatchObject({ filter: 'alp' })
   expect(step(p, lanes, e({ inputText: 'a b' })).box).toEqual({ text: '@a b', cursor: 4 })
 })
 
 test('Backspace trims the filter, then on an empty one drops the @', () => {
-  const p: LanePicker = { anchor: 0, text: '', filter: 'a', index: 0 }
+  const p: LanePicker = { anchor: 0, text: '', filter: 'a' }
   const trimmed = step(p, lanes, e({ key: { key: 'backspace' } }))
   expect(trimmed.picker).toMatchObject({ filter: '' })
   const gone = step(trimmed.picker, lanes, e({ key: { key: 'backspace' } }))
@@ -190,12 +224,15 @@ test('Backspace trims the filter, then on an empty one drops the @', () => {
 })
 
 test('a picker opened on another text is stale and forgotten', () => {
-  const p: LanePicker = { anchor: 0, text: 'old', filter: 'a', index: 0 }
+  const p: LanePicker = { anchor: 0, text: 'old', filter: 'a' }
   expect(step(p, lanes, e({ text: 'new', cursor: 3, start: 3, end: 3, inputText: 'x' }))).toEqual({ picker: null })
 })
 
-test('Enter with no match keeps what was typed; the mention finder ignores files and email', () => {
-  const p: LanePicker = { anchor: 0, text: '', filter: 'zzz', index: 0 }
-  expect(step(p, lanes, e({ key: { key: 'return' } })).box).toEqual({ text: '@zzz', cursor: 4 })
+test('finish takes the best match, or the typed text; the mention finder ignores files and email', () => {
+  const p: LanePicker = { anchor: 3, text: 'hi  there', filter: 'be' }
+  expect(finish(p, lanes, 'hi  there')).toEqual({ text: 'hi @beta there', cursor: 8 })
+  // The engine trims the box on a submit ("ask " arrives as "ask").
+  expect(finish({ anchor: 4, text: 'ask ', filter: 'al' }, lanes, 'ask')).toEqual({ text: 'ask @alpha ', cursor: 11 })
+  expect(finish({ ...p, filter: 'zzz' }, lanes, 'hi  there')).toEqual({ text: 'hi @zzz there', cursor: 7 })
   expect(mentions('see @alpha.md and a@beta and @beta.', lanes)).toEqual(['@beta'])
 })

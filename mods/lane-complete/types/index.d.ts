@@ -4,10 +4,8 @@ export type LanePicker = {
   anchor: number
   /** The box text the picker opened on; a different text means it is stale. */
   text: string
-  /** What the operator has typed since the swallowed `@`. */
+  /** What the operator has typed since the swallowed `@`; Enter takes its best match. */
   filter: string
-  /** Which row of the filtered list Enter or Tab takes. */
-  index: number
 }
 
 declare module 'claude-code' {

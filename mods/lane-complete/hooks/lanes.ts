@@ -89,14 +89,30 @@ function isWordStart(text: string, at: number): boolean {
 }
 
 /** The box with the picker's choice at its anchor; one space after it unless one follows. */
-function accept(p: LanePicker, address: string) {
-  const space = /\s/.test(p.text.charAt(p.anchor)) ? '' : ' '
-  return splice(p.text, p.anchor, `${address}${space}`)
+function accept(p: LanePicker, text: string, address: string) {
+  const at = Math.min(p.anchor, text.length)
+  const space = /\s/.test(text.charAt(at)) ? '' : ' '
+  return splice(text, at, `${address}${space}`)
 }
 
 /** The box with what the operator typed put in as plain text: `@` and the filter. */
-function literal(p: LanePicker, extra = '') {
-  return splice(p.text, p.anchor, `@${p.filter}${extra}`)
+function literal(p: LanePicker, text: string, extra = '') {
+  return splice(text, Math.min(p.anchor, text.length), `@${p.filter}${extra}`)
+}
+
+/**
+ * The box an Enter pressed with the picker open leaves: the best match at the
+ * anchor, or what was typed as plain text when nothing matches. The picker
+ * swallowed the typed characters, so the submitted `text` has none of them;
+ * the caller drops the submit and puts this box back (a submit also trims
+ * the box's ends, which `finish` undoes where it can).
+ */
+export function finish(p: LanePicker, lanes: readonly Lane[], submitted: string) {
+  // A submit trims the box ("ask " arrives as "ask"), which would put the
+  // anchor past its end: the text the picker opened on is the truer base then.
+  const text = submitted.trim() === p.text.trim() ? p.text : submitted
+  const best = matchLanes(lanes, p.filter)[0]
+  return best === undefined ? literal(p, text) : accept(p, text, best.address)
 }
 
 /**
@@ -104,6 +120,10 @@ function literal(p: LanePicker, extra = '') {
  * picker opens on a swallowed word-start `@` (only when there are lanes to
  * pick: with none, the `@` goes on to the stock menu); an open one swallows
  * every edit until it closes.
+ *
+ * Only keys the editor takes as an edit reach prompt.edit: Enter, Tab, Esc and
+ * the arrows Up/Down never do, so none of them is handled here. Enter arrives
+ * as a prompt.submit and is answered by `finish`.
  */
 export function step(picker: LanePicker | null, lanes: readonly Lane[], e: Edit): Step {
   // A picker opened on another text is stale (the box was cleared or changed
@@ -113,53 +133,37 @@ export function step(picker: LanePicker | null, lanes: readonly Lane[], e: Edit)
   if (picker === null) {
     const isAt = e.inputText === '@' && e.start === e.end && isWordStart(e.text, e.start)
     if (!isAt || lanes.length === 0) return { picker: null }
-    const opened = { anchor: e.start, text: e.text, filter: '', index: 0 }
+    const opened = { anchor: e.start, text: e.text, filter: '' }
     return { picker: opened, box: { text: e.text, cursor: e.cursor } }
   }
 
   const key = e.key
   const name = key !== undefined && key.key.length > 1 ? key.key : undefined
   const isMod = key !== undefined && (key.ctrl === true || key.meta === true)
-  const matches = matchLanes(lanes, picker.filter)
   const keep = (next: LanePicker) => ({ picker: next, box: { text: e.text, cursor: e.cursor } })
   const close = (box?: { text: string; cursor: number }): Step => ({
     picker: null,
     box: box ?? { text: e.text, cursor: e.cursor },
   })
 
-  // Enter and Tab take the highlighted match; with none, the typed text stays.
-  if (name === 'return' || name === 'enter' || name === 'tab' || e.inputText === '\n' || e.inputText === '\r' || e.inputText === '\t') {
-    const chosen = matches[Math.min(picker.index, matches.length - 1)]
-    return close(chosen === undefined ? literal(picker) : accept(picker, chosen.address))
-  }
-  if (name === 'escape' || name === 'esc') return close(literal(picker))
-
-  if (name === 'up' || (isMod && key?.key === 'p')) {
-    const index = Math.min(picker.index, matches.length - 1)
-    return keep({ ...picker, index: Math.max(index - 1, 0) })
-  }
-  if (name === 'down' || (isMod && key?.key === 'n')) {
-    return keep({ ...picker, index: Math.min(picker.index + 1, Math.max(matches.length - 1, 0)) })
-  }
-
   // Backspace trims the filter; on an empty one it undoes the `@` itself.
   const isBackspace = name === 'backspace' || (name === undefined && e.inputText === '' && e.end > e.start && !isMod)
   if (isBackspace) {
     if (picker.filter === '') return close()
-    return keep({ ...picker, filter: picker.filter.slice(0, -1), index: 0 })
+    return keep({ ...picker, filter: picker.filter.slice(0, -1) })
   }
 
   // `@@`: a second `@` right after the swallowed one goes on to the stock menu.
   if (e.inputText === '@' && picker.filter === '') return { picker: null }
 
   if (name === undefined && !isMod && FILTER_CHARS.test(e.inputText)) {
-    return keep({ ...picker, filter: picker.filter + e.inputText.toLowerCase(), index: 0 })
+    return keep({ ...picker, filter: picker.filter + e.inputText.toLowerCase() })
   }
 
   // Anything else (a space, punctuation, a paste of prose, an unknown key)
   // is not a lane: give the operator back what they typed, as plain text.
-  if (name === undefined && !isMod && e.inputText !== '') return close(literal(picker, e.inputText))
-  return close(literal(picker))
+  if (name === undefined && !isMod && e.inputText !== '') return close(literal(picker, e.text, e.inputText))
+  return close(literal(picker, e.text))
 }
 
 /**

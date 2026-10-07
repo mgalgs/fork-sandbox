@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { LanePicker } from '../types'
-import { VISIBLE, matchLanes, mentionContext, mentions, parseLanes, step } from './lanes'
+import { VISIBLE, finish, matchLanes, mentionContext, mentions, parseLanes, step } from './lanes'
 import type { Lane } from './lanes'
 
 // How often the lane list is re-read, in the background; never per keystroke.
@@ -33,9 +33,11 @@ export const register: Register = on => {
   })
 
   // Every edit goes through the picker. Closed, it passes all but a word-start
-  // `@`; open, it owns the keys until Enter, Tab, Esc, Backspace-on-empty or a
-  // non-lane character closes it. The text itself is edited here, in the
-  // answer, so nothing depends on the band taking keyboard focus.
+  // `@`; open, it owns the edits until Backspace-on-empty, a cursor move or a
+  // non-lane character closes it, or Enter takes the choice (below). The text
+  // itself is edited here, in the answer, so nothing depends on the band
+  // taking keyboard focus. Only edits arrive here: Enter, Tab, Esc and
+  // Up/Down never do.
   on('prompt.edit', async ($, e, next) => {
     const open = await read($, picker)
     if (open === null && !(e.inputText === '@' && e.start === e.end)) return next(e)
@@ -46,10 +48,20 @@ export const register: Register = on => {
     return result.box ?? next(e)
   })
 
-  // A submit never rewrites the text: it only adds a note for the model when
-  // the prompt names a lane.
+  // Enter with the picker open is the choice, not a send: the typed filter
+  // lives in the picker, not the box, so the submit is dropped and the whole
+  // box put back with the best match (or, with none, what was typed) in it.
+  // Otherwise a submit never rewrites the text: it only adds a note for the
+  // model when the prompt names a lane.
   on('prompt.submit', async ($, e, next) => {
-    if ((await read($, picker)) !== null) await update($, picker, () => null)
+    const open = await read($, picker)
+    if (open !== null) {
+      await update($, picker, () => null)
+      const box = finish(open, lanes, e.text)
+      // The cursor ends at the box's end: fill has no way to place it.
+      await $.prompt.fill({ text: box.text, mode: 'replace' })
+      return { drop: 'lane picked' }
+    }
 
     const named = mentions(e.text, lanes)
     if (named.length === 0) return next(e)
@@ -63,9 +75,7 @@ export const register: Register = on => {
 
     const { Box, Text } = $.ui.resolve(e)
     const matches = matchLanes(lanes, open.filter)
-    const at = Math.min(open.index, Math.max(matches.length - 1, 0))
-    const first = Math.max(0, Math.min(at - Math.floor(VISIBLE / 2), matches.length - VISIBLE))
-    const shown = matches.slice(first, first + VISIBLE)
+    const shown = matches.slice(0, VISIBLE)
 
     return (
       <Box flexDirection="column">
@@ -75,12 +85,12 @@ export const register: Register = on => {
         </Text>
         {shown.length === 0 && <Text dimColor>  no lane matches; Enter keeps @{open.filter} as typed</Text>}
         {shown.map((lane, i) => (
-          <Text key={lane.address} bold={first + i === at} color={first + i === at ? 'cyan' : undefined} dimColor={lane.source === 'peer' && first + i !== at}>
-            {first + i === at ? '> ' : '  '}
+          <Text key={lane.address} bold={i === 0} color={i === 0 ? 'cyan' : undefined} dimColor={lane.source === 'peer' && i !== 0}>
+            {i === 0 ? '> ' : '  '}
             {lane.address}
           </Text>
         ))}
-        <Text dimColor>Enter/Tab insert · Up/Down choose · Backspace/Esc cancel · @ again: stock menu</Text>
+        <Text dimColor>Enter inserts the top match · keep typing to narrow · Backspace trims · space cancels · @ again: stock menu</Text>
       </Box>
     )
   })

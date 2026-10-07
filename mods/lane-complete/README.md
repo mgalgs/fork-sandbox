@@ -13,10 +13,11 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
   substring matches. The list is live lanes (registered sessions), then lanes
   that only have a mailbox, then each of those qualified with each peer host
   from the peers file (`@lane:host`).
-- Enter or Tab inserts the highlighted address at the cursor, followed by a
-  space.
-- Esc inserts a literal `@` (plus anything typed after it) and closes the
-  picker.
+- Enter inserts the top match where the `@` was, followed by a space. It does
+  not send the prompt. With no match, the `@` and what you typed are put back
+  as plain text (also not sent).
+- A space or other non-lane character, or a cursor move, cancels: the `@` and
+  what you typed are put back as plain text.
 - `@@`: a second `@` right after the first closes the picker and lets a single
   `@` through, so Claude Code's own agent/file menu opens as usual.
 - With no lanes known, `@` is not swallowed at all.
@@ -28,15 +29,21 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
 
 ## Keys
 
+Claude Code hands a mod only the keys the editor takes as an edit (letters,
+Backspace, Left/Right, ...). Tab, Esc, Up and Down never reach it, so the
+picker uses none of them; Enter reaches it as a submit.
+
 | Key | In the picker |
 | --- | --- |
 | letters, digits, `-` `.` `:` | filter |
-| Enter, Tab | insert the highlighted lane |
-| Up / Down (Ctrl-P / Ctrl-N) | move the highlight |
+| Enter | insert the top match (the band's `>` row); nothing is sent |
 | Backspace | trim the filter; on an empty filter, drop the `@` |
-| Esc | cancel, leaving a literal `@` |
 | `@` (on an empty filter) | `@@`: close, pass one `@` to the stock menu |
-| space or other punctuation | not a lane: cancel, keeping what was typed |
+| space or other punctuation, a cursor move | not a lane: cancel, keeping what was typed |
+
+To pick a lane other than the top one, type more of its name (`@fs:` narrows
+to the cross-host forms). The cursor ends at the end of the prompt after an
+Enter, wherever the `@` was.
 
 ## Try it
 
