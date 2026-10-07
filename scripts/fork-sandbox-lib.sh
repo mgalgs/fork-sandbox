@@ -4700,10 +4700,11 @@ fs_tidy_leg_live_pgid() {
 # Usage: fs_refresh_resolve <harness> <refresh_at_arg> <refresh_at_given>
 #                           <refresh_max_arg> <model>
 #
-# <refresh_at_given> is "true" when --refresh-at was passed explicitly. It is
-# refused outright on every harness but claude (the threshold is measured by
-# a hook installed into the claude session), and only when GIVEN, so the 0.5
-# default stays silent on a plain pi run. On success it sets, in the caller's
+# <refresh_at_given> is "true" when --refresh-at was passed explicitly. A
+# nonzero value is refused on every harness but claude (the threshold is
+# measured by a hook installed into the claude session); 0, "off", is
+# accepted everywhere, so a caller can disable refresh without knowing the
+# harness. On success it sets, in the caller's
 # scope, refresh_at, refresh_enabled (0|1), refresh_max, refresh_context_window,
 # refresh_threshold_tokens and refresh_ceiling_tokens (the last three empty
 # when disabled). Returns 1 after printing the reason on refusal.
@@ -4711,7 +4712,8 @@ fs_tidy_leg_live_pgid() {
 fs_refresh_resolve() {
     local harness="$1" refresh_at_arg="$2" refresh_at_given="$3" \
         refresh_max_arg="$4" model="$5"
-    if [[ "$refresh_at_given" == true && "$harness" != "claude" ]]; then
+    if [[ "$refresh_at_given" == true && "$harness" != "claude" ]] \
+        && ! [[ "$refresh_at_arg" =~ ^0+(\.0+)?$ ]]; then
         echo "Error: --refresh-at only works with --harness claude. The context" >&2
         echo "threshold is measured by a hook installed into the claude session;" >&2
         echo "the other harnesses have no hook system to measure with, and this" >&2

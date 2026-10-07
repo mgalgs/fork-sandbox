@@ -382,6 +382,10 @@ contains "pi refuses an explicit --refresh-at" "Error: --refresh-at only works w
     "$(resolve pi 0.5 true "" m)"
 check "pi without --refresh-at stays silent and disabled" "0|0|0|6|||	" \
     "$(resolve pi "" false "" m)"
+check "pi accepts an explicit --refresh-at 0 and stays disabled" "0|0|0|6|||	" \
+    "$(resolve pi 0 true "" m)"
+check "codex accepts an explicit --refresh-at 0.0 and stays disabled" "0|0|0|6|||	" \
+    "$(resolve codex 0.0 true "" m)"
 contains "pi refuses --refresh-max" "Error: --refresh-max only applies with --harness claude" \
     "$(resolve pi "" false 2 m)"
 contains "a non-numeric --refresh-at is refused" "Error: --refresh-at takes a fraction" \
