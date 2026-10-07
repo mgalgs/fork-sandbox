@@ -1140,6 +1140,37 @@ fs_require_gnu_tools || exit 1
 formatter="$script_dir/fork-sandbox-format.sh"
 status_cmd="fork-sandbox-status.sh"
 
+# This run's private copy of $script_dir, set once the run dir exists (see
+# where it is taken, below). Empty before that, and for a --k8s run, which
+# stages its own, smaller set of scripts for the pod instead.
+scripts_snapshot=""
+
+# fs_snapshot_path PATH -- prints PATH, or the same helper inside the run's
+# scripts snapshot when PATH is one of THIS checkout's scripts: named
+# directly, or through the ~/.claude/scripts farm's symlink into it. A path
+# anywhere else (another checkout linked into the farm, a stub on PATH, a
+# user-supplied formatter) is not ours to pin and comes back unchanged, as
+# does everything while no snapshot exists. The name used inside the
+# snapshot is PATH's own, not the link target's: pi-sandboxed is a link to
+# agent-sandboxed, and the pair is told apart by the name they are run as.
+fs_snapshot_path() {
+    local p="$1" real name
+    if [[ -z "$p" || -z "$scripts_snapshot" ]]; then
+        printf '%s' "$p"
+        return 0
+    fi
+    real="$(readlink -f -- "$p" 2>/dev/null || true)"
+    name="${p##*/}"
+    if [[ -n "$real" && "$(dirname "$real")" == "$script_dir" ]]; then
+        [[ -e "$scripts_snapshot/$name" ]] || name="${real##*/}"
+        if [[ -e "$scripts_snapshot/$name" ]]; then
+            printf '%s/%s' "$scripts_snapshot" "$name"
+            return 0
+        fi
+    fi
+    printf '%s' "$p"
+}
+
 # Per-machine facts a shared checkout must not carry: the model endpoint for
 # a pi-local run, and the OpenRouter key for a pi run. agent-sandboxed reads
 # the same directory, and honors the same override.
@@ -5832,10 +5863,10 @@ run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
 fs_reject_unsafe_chars "$run_dir"
 
 # runner_script_dir is where run.sh's own preamble points $script_dir at
-# (fs_emit_run_sh_preamble, far below) -- a local run sources
-# fork-sandbox-lib.sh/fork-sandbox-refresh.sh straight from this host's
-# install, but a --k8s pod has no install to source from at all, only
-# whatever run_dir's own mount carries. fs_build_sandbox_cmd's pod branch
+# (fs_emit_run_sh_preamble, far below). A local run points it at its own
+# launch-time snapshot of this checkout's scripts/ (see the else arm below);
+# a --k8s pod has no install to source from at all, only whatever run_dir's
+# own mount carries. fs_build_sandbox_cmd's pod branch
 # (which fires long before fs_emit_run_sh_preamble does, as each step's
 # sandbox_cmd is built) reads this same variable for the leg wrapper's own
 # path, so it is set here, as early as run_dir itself, rather than beside
@@ -5868,7 +5899,44 @@ if [[ "$k8s_runner_mode" == true ]]; then
         fi
     done
 else
-    runner_script_dir="$script_dir"
+    # A local run executes a private snapshot of the scripts it was launched
+    # from, taken here and never refreshed. The checkout these scripts live
+    # in is live infrastructure -- install.sh symlinks ~/.claude/scripts into
+    # it, and a pull or merge moves it under every run in flight -- while a
+    # run keeps launching helpers for hours (review, fix and maintain legs,
+    # refresh continuations, the run log at the very end). Without this a
+    # checkout that moves mid-run gives that run old callers and new helpers.
+    # The whole directory, not a list: a list drifts the first time someone
+    # adds a helper, and a missed file fails only mid-run. cp -a keeps
+    # pi-sandboxed's relative link to agent-sandboxed intact within the copy.
+    scripts_snapshot="$run_dir/scripts"
+    mkdir -p "$scripts_snapshot"
+    if ! cp -a -- "$script_dir/." "$scripts_snapshot/"; then
+        echo "Error: could not snapshot $script_dir into $scripts_snapshot." >&2
+        exit 1
+    fi
+    # agent-sandboxed (and pi-sandboxed, which links to it) finds the sandbox's
+    # pi configuration at <its own resolved dir>/../pi-agent, so the snapshot
+    # needs that sibling at <run-dir>/pi-agent or every pi leg runs bare.
+    if [[ -d "$script_dir/../pi-agent" ]]; then
+        if ! cp -a -- "$script_dir/../pi-agent" "$run_dir/pi-agent"; then
+            echo "Error: could not snapshot $script_dir/../pi-agent into $run_dir/pi-agent." >&2
+            exit 1
+        fi
+    fi
+    runner_script_dir="$scripts_snapshot"
+    # Everything below that names a helper -- the formatter, each leg's
+    # sandbox wrapper, the run-log writer, the hooks staged into the inbox,
+    # the in-sandbox script farm -- resolves into the snapshot, not into
+    # $script_dir or the ~/.claude/scripts farm that links to it. The
+    # formatter and the per-seat wrapper paths were resolved long before
+    # run_dir existed (the seat-resolution loop above), so they are
+    # re-pointed here, the same way the --k8s arm re-points the formatter.
+    for snap_var in $(compgen -A variable | grep -E '(^|_)(run_)?formatter$|(^|_)harness_sandbox_bin$'); do
+        [[ "${!snap_var@a}" != *[aA]* ]] || continue
+        printf -v "$snap_var" '%s' "$(fs_snapshot_path "${!snap_var}")"
+    done
+    unset snap_var
 fi
 
 # The task metadata rides beside the run, where sandbox-run-log.py picks it
@@ -6596,7 +6664,15 @@ if [[ -d "$HOME/.claude/scripts" ]]; then
     done < <(find "$HOME/.claude/scripts" -maxdepth 1 -type l -print0)
     for _fs_farm_target_dir in "${!_fs_farm_target_dirs[@]}"; do
         [[ "$_fs_farm_target_dir" != "$HOME/.claude/scripts" ]] || continue
-        review_kit_flags+=(--bind-ro "$_fs_farm_target_dir")
+        if [[ -n "$scripts_snapshot" && "$_fs_farm_target_dir" == "$script_dir" ]]; then
+            # THIS checkout's scripts are served from the run's snapshot, at
+            # the checkout's own path, so the farm's symlinks into it resolve
+            # to the launch-time copy and a checkout that moves mid-run
+            # changes nothing in here. Other checkouts stay live.
+            review_kit_flags+=(--bind-ro-at "$scripts_snapshot" "$script_dir")
+        else
+            review_kit_flags+=(--bind-ro "$_fs_farm_target_dir")
+        fi
     done
     unset _fs_farm_target_dirs _fs_farm_target_dir _fs_farm_link
 fi
@@ -6665,7 +6741,7 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
     || "$maintainer_harness" == "claude" || "$fix_harness" == "claude" \
     || "$mntfix_harness" == "claude" \
     || ( "$k8s_runner_mode" == true && "$composed_has_claude_seat" == true ) ]]; then
-    inbox_hook_src="$script_dir/fork-sandbox-inbox-hook.sh"
+    inbox_hook_src="${scripts_snapshot:-$script_dir}/fork-sandbox-inbox-hook.sh"
     if [[ ! -r "$inbox_hook_src" ]]; then
         echo "Error: $inbox_hook_src is missing. It delivers operator addenda" >&2
         echo "to a running session. Run install.sh in the fork-sandbox repo." >&2
@@ -6679,7 +6755,7 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
     # The commit guard: a second Stop hook, registered only in the EDITING
     # settings file, that refuses to let a leg finish with uncommitted work
     # in its clone -- see fork-sandbox-stop-guard.sh's header.
-    stop_guard_hook_src="$script_dir/fork-sandbox-stop-guard.sh"
+    stop_guard_hook_src="${scripts_snapshot:-$script_dir}/fork-sandbox-stop-guard.sh"
     if [[ ! -r "$stop_guard_hook_src" ]]; then
         echo "Error: $stop_guard_hook_src is missing. It stops a claude leg" >&2
         echo "from ending its turn with uncommitted work. Run install.sh in" >&2
@@ -7559,6 +7635,7 @@ if [[ "$k8s_runner_mode" == true ]]; then
 else
     run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
     [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
+    run_log_bin="$(fs_snapshot_path "$run_log_bin")"
     [[ -x "$run_log_bin" ]] || run_log_bin=""
 fi
 
@@ -7721,6 +7798,7 @@ fs_build_sandbox_cmd() {
         if [[ -z "$sandbox_bin" ]]; then
             sandbox_bin="$HOME/.claude/scripts/claude-sandboxed"
         fi
+        sandbox_bin="$(fs_snapshot_path "$sandbox_bin")"
     fi
 
     # claude-sandboxed stops parsing its own flags at the first argument
@@ -8672,6 +8750,17 @@ fs_emit_run_sh_preamble() {
     printf '\n'
     printf 'run_dir=%q\n' "$run_dir"
     printf 'script_dir=%q\n' "$runner_script_dir"
+    # A local run's helpers are looked up by name in places -- the sandbox
+    # backend, which a wrapper finds on PATH before it looks beside itself --
+    # and the PATH here is whatever the tmux server (or the launching shell)
+    # carries, which usually reaches the live checkout through the
+    # ~/.claude/scripts farm. Putting the snapshot first makes those lookups
+    # land in it. Not for a --k8s pod run, whose scripts/ holds only the
+    # four files the pod needs and whose environment is its own.
+    if [[ "$k8s_runner_mode" != true ]]; then
+        # shellcheck disable=SC2016  # expands in the generated run.sh
+        printf 'export PATH="$script_dir:$PATH"\n'
+    fi
     printf 'clone_dir=%q\n' "$clone_dir"
     # Empty for a fresh clone under run_dir, which nothing else can ever
     # reach and so needs no lock. Non-empty for a --clone-dir workspace: the

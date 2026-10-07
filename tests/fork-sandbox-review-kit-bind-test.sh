@@ -76,6 +76,18 @@ argv_has_flag_value() {
     ' "$file"
 }
 
+# Checks that argv contains FLAG SRC DEST as three consecutive tokens -- the
+# shape of --bind-ro-at.
+argv_has_flag_pair() {
+    local file="$1" flag="$2" src="$3" dest="$4"
+    awk -v f="$flag" -v a="$src" -v b="$dest" '
+        $0 == f { n = 1; next }
+        n == 1 { if ($0 == a) { n = 2; next } n = 0 }
+        n == 2 { if ($0 == b) found = 1; n = 0 }
+        END { exit !found }
+    ' "$file"
+}
+
 argv_lacks_bind_ro() {
     local file="$1" dir="$2"
     ! argv_has_flag_value "$file" --bind-ro "$dir"
@@ -152,6 +164,7 @@ register_run_paths() {
     local -a fields
     mapfile -t fields <<<"$result"
     REGISTERED_ARGV_FILE="${fields[0]:-}"
+    REGISTERED_RUN_DIR="${fields[3]:-}"
     local handoff_dir="${fields[1]:-}" cfg="${fields[2]:-}" rd="${fields[3]:-}"
     [[ -n "$REGISTERED_ARGV_FILE" ]] && tmpdirs+=("$REGISTERED_ARGV_FILE")
     [[ -n "$handoff_dir" ]] && tmpdirs+=("$handoff_dir")
@@ -204,10 +217,18 @@ check_farm_case() {
         no "run_and_capture_argv produced an argv file$label_suffix" "run failed"
         return
     fi
-    if argv_has_flag_value "$argv_file" --bind-ro "$repo_dir/scripts"; then
-        ok "this checkout's scripts dir is bound$label_suffix"
+    # This checkout's scripts are served from the run's launch-time
+    # snapshot, mounted at the checkout's own path, so the farm's symlinks
+    # into it resolve -- and never to the live checkout.
+    if argv_has_flag_pair "$argv_file" --bind-ro-at "$REGISTERED_RUN_DIR/scripts" "$repo_dir/scripts"; then
+        ok "this checkout's scripts dir is bound, from the run's snapshot$label_suffix"
     else
-        no "this checkout's scripts dir is bound$label_suffix" "$(cat "$argv_file")"
+        no "this checkout's scripts dir is bound, from the run's snapshot$label_suffix" "$(cat "$argv_file")"
+    fi
+    if argv_lacks_bind_ro "$argv_file" "$repo_dir/scripts"; then
+        ok "the live checkout is not bound read-only as itself$label_suffix"
+    else
+        no "the live checkout is not bound read-only as itself$label_suffix" "$(cat "$argv_file")"
     fi
     if argv_has_flag_value "$argv_file" --bind-ro "$foreign_dir"; then
         ok "the foreign checkout's dir is ALSO bound$label_suffix"
@@ -272,7 +293,7 @@ run_rc_plain=$?
 register_run_paths "$run_result_plain"
 argv_file_plain="$REGISTERED_ARGV_FILE"
 if (( run_rc_plain == 0 )); then
-    if argv_has_flag_value "$argv_file_plain" --bind-ro "$repo_dir/scripts"; then
+    if argv_has_flag_pair "$argv_file_plain" --bind-ro-at "$REGISTERED_RUN_DIR/scripts" "$repo_dir/scripts"; then
         ok "the checkout is bound even when the farm holds only regular files"
     else
         no "the checkout is bound even when the farm holds only regular files" \
