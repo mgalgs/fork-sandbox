@@ -72,11 +72,26 @@ five minutes ago and is waiting to be collected," and only the sentinel
 tells the two apart. `run` polls every 10 seconds (each probe is a `kubectl
 exec`), gives up after `--timeout` (default 3600, matching the entrypoint's
 own `RUN_TTL` default — waiting longer than the pod will idle for is
-pointless), and detects a pod that died before writing the sentinel — an
-OOM kill, a crashed image pull, a node eviction — by checking pod and Job
-state each iteration, rather than polling a corpse for the full timeout. A
-run still going at the deadline is left exactly as it is: `run` does not
-fetch a half-finished branch and does not remove a still-running pod, and
+pointless — but that is a legacy single-leg run's default; a composed run,
+submitted via `run --run-dir DIR`, instead defaults to 3600 seconds times
+the MAXIMUM number of legs the runner can start for `DIR/pipeline.json`,
+summed over every step: a code step's `repeat` cap, each pass counted
+once; a review or maintain step's `repeat` cap, each iteration counted as
+`1 + fix.repeat` legs (its own leg, plus a fix leg for each of
+`fix.repeat`'s passes) — `fix.repeat` defaulting to 1 even when the step
+has no `fix` key at all, since the runner still resolves a fix seat for a
+FINDINGS verdict either way; and, on top of every code
+pass and fix leg whose harness is `claude` with refresh enabled (the
+default for a claude leg — see "A claude pod refreshes its own context"
+below), up to `--refresh-max` (default 6) further continuation legs. A fix
+seat with no harness of its own inherits `--harness`'s, the same fallback
+the runner itself applies. `--timeout` overrides either default), and
+detects a pod that died before
+writing the sentinel — an OOM kill, a crashed image pull, a node eviction —
+by checking pod and Job state each iteration, rather than polling a corpse
+for the full timeout. A run still going at the deadline is left exactly as
+it is: `run` does not fetch a half-finished branch and does not remove a
+still-running pod, and
 its error message prints the exact `fetch` command to run by hand once the
 agent does finish. `--keep` skips the final `rm`, for a caller who wants
 the Job and pod left in place after a successful fetch. `run` and `collect`
@@ -339,7 +354,14 @@ The pull-back is:
   own CVEs have had; the extraction script's own header comment has the
   full reasoning, including why listing every entry up front catches a
   symlink-then-write escape that per-entry extraction-time checks alone
-  would miss.
+  would miss. The same listing pass also sums every member's DECLARED size
+  (from `tar -tvf`'s size column, not the archive's own byte count) and
+  refuses the whole archive if that sum is over the cap, and refuses it
+  outright past `FS_EXTRACT_MAX_ENTRIES` (default 20000) entries — a
+  sparse member lists at its full logical size in a GNU tar archive far
+  smaller than that size on disk, so the byte-spool cap alone does not
+  catch one, and a many-small-entries archive costs real wall-clock time
+  to walk even when every entry is individually harmless.
 - **Best-effort.** A failure anywhere in the pull-back — the exec failing,
   the size cap, the extraction guard rejecting the archive — warns and
   falls through rather than failing the run. Retrieving artifacts must
@@ -593,15 +615,20 @@ dead or timed-out run gets a row instead of vanishing.
   was measured and free -- a permanent false economy on every cluster row
   otherwise.
 - **`uncommitted_files`/`uncommitted_files_list`: omitted entirely, for a
-  different reason than cost -- not unmeasured, structurally moot.** The
-  pod IS the sandbox, so the entrypoint runs `commit_uncommitted_work`
-  directly after the coding leg and again after the review loop: whatever
-  either left uncommitted is swept into a fixed-message commit before the
-  pod ever idles for the fetch. A local run has no such backstop (its
-  session's own turn ending is the only signal it gets), which is what
-  `uncommitted_files` exists to catch there -- see `README.md`'s "How a
-  run works". Adding the same field here would report `0` on every run by
-  construction, which is not a fact worth a key.
+  different reason than cost -- not unmeasured, structurally moot.** On
+  the fixed-skeleton (legacy) shape above, the pod IS the sandbox, so the
+  entrypoint runs `commit_uncommitted_work` directly after the coding leg
+  and again after the review loop: whatever either left uncommitted is
+  swept into a fixed-message commit before the pod ever idles for the
+  fetch. A local run has no such backstop (its session's own turn ending
+  is the only signal it gets), which is what `uncommitted_files` exists to
+  catch there -- see `README.md`'s "How a run works". Adding the same
+  field here would report `0` on every run by construction, which is not
+  a fact worth a key. A composed run (see "Composed pipelines on `--k8s`"
+  below) has no `commit_uncommitted_work` sweep either way -- it matches
+  local behavior instead of this shape's, and that difference matters
+  more there, so it is called out separately in that section rather than
+  folded into this one.
 
 **The append is best-effort**, on both paths: a machine without
 `sandbox-run-log.py` on `PATH` or under `$HOME/.claude/scripts/` skips it,
@@ -933,6 +960,153 @@ claude's) and routes alias lookup there, but validates nothing about the
 id itself: an operator's habit-typed `--review-model opus`, which would
 mean a claude model locally, is still forwarded verbatim and only fails
 pod-side, on the first review leg, after the coding leg has already run.
+
+## Composed pipelines on `--k8s`
+
+`fork-sandbox run --preset X --k8s` (or `--pipeline SPEC --k8s`), for a
+preset or pipeline spec that is *composed* — more than the fixed
+code/review/maintain skeleton the flags above describe — runs through one
+pod and one shared walker, `fork-sandbox-runner.sh`: the same script, the
+same body, that a local composed run executes. There is no second
+implementation of the walk here, and no cluster-specific review loop for
+this shape — that is what "The cluster review loop" above is, and it stays
+a separate, `--review-loop`-only path.
+
+**What runs.** The launcher (`fork-sandbox.sh`) does everything a local run
+does to turn a preset into a run directory — compile the step spine,
+resolve every seat's harness/model, render every step's and fix seat's
+prompt, write `pipeline.json`, stage the inbox hooks and settings — and
+then, instead of cloning the project, starting tmux and executing
+`run.sh` itself, it stages one more thing beside it (a copy of
+`fork-sandbox-lib.sh`, `fork-sandbox-refresh.sh`, `fork-sandbox-format.sh`
+and `fork-sandbox-k8s-leg.sh` — everything `run.sh` sources or execs, since
+the pod mounts only the run directory, never this host's own install) and
+hands the whole directory to `fork-sandbox-k8s.sh run --run-dir DIR`
+instead. **No host-side clone is ever made, no tmux session is started,
+and `run.sh` is never executed on the host** — the pod is the only place
+it runs. `--dry-run` stops before any of this: it prints the composed
+listing it always does, plus one `k8s_step_<N>=` line per step (and a
+`_fix` line for a step with a fix seat) naming every seat's action,
+harness and model, and exits 0 having staged nothing and called
+`fork-sandbox-k8s.sh` not at all.
+
+Pod-side, the entrypoint's `RUN_DIR` mode installs the claude credential
+and synthesizes `~/.pi/agent/models.json` for every distinct pi model
+`pipeline.json` names (one proxy-model entry per id, the composed
+counterpart of the single-seat path's own model synthesis above), then
+simply runs `bash "$RUN_DIR/run.sh"` with the clone as its cwd. Every leg
+`run.sh` dispatches execs `fork-sandbox-k8s-leg.sh --harness H --model M
+--clone DIR -- [extras]` — the pod's counterpart of `claude-sandboxed`/
+`pi-sandboxed`, a thin, unconfined translation into the harness's own argv
+(no bubblewrap layer: the pod's own confinement, NetworkPolicy and no
+outbound route but the proxy, already does what bwrap does locally) that
+`exec`s into it so the exit code and stdio are the harness's own.
+
+**What collect lands.** `fork-sandbox-k8s.sh collect --run-dir DIR`
+recognizes a `RUNNER=1` run (the marker `submit` wrote) and, on top of its
+ordinary outbox/branch pull, tars the pod's whole run directory back --
+but the pod's copy sits on a shared `emptyDir` every leg can write, so
+only a fixed allowlist of names ever lands: `progress.json`, every
+`step-<N>-loop.json`, `review-loop.json`/`maintainer-loop.json`/
+`tidy.json`, `summary.txt`, `sandbox.log`, `plan.md`, `uncommitted.patch`
+(below), the per-leg `events*.jsonl` files and verdict `.md` files --
+fork-sandbox-status.sh's own `resolve_run_file` allowlist, minus every
+name the host already owns and writes itself (`run.env`, `pid`,
+`exit-code`, `handoff.md`, `pipeline.json`, `run.sh`, `scripts/`,
+`inbox/`). Each candidate must be a regular file under a size cap. Two
+host-owned fields are merged in by exception, never by blind copy:
+`run.env`'s `cost=`/`model=`/`outbox_bytes=`/`outbox_max_bytes=` (the
+four fields the runner rewrites in place, each individually validated and
+spliced in, never the whole file), and `summary.json`, read into memory
+and merged into the client's own write -- requiring exactly one JSON
+object from the pod (not two concatenated documents, which would let a
+planted second document completely displace the client's own fields) and
+taking only an allowlist of pod-only keys (cost, usage, retries, the
+uncommitted-work fields, the tidy leg's own record) from it. Every host-
+known fact -- branch, origin repo, commits, exit code, the run directory
+and clone paths, timing, session identity -- always comes from the
+client's own write, never the pod's. A composed `--k8s` run therefore
+leaves the same shape of artifacts in the host run directory a local
+composed run would, down to the file names, without trusting the pod for
+anything the host already knows on its own.
+
+**Uncommitted work is never committed here, matching local, not the
+fixed-skeleton shape -- but it is recoverable.** The entrypoint's
+`RUN_DIR` arm never calls `commit_uncommitted_work` -- `run.sh` itself
+already runs its own end-of-run uncommitted-work check (the same one a
+local run runs, against the clone directly rather than through a sandbox
+backend), and that check only records what it finds, the same as local,
+never commits it (see "The durable run log" above for why the fixed-
+skeleton shape's own sweep does not generalize here). A claude leg that
+ends its own turn normally is still caught first by the stop-guard hook
+(installed whenever any composed seat is claude, the same as locally),
+which refuses to let the turn end with uncommitted work. What has no such
+hook is a leg whose process is killed or crashes mid-edit: locally the
+clone is a host directory that outlives the run, so the work just sits
+there; in a pod, the clone lives only in the pod's own `emptyDir`, which
+goes away with the pod. So when the check finds anything uncommitted,
+`run.sh` also stages it (tracked and untracked files alike, binary-safe)
+and saves it as `uncommitted.patch` in the run directory, without ever
+running `git commit` -- the same "check and record, never commit"
+discipline, just with the one extra step a pod's ephemeral filesystem
+needs that a host directory does not. `collect` brings the patch back as
+one of the allowlisted artifacts above, and `summary.json`'s
+`uncommitted_patch` key records whether one exists, so a reader does not
+have to stat the run directory separately to find out.
+
+**What is refused, by name, before anything is staged:**
+
+- A step or fix seat on codex — codex has no sandboxed path in the
+  cluster yet (see "Deliberately not done" below).
+- A step or fix seat with `network: sealed`, or the `pi-local` alias — a
+  cluster pod still reaches the in-cluster model proxy, so a sealed claim
+  would be false there; cluster isolation is enforced by NetworkPolicy
+  instead, an axis this key does not cover.
+- A claude seat with no model, or a pi seat with no model — the pod has no
+  per-seat model discovery for a composed run (unlike the legacy
+  `--endpoint` shape's own discovery), so every seat needs an explicit
+  model.
+- `--review-only`, a read-only pipeline, and the universal `--k8s` flag
+  refusals (`--claude-args`/`--pi-args`/`--codex-args`,
+  `--prompts-dir`, `--kit-skill`, `--sandbox-args`, `--network sealed`,
+  session-state flags, the refresh-chain flags) — unchanged from the
+  fixed-skeleton shapes above.
+
+**The tidy-history leg never runs in a pod, and is recorded as skipped,
+not refused.** A preset that ends in an approving maintain step — the
+shape this whole feature exists to run on `--k8s` — is tidy-eligible
+locally, but a pod's own run never fetches back to the host (the clone
+lives only in the pod's own `emptyDir`), and the tidy leg's verification
+and publish (`fs_tidy_verify`/`fs_tidy_publish`) are host-side only, run
+against `origin_repo`, a path with no meaning inside the pod. Rather than
+refuse the one shape this feature is for, `summary.txt`/`summary.json`
+record `tidy: skipped (a --k8s pod run does not fetch back; the
+tidy-history leg's verification and publish are host-side only)`, and the
+pod never reaches the tidy leg at all. No rewrite is ever published from a
+cluster run.
+
+**Known limit: a leg can write the runner's own state.** In the pod, the
+runner and the legs it starts share one container and one writable run
+directory. A leg can therefore rewrite `run.sh`, `pipeline.json`, later
+steps' prompts and the inbox settings, and so skip or forge a later step.
+A local run does not have this gap: its legs never see the run directory,
+and the inbox is bound read-only. Until the pod separates the two, treat a
+composed `--k8s` run's review and maintain verdicts as advisory. What
+reaches the host is still bounded: `collect` takes only the allowlisted
+artifacts above, and the branch arrives as git objects.
+
+**The fixed-skeleton (legacy) shapes above — `--harness`, `--review-loop`,
+`--review-harness pi` — are untouched.** They dispatch exactly as they
+always have, byte-identical argv to `fork-sandbox-k8s.sh`; this feature
+adds a second path through the same early `--k8s` handling, selected only
+when the preset or pipeline spec is composed, and falls through to the
+unchanged legacy exec otherwise.
+
+**`FORK_SANDBOX_K8S_WORK_DIR`** overrides the pod work directory the
+generated `run.sh` bakes `clone_dir=`/`outbox_dir=` against (default
+`/work`, the entrypoint's own hard-coded layout) — a test hook, the same
+class as `FORK_SANDBOX_PRESETS_DIR`, never meant for an operator to set on
+a real run.
 
 ## Egress is sealed, except the proxy
 
@@ -2478,7 +2652,14 @@ Scoped out of v1 on purpose, not overlooked:
 - **The codex harness inside a pod.** `--harness claude` now has its own
   sealed-egress story (the per-run proxy — see "Model access" above), so
   the reasoning that used to cover both no longer applies to it; codex has
-  no sandboxed credential path built at all, for either run mode.
+  no sandboxed credential path built at all, for either run mode. Same
+  reason a composed `--k8s` run refuses a codex seat or fix seat by name
+  (see "Composed pipelines on `--k8s`" above).
+- **The tidy-history leg in a pod.** A composed `--k8s` run's own fetch
+  seam means the pod never reaches it; see "Composed pipelines on
+  `--k8s`" above for the recorded skip and why publishing a rewrite from a
+  pod is not just unbuilt but structurally out of reach (no fetch-back
+  means no host-side ref to verify against).
 - **A second model-access upstream.** OpenRouter only; see "Model access"
   above for why the shape is a new proxy config file, not a rewrite, when a
   second one is added.

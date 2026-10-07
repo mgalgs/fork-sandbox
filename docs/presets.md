@@ -254,11 +254,12 @@ every other non-step-1 leg's, lands in `summary.json`'s `leg_refreshes`
 array instead. A `plan` leg itself never refreshes — it is a short
 read-and-verdict leg, same as review and maintain.
 
-A `plan` step is refused on a read-only pipeline, with `--review-only`,
-and with `--k8s` — like any other pipeline shape that is not legacy-
-shaped (a `plan` step always makes a pipeline composed; see "Composed
-runs" below), `--k8s` refuses it outright rather than running it without
-the leg a cluster pod has no path to.
+A `plan` step is refused on a read-only pipeline and with `--review-only`
+(both read-only shapes; a plan step always makes a pipeline composed, and
+a read-only pipeline has no code step for a plan to precede). It runs on
+`--k8s` like any other composed step: its seat is a claude or pi seat the
+same per-seat checks apply to (see "Composed pipelines on `--k8s`" in
+`docs/kubernetes-runs.md`), not a role the cluster path special-cases.
 
 The same agent may sit any number of seats; an agent that sits none
 draws a warning, not an error.
@@ -442,15 +443,22 @@ preset-only knobs.
 There is no separate preset semantic to learn, which also means the sharp
 edges are the flags' own — plus the edges of the two preset-only knobs:
 
-- **`--k8s` works with a preset** — the compiled values flow into the
-  cluster path like typed flags — but a preset that sets things the
-  cluster path refuses (a `maintain` step, `claude-args`, `pi-args`, `codex-args`, the
-  refresh keys) is refused exactly as those flags are, and fix seats and
-  `repeat` are refused there by name too: the pod's own review loop runs
-  its fix legs on the coding model, once each. A code seat may carry an
-  `endpoint` key, which wires the run to that named proxy endpoint on a
-  `K8S_PROXY_ENDPOINTS` install, with `--endpoint` overriding it like
-  every other key. A cluster run wants a preset shaped for the cluster.
+- **`--k8s` works with a preset, two different ways depending on its
+  shape.** A legacy-shaped preset (the fixed one-code/one-review/one-
+  maintain skeleton, or a subset of it) has its compiled values flow into
+  the cluster path like typed flags — but its agent's own preset-only
+  knobs that have no `--k8s` flag equivalent (`fix_agent`, `repeat > 1`)
+  are refused there by name, same as `claude-args`/`pi-args`/`codex-args`
+  and the refresh keys are refused against ANY composed preset above
+  (unrelated to `--k8s`: a composed step's seat has nothing those
+  flags would land on). A code seat may carry an `endpoint` key, which
+  wires the run to that named proxy endpoint on a `K8S_PROXY_ENDPOINTS`
+  install, with `--endpoint` overriding it like every other key.
+  A *composed* preset instead dispatches through the shared runner — see
+  "Composed pipelines on `--k8s`" in `docs/kubernetes-runs.md` for what
+  runs, what collect lands, and the handful of seat shapes (codex, a
+  sealed/pi-local network, a model-less claude or pi seat) still refused
+  by name.
 - **`--review-only` refuses review and maintainer flags**, so it refuses
   a preset that carries loops — and one whose code seat repeats, since
   there is no coding leg to repeat. A preset with only a code step works
