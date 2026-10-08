@@ -8,7 +8,8 @@
 # itself. In order:
 #
 #   1. Checks that every tool the rest of this script and the postmaster
-#      need is on PATH: kubectl, git, ssh, flock, setsid, python3, tar.
+#      need is on PATH: kubectl, git, ssh, flock, setsid, python3, tar,
+#      jq, ps, timeout.
 #      Refuses, naming every missing one, rather than fail later on
 #      whichever happens to be called first.
 #   2. Reads $FORK_SANDBOX_CONFIG_DIR/k8s.env (default
@@ -76,7 +77,7 @@ fi
 # --- 1. self-check ----------------------------------------------------
 
 missing=()
-for tool in kubectl git ssh flock setsid python3 tar; do
+for tool in kubectl git ssh flock setsid python3 tar jq ps timeout; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if (( ${#missing[@]} > 0 )); then

@@ -23,13 +23,15 @@ ARG KUBECTL_SHA256_ARM64=922df28df248cc00a9e025f947704f1d1482de64ece54cfe57e61f1
 
 USER root
 
-# openssh-client: the base image has git, curl, python3 and jq, but no ssh,
+# openssh-client: the base image has git, curl and python3, but no ssh,
 # and the postmaster's pod init clones/fetches the project over ssh (deploy
 # key only -- see docs/cluster-postmaster.md).
 # python3-yaml: `deliver --cluster` parses the fleet file at startup and
 # exits without PyYAML. The import check fails the build, not the pod.
+# jq and procps: the submitter and resume paths need jq and ps even when
+# the base image does not provide them.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-client python3-yaml \
+    && apt-get install -y --no-install-recommends openssh-client python3-yaml jq procps \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c 'import yaml'
 

@@ -38,7 +38,7 @@ newdir() { mktemp -d; }
 # external command pod-init or its shebang needs, symlinked from whatever
 # the test host actually has: bash itself (env resolves it from PATH even
 # though env's own absolute path comes from the shebang line), the few
-# coreutils pod-init calls directly, and flock/setsid/python3/tar for the
+# coreutils pod-init calls directly, and flock/setsid/python3/tar/jq/ps for the
 # self-check (their behavior is never exercised, only their presence).
 # git/ssh/kubectl are fakes: git records every invocation to $GIT_LOG and
 # either fakes a clone (mkdir the .git dir) or a fetch, each failable via
@@ -46,7 +46,7 @@ newdir() { mktemp -d; }
 # never execs either -- it only needs them to exist for the self-check,
 # and to build the GIT_SSH_COMMAND string).
 full_tools="$(newdir)"; tmpdirs+=("$full_tools")
-for t in bash dirname readlink mkdir chmod cat mv sed ln id flock setsid python3 tar; do
+for t in bash dirname readlink mkdir chmod cat mv sed ln id flock setsid python3 tar jq ps timeout; do
     p="$(command -v "$t" 2>/dev/null || true)"
     [[ -n "$p" ]] && ln -sf "$p" "$full_tools/$t"
 done
@@ -156,6 +156,14 @@ for f in "$full_tools"/*; do
     cp -P "$f" "$no_tar/"
 done
 PI_TOOLS="$no_tar" refuses "missing tar refuses, naming it" "tar" run_init
+
+no_submitter_tools="$(newdir)"; tmpdirs+=("$no_submitter_tools")
+for f in "$full_tools"/*; do
+    case "$(basename "$f")" in jq|ps|timeout) continue ;; esac
+    cp -P "$f" "$no_submitter_tools/"
+done
+PI_TOOLS="$no_submitter_tools" refuses "missing submitter tools refuse, naming all" \
+    "Error: missing required tools: jq ps timeout." run_init
 
 printf '\n== config validation refuses before any git call ==\n'
 setup_env
