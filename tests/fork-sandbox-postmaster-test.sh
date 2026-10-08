@@ -5534,10 +5534,161 @@ check "upstream-head case 6: the thread is not flagged" 0 \
 uh_kickoff ken; uh7_mid="$UH_MID"
 uh7_tid="$(thread_of "$uh7_mid")"
 reply_msg '@ci-demo' "$uh7_mid" 'pushed' --to '@ken' --upstream-head "feature/pushed:$uh5_missing" >/dev/null
-once
-contains "upstream-head case 7: a sha the fetched branch does not hold is flagged" \
+FORK_SANDBOX_POSTMASTER_FETCH_WINDOW=0 once
+contains "upstream-head case 7: with the fetch window at 0 a sha the fetched branch does not hold is flagged at once" \
     "$(cat "$PM_STATE_DIR/needs-operator/$uh7_tid" 2>/dev/null)" "upstream head feature/pushed $uh5_missing not found"
 check "upstream-head case 7: ken was not woken" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "upstream-head case 7: nothing was deferred" 0 "$(grep -c 'reason=fetch-miss' "$work/once.out")"
+check "upstream-head case 7: no fetch-wait record" 0 "$(find "$PM_STATE_DIR/fetch-wait" -type f 2>/dev/null | wc -l)"
+
+# ---- fetch-miss cases: the origin is a pull mirror that has not synced yet.
+# A miss defers instead of flagging; each `once` is a fresh postmaster
+# process, so a resolve on a later `once` is also a restart picking the wait
+# up from disk. fw_set rewrites a key in a pending record (a clock stand-in:
+# the cases never sleep). ----
+export FORK_SANDBOX_POSTMASTER_FETCH_WINDOW=120
+fw_file() { printf '%s/fetch-wait/%s/%s' "$PM_STATE_DIR" "$1" "$2"; }
+fw_set() { sed -i "s/^$3=.*/$3=$4/" "$(fw_file "$1" "$2")"; }
+fw_get() { sed -n "s/^$3=//p" "$(fw_file "$1" "$2")"; }
+# fw_commit <branch>: a commit in the origin's source repo, NOT yet pushed.
+fw_commit() {
+    git -C "$UH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test \
+        commit -q --allow-empty -m "mirror lag $1"
+    git -C "$UH_ORIGIN_SRC" rev-parse HEAD
+}
+fw_sync() { git -C "$UH_ORIGIN_SRC" push -q -f "$UH_ORIGIN_BARE" "$2:refs/heads/$1"; }
+
+# case 9: the sha is not on origin at first and arrives inside the window.
+uh_kickoff ken; fw9_mid="$UH_MID"
+fw9_tid="$(thread_of "$fw9_mid")"; fw9_short="${fw9_tid:0:8}"
+fw9_sha="$(fw_commit feature/late)"
+reply_msg '@ci-demo' "$fw9_mid" 'pushed' --to '@ken' --upstream-head "feature/late:$fw9_sha" >/dev/null
+start=$SECONDS
+once
+check "fetch-miss case 9: the pass did not sleep on the miss" 1 "$(( SECONDS - start < 10 ))"
+check "fetch-miss case 9: the thread is not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$fw9_tid" ]] && echo 1 || echo 0 )"
+contains "fetch-miss case 9: a deferral event with the attempt count" \
+    "$(cat "$work/once.out")" "pm defer thread=$fw9_short agent=ken reason=fetch-miss attempt=1"
+check "fetch-miss case 9: ken was not woken" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "fetch-miss case 9: the wait is recorded under the state dir" 1 \
+    "$( [[ -f "$(fw_file "$fw9_tid" ken)" ]] && echo 1 || echo 0 )"
+check "fetch-miss case 9: the record names the announced head" "feature/late $fw9_sha" "$(fw_get "$fw9_tid" ken KEY)"
+once
+check "fetch-miss case 9: not due yet -- the next pass does not fetch or defer again" 0 \
+    "$(grep -c 'reason=fetch-miss' "$work/once.out")"
+check "fetch-miss case 9: still one attempt on record" 1 "$(fw_get "$fw9_tid" ken ATTEMPTS)"
+check "fetch-miss case 9: a pending wait keeps the thread from quiescence" 1 \
+    "$( [[ -n "$(find "$PM_STATE_DIR/fetch-wait/$fw9_tid" -type f 2>/dev/null)" ]] && echo 1 || echo 0 )"
+fw_set "$fw9_tid" ken NOT_BEFORE 0
+once
+contains "fetch-miss case 9: a due re-check that still misses defers again, attempt 2" \
+    "$(cat "$work/once.out")" "pm defer thread=$fw9_short agent=ken reason=fetch-miss attempt=2"
+check "fetch-miss case 9: the window is not restarted by a re-check" 1 \
+    "$( [[ "$(fw_get "$fw9_tid" ken SINCE)" -le "$(date +%s)" ]] && echo 1 || echo 0 )"
+fw_sync feature/late "$fw9_sha"
+fw_set "$fw9_tid" ken NOT_BEFORE 0
+once
+contains "fetch-miss case 9: the mirror synced, the wait resolves" \
+    "$(cat "$work/once.out")" "pm defer-resolved thread=$fw9_short agent=ken reason=fetch-miss attempts=2"
+check "fetch-miss case 9: ken then wakes carrying the extra ref" \
+    "upstream=$fw9_sha" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+check "fetch-miss case 9: the record is gone" 0 "$(find "$PM_STATE_DIR/fetch-wait" -type f 2>/dev/null | wc -l)"
+check "fetch-miss case 9: the thread was never flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$fw9_tid" ]] && echo 1 || echo 0 )"
+
+# case 10: the sha never arrives -- flagged once the window has passed, not before.
+uh_kickoff ken; fw10_mid="$UH_MID"
+fw10_tid="$(thread_of "$fw10_mid")"; fw10_short="${fw10_tid:0:8}"
+fw10_sha="$(fw_commit feature/never)"
+reply_msg '@ci-demo' "$fw10_mid" 'pushed' --to '@ken' --upstream-head "feature/never:$fw10_sha" >/dev/null
+once
+now="$(date +%s)"
+fw_set "$fw10_tid" ken SINCE "$(( now - 100 ))"
+fw_set "$fw10_tid" ken NOT_BEFORE 0
+once
+check "fetch-miss case 10: 100s into a 120s window it still only defers" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$fw10_tid" ]] && echo 1 || echo 0 )"
+contains "fetch-miss case 10: ... as attempt 2" "$(cat "$work/once.out")" "reason=fetch-miss attempt=2"
+check "fetch-miss case 10: the last attempt is scheduled no later than the window's end" 1 \
+    "$( [[ "$(fw_get "$fw10_tid" ken NOT_BEFORE)" -le "$(( $(fw_get "$fw10_tid" ken SINCE) + 120 ))" ]] && echo 1 || echo 0 )"
+fw_set "$fw10_tid" ken SINCE "$(( now - 130 ))"
+fw_set "$fw10_tid" ken NOT_BEFORE 0
+once
+contains "fetch-miss case 10: past the window the thread is flagged as before" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$fw10_tid" 2>/dev/null)" "upstream head feature/never $fw10_sha not found"
+contains "fetch-miss case 10: with the upstream-head keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$fw10_short reason=upstream-head"
+check "fetch-miss case 10: ken was never woken" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "fetch-miss case 10: the record is gone" 0 "$(find "$PM_STATE_DIR/fetch-wait" -type f 2>/dev/null | wc -l)"
+once
+check "fetch-miss case 10: a flagged thread is not re-dispatched" 0 "$(grep -c 'reason=fetch-miss' "$work/once.out")"
+
+# case 11: a second announcement replaces the pending one, with a fresh window.
+uh_kickoff ken; fw11_mid="$UH_MID"
+fw11_tid="$(thread_of "$fw11_mid")"
+fw11_a="$(fw_commit feature/v1)"
+fw11_r="$(reply_msg '@ci-demo' "$fw11_mid" 'pushed' --to '@ken' --upstream-head "feature/v1:$fw11_a")"
+once
+fw_set "$fw11_tid" ken SINCE "$(( $(date +%s) - 110 ))"
+fw_set "$fw11_tid" ken ATTEMPTS 5
+fw11_b="$(fw_commit feature/v2)"
+reply_msg '@ci-demo' "$fw11_r" 'force-pushed again' --to '@ken' --upstream-head "feature/v2:$fw11_b" >/dev/null
+once
+check "fetch-miss case 11: the pending wait now names the newest head" "feature/v2 $fw11_b" "$(fw_get "$fw11_tid" ken KEY)"
+check "fetch-miss case 11: its window started fresh" 1 \
+    "$( [[ "$(fw_get "$fw11_tid" ken SINCE)" -ge "$(( $(date +%s) - 20 ))" ]] && echo 1 || echo 0 )"
+check "fetch-miss case 11: and its attempt count with it" 1 "$(fw_get "$fw11_tid" ken ATTEMPTS)"
+check "fetch-miss case 11: still one record for the seat" 1 "$(find "$PM_STATE_DIR/fetch-wait" -type f | wc -l)"
+check "fetch-miss case 11: no flag from the old window" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$fw11_tid" ]] && echo 1 || echo 0 )"
+fw_sync feature/v2 "$fw11_b"
+fw_set "$fw11_tid" ken NOT_BEFORE 0
+once
+check "fetch-miss case 11: the newest head is what the seat is handed" \
+    "upstream=$fw11_b" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+
+# case 12: while one thread waits on the mirror, others route normally.
+uh_kickoff ken; fw12_mid="$UH_MID"
+fw12_tid="$(thread_of "$fw12_mid")"
+fw12_sha="$(fw_commit feature/slow)"
+reply_msg '@ci-demo' "$fw12_mid" 'pushed' --to '@ken' --upstream-head "feature/slow:$fw12_sha" >/dev/null
+once
+check "fetch-miss case 12 setup: ken's thread is waiting" 1 "$( [[ -f "$(fw_file "$fw12_tid" ken)" ]] && echo 1 || echo 0 )"
+send_msg '@carol' '@kai' 'another thread' 'hello kai' 8 >/dev/null
+start=$SECONDS
+once
+check "fetch-miss case 12: the other thread's seat woke while ken waits" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "fetch-miss case 12: the pass did not sleep" 1 "$(( SECONDS - start < 10 ))"
+check "fetch-miss case 12: ken is still waiting" 1 "$( [[ -f "$(fw_file "$fw12_tid" ken)" ]] && echo 1 || echo 0 )"
+
+# case 13: the review target a `follow` seat is checked out at gets the same wait.
+uh_kickoff ken
+fw13_branch="feature/target-lag"
+fw13_sha="$(fw_commit "$fw13_branch")"
+printf '%s\n' 'review this' > "$work/body.tmp"
+fw13_mid="$("$MAIL" send --from '@carol' --to '@kai' --subject 'review target lag' \
+    --body "$work/body.tmp" --hops 8 --review-target "$fw13_branch:$fw13_sha" 2>/dev/null)"
+fw13_tid="$(thread_of "$fw13_mid")"; fw13_short="${fw13_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+contains "fetch-miss case 13: a review-target miss defers" \
+    "$(cat "$work/once.out")" "pm defer thread=$fw13_short agent=kai reason=fetch-miss attempt=1"
+check "fetch-miss case 13: kai is not woken and the thread not flagged" 0 \
+    "$(( $(grep -c -- '^--k8s$' "$STUB_ARGV_LOG") + $( [[ -e "$PM_STATE_DIR/needs-operator/$fw13_tid" ]] && echo 1 || echo 0 ) ))"
+fw_sync "$fw13_branch" "$fw13_sha"
+fw_set "$fw13_tid" kai NOT_BEFORE 0
+once
+check "fetch-miss case 13: after the sync kai is checked out at the target" \
+    "$fw13_sha" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+fw_gone="$(git -C "$PROJECT_DIR" cat-file -e "$fw13_sha^{commit}" 2>/dev/null && echo 1 || echo 0)"
+check "fetch-miss case 13: the sha was fetched into the project repo" 1 "$fw_gone"
+unset FORK_SANDBOX_POSTMASTER_FETCH_WINDOW
+
+refuses "fetch-miss: a non-numeric FETCH_WINDOW refuses deliver" \
+    env FORK_SANDBOX_POSTMASTER_FETCH_WINDOW=soon "$postmaster" deliver --project "$PROJECT_DIR" --once
+refuses "fetch-miss: a negative FETCH_WINDOW refuses deliver" \
+    env FORK_SANDBOX_POSTMASTER_FETCH_WINDOW=-5 "$postmaster" deliver --project "$PROJECT_DIR" --once
 git -C "$PROJECT_DIR" remote remove origin
 
 # ---- upstream-head case 8: a malformed value (only the store can produce

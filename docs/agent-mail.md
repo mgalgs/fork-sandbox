@@ -988,11 +988,28 @@ fleet agent** (a fleet seat's copy is ignored and logged as
    never reset. (In a cluster this applies to any non-fleet sender, not
    only one on the operator list: the `upstream` cap at the API is what
    authorized the message.)
-3. **Fetch or flag.** Before waking the thread's `sets` seat, if the file
-   exists, it makes sure the sha is in the project repo: it fetches
+3. **Fetch, defer, or flag.** Before waking the thread's `sets` seat, if
+   the file exists, it makes sure the sha is in the project repo: it fetches
    `refs/heads/<branch>` from `origin` (when configured), then requires the
-   sha. Still absent — the branch moved on again — the thread is flagged
-   (keyword `upstream-head`) and the seat is **not** woken.
+   sha. A miss — the ref is not on `origin` yet, the fetch fails, or the
+   fetch works and the sha is still absent — does **not** flag at once,
+   because `origin` is often a forge pull mirror that syncs every few
+   minutes and the announcement beats it. The wake is held in
+   `fetch-wait/<thread-id>/<agent>` and re-checked on later passes (after
+   15 s, 30 s, then every 60 s; nothing sleeps, so other threads keep
+   routing) until `$FORK_SANDBOX_POSTMASTER_FETCH_WINDOW` seconds (default
+   `300`) have passed since the first miss. A re-check that finds the sha
+   wakes the seat as if the first fetch had worked (step 4). A window that
+   runs out flags the thread (keyword `upstream-head`) and the seat is
+   **not** woken — the branch really moved on again. A newer announcement on
+   the thread supersedes a pending wait and its window starts fresh; the
+   wait is on disk, so a restarted postmaster resumes it. `0` restores the
+   flag-at-once behavior, as does a project with no `origin` (nothing to
+   wait for). The same wait covers the review-target sha a `follow` seat is
+   checked out at (keyword `review-target`). Events:
+   `defer ... reason=fetch-miss attempt=<n>` per failed check, and
+   `defer-resolved ... reason=fetch-miss attempts=<n>` when it resolves; a
+   thread with a pending wait is not quiescent.
 4. **Deliver.** The seat's k8s launch gets `--extra-ref upstream=<sha>`, on
    **every** wake of that seat while the file exists. The postmaster keeps
    no "answered" state; the persona decides whether it has already
@@ -1226,7 +1243,11 @@ flag; `flagged` says whether the thread is still flagged for something
 else; one line per cleared attempt), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
 `defer` (thread, agent, reason=wake-when — a seat's wake gate said not
-now; see rule 5), `wake-gate-error` (thread, agent,
+now; see rule 5; or reason=fetch-miss, attempt=<n> — the sha a wake needs
+is not on `origin` yet, so the wake is held and re-checked; see "Upstream
+moved" step 3), `defer-resolved` (thread, agent, reason=fetch-miss,
+attempts=<n> — the held wake's sha arrived and the wake proceeds; a window
+that runs out ends in the ordinary `flag` event), `wake-gate-error` (thread, agent,
 reason=exit-<N>|timeout|missing|context — a gate could not answer and
 the seat was woken anyway),
 `refuse` (agent, thread, reason=hops|budget|budget-reserved|upstream-closed — at
@@ -1390,7 +1411,8 @@ A thread is quiescent when ALL of these hold:
 - no pending retry under `retries/<thread-id>/` (a record with
   `STATE=pending`; `recovered`, `exhausted` and `FAILS`-only records are
   history and do not count);
-- no held seat under `held/<thread-id>/`.
+- no held seat under `held/<thread-id>/`;
+- no wake waiting on a fetch miss under `fetch-wait/<thread-id>/`.
 
 A flagged thread can be quiescent: `FS_HOOK_FLAGGED` is `1`. "The round
 ended because someone must act" is still a round ending, and the hook
@@ -1860,6 +1882,7 @@ own thread scans never see it:
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
+| `fetch-wait/<thread-id>/<agent>` | a wake deferred because its sha (upstream head or review target) is not on `origin` yet: `TRIGGER`, `RETRY`, `KIND`, `KEY` (`<branch> <sha>`), `SINCE`, `ATTEMPTS`, `NOT_BEFORE` — see "Upstream moved" step 3 |
 | `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |
 | `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
@@ -2070,6 +2093,7 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_THREAD_BUDGET` | `32` | router (rule 3) |
 | `FORK_SANDBOX_POSTMASTER_DEBOUNCE` | `30` (seconds, `0` disables) | router (pre-rule-0 quiescence gate) |
 | `FORK_SANDBOX_POSTMASTER_INTERVAL` | `15` (seconds) | router loop |
+| `FORK_SANDBOX_POSTMASTER_FETCH_WINDOW` | `300` (seconds, `0` flags at once) | router (how long a wake whose sha is not on `origin` yet is deferred before the thread is flagged — see "Upstream moved") |
 | `FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE` | see `--help` | dead-wake detection |
 | `FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT` | `120` (seconds) | Cc triage classifier call |
 | `FORK_SANDBOX_HANDLERS_DIR` | `~/.config/fork-sandbox/handlers` | registry, router (`handler: exec` seats) |

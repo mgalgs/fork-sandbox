@@ -97,6 +97,18 @@
 #                else is cleared. See pm_wake_exit_clear.
 #   defer        thread, agent, reason=wake-when -- the seat's wake gate
 #                (rule 5) answered "not now": no spawn, no budget slot
+#   defer        thread, agent, reason=fetch-miss, attempt=<n> -- the sha
+#                the wake needs (the upstream head, or the review target)
+#                could not be had from origin, so the wake is held and
+#                re-checked on a later pass instead of flagging the thread;
+#                one line per failed check, n counting from 1. See FETCH
+#                MISS below.
+#   defer-resolved thread, agent, reason=fetch-miss, attempts=<n> -- a
+#                deferred wake's sha arrived (0 attempts: a newer
+#                announcement replaced the pending one and its first check
+#                succeeded); the wake proceeds as if the first fetch had
+#                worked. A window that runs out ends in the ordinary
+#                `flag` event (keyword upstream-head or review-target).
 #   wake-gate-error thread, agent, reason=exit-<N>|timeout|missing|context --
 #                a wake gate could not answer, so the seat was woken anyway
 #   refuse       agent, thread, reason=hops|budget|budget-reserved|no-grant|
@@ -210,8 +222,9 @@
 # its needs-operator flag and truncates its spawn count ($SEQ is never
 # reset). Every wake of the thread's `review-target: sets` seat, while the
 # file exists, first makes sure the sha is in the project repo (fetching
-# refs/heads/<branch> from origin) -- flagging the thread (keyword
-# upstream-head) and NOT waking when it is still absent -- and then passes
+# refs/heads/<branch> from origin) -- deferring the wake, then flagging the
+# thread (keyword upstream-head) once the FETCH MISS window has passed, and
+# NOT waking while it is still absent -- and then passes
 # `--extra-ref upstream=<sha>` on to the seat's k8s launch, so the pod sees
 # the commit as a local branch named `upstream`. The seat's --checkout is
 # unchanged. No other seat gets the ref, and the postmaster keeps no
@@ -224,6 +237,31 @@
 # deleted), the reply is accepted and stamped with the CURRENT target's
 # branch and sha and the new X-Version; the review-target file keeps its sha
 # and takes the new VERSION.
+#
+# FETCH MISS
+#
+# The postmaster's origin can be a forge pull mirror that syncs every few
+# minutes, so a sha announced seconds ago (X-Upstream-Head) may not be
+# fetchable yet. Before waking a seat, pm_spawn_wake needs two kinds of sha
+# from origin: the upstream head (a `sets` k8s seat) and the review target (a
+# `follow` seat, or a `sets` seat with no lineage yet). A miss -- the ref is
+# missing, the fetch fails, or the fetch works and the sha is still absent --
+# does not flag at once: pm_fetch_wait_gate records the wake under
+# $STATE/fetch-wait/<thread-id>/<agent> (TRIGGER, RETRY, KIND, KEY=<branch>
+# <sha>, SINCE, ATTEMPTS, NOT_BEFORE), emits `defer ... reason=fetch-miss`,
+# and returns. pm_fetch_wait_pass, once per deliver pass, re-dispatches every
+# record whose NOT_BEFORE has come (backoff 15s, 30s, then 60s, the last
+# attempt landing on the end of the window); nothing sleeps, so other
+# threads route normally meanwhile, and the record is on disk, so a restarted
+# postmaster picks it up. A hit drops the record, emits `defer-resolved` and
+# wakes the seat as if the first fetch had worked. Once
+# $FORK_SANDBOX_POSTMASTER_FETCH_WINDOW seconds (default 300; 0 = flag at
+# once, the old behavior) have passed since the first miss, the thread is
+# flagged exactly as a miss always was (keyword upstream-head or
+# review-target) and the seat is not woken. A newer upstream-head
+# announcement supersedes a pending wait: its window starts fresh. A project
+# with no `origin` has nothing to wait for and flags at once. A thread that
+# is waiting is not quiescent; closing the upstream drops the wait.
 #
 # UPSTREAM STATE
 #
@@ -799,6 +837,8 @@
 #                                   message-id, run-id) -- an audit trail
 #                                   for the routing decision, not read back
 #                                   by anything (pm_ledger_delivered_live)
+#   fetch-wait/<thread-id>/<agent> a wake deferred on a fetch miss -- see
+#                                   FETCH MISS.
 #   upstream-state/<thread-id>.env STATE=closed|open, MSGID (the message
 #                                   that set it), AT -- see UPSTREAM STATE.
 #                                   Absent means open
@@ -1103,6 +1143,9 @@ DEFERRAL_MARKS="$STATE/deferral-marks"
 # MSGID, AT) -- see UPSTREAM STATE in the header. No file means open.
 UPSTREAM_STATE="$STATE/upstream-state"
 PM_SEAT_RECORD_DIRS=("$WAKE_DEFERRED" "$BUDGET_RESERVED")
+# One pending fetch-miss re-check per seat, $FETCH_WAIT/<thread-id>/<agent>
+# -- see FETCH MISS in the header. Under $STATE, so it survives a restart.
+FETCH_WAIT="$STATE/fetch-wait"
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
 # same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
@@ -2539,6 +2582,25 @@ pm_require_k8s_timeout() {
     pm_parse_k8s_timeout
 }
 
+# Validates $FORK_SANDBOX_POSTMASTER_FETCH_WINDOW, how long (seconds) a wake
+# that cannot get its sha from origin is deferred and re-checked before the
+# thread is flagged (see FETCH MISS in the header). Unset or empty takes the
+# default (300); 0 is legal and flags at once. Anything else is a config
+# error, reported here once, same posture as pm_require_retry_backoff.
+pm_parse_fetch_window() {
+    local raw="${FORK_SANDBOX_POSTMASTER_FETCH_WINDOW-}"
+    [[ -z "$raw" ]] && return 0
+    if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+        echo "Error: postmaster: \$FORK_SANDBOX_POSTMASTER_FETCH_WINDOW '$raw' is not a non-negative integer (seconds)." >&2
+        return 1
+    fi
+    return 0
+}
+
+pm_require_fetch_window() {
+    pm_parse_fetch_window
+}
+
 # The cluster operator list: the From addresses whose mail carries rule-1
 # authority (clears the thread's needs-operator flag, resets its spawn
 # budget) under `deliver --cluster`. $FORK_SANDBOX_OPERATORS is a
@@ -2721,6 +2783,115 @@ pm_target_sha_present() {
     git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null
 }
 
+# Atomic tmp+mv write of one pending fetch-miss record (see FETCH MISS in the
+# header), $FETCH_WAIT/<tid>/<agent>.
+pm_fetch_wait_write() {
+    local tid="$1" agent="$2" trigger="$3" retry="$4" kind="$5" key="$6" since="$7" attempts="$8" not_before="$9"
+    mkdir -p -- "$FETCH_WAIT/$tid"
+    local tmp
+    tmp="$(mktemp "$FETCH_WAIT/$tid/.tmp.XXXXXX")"
+    {
+        printf 'TRIGGER=%s\n' "$trigger"
+        printf 'RETRY=%s\n' "$retry"
+        printf 'KIND=%s\n' "$kind"
+        printf 'KEY=%s\n' "$key"
+        printf 'SINCE=%s\n' "$since"
+        printf 'ATTEMPTS=%s\n' "$attempts"
+        printf 'NOT_BEFORE=%s\n' "$not_before"
+    } > "$tmp"
+    mv -- "$tmp" "$FETCH_WAIT/$tid/$agent"
+}
+
+pm_fetch_wait_drop() {
+    rm -f -- "$FETCH_WAIT/$1/$2"
+    rmdir -- "$FETCH_WAIT/$1" 2>/dev/null || true
+}
+
+# The sha a seat's wake needs from origin before it may start: <kind> is
+# `upstream-head` or `review-target`, <branch>/<sha> what to have. Returns 0
+# when the wake may go ahead; 1 when it may not -- either deferred (a pending
+# record is written or kept; pm_fetch_wait_pass re-dispatches it) or, once the
+# window has passed, flagged exactly as a miss always was. Never sleeps. See
+# FETCH MISS in the header.
+pm_fetch_wait_gate() {
+    local project="$1" tid="$2" agent="$3" mid="$4" is_retry="$5" kind="$6" branch="$7" sha="$8"
+    local f="$FETCH_WAIT/$tid/$agent" key="$branch $sha"
+    local window="${FORK_SANDBOX_POSTMASTER_FETCH_WINDOW:-300}"
+    local now since="" attempts=0 not_before=0 retry_flag=0
+    now="$(date +%s)"
+    [[ -n "$is_retry" ]] && retry_flag=1
+    local pending=0
+    # A record of the other kind belongs to the other check in pm_spawn_wake
+    # (a `sets` seat can need both): this one neither reads nor resolves it.
+    if [[ -f "$f" && "$(fs_pm_env_get "$f" KIND)" == "$kind" ]]; then
+        pending=1
+        # A record for another key was superseded by a newer announcement:
+        # the window starts fresh.
+        if [[ "$(fs_pm_env_get "$f" KEY)" == "$key" ]]; then
+            since="$(fs_pm_env_get "$f" SINCE)"
+            attempts="$(fs_pm_env_get "$f" ATTEMPTS)"
+            not_before="$(fs_pm_env_get "$f" NOT_BEFORE)"
+            [[ "$since" =~ ^[0-9]+$ ]] || since="$now"
+            [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+            [[ "$not_before" =~ ^[0-9]+$ ]] || not_before=0
+        fi
+    fi
+
+    local present=0
+    if git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null; then
+        present=1
+    elif [[ -n "$since" ]] && (( now < not_before )); then
+        # Not due yet: keep the clock, take the newest trigger, fetch nothing.
+        pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before"
+        return 1
+    elif pm_target_sha_present "$project" "$branch" "$sha"; then
+        present=1
+    fi
+    if (( present )); then
+        if (( pending )); then
+            pm_fetch_wait_drop "$tid" "$agent"
+            pm_event "defer-resolved thread=${tid:0:8} agent=$agent reason=fetch-miss attempts=$attempts"
+        fi
+        return 0
+    fi
+
+    # Missed. With nothing to wait for (no origin, or the window is 0) it is
+    # today's flag at once.
+    if [[ "$window" == 0 ]] || ! git -C "$project" remote get-url origin >/dev/null 2>&1; then
+        (( ! pending )) || pm_fetch_wait_drop "$tid" "$agent"
+        pm_flag "$tid" "${kind//-/ } $branch $sha not found in the project repo" "$kind"
+        return 1
+    fi
+    [[ -n "$since" ]] || since="$now"
+    attempts=$(( attempts + 1 ))
+    if (( now >= since + window )); then
+        pm_fetch_wait_drop "$tid" "$agent"
+        pm_flag "$tid" "${kind//-/ } $branch $sha not found in the project repo" "$kind"
+        return 1
+    fi
+    # 15s, 30s, then every 60s -- but never past the end of the window, so
+    # the last attempt lands on it and the flag is not late by a full step.
+    local delay=$(( 15 << (attempts > 3 ? 2 : attempts - 1) ))
+    not_before=$(( now + delay ))
+    (( not_before <= since + window )) || not_before=$(( since + window ))
+    pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before"
+    pm_event "defer thread=${tid:0:8} agent=$agent reason=fetch-miss attempt=$attempts"
+    return 1
+}
+
+# A newer upstream-head announcement for <tid> supersedes whatever fetch-miss
+# wait the thread's seats have pending: each is made due now and loses its
+# key, so the next check starts a fresh window on the newest head.
+pm_fetch_wait_supersede() {
+    local tid="$1" f
+    for f in "$FETCH_WAIT/$tid"/*; do
+        [[ -f "$f" ]] || continue
+        [[ "$(fs_pm_env_get "$f" KIND)" == upstream-head ]] || continue
+        pm_fetch_wait_write "$tid" "$(basename -- "$f")" "$(fs_pm_env_get "$f" TRIGGER)" \
+            "$(fs_pm_env_get "$f" RETRY)" "$(fs_pm_env_get "$f" KIND)" "" 0 0 0
+    done
+}
+
 # Writes the per-thread review-target state file for <tid>, atomically
 # (mktemp in the same dir, then mv) -- this store's own copy of mail.sh's
 # mail_write_review_target, which is private to that script. The one
@@ -2788,6 +2959,7 @@ pm_record_upstream_head() {
         echo "Error: postmaster: could not write the upstream-head file for thread $tid" >&2
         return 1
     fi
+    pm_fetch_wait_supersede "$tid"
     pm_event "upstream-head thread=${tid:0:8} sha=${sha:0:12}"
     return 0
 }
@@ -3396,8 +3568,8 @@ pm_spawn_wake() {
             rt_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
             rt_sha="$(fs_pm_env_get "$rt_file" SHA)"
             rt_version="$(fs_pm_env_get "$rt_file" VERSION)"
-            if [[ -n "$rt_sha" ]] && ! pm_target_sha_present "$project" "$rt_branch" "$rt_sha"; then
-                pm_flag "$tid" "review target $rt_branch $rt_sha not found in the project repo" "review-target"
+            if [[ -n "$rt_sha" ]] \
+                && ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" review-target "$rt_branch" "$rt_sha"; then
                 return 0
             fi
         fi
@@ -3417,8 +3589,7 @@ pm_spawn_wake() {
                 local uh_branch
                 uh_branch="$(fs_pm_env_get "$uh_file" BRANCH)"
                 uh_sha="$(fs_pm_env_get "$uh_file" SHA)"
-                if ! pm_target_sha_present "$project" "$uh_branch" "$uh_sha"; then
-                    pm_flag "$tid" "upstream head $uh_branch $uh_sha not found in the project repo" "upstream-head"
+                if ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" upstream-head "$uh_branch" "$uh_sha"; then
                     return 0
                 fi
             else
@@ -5165,6 +5336,52 @@ pm_held_pass() {
     done
 }
 
+# ---- fetch-wait pass ----
+
+# Re-dispatches each $FETCH_WAIT/<tid>/<agent> record that has come due (see
+# pm_fetch_wait_gate and FETCH MISS in the header). One pass does at most one
+# bounded fetch per due record and never sleeps, so other threads route at
+# full speed meanwhile. The wake goes back through pm_followup_wake with the
+# wake gate already answered; its own pm_spawn_wake re-runs the gate, which
+# resolves, re-defers or flags the record. A record the re-dispatch left
+# untouched (a refusal before the gate: hops, budget, a seat that no longer
+# resolves) is dropped here, or it would be re-dispatched on every pass.
+pm_fetch_wait_pass() {
+    local project="$1" tid_dir tid f agent now
+    mkdir -p -- "$FETCH_WAIT"
+    for tid_dir in "$FETCH_WAIT"/*/; do
+        [[ -d "$tid_dir" ]] || continue
+        tid="$(basename -- "$tid_dir")"
+        for f in "$tid_dir"*; do
+            [[ -f "$f" ]] || continue
+            agent="$(basename -- "$f")"
+            if pm_upstream_closed "$tid"; then
+                pm_fetch_wait_drop "$tid" "$agent"
+                pm_upstream_refuse "$tid" "$agent"
+                continue
+            fi
+            # A live run means the seat is not actually waiting; leave it.
+            if fs_pm_find_live_run "$agent" "$tid" >/dev/null; then
+                continue
+            fi
+            now="$(date +%s)"
+            local not_before attempts trigger retry_flag is_retry=""
+            not_before="$(fs_pm_env_get "$f" NOT_BEFORE)"
+            [[ "$not_before" =~ ^[0-9]+$ ]] || not_before=0
+            (( now >= not_before )) || continue
+            attempts="$(fs_pm_env_get "$f" ATTEMPTS)"
+            trigger="$(fs_pm_env_get "$f" TRIGGER)"
+            retry_flag="$(fs_pm_env_get "$f" RETRY)"
+            [[ "$retry_flag" == 1 ]] && is_retry=1
+            local PM_WAKE_ADMITTED=1
+            pm_followup_wake "$project" "$agent" "$tid" "$trigger" "$is_retry" || true
+            if [[ -f "$f" && "$(fs_pm_env_get "$f" ATTEMPTS)" == "$attempts" ]]; then
+                pm_fetch_wait_drop "$tid" "$agent"
+            fi
+        done
+    done
+}
+
 # ---- verbs ----
 
 # ---- hook pass: on-target and on-quiescent ----
@@ -5214,7 +5431,7 @@ pm_thread_is_quiescent() {
         [[ -f "$f" ]] || continue
         [[ "$(fs_pm_env_get "$f" STATE)" == pending ]] && return 1
     done
-    for f in "$STATE/held/$tid"/*; do
+    for f in "$STATE/held/$tid"/* "$FETCH_WAIT/$tid"/*; do
         [[ -e "$f" ]] && return 1
     done
     return 0
@@ -5425,6 +5642,7 @@ cmd_deliver() {
     pm_require_budget_reserve || return 2
     pm_require_retry_backoff || return 1
     pm_require_k8s_timeout || return 1
+    pm_require_fetch_window || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1
@@ -5438,6 +5656,7 @@ cmd_deliver() {
         pm_hook_reap
         pm_route_pass "$project"
         pm_held_pass "$project"
+        pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
         pm_deferral_pass
@@ -5451,6 +5670,7 @@ cmd_deliver() {
         pm_hook_reap
         pm_route_pass "$project"
         pm_held_pass "$project"
+        pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
         pm_deferral_pass
