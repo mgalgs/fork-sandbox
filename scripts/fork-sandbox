@@ -11,6 +11,7 @@
 #        fork-sandbox validate-services <file>
 #        fork-sandbox mail <verb> [options]
 #        fork-sandbox mail-api <serve|mint|check> [options]
+#        fork-sandbox mail-forward <--setup ...|--status|--stop>
 #        fork-sandbox fleet <verb> [options]
 #        fork-sandbox postmaster <verb> [options]
 #
@@ -27,6 +28,7 @@
 #   validate-services  fork-sandbox-k8s-services-parse.py
 #   mail       fork-sandbox-mail.sh
 #   mail-api   fork-sandbox-mail-api.py
+#   mail-forward  fork-sandbox-mail-forward.py
 #   fleet      fork-sandbox-fleet.sh
 #   postmaster fork-sandbox-postmaster.sh
 #
@@ -87,6 +89,9 @@ case "$verb" in
     mail-api)
         target='fork-sandbox-mail-api.py'
         ;;
+    mail-forward)
+        target='fork-sandbox-mail-forward.py'
+        ;;
     fleet)
         target='fork-sandbox-fleet.sh'
         ;;
@@ -95,7 +100,7 @@ case "$verb" in
         ;;
     *)
         printf "fork-sandbox: unknown verb '%s'\n" "$verb" >&2
-        printf '%s\n' 'Verbs: run status say stop configure k8s log validate-services mail mail-api fleet postmaster' >&2
+        printf '%s\n' 'Verbs: run status say stop configure k8s log validate-services mail mail-api mail-forward fleet postmaster' >&2
         printf '%s\n' "Try 'fork-sandbox --help'." >&2
         exit 2
         ;;

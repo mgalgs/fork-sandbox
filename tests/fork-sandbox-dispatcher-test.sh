@@ -51,7 +51,8 @@ chmod +x "$tmp/fork-sandbox"
 for target in fork-sandbox.sh fork-sandbox-status.sh fork-sandbox-say.sh \
     fork-sandbox-stop.sh fork-sandbox-k8s.sh sandbox-run-log.py \
     fork-sandbox-k8s-services-parse.py \
-    fork-sandbox-mail.sh fork-sandbox-mail-api.py fork-sandbox-fleet.sh \
+    fork-sandbox-mail.sh fork-sandbox-mail-api.py fork-sandbox-mail-forward.py \
+    fork-sandbox-fleet.sh \
     fork-sandbox-postmaster.sh; do
     cat > "$tmp/$target" <<'STUB'
 #!/usr/bin/env bash
@@ -108,6 +109,8 @@ run_case 'configure prepends configure' $'fork-sandbox.sh\nconfigure\n--dry-run'
 run_case 'mail passes arguments' $'fork-sandbox-mail.sh\nlist' mail list
 run_case 'mail-api passes arguments' \
     $'fork-sandbox-mail-api.py\nserve\n--tokens\nt' mail-api serve --tokens t
+run_case 'mail-forward passes arguments' \
+    $'fork-sandbox-mail-forward.py\n--setup\n--context\nc' mail-forward --setup --context c
 run_case 'fleet passes arguments' $'fork-sandbox-fleet.sh\ncheck' fleet check
 run_case 'postmaster passes arguments' $'fork-sandbox-postmaster.sh\nstatus' postmaster status
 run_case 'help after verb reaches target' $'fork-sandbox.sh\n--help' run --help
@@ -119,7 +122,9 @@ if [[ "$help" == *'run'* && "$help" == *'status'* && "$help" == *'say'* &&
     "$help" == *'validate-services'* && "$help" == *'mail'* && "$help" == *'fleet'* &&
     "$help" == *'postmaster'* &&
     "$help" == *'fork-sandbox mail-api <serve|mint|check>'* &&
-    "$help" == *'mail-api   fork-sandbox-mail-api.py'* ]]; then
+    "$help" == *'mail-api   fork-sandbox-mail-api.py'* &&
+    "$help" == *'fork-sandbox mail-forward <--setup'* &&
+    "$help" == *'mail-forward  fork-sandbox-mail-forward.py'* ]]; then
     ok '--help names all verbs'
 else
     no '--help names all verbs' "$help"
@@ -148,7 +153,7 @@ if grep -Fq "unknown verb 'frobnicate'" "$tmp/unknown-err"; then
 else
     no 'unknown verb names offender' "$(cat "$tmp/unknown-err")"
 fi
-if grep -qF 'Verbs: run status say stop configure k8s log validate-services mail mail-api fleet postmaster' \
+if grep -qF 'Verbs: run status say stop configure k8s log validate-services mail mail-api mail-forward fleet postmaster' \
         "$tmp/unknown-err"; then
     ok 'unknown verb lists every verb'
 else

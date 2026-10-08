@@ -43,12 +43,25 @@ stdin, and `--attach <path>` becomes `--attach <basename>` with the bytes
 uploaded alongside. Two attachments with one basename are refused here. Nothing
 else is validated: the server is the boundary.
 
+Team access. When neither a URL nor a token file is configured and `fork-sandbox
+mail-forward --setup` has been run, this client sets itself up instead (see
+fork-sandbox-mail-forward.py, and docs/mail-api.md, "Team access"): it starts
+or reuses one background `kubectl port-forward` to the mail API on a stable
+local port, using the kube context recorded at setup and never the
+kubeconfig's current one, reads the shared team token with the caller's own
+kube credentials once per run, holds it in memory only, and defaults `--from`
+on send and reply to the @name recorded at setup (an explicit --from wins). The
+forward is re-established before a retry when it has died with a replaced pod,
+and a 401 after a token rotation is retried once with a fresh token. Explicit
+URL / token configuration takes precedence over all of it.
+
 The connection ignores http_proxy and friends and does not follow redirects,
 so the token goes only to the configured URL.
 """
 
 import base64
 import http.client
+import importlib.util
 import json
 import os
 import random
@@ -80,9 +93,10 @@ VALUE_FLAGS = {
 
 
 class Fail(Exception):
-    def __init__(self, message, rc=2):
+    def __init__(self, message, rc=2, status=None):
         super().__init__(message)
         self.rc = rc
+        self.status = status  # the HTTP status behind it, when there was one
 
 
 class Retryable(Fail):
@@ -106,11 +120,14 @@ def read_env_key(path, key):
     return None
 
 
+def config_dir():
+    return (os.environ.get("FORK_SANDBOX_CONFIG_DIR")
+            or os.path.join(os.path.expanduser("~"),
+                            ".config", "fork-sandbox"))
+
+
 def k8s_env_path():
-    config_dir = (os.environ.get("FORK_SANDBOX_CONFIG_DIR")
-                  or os.path.join(os.path.expanduser("~"),
-                                  ".config", "fork-sandbox"))
-    return os.path.join(config_dir, "k8s.env")
+    return os.path.join(config_dir(), "k8s.env")
 
 
 def setting(keys):
@@ -125,7 +142,8 @@ def config(tool):
     prefix = "fork-sandbox %s --remote: " % tool
     url = setting(URL_KEYS)
     if not url:
-        raise Fail("%sno API URL: set %s or %s in %s"
+        raise Fail("%sno API URL: set %s or %s in %s (or run `fork-sandbox "
+                   "mail-forward --setup` for team access)"
                    % (prefix, URL_KEYS[0], URL_KEYS[1], k8s_env_path()))
     if not url.startswith(("http://", "https://")):
         raise Fail("%sthe API URL must start with http:// or https://"
@@ -144,6 +162,56 @@ def config(tool):
         raise Fail("%sno token: the token file is empty (%s or %s)"
                    % (prefix, TOKEN_KEYS[0], TOKEN_KEYS[1]))
     return url.rstrip("/") + "/v1/exec", token, retry_budget(prefix)
+
+
+class Team:
+    """The team-access path: a recorded setup, the forward helper, and the
+    kube-credentialed token read. Nothing here keeps the token."""
+
+    def __init__(self, tool, mod, setup):
+        self.prefix = "fork-sandbox %s --remote: " % tool
+        self.mod = mod
+        self.setup = setup
+        self.url = None
+
+    def translate(self, e):
+        failure = Retryable if e.retryable else Fail
+        return failure("%s%s" % (self.prefix, e))
+
+    def token(self):
+        try:
+            return self.mod.fetch_token(self.setup)
+        except self.mod.ForwardError as e:
+            raise Fail("%s%s" % (self.prefix, e))
+
+    def refresh(self):
+        """Before every attempt: a forward that is up costs one /healthz; a
+        dead one (its pod was replaced) is started again."""
+        try:
+            self.url = self.mod.ensure_forward(self.setup) + "/v1/exec"
+        except self.mod.ForwardError as e:
+            raise self.translate(e)
+
+
+def load_team(tool):
+    """A Team when no URL or token file is configured and the setup file
+    exists, else None. The explicit configuration always takes precedence."""
+    if setting(URL_KEYS) or setting(TOKEN_KEYS):
+        return None
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                        "fork-sandbox-mail-forward.py")
+    if not os.path.exists(os.path.join(config_dir(), "mail-team.env")):
+        return None
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("fork_sandbox_mail_forward",
+                                                  path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    try:
+        setup = mod.load_setup()
+    except mod.ForwardError as e:
+        raise Fail("fork-sandbox %s --remote: %s" % (tool, e))
+    return Team(tool, mod, setup) if setup else None
 
 
 def retry_budget(prefix):
@@ -165,6 +233,24 @@ def read_file(path, what):
     except OSError as e:
         raise Fail("Error: %s '%s' is unreadable: %s"
                    % (what, path, e.strerror), rc=1)
+
+
+# Every flag of send and reply that takes a value, for finding an explicit
+# --from without mistaking a value for a flag.
+ANY_VALUE_FLAGS = VALUE_FLAGS | {"--review-target", "--upstream-head",
+                                 "--upstream-state"}
+
+
+def default_from(tool, argv, name):
+    """send and reply with no --from get the @name recorded at setup."""
+    if tool != "mail" or not argv or argv[0] not in ("send", "reply"):
+        return argv
+    i = 1
+    while i < len(argv):
+        if argv[i] == "--from":
+            return argv
+        i += 2 if argv[i] in ANY_VALUE_FLAGS else 1
+    return argv[:1] + ["--from", name] + argv[1:]
 
 
 def rewrite(tool, argv):
@@ -228,7 +314,8 @@ def post(tool, url, token, request, key):
             message = e.reason or "no detail"
         message = " ".join(message.split()) or "no detail"
         failure = Retryable if e.code in RETRY_STATUS else Fail
-        raise failure("%sHTTP %d: %s" % (prefix, e.code, message))
+        raise failure("%sHTTP %d: %s" % (prefix, e.code, message),
+                      status=e.code)
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
         reason = getattr(e, "reason", None) or e
         raise Retryable("%scannot reach %s: %s"
@@ -238,15 +325,20 @@ def post(tool, url, token, request, key):
         raise Fail("%sthe server sent a reply that is not JSON" % prefix)
 
 
-def post_with_retries(tool, url, token, request, key, budget):
+def post_with_retries(tool, url, token, request, key, budget, team=None):
     """post(), tried again on a Retryable failure until budget seconds have
-    passed since the first attempt. Budget 0 is one attempt."""
+    passed since the first attempt. Budget 0 is one attempt. With team, its
+    forward is made sure of before every attempt, so a retry after a pod was
+    replaced goes through a fresh forward; url is then team.url."""
     prefix = "fork-sandbox %s --remote: " % tool
     start = time.monotonic()
     attempt = 0
     while True:
         attempt += 1
         try:
+            if team is not None:
+                team.refresh()
+                url = team.url
             return post(tool, url, token, request, key)
         except Retryable as e:
             if budget <= 0:
@@ -266,7 +358,13 @@ def post_with_retries(tool, url, token, request, key, budget):
 
 
 def run(tool, argv):
-    url, token, budget = config(tool)
+    team = load_team(tool)
+    if team is None:
+        url, token, budget = config(tool)
+    else:
+        url, budget = None, retry_budget(team.prefix)
+        token = team.token()
+        argv = default_from(tool, argv, team.setup["name"])
     argv, stdin, files = rewrite(tool, argv)
     request = {"tool": tool, "argv": argv}
     if stdin is not None:
@@ -275,7 +373,18 @@ def run(tool, argv):
         request["files"] = {name: base64.b64encode(data).decode("ascii")
                             for name, data in files.items()}
     key = secrets.token_urlsafe(24) if argv[0] in MUTATING else None
-    reply = post_with_retries(tool, url, token, request, key, budget)
+    try:
+        reply = post_with_retries(tool, url, token, request, key, budget, team)
+    except Fail as e:
+        # A rotated team token answers 401 until the caller reads the new
+        # one; read it once more and try again, never more than once.
+        if team is None or e.status != 401:
+            raise
+        fresh = team.token()
+        if fresh == token:
+            raise
+        reply = post_with_retries(tool, url, fresh, request, key, budget,
+                                  team)
     try:
         rc = int(reply["rc"])
         out = base64.b64decode(reply["stdout_b64"])

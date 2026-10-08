@@ -301,6 +301,7 @@ PORCELAIN=(
     fork-sandbox-fleet.sh
     fork-sandbox-k8s.sh
     fork-sandbox-mail-api.py
+    fork-sandbox-mail-forward.py
     fork-sandbox-mail-render.py
     fork-sandbox-mail.sh
     fork-sandbox-postmaster.sh
