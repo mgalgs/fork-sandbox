@@ -3,7 +3,7 @@
 postmaster, for callers that must not have a shell on the store's host.
 
 Usage: fork-sandbox-mail-api.py serve --tokens <file> [--listen 0.0.0.0:8080]
-       fork-sandbox-mail-api.py check --tokens <file>
+       fork-sandbox-mail-api.py check --tokens <file> [--team-hash <sha256-hex>]
        fork-sandbox-mail-api.py mint --role operator|client --label <label>
                                 [--as @a[,@b]] [--caps read,grant,seen,target]
 
@@ -21,6 +21,15 @@ was started with (so FORK_SANDBOX_MAIL_ROOT passes through), without a shell.
 check runs the loader serve runs on the tokens file and exits: it prints
 "ok: <n> entries (<k> operator, <m> client)" and exits 0, or prints the one
 line serve would and exits 2. It never prints a hash or a token.
+
+The team token. Beside the tokens file, serve and check read an optional file
+named team-token-sha256: one SHA-256 hex digest, the hash of the cluster's
+shared team token. When it is there, the table gains one more entry, an
+operator named "team" (so a tokens-file entry labelled "team" is refused as a
+duplicate). The tokens file keeps working exactly as before; with no such file
+nothing changes. check --team-hash <hex> validates a digest the way the file
+would be read, for `install --postmaster`, which computes it from the
+cluster's team Secret. See docs/mail-api.md, "Team access".
 
 The operator list is $FORK_SANDBOX_OPERATORS, the same variable the
 postmaster reads: comma-separated @names, no spaces, no empty elements;
@@ -145,6 +154,8 @@ ADDR_RE = re.compile(r"@[a-z0-9][a-z0-9-]*")
 OPERATORS_ENV = "FORK_SANDBOX_OPERATORS"
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 HASH_RE = re.compile(r"[0-9a-fA-F]{64}")
+TEAM_LABEL = "team"
+TEAM_HASH_FILE = "team-token-sha256"
 
 MAX_BODY = 24 * 1024 * 1024
 MAX_FILE = 4 * 1024 * 1024
@@ -333,7 +344,25 @@ def validate_entry(role, digest, label, identities, caps, operators):
     return Entry(role, digest.lower(), label, ids, cap_list)
 
 
-def load_tokens(path, operators):
+def team_hash_beside(path):
+    """The digest in team-token-sha256 beside the tokens file, or None when
+    there is no such file. An unreadable or empty one is an error: serving
+    without the team entry would lock the team out without a word."""
+    candidate = os.path.join(os.path.dirname(os.path.abspath(path)),
+                             TEAM_HASH_FILE)
+    if not os.path.exists(candidate):
+        return None
+    try:
+        with open(candidate, encoding="ascii") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError("cannot read %s: %s"
+                          % (TEAM_HASH_FILE, e.__class__.__name__))
+
+
+def load_tokens(path, operators, team_hash=None):
+    """The tokens file's entries, plus the team entry when team_hash (a
+    digest) is given."""
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.read().splitlines()
@@ -366,6 +395,17 @@ def load_tokens(path, operators):
         by_label[entry.label] = True
         by_digest[entry.digest] = entry.label
         entries.append(entry)
+    if team_hash is not None:
+        if not HASH_RE.fullmatch(team_hash):
+            raise ConfigError("the team token hash is not a SHA-256 hex "
+                              "digest")
+        digest = team_hash.lower()
+        if TEAM_LABEL in by_label:
+            raise ConfigError("duplicate label '%s'" % TEAM_LABEL)
+        if digest in by_digest:
+            raise ConfigError("entries '%s' and '%s' share a token hash"
+                              % (by_digest[digest], TEAM_LABEL))
+        entries.append(Entry("operator", digest, TEAM_LABEL, [], []))
     if not entries:
         raise ConfigError("no entries in the tokens file")
     return entries
@@ -863,18 +903,21 @@ def parse_listen(text):
     return host.strip("[]") or "0.0.0.0", int(port)
 
 
-def load_or_die(path):
+def load_or_die(path, team_hash=None):
     """Load the tokens file under the env operator list, or exit 2 with one
-    line. Returns (entries, operators)."""
+    line. The team entry comes from team_hash, else from the file beside the
+    tokens file. Returns (entries, operators)."""
     try:
         operators = operator_names()
-        return load_tokens(path, operators), operators
+        if team_hash is None:
+            team_hash = team_hash_beside(path)
+        return load_tokens(path, operators, team_hash), operators
     except ConfigError as e:
         die("%s: %s" % (path, e))
 
 
 def cmd_check(args):
-    entries, _ = load_or_die(args.tokens)
+    entries, _ = load_or_die(args.tokens, args.team_hash)
     ops = sum(1 for e in entries if e.is_operator())
     sys.stdout.write("ok: %d entries (%d operator, %d client)\n"
                      % (len(entries), ops, len(entries) - ops))
@@ -940,6 +983,7 @@ def main(argv):
     serve.add_argument("--listen", default="0.0.0.0:8080")
     check = sub.add_parser("check", add_help=False, allow_abbrev=False)
     check.add_argument("--tokens", required=True)
+    check.add_argument("--team-hash")
     mint = sub.add_parser("mint", add_help=False, allow_abbrev=False)
     mint.add_argument("--role", required=True)
     mint.add_argument("--label", required=True)

@@ -1167,6 +1167,86 @@ shim_at "127.0.0.1:$pport" 60 mail --remote send --from @operator --to @x --subj
 check "a real 403: exit 2" "2" "$rc"
 check "... with one line, no retry, and quickly" "1" "$(( $(wc -l < "$work/err") == 1 && SECONDS - start < 3 ? 1 : 0 ))"
 
+printf '== 15. the team entry ==\n'
+
+# A digest beside the tokens file (or given to check) adds one operator
+# entry labelled "team"; the file's own entries are untouched.
+team_tok="$("$api" mint --role operator --label team | sed -n 1p)"
+team_hash="$(printf '%s' "$team_tok" | sha256sum | cut -d' ' -f1)"
+team_dir="$work/team-beside"; mkdir -p "$team_dir"
+cp "$work/good.tokens" "$team_dir/tokens"
+out="$("$api" check --tokens "$team_dir/tokens" 2>&1)"
+check "no digest beside the file: the count is unchanged" "ok: 3 entries (1 operator, 2 client)" "$out"
+printf '%s\n' "$team_hash" > "$team_dir/team-token-sha256"
+out="$("$api" check --tokens "$team_dir/tokens" 2>&1)"
+check "a digest beside the file adds one operator entry" "ok: 4 entries (2 operator, 2 client)" "$out"
+out="$("$api" check --tokens "$work/good.tokens" --team-hash "$team_hash" 2>&1)"
+check "check --team-hash does the same without a file" "ok: 4 entries (2 operator, 2 client)" "$out"
+
+team_refuses() {
+    local label="$1" want="$2" out rc; shift 2
+    out="$("$@" 2>&1)"; rc=$?
+    check "team: $label: exit 2" "2" "$rc"
+    contains "team: $label: says why" "$out" "$want"
+    check "team: $label: one line" "1" "$(printf '%s\n' "$out" | wc -l)"
+    lacks "team: $label: no digest in the error" "$out" "$team_hash"
+}
+team_refuses "a malformed --team-hash" "team token hash" \
+    "$api" check --tokens "$work/good.tokens" --team-hash nothex
+team_refuses "an empty --team-hash" "team token hash" \
+    "$api" check --tokens "$work/good.tokens" --team-hash ""
+printf 'operator %s team - -\n' "$good_hash" > "$work/team-label.tokens"
+team_refuses "a tokens-file entry labelled team" "duplicate label 'team'" \
+    "$api" check --tokens "$work/team-label.tokens" --team-hash "$team_hash"
+team_refuses "a digest that is already in the file" "share a token hash" \
+    "$api" check --tokens "$work/good.tokens" --team-hash "$good_hash"
+mkdir -p "$work/team-bad"; cp "$work/good.tokens" "$work/team-bad/tokens"
+printf 'garbage\n' > "$work/team-bad/team-token-sha256"
+team_refuses "a malformed team-token-sha256 file" "team token hash" \
+    "$api" serve --tokens "$work/team-bad/tokens" --listen 127.0.0.1:0
+: > "$work/team-bad/team-token-sha256"
+team_refuses "an empty team-token-sha256 file" "team token hash" \
+    "$api" serve --tokens "$work/team-bad/tokens" --listen 127.0.0.1:0
+
+# Served: the team token is an operator, beside the entries that were there.
+team_serve="$work/team-serve"; mkdir -p "$team_serve"
+"$api" mint --role client --label teamreader --as @reader --caps read > "$work/teamreader.out"
+sed -n 1p "$work/teamreader.out" > "$work/teamreader-token"
+sed -n 2p "$work/teamreader.out" > "$team_serve/tokens"
+printf '%s\n' "$team_hash" > "$team_serve/team-token-sha256"
+team_port="$(free_port)"
+"$api" serve --tokens "$team_serve/tokens" --listen "127.0.0.1:$team_port" 2>> "$work/team-server.log" &
+team_pid=$!
+extra_pids+=("$team_pid")
+for _ in $(seq 100); do
+    python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1)' "$team_port" 2>/dev/null && break
+    sleep 0.1
+done
+printf '%s' "$team_tok" > "$work/team-token"
+team_xr() { API_HOSTPORT="127.0.0.1:$team_port" xr "$@"; }
+check "the team token reads: 200" "200" "$(team_xr "$work/team-token" --tool mail -- list)"
+check "... and the verb ran (rc 0)" "0" "$(rjson rc)"
+check "the team token may post as @operator: 200" "200" \
+    "$(team_xr "$work/team-token" --tool mail --stdin hi -- send --from @operator --to @x --subject team --body -)"
+check "... and the verb ran (rc 0)" "0" "$(rjson rc)"
+check "the team token may post as any name: 200" "200" \
+    "$(team_xr "$work/team-token" --tool mail --stdin hi -- send --from @someone --to @x --subject team --body -)"
+check "the team token may use the operator-only verbs: 200" "200" \
+    "$(team_xr "$work/team-token" --tool postmaster -- status)"
+check "the file's own client token still reads beside it: 200" "200" \
+    "$(team_xr "$work/teamreader-token" --tool mail -- list)"
+check "... and is still no operator: 403 posting as @operator" "403" \
+    "$(team_xr "$work/teamreader-token" --tool mail --stdin hi -- send --from @operator --to @x --subject s --body -)"
+printf 'wrong' > "$work/wrong-token"
+check "a wrong token is still refused: 401" "401" "$(team_xr "$work/wrong-token" --tool mail -- list)"
+printf '%s' "$team_hash" > "$work/team-hash-as-token"
+check "the team digest is not itself a token: 401" "401" "$(team_xr "$work/team-hash-as-token" --tool mail -- list)"
+sleep 0.2
+lacks "the log never holds the team token" "$(cat "$work/team-server.log")" "$team_tok"
+lacks "the log never holds the team digest" "$(cat "$work/team-server.log")" "$team_hash"
+contains "the log labels the team token's calls" "$(cat "$work/team-server.log")" " team mail list 200 rc=0"
+kill "$team_pid" 2>/dev/null; wait "$team_pid" 2>/dev/null
+
 printf '== 13. the log ==\n'
 
 sleep 0.2

@@ -23,7 +23,14 @@
 # This file is skipped by plain `install` (the same way
 # 31-claude-proxy.yaml is) since those placeholders have no value to take
 # without --postmaster. The mail-api container, its tokens volume and its
-# Service are stripped when K8S_MAIL_API_TOKENS_FILE is unset. The
+# Service are stripped when K8S_MAIL_API_TOKENS_FILE is unset, and so is the
+# team Role below (the "mail-team role" block); its RoleBinding (the
+# "mail-team binding" block) is stripped unless K8S_MAIL_TEAM_SUBJECTS is
+# set too, and when it is kept install replaces the one line below
+# `subjects:` (the only line that holds a placeholder) with the entries it
+# builds from that key (one entry per user or group, shape-checked first).
+# The team token Secret is not in this file: install creates it with
+# `kubectl create`, so a re-install can never overwrite it. The
 # claude-credentials env/volumeMount/volume (postmaster container only)
 # are stripped when K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE is unset; when
 # set, they mount Secret fork-sandbox-postmaster-claude (created by
@@ -444,3 +451,48 @@ spec:
       port: 80
       targetPort: http
       # <<< mail-api service
+# >>> mail-team role
+---
+# What a teammate needs to reach the mail API with `kubectl port-forward
+# svc/fork-sandbox-mail-api` and to read the shared team token: nothing else.
+# The Service and the Secret are granted by name. RBAC cannot narrow pods by
+# label or name (the postmaster pod's name changes with every rollout), so
+# `pods` get/list and `pods/portforward` create are namespace-wide; that is
+# the least a port-forward to a Service takes. Nothing here can read any
+# other Secret, exec into a pod, or write anything.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fork-sandbox-mail-team
+  namespace: __NAMESPACE__
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["fork-sandbox-mail-api"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["fork-sandbox-mail-api-team-token"]
+    verbs: ["get"]
+# <<< mail-team role
+# >>> mail-team binding
+---
+# Only rendered when K8S_MAIL_TEAM_SUBJECTS names who the Role is for.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fork-sandbox-mail-team
+  namespace: __NAMESPACE__
+subjects:
+  - __PM_TEAM_SUBJECTS__
+roleRef:
+  kind: Role
+  name: fork-sandbox-mail-team
+  apiGroup: rbac.authorization.k8s.io
+# <<< mail-team binding

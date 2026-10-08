@@ -17499,12 +17499,41 @@ for a in "$@"; do
     esac
     args+=("$a")
 done
+# K8S_STUB_STATE, when set, is a directory standing in for the cluster's
+# team token Secret: `create -f -` stores the token it is handed (and fails
+# like a real create when one is already there), `get secret` answers
+# "<name> <base64 token>" or nothing, `delete secret` removes it.
 case "${args[0]:-} ${args[1]:-}" in
     "apply -f")
         body="$(cat)"
         printf 'applied: %s\n' "$(grep -m1 '^  name:' <<< "$body")" >> "$K8S_STUB_LOG"
         if [[ -n "${K8S_STUB_APPLY_CAPTURE:-}" ]]; then
             printf '%s\n---\n' "$body" >> "$K8S_STUB_APPLY_CAPTURE"
+        fi
+        exit 0
+        ;;
+    "create -f")
+        body="$(cat)"
+        if [[ -n "${K8S_STUB_STATE:-}" ]]; then
+            if [[ -e "$K8S_STUB_STATE/team-token" ]]; then
+                echo 'Error from server (AlreadyExists): secrets already exists' >&2
+                exit 1
+            fi
+            sed -n 's/^  token: "\(.*\)"$/\1/p' <<< "$body" > "$K8S_STUB_STATE/team-token"
+        fi
+        exit 0
+        ;;
+    "get secret")
+        if [[ -n "${K8S_STUB_STATE:-}" && "${args[2]:-}" == fork-sandbox-mail-api-team-token \
+            && -s "$K8S_STUB_STATE/team-token" ]]; then
+            printf 'fork-sandbox-mail-api-team-token %s\n' \
+                "$(tr -d '\n' < "$K8S_STUB_STATE/team-token" | base64 -w0)"
+        fi
+        exit "${K8S_STUB_GET_RC:-0}"
+        ;;
+    "delete secret")
+        if [[ -n "${K8S_STUB_STATE:-}" && "${args[2]:-}" == fork-sandbox-mail-api-team-token ]]; then
+            rm -f "$K8S_STUB_STATE/team-token"
         fi
         exit 0
         ;;
@@ -17528,6 +17557,10 @@ for a in "${args[@]}"; do
             path="${kv#*=}"
             printf '  %s: |\n' "$k"
             sed 's/^/    /' "$path"
+            ;;
+        --from-literal=*)
+            kv="${a#--from-literal=}"
+            printf '  %s: |\n    %s\n' "${kv%%=*}" "${kv#*=}"
             ;;
     esac
 done
@@ -18621,6 +18654,205 @@ env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_badmail_wd/log" FORK_SANDBOX_CON
     "$k8s_sh" install --postmaster >/dev/null 2>&1
 check "storage: a refused real install exits 1" "1" "$?"
 check "storage: a refused real install applies nothing" "0" "$(cat "$pm_badmail_wd/log" 2>/dev/null | grep -c 'apply')"
+
+printf '\n== install --postmaster: team access (shared mail API token, Role, binding) ==\n'
+# Everything here runs against the kubectl stub above; K8S_STUB_STATE gives
+# it a team-token Secret that outlives one install, so "a second install
+# leaves the token alone" is a real comparison and not a canned answer.
+
+# pm_team_real <cfgdir> <statedir> [install args...]: a REAL install (not a
+# dry-run) against the stub. The kubectl call log, everything applied, stdout
+# and stderr land in the state dir; $pm_team_rc is the status.
+pm_team_rc=0
+pm_team_real() {
+    local cfg="$1" st="$2"; shift 2
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$st/log" K8S_STUB_STATE="$st" \
+        K8S_STUB_APPLY_CAPTURE="$st/applied" FORK_SANDBOX_CONFIG_DIR="$cfg" \
+        "$k8s_sh" install --postmaster "$@" >"$st/out" 2>"$st/err"
+    pm_team_rc=$?
+}
+pm_team_tokens_hash() { # the team hash the tokens Secret was applied with
+    yq -r 'select(.kind == "Secret" and .metadata.name == "fork-sandbox-mail-api-tokens") | .data."team-token-sha256"' "$1/applied" | tr -d ' \n'
+}
+pm_team_sum() { grep -o 'checksum/pm-config: "[a-f0-9]*"' "$1/applied" | tail -1; }
+pm_team_calls() { grep -c -- "$2" "$1/log" || true; }
+
+pm_cfg_team="$(pm_api_cfg)"
+pm_team_a="$(newdir)"; tmpdirs+=("$pm_team_a")
+pm_team_real "$pm_cfg_team" "$pm_team_a"
+check "team: a fresh install exits 0" "0" "$pm_team_rc"
+check "team: it created the team Secret exactly once" "1" "$(pm_team_calls "$pm_team_a" ' create -f -$')"
+check "team: ... after looking for it" "1" "$(pm_team_calls "$pm_team_a" ' get secret fork-sandbox-mail-api-team-token ')"
+check "team: ... never with apply (so it can never overwrite)" "0" \
+    "$(grep -c 'applied:   name: fork-sandbox-mail-api-team-token' "$pm_team_a/log" || true)"
+pm_team_tok_a="$(cat "$pm_team_a/team-token")"
+check "team: the stored token is non-empty" "1" "$([[ -n "$pm_team_tok_a" ]] && echo 1 || echo 0)"
+check "team: the tokens Secret carries that token's SHA-256" \
+    "$(printf '%s' "$pm_team_tok_a" | sha256sum | cut -d' ' -f1)" "$(pm_team_tokens_hash "$pm_team_a")"
+check "team: the install says it created the token" "1" "$(grep -c 'created the mail API team token' "$pm_team_a/err")"
+check "team: the raw token appears in no output stream" "0" \
+    "$(cat "$pm_team_a/out" "$pm_team_a/err" | grep -cF -- "$pm_team_tok_a")"
+check "team: ... nor in anything applied" "0" "$(grep -cF -- "$pm_team_tok_a" "$pm_team_a/applied")"
+check "team: ... nor in any kubectl argument" "0" "$(grep -cF -- "$pm_team_tok_a" "$pm_team_a/log")"
+check "team: the order is Secret, then the tokens Secret, then the Deployment bundle" "ok" \
+    "$(awk '/ create -f -$/ && !c {c=NR} /^applied:   name: fork-sandbox-mail-api-tokens$/ && !t {t=NR} /^applied:   name: fork-sandbox-postmaster$/ {d=NR} END {print (c && t && d && c < t && t < d) ? "ok" : "bad"}' "$pm_team_a/log")"
+# The team hash is what the server reads, as a sibling of the tokens file.
+check "team: the real hash passes the server's own check as a team entry" "ok: 3 entries (2 operator, 1 client)" \
+    "$("$pm_api_mint" check --tokens "$pm_cfg_team/mail-api-tokens" --team-hash "$(pm_team_tokens_hash "$pm_team_a")")"
+
+# A second install: the token is unchanged, nothing is created, the pod is
+# not rolled (same checksum), the same hash is served.
+cp "$pm_team_a/team-token" "$pm_team_a/team-token.first"
+pm_team_sum_a="$(pm_team_sum "$pm_team_a")"
+pm_team_hash_a="$(pm_team_tokens_hash "$pm_team_a")"
+: > "$pm_team_a/log"; : > "$pm_team_a/applied"
+pm_team_real "$pm_cfg_team" "$pm_team_a"
+check "team: a second install exits 0" "0" "$pm_team_rc"
+check "team: ... creates nothing" "0" "$(pm_team_calls "$pm_team_a" ' create -f -$')"
+check "team: ... deletes nothing" "0" "$(pm_team_calls "$pm_team_a" ' delete ')"
+check "team: ... leaves the token byte for byte" "" "$(cmp "$pm_team_a/team-token" "$pm_team_a/team-token.first" 2>&1)"
+check "team: ... serves the same hash" "$pm_team_hash_a" "$(pm_team_tokens_hash "$pm_team_a")"
+check "team: ... and does not change checksum/pm-config" "$pm_team_sum_a" "$(pm_team_sum "$pm_team_a")"
+check "team: ... and says nothing about creating" "0" "$(grep -c 'team token' "$pm_team_a/err")"
+
+# Rotation: the explicit, separate operation.
+: > "$pm_team_a/log"; : > "$pm_team_a/applied"
+pm_team_real "$pm_cfg_team" "$pm_team_a" --rotate-team-token
+check "team: --rotate-team-token exits 0" "0" "$pm_team_rc"
+check "team: ... deletes the old Secret" "1" "$(pm_team_calls "$pm_team_a" ' delete secret fork-sandbox-mail-api-team-token')"
+check "team: ... creates the new one" "1" "$(pm_team_calls "$pm_team_a" ' create -f -$')"
+pm_team_tok_b="$(cat "$pm_team_a/team-token")"
+check "team: ... the token changed" "1" "$([[ -n "$pm_team_tok_b" && "$pm_team_tok_b" != "$pm_team_tok_a" ]] && echo 1 || echo 0)"
+check "team: ... the served hash changed to the new token's" \
+    "$(printf '%s' "$pm_team_tok_b" | sha256sum | cut -d' ' -f1)" "$(pm_team_tokens_hash "$pm_team_a")"
+check "team: ... which rolls the pod (checksum/pm-config changed)" "1" \
+    "$([[ "$(pm_team_sum "$pm_team_a")" != "$pm_team_sum_a" ]] && echo 1 || echo 0)"
+check "team: ... and says it rotated" "1" "$(grep -c 'rotated the mail API team token' "$pm_team_a/err")"
+check "team: ... neither the old nor the new token is printed" "0" \
+    "$(cat "$pm_team_a/out" "$pm_team_a/err" "$pm_team_a/log" | grep -cF -e "$pm_team_tok_a" -e "$pm_team_tok_b")"
+: > "$pm_team_a/log"; : > "$pm_team_a/applied"
+pm_team_real "$pm_cfg_team" "$pm_team_a"
+check "team: an install after a rotation keeps the rotated token" "$pm_team_tok_b" "$(cat "$pm_team_a/team-token")"
+check "team: --rotate-team-token without --postmaster is refused" "1" \
+    "$(env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_team_a/log2" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_team" \
+        "$k8s_sh" install --rotate-team-token >/dev/null 2>&1; echo $?)"
+
+# A cluster read that fails is not "absent": never mint over what could not be seen.
+pm_team_b="$(newdir)"; tmpdirs+=("$pm_team_b")
+printf 'kept-token' > "$pm_team_b/team-token"
+env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_team_b/log" K8S_STUB_STATE="$pm_team_b" K8S_STUB_GET_RC=1 \
+    FORK_SANDBOX_CONFIG_DIR="$pm_cfg_team" "$k8s_sh" install --postmaster >/dev/null 2>"$pm_team_b/err"
+check "team: a failed read of the Secret fails the install" "1" "$?"
+check "team: ... without creating or deleting anything" "0" "$(grep -cE ' (create -f -|delete )' "$pm_team_b/log" || true)"
+check "team: ... and the stored token is untouched" "kept-token" "$(cat "$pm_team_b/team-token")"
+
+# An existing Secret is kept whatever it holds: it is the cluster's, not install's.
+pm_team_c="$(newdir)"; tmpdirs+=("$pm_team_c")
+printf 'a-token-made-by-hand' > "$pm_team_c/team-token"
+pm_team_real "$pm_cfg_team" "$pm_team_c"
+check "team: a pre-existing Secret is adopted, not replaced" "a-token-made-by-hand" "$(cat "$pm_team_c/team-token")"
+check "team: ... and its hash is served" "$(printf '%s' 'a-token-made-by-hand' | sha256sum | cut -d' ' -f1)" "$(pm_team_tokens_hash "$pm_team_c")"
+check "team: ... without a create" "0" "$(pm_team_calls "$pm_team_c" ' create -f -$')"
+
+# No mail API (the base fixture): no team token, no Role, no cluster read for it.
+pm_team_d="$(newdir)"; tmpdirs+=("$pm_team_d")
+pm_team_real "$pm_cfg1" "$pm_team_d"
+check "team: without the mail API a real install exits 0" "0" "$pm_team_rc"
+check "team: ... and never touches the team Secret" "0" "$(grep -c 'team-token' "$pm_team_d/log" || true)"
+check "team: ... and creates nothing" "0" "$(pm_team_calls "$pm_team_d" ' create -f -$')"
+check "team: ... and renders no team Role" "0" "$(grep -c 'fork-sandbox-mail-team' "$pm_team_d/applied" || true)"
+
+# A dry-run reads no cluster and writes none.
+pm_api_install "$pm_cfg_team" K8S_STUB_STATE="$pm_team_c"
+check "team: a dry-run exits 0" "0" "$pm_api_rc"
+check "team: ... never reads the cluster for the team token" "0" "$(grep -c ' get ' "$pm_api_log" || true)"
+check "team: ... prints the one-line placeholder, never a token" "1" \
+    "$(grep -cF '# (dry-run) would create Secret fork-sandbox-mail-api-team-token if absent ... -- not shown.' <<< "$pm_api_out")"
+pm_api_install "$pm_cfg_team" K8S_STUB_STATE="$pm_team_c" --rotate-team-token 2>/dev/null
+env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_team_c/dlog" K8S_STUB_STATE="$pm_team_c" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_team" \
+    "$k8s_sh" install --postmaster --dry-run --rotate-team-token > "$pm_team_c/dout" 2>/dev/null
+check "team: a rotating dry-run says it would replace" "1" "$(grep -cF '# (dry-run) would REPLACE Secret fork-sandbox-mail-api-team-token' "$pm_team_c/dout")"
+check "team: ... and deletes nothing" "a-token-made-by-hand" "$(cat "$pm_team_c/team-token")"
+
+# The Role: exactly a port-forward to the API's pod and a get on one Secret.
+pm_api_install "$pm_cfg_team"
+pm_team_role() { yq -r 'select(.kind == "Role" and .metadata.name == "fork-sandbox-mail-team") | '"$1" <<< "$pm_api_out"; }
+check "team: a Role fork-sandbox-mail-team is rendered with the API" "fork-sandbox-mail-team" "$(pm_team_role '.metadata.name')"
+check "team: ... in the install's namespace" "fork-sandbox-test" "$(pm_team_role '.metadata.namespace')"
+check "team: ... with exactly four rules" "4" "$(pm_team_role '.rules | length')"
+check "team: ... exactly these rules, nothing wider" \
+    "[core] services [fork-sandbox-mail-api] get|[core] pods [] get,list|[core] pods/portforward [] create|[core] secrets [fork-sandbox-mail-api-team-token] get" \
+    "$(pm_team_role '.rules[] | "[\(.apiGroups | map(if . == "" then "core" else . end) | join(","))] \(.resources | join(",")) [\(.resourceNames // [] | join(","))] \(.verbs | join(","))"' | paste -sd'|')"
+check "team: ... no wildcard anywhere in the Role" "0" "$(pm_team_role '.rules[] | (.verbs + .resources + .apiGroups)[]' | grep -c '\*')"
+check "team: ... nothing grants exec, delete, list on secrets or create on pods" "0" \
+    "$(pm_team_role '.rules[] | select((.resources | index("secrets")) and (.verbs | index("list") or index("watch") or index("create")))' | grep -c .)"
+check "team: no RoleBinding without K8S_MAIL_TEAM_SUBJECTS" "0" \
+    "$(yq -r 'select(.kind == "RoleBinding") | .metadata.name' <<< "$pm_api_out" | grep -c 'fork-sandbox-mail-team')"
+check "team: ... and nothing binds the Role by another name" "0" \
+    "$(yq -r 'select(.kind == "RoleBinding" or .kind == "ClusterRoleBinding") | .roleRef.name' <<< "$pm_api_out" | grep -c 'fork-sandbox-mail-team')"
+check "team: no placeholder is left, and the binding's markers went with it" "0" "$(grep -cE '# (>>>|<<<) mail-team binding|__PM_' <<< "$pm_api_out")"
+check "team: the objects are the existing ones plus the Role" \
+    "Deployment/fork-sandbox-postmaster PersistentVolumeClaim/fork-sandbox-postmaster PersistentVolumeClaim/fork-sandbox-postmaster-mail Role/fork-sandbox-mail-team Role/fork-sandbox-postmaster RoleBinding/fork-sandbox-postmaster Service/fork-sandbox-mail-api ServiceAccount/fork-sandbox-postmaster" \
+    "$(yq -r 'select((.metadata.name | test("postmaster|mail")) and .kind != "ConfigMap") | "\(.kind)/\(.metadata.name)"' <<< "$pm_api_out" | LC_ALL=C sort -u | paste -sd' ')"
+check "team: the Deployment is unchanged: same containers" "postmaster mail-api" \
+    "$(pm_api_dep '.spec.template.spec.containers[].name' | paste -sd' ')"
+check "team: ... same volumes, none for the team token" "0" \
+    "$(pm_api_dep '.spec.template.spec.volumes[].name' | grep -c team)"
+check "team: ... and the mail-api container's arguments" "fork-sandbox-mail-api.py serve --tokens /etc/fork-sandbox/mail-api/tokens --listen 0.0.0.0:8080" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .command | join(" ")')"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: team Role, no binding"; else no "yamllint: team Role, no binding" "$out"; fi
+fi
+
+# The binding: only when the key is set, to exactly the named subjects.
+pm_cfg_tsub="$(pm_api_cfg 'K8S_MAIL_TEAM_SUBJECTS=user:alice@example.com,group:platform-team,user:oidc:bob')"
+pm_api_install "$pm_cfg_tsub"
+check "team subjects: install exits 0" "0" "$pm_api_rc"
+pm_team_rb() { yq -r 'select(.kind == "RoleBinding" and .metadata.name == "fork-sandbox-mail-team") | '"$1" <<< "$pm_api_out"; }
+check "team subjects: a RoleBinding is rendered" "fork-sandbox-mail-team" "$(pm_team_rb '.metadata.name')"
+check "team subjects: ... in the install's namespace" "fork-sandbox-test" "$(pm_team_rb '.metadata.namespace')"
+check "team subjects: ... to exactly the named users and groups" \
+    "User:alice@example.com:rbac.authorization.k8s.io|Group:platform-team:rbac.authorization.k8s.io|User:oidc:bob:rbac.authorization.k8s.io" \
+    "$(pm_team_rb '.subjects[] | "\(.kind):\(.name):\(.apiGroup)"' | paste -sd'|')"
+check "team subjects: ... to the team Role, a Role and not a ClusterRole" "Role/fork-sandbox-mail-team" \
+    "$(pm_team_rb '"\(.roleRef.kind)/\(.roleRef.name)"')"
+check "team subjects: ... and to no ServiceAccount" "0" "$(pm_team_rb '.subjects[].kind' | grep -c ServiceAccount)"
+check "team subjects: the postmaster's own binding is untouched" "ServiceAccount:fork-sandbox-postmaster" \
+    "$(yq -r 'select(.kind == "RoleBinding" and .metadata.name == "fork-sandbox-postmaster") | .subjects[] | "\(.kind):\(.name)"' <<< "$pm_api_out")"
+check "team subjects: no placeholder is left" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: team Role and binding"; else no "yamllint: team Role and binding" "$out"; fi
+fi
+pm_cfg_tsub1="$(pm_api_cfg 'K8S_MAIL_TEAM_SUBJECTS=group:everyone')"
+pm_api_install "$pm_cfg_tsub1"
+check "team subjects: one subject renders one entry" "Group:everyone" \
+    "$(yq -r 'select(.kind == "RoleBinding" and .metadata.name == "fork-sandbox-mail-team") | .subjects[] | "\(.kind):\(.name)"' <<< "$pm_api_out")"
+
+for pm_bad_subj in 'alice' 'user:' 'group:' 'team:alice' 'User:alice' 'user:a b' 'user:alice,,group:x' \
+    'user:alice,' ',user:alice' 'user:"x"' 'user:-alice' 'user:a#b' 'user:a{b}'; do
+    pm_api_refused "team subjects: '$pm_bad_subj' is refused" "K8S_MAIL_TEAM_SUBJECTS element" \
+        "$(pm_api_cfg "K8S_MAIL_TEAM_SUBJECTS=$pm_bad_subj")"
+done
+
+# The key without the API: ignored, said once, nothing rendered.
+pm_cfg_tsub_noapi="$(newdir)"; tmpdirs+=("$pm_cfg_tsub_noapi")
+cp -r "$pm_cfg1"/. "$pm_cfg_tsub_noapi"/
+printf 'K8S_MAIL_TEAM_SUBJECTS=user:alice\n' >> "$pm_cfg_tsub_noapi/k8s.env"
+pm_api_install "$pm_cfg_tsub_noapi"
+check "team subjects: without the API the install exits 0" "0" "$pm_api_rc"
+check "team subjects: ... renders no team object" "0" "$(grep -c 'fork-sandbox-mail-team' <<< "$pm_api_out")"
+check "team subjects: ... and says the key is ignored" "1" "$(grep -c 'K8S_MAIL_TEAM_SUBJECTS is ignored' <<< "$pm_api_err")"
+
+# The team Secret's name is reserved against the hooks Secret.
+pm_api_refused "team: the team token Secret cannot be named as the hooks Secret" "installer's own Secrets" \
+    "$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=fork-sandbox-mail-api-team-token)"
+
+# A tokens-file entry labelled "team" would collide with the team entry.
+pm_cfg_teamlabel="$(pm_api_cfg)"
+"$pm_api_mint" mint --role operator --label team | sed -n 2p >> "$pm_cfg_teamlabel/mail-api-tokens"
+pm_api_refused "team: a tokens-file entry labelled team is refused at install" "duplicate label 'team'" "$pm_cfg_teamlabel"
 
 printf '\n== install --postmaster: K8S_AGENT_* keys reach a postmaster-launched seat ==\n'
 # The postmaster pod's own k8s.env IS the laptop's, shipped whole as a
