@@ -78,7 +78,7 @@ cleanup() {
     # alive holds processes inside the run dirs the loop below removes.
     for t in "${tmux_tmpdirs[@]-}"; do
         [[ -n "$t" && -d "$t" ]] || continue
-        TMUX_TMPDIR="$t" tmux kill-server >/dev/null 2>&1 || true
+        TMUX_TMPDIR="$t" tmux -L default kill-server >/dev/null 2>&1 || true
         rm -rf -- "$t"
     done
     for d in "${tmpdirs[@]-}"; do
