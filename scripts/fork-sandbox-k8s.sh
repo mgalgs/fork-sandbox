@@ -3,7 +3,7 @@
 #
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME [--model MODEL]
-#                            [--endpoint NAME] [--harness pi|claude]
+#                            [--endpoint NAME] [--harness pi|claude|codex]
 #                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR | --context-secret NAME]
@@ -18,7 +18,7 @@
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
-#                            [--harness pi|claude] [--pi-args ARGS]
+#                            [--harness pi|claude|codex] [--pi-args ARGS]
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR | --context-secret NAME]
@@ -508,13 +508,15 @@
 # submit printed on its "run dir:" line. See "The durable run log" in
 # docs/kubernetes-runs.md.
 #
-# --harness pi|claude (submit): which coding harness the pod runs. Defaults
+# --harness pi|claude|codex (submit): which coding harness the pod runs. Defaults
 # to pi, which talks to the shared fork-sandbox-proxy over PROXY_BASE_URL,
 # exactly as before this flag existed. claude runs Claude Code instead,
 # against a PER-RUN proxy Pod (manifests/k8s/31-claude-proxy.yaml, rendered
 # and applied alongside this run's Job) that carries the operator's own
 # access token in a per-run Secret -- the pod itself still holds no
-# credential. See docs/kubernetes-runs.md's "Model access" section for the
+# real credential. codex is allowed only with --run-dir, whose composed
+# seats use their own per-run Codex proxy. A legacy single-harness codex
+# run stays refused. See docs/kubernetes-runs.md's "Model access" section for the
 # full design.
 #
 # --image REF (submit, run): the pod image for THIS run only, overriding both
@@ -1507,7 +1509,8 @@ require_secret_file() {
 # `set $upstream "...";`).
 reject_nginx_unsafe_chars() {
     local v="$1" label="$2"
-    if [[ "$v" == *'"'* || "$v" == *'$'* || "$v" == *\\* ]]; then
+    if [[ "$v" == *'"'* || "$v" == *'$'* || "$v" == *\\* \
+        || "$v" == *$'\n'* || "$v" == *$'\r'* ]]; then
         echo "Error: $label contains a '\"', a '\$' or a backslash, which" >&2
         echo "would break the nginx config line it is rendered into" >&2
         echo "(set \$var \"...\";). Use a credential without those" >&2
@@ -1552,6 +1555,21 @@ k8s_render_claude_token_secret_manifest() {
             type: "Opaque",
             data: { "upstream-key.conf": ("set $upstream_key \"" + . + "\";\n" | @base64) }
         }'
+}
+
+# Reads both values from one host auth snapshot and emits a complete nginx
+# include. Never install a partial include: nginx -t accepts empty strings.
+k8s_render_codex_key_conf() {
+    local auth_path="$1" token account_id
+    token="$(jq -er '.tokens.access_token | select(type == "string" and length > 0)' \
+        "$auth_path" 2>/dev/null)" || return 1
+    account_id="$(jq -er '.tokens.account_id | select(type == "string" and length > 0)' \
+        "$auth_path" 2>/dev/null)" || return 1
+    reject_nginx_unsafe_chars "$token" "the Codex access token" || return 1
+    reject_nginx_unsafe_chars "$account_id" "the Codex account id" || return 1
+    # shellcheck disable=SC2016  # nginx variables are literal config text
+    printf 'set $upstream_key "%s";\nset $upstream_account_id "%s";\n' \
+        "$token" "$account_id"
 }
 
 # Builds the fork-sandbox-upstream-key Secret manifest from the finished
@@ -4172,6 +4190,7 @@ cmd_install() {
         # it from. Applying it here would apply a broken manifest with a
         # literal, unsubstituted __RUN_NAME__ in it.
         [[ "$(basename "$f")" == 31-claude-proxy.yaml ]] && continue
+        [[ "$(basename "$f")" == 32-codex-proxy.yaml ]] && continue
         # 40-postmaster.yaml carries __PM_*__ placeholders that only
         # `install --postmaster` has values for (see that block, below the
         # base render loop and the platform NetworkPolicy render) -- plain
@@ -4873,6 +4892,11 @@ validate_context_secret_name() {
         echo "suffix reserved for the per-run Claude token Secrets." >&2
         exit 1
     fi
+    if [[ "$name" == *-codex-token ]]; then
+        echo "Error: --context-secret '$name' ends with '-codex-token', a" >&2
+        echo "suffix reserved for the per-run Codex token Secrets." >&2
+        exit 1
+    fi
 }
 
 # --context-secret and --context-ro both populate /work/context.
@@ -5217,7 +5241,7 @@ cmd_submit() {
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --image) image_flag="${2:?--image requires an image reference}"; shift 2 ;;
-            --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
+            --harness) harness="${2:?--harness requires a harness}"; shift 2 ;;
             --pi-args) pi_args="${2:?--pi-args requires a value}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
@@ -5249,6 +5273,13 @@ cmd_submit() {
 
     case "$harness" in
         pi|claude) ;;
+        codex)
+            if [[ -z "$run_dir_flag" ]]; then
+                echo "Error: --harness codex requires a composed --run-dir run;" >&2
+                echo "the legacy single-harness entrypoint has no Codex proxy." >&2
+                exit 1
+            fi
+            ;;
         *)
             echo "Error: --harness takes 'pi' or 'claude', not '$harness'." >&2
             exit 1
@@ -5265,7 +5296,7 @@ cmd_submit() {
     # reads pipeline_has_claude, under set -u, so it must exist (0/"" when
     # --run-dir was not given) before that point, not merely before the
     # Job is rendered.
-    local pipeline_has_claude=0 pipeline_pi_models=""
+    local pipeline_has_claude=0 pipeline_has_codex=0 pipeline_pi_models=""
     if [[ -n "$run_dir_flag" ]]; then
         run_dir_flag="$(validate_run_dir_flag "$run_dir_flag")" || exit 1
         if jq -e '
@@ -5273,6 +5304,12 @@ cmd_submit() {
              + [.steps[] | select(.fix != null and .fix.harness == "claude")])
             | length > 0' "$run_dir_flag/pipeline.json" > /dev/null 2>&1; then
             pipeline_has_claude=1
+        fi
+        if jq -e '
+            ([.steps[] | select(.harness == "codex")]
+             + [.steps[] | select(.fix != null and .fix.harness == "codex")])
+            | length > 0' "$run_dir_flag/pipeline.json" > /dev/null 2>&1; then
+            pipeline_has_codex=1
         fi
         pipeline_pi_models="$(jq -r '
             [.steps[] | select(.harness == "pi") | .model] +
@@ -5409,7 +5446,9 @@ cmd_submit() {
     # startup (fork-sandbox-k8s-entrypoint.sh) -- with one carve-out:
     # --harness claude, because discovery lists the pi endpoint's model
     # ids, never a Claude Code model name.
-    if [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
+    if [[ -n "$run_dir_flag" ]]; then
+        : # A composed runner uses each seat's own model, not this record field.
+    elif [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
         if [[ -z "$model" && -n "$K8S_DEFAULT_MODEL" ]]; then
             # Same shape as the K8S_DEFAULT_ENDPOINT refusal above: a
             # legacy install has no model discovery for K8S_DEFAULT_MODEL
@@ -5589,8 +5628,27 @@ cmd_submit() {
     # duplicated rather than factored into a second shared function (see
     # fs_balance_claude_credential's own header comment).
     local claude_cred_json="" claude_access_token="" claude_configmap_cred=""
+    local codex_key_conf="" codex_auth_path=""
+    if (( pipeline_has_codex )); then
+        codex_auth_path="${CODEX_HOME:-$HOME/.codex}/auth.json"
+        if [[ ! -f "$codex_auth_path" ]]; then
+            echo "Error: a composed Codex seat needs host Codex sign-in." >&2
+            exit 1
+        fi
+        if [[ "$dry_run" != true ]]; then
+            if ! python3 "$script_dir/fork-sandbox-codex-refresh.py" "$codex_auth_path"; then
+                echo "Error: the host Codex access token could not be refreshed." >&2
+                exit 1
+            fi
+        fi
+        if ! codex_key_conf="$(k8s_render_codex_key_conf "$codex_auth_path")"; then
+            echo "Error: host Codex auth needs an access token and account id." >&2
+            exit 1
+        fi
+    fi
     local claude_credentials_override="" claude_credentials_via="default"
-    if [[ -n "$claude_credentials_flag" && "$harness" != claude ]]; then
+    if [[ -n "$claude_credentials_flag" && "$harness" != claude \
+        && "$pipeline_has_claude" != 1 ]]; then
         # A typo in --claude-credentials is refused here too, even though
         # this harness will never read the file -- the same "fail loud
         # rather than silently drop it" rule fork-sandbox.sh's own two
@@ -6165,6 +6223,9 @@ cmd_submit() {
     local egress_proxy_host="fork-sandbox-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
     [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]] \
         && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
+    if (( pipeline_has_codex )) && (( ! pipeline_has_claude )); then
+        egress_proxy_host="$safe_name-codex-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
+    fi
 
     # The fork-sandbox/owner label plus this run's free-form labels --
     # resolved once here, ahead of both the claude-proxy template
@@ -6264,6 +6325,25 @@ cmd_submit() {
         [[ -n "$extra_labels_proxy_block" ]] && extra_labels_proxy_block+=$'\n'
         claude_proxy_rendered="${claude_proxy_rendered//$extra_labels_marker/$extra_labels_proxy_block}"
     fi
+    local codex_proxy_rendered=""
+    if (( pipeline_has_codex )); then
+        local codex_proxy_template
+        codex_proxy_template="$(dirname "$script_dir")/manifests/k8s/32-codex-proxy.yaml"
+        [[ -f "$codex_proxy_template" ]] || {
+            echo "Error: $codex_proxy_template not found." >&2
+            exit 1
+        }
+        codex_proxy_rendered="$(sed \
+            -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
+            -e "s|__RUN_NAME__|$safe_name|g" \
+            -e "s|__CLUSTER_DOMAIN__|$K8S_CLUSTER_DOMAIN|g" \
+            "$codex_proxy_template")"$'\n'
+        local codex_label_marker=$'    __EXTRA_LABELS__: "true"\n'
+        local codex_label_block
+        codex_label_block="$(render_extra_labels_block 4)"
+        [[ -n "$codex_label_block" ]] && codex_label_block+=$'\n'
+        codex_proxy_rendered="${codex_proxy_rendered//$codex_label_marker/$codex_label_block}"
+    fi
 
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
     local gate_sh="$script_dir/fork-sandbox-k8s-egress-gate.sh"
@@ -6295,6 +6375,14 @@ cmd_submit() {
             || { echo "Error: $lib_sh is missing or unreadable." >&2; exit 1; }
         claude_configmap_keys=$'\n'"$(render_claude_configmap_keys \
             "$claude_configmap_cred" "$inbox_hook_sh" "$stop_guard_sh" "$lib_sh")"
+    fi
+    local codex_env=""
+    if (( pipeline_has_codex )); then
+        codex_env=$'\n'"$(cat <<CENV
+            - name: CODEX_PROXY_BASE_URL
+              value: "http://$safe_name-codex-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN:8080/v1"
+CENV
+)"
     fi
 
     # Must track fork-sandbox-k8s-entrypoint.sh's own work_dir/clone_dir --
@@ -6731,7 +6819,7 @@ CENV
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${codex_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
             - name: FORK_SANDBOX_LEG_HANDOFF_DIR
               value: "$leg_handoff_dir"
           securityContext:
@@ -6767,7 +6855,7 @@ CENV
             - name: FORK_SANDBOX_LEG_HANDOFF_DIR
               value: "$leg_handoff_dir"
             - name: FORK_SANDBOX_CLONE_DIR
-              value: "$leg_clone_dir"${claude_env}
+              value: "$leg_clone_dir"${claude_env}${codex_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -6983,12 +7071,16 @@ $containers_yaml
 $volumes_yaml
 EOF
 )"
-    rendered="${grant_rendered}${claude_proxy_rendered}${job_rendered}"
+    rendered="${grant_rendered}${claude_proxy_rendered}${codex_proxy_rendered}${job_rendered}"
 
     if [[ "$dry_run" == true ]]; then
         printf '%s\n' "$rendered"
         if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
             printf '# (dry-run) would create Secret %s-claude-token here, holding the operator access token -- not shown.\n' \
+                "$safe_name"
+        fi
+        if (( pipeline_has_codex )); then
+            printf '# (dry-run) would create Secret %s-codex-token here, holding the operator access token -- not shown.\n' \
                 "$safe_name"
         fi
         # Unlike an ordinary (no --run-dir) dry-run, which creates nothing
@@ -7238,6 +7330,9 @@ EOF
             # skips its own live-sync loop for one.
             printf 'CLAUDE_CREDENTIAL_PATH=%s\n' "$claude_cred_file"
         fi
+        if (( pipeline_has_codex )); then
+            printf 'CODEX_AUTH_PATH=%s\n' "$codex_auth_path"
+        fi
         # Read back by cmd_collect, before cmd_fetch, so a standalone
         # collect (no run.env in scope of the calling process) still
         # knows where to pull the session store from and which harness's
@@ -7433,6 +7528,7 @@ EOF
     K8S_SUBMIT_BRANCH="$branch"
     trap '
         rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"
+        kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-codex-token" --ignore-not-found >&2
         kubectl delete job,pod,service,secret,configmap,networkpolicy \
             -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
         echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster" >&2
@@ -7472,6 +7568,7 @@ EOF
         trap '
             rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"
             kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-claude-token" --ignore-not-found >&2
+            kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-codex-token" --ignore-not-found >&2
             kubectl delete job,pod,service,secret,configmap,networkpolicy \
                 -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
             echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster objects, if any were created (branch $K8S_SUBMIT_BRANCH)." >&2
@@ -7498,6 +7595,18 @@ EOF
         k8s_apply_waiting_for_quota "$claude_proxy_rendered"
         echo "fork-sandbox-k8s: waiting for proxy pod ($safe_name-claude-proxy) to be ready" >&2
         kubectl wait --for=condition=Ready "pod/$safe_name-claude-proxy" --timeout=120s
+    fi
+    if (( pipeline_has_codex )); then
+        printf '%s\n' "$codex_key_conf" \
+            | k8s_render_upstream_key_secret_manifest "$safe_name-codex-token" "$K8S_NAMESPACE" \
+            | kubectl apply -f - --server-side \
+                --field-manager="$K8S_CLAUDE_TOKEN_FIELD_MANAGER" --force-conflicts
+        kubectl label secret "$safe_name-codex-token" \
+            "${run_label_pairs[@]}" --overwrite
+        k8s_quota_wait_for_room 2
+        k8s_apply_waiting_for_quota "$codex_proxy_rendered"
+        echo "fork-sandbox-k8s: waiting for proxy pod ($safe_name-codex-proxy) to be ready" >&2
+        kubectl wait --for=condition=Ready "pod/$safe_name-codex-proxy" --timeout=120s
     fi
 
     # Server-side: client-side apply copies the whole object into the
@@ -7688,10 +7797,13 @@ EOF
 # run with no file-backed credential recorded (nothing this note would
 # apply to).
 k8s_note_standalone_submit_keeper() {
-    local run_dir="$K8S_LAST_SUBMIT_RUN_DIR" wait_harness claude_cred_path
+    local run_dir="$K8S_LAST_SUBMIT_RUN_DIR" claude_cred_path codex_auth_path_note
     [[ -n "$run_dir" && -f "$run_dir/run.env" ]] || return 0
-    wait_harness="$(read_env_value "$run_dir/run.env" harness || true)"
-    [[ "$wait_harness" == claude ]] || return 0
+    codex_auth_path_note="$(read_env_value "$run_dir/run.env" CODEX_AUTH_PATH || true)"
+    if [[ -n "$codex_auth_path_note" ]]; then
+        echo "fork-sandbox-k8s: the Codex proxy token is refreshed only while" >&2
+        echo "'run', 'resume', or 'wait --run-dir $run_dir' is active." >&2
+    fi
     claude_cred_path="$(read_env_value "$run_dir/run.env" CLAUDE_CREDENTIAL_PATH || true)"
     [[ -n "$claude_cred_path" ]] || return 0
     echo "fork-sandbox-k8s: the pod's Claude access token is kept alive only" >&2
@@ -8138,6 +8250,90 @@ k8s_teardown_claude_proxy() {
     fi
 }
 
+# The Codex access token stays in this proxy's private key volume. This
+# mirrors the Claude push, with the token supplied on stdin and no token
+# bytes in kubectl arguments, ConfigMaps or agent-container mounts.
+k8s_push_codex_key() {
+    local safe_name="$1" key_conf
+    key_conf="$(cat)"
+    # shellcheck disable=SC2016  # nginx variables are literal config text
+    [[ "$key_conf" == *'set $upstream_key "'* \
+        && "$key_conf" == *'set $upstream_account_id "'* ]] || return 1
+    # shellcheck disable=SC2016
+    local exec_script='dir=/etc/nginx/key
+umask 077
+cp "$dir/upstream-key.conf" "$dir/upstream-key.conf.bak" 2>/dev/null
+cat > "$dir/upstream-key.conf.new" || exit 1
+mv -f "$dir/upstream-key.conf.new" "$dir/upstream-key.conf"
+if nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1; then
+    rm -f "$dir/upstream-key.conf.bak"
+else
+    rc=$?
+    mv -f "$dir/upstream-key.conf.bak" "$dir/upstream-key.conf" 2>/dev/null
+    exit "$rc"
+fi'
+    # shellcheck disable=SC2016
+    if ! printf '%s\n' "$key_conf" \
+        | kubectl exec -i "$safe_name-codex-proxy" -- sh -c "$exec_script" \
+            >/dev/null 2>&1; then
+        echo "fork-sandbox-k8s: warning: could not update the Codex proxy key." >&2
+        return 1
+    fi
+    if ! printf '%s\n' "$key_conf" \
+        | k8s_render_upstream_key_secret_manifest "$safe_name-codex-token" "$K8S_NAMESPACE" \
+        | kubectl apply -f - --server-side \
+            --field-manager="$K8S_CLAUDE_TOKEN_FIELD_MANAGER" --force-conflicts \
+            >/dev/null 2>&1; then
+        echo "fork-sandbox-k8s: warning: Codex proxy key updated, Secret update failed." >&2
+        return 1
+    fi
+}
+
+K8S_CODEX_KEEPER_PID=""
+k8s_codex_keeper_start() {
+    local auth_path="$1" safe_name="$2" parent_pid=$BASHPID
+    (
+        exec >/dev/null
+        last_hash=""
+        while kill -0 "$parent_pid" 2>/dev/null; do
+            if ! python3 "$script_dir/fork-sandbox-codex-refresh.py" "$auth_path"; then
+                echo "fork-sandbox-k8s: warning: host Codex token refresh failed." >&2
+            fi
+            key_conf="$(k8s_render_codex_key_conf "$auth_path")" || key_conf=""
+            if [[ -n "$key_conf" ]]; then
+                hash="$(printf '%s' "$key_conf" | sha256sum | cut -d' ' -f1)"
+                if [[ "$hash" != "$last_hash" ]]; then
+                    if printf '%s\n' "$key_conf" | k8s_push_codex_key "$safe_name"; then
+                        last_hash="$hash"
+                    fi
+                fi
+            fi
+            sleep 30
+        done
+    ) &
+    K8S_CODEX_KEEPER_PID=$!
+}
+
+k8s_codex_keeper_stop() {
+    if [[ -n "$K8S_CODEX_KEEPER_PID" ]]; then
+        kill "$K8S_CODEX_KEEPER_PID" 2>/dev/null || true
+        wait "$K8S_CODEX_KEEPER_PID" 2>/dev/null || true
+        K8S_CODEX_KEEPER_PID=""
+    fi
+    true
+}
+
+k8s_teardown_codex_proxy() {
+    local safe_name="$1"
+    kubectl delete \
+        pod/"$safe_name-codex-proxy" \
+        service/"$safe_name-codex-proxy" \
+        configmap/"$safe_name-codex-proxy-conf" \
+        networkpolicy/"$safe_name-codex-proxy" \
+        secret/"$safe_name-codex-token" \
+        --ignore-not-found --wait=false >&2
+}
+
 # cmd_run's wait phase, standalone: poll the run's pod until its entrypoint
 # writes /work/.run-complete (which holds the agent's own exit code),
 # failing fast on a dead pod, a Failed job condition, a timeout or a
@@ -8288,22 +8484,27 @@ cmd_wait() {
     # after its locals are gone: the ${...:-} defaults matter under set -u.
     trap '
         k8s_claude_keeper_stop
+        k8s_codex_keeper_stop
         if [[ "${wait_terminal_teardown:-false}" == true ]]; then
             k8s_teardown_claude_proxy "${safe_name:-}" || true
+            k8s_teardown_codex_proxy "${safe_name:-}" || true
         fi
     ' EXIT
     if [[ -n "$run_dir" && -f "$run_dir/run.env" ]]; then
         local wait_harness claude_cred_path
         wait_harness="$(read_env_value "$run_dir/run.env" harness || true)"
-        if [[ "$wait_harness" == claude ]]; then
-            claude_cred_path="$(read_env_value "$run_dir/run.env" CLAUDE_CREDENTIAL_PATH || true)"
-            if [[ -n "$claude_cred_path" ]]; then
-                k8s_claude_keeper_start "$claude_cred_path" "$safe_name"
-            else
-                echo "fork-sandbox-k8s: no Claude credential path was recorded for this run" >&2
-                echo "(a Keychain-backed credential, or a run submitted before this" >&2
-                echo "feature existed) -- the pod's access token will not be kept alive." >&2
-            fi
+        claude_cred_path="$(read_env_value "$run_dir/run.env" CLAUDE_CREDENTIAL_PATH || true)"
+        if [[ -n "$claude_cred_path" ]]; then
+            k8s_claude_keeper_start "$claude_cred_path" "$safe_name"
+        elif [[ "$wait_harness" == claude ]]; then
+            echo "fork-sandbox-k8s: no Claude credential path was recorded for this run" >&2
+            echo "(a Keychain-backed credential, or a run submitted before this" >&2
+            echo "feature existed) -- the pod's access token will not be kept alive." >&2
+        fi
+        local codex_auth_path_wait
+        codex_auth_path_wait="$(read_env_value "$run_dir/run.env" CODEX_AUTH_PATH || true)"
+        if [[ -n "$codex_auth_path_wait" ]]; then
+            k8s_codex_keeper_start "$codex_auth_path_wait" "$safe_name"
         fi
     elif [[ "$probe" != true ]]; then
         # No --run-dir at all (a hand-run `wait --branch X` that did not
@@ -10029,7 +10230,9 @@ cmd_run() {
     # optional on a K8S_PROXY_ENDPOINTS install (the pod discovers it).
     # --harness claude keeps the requirement, for the same reason submit
     # does.
-    if [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
+    if [[ -n "$run_dir_flag" ]]; then
+        : # cmd_submit validates each composed seat after forwarding.
+    elif [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
         if [[ -z "$model" && -n "$K8S_DEFAULT_MODEL" ]]; then
             # Same refusal cmd_submit gives, checked here too since this
             # is the fail-fast duplicate of cmd_submit's own --model

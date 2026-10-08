@@ -291,8 +291,15 @@ set -euo pipefail
 : "${HARNESS:=pi}"
 case "$HARNESS" in
     pi|claude) ;;
+    codex)
+        # Only the composed runner has a Codex leg (and a Codex proxy).
+        if [[ -z "${RUN_DIR:-}" ]]; then
+            echo "Error: HARNESS=codex requires RUN_DIR (a composed run)." >&2
+            exit 1
+        fi
+        ;;
     *)
-        echo "Error: HARNESS must be 'pi' or 'claude', got '$HARNESS'." >&2
+        echo "Error: HARNESS must be 'pi', 'claude' or 'codex', got '$HARNESS'." >&2
         exit 1
         ;;
 esac

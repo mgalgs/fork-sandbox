@@ -322,6 +322,7 @@ PORCELAIN=(
 
 PLUMBING=(
     fork-sandbox-claude-token-probe
+    fork-sandbox-codex-refresh.py  # run by fork-sandbox-k8s.sh's Codex keeper
     fork-sandbox-discover-claude
     fork-sandbox-discover-k8s
     fork-sandbox-discover-model

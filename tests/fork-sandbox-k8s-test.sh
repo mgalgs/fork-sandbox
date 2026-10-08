@@ -8235,6 +8235,9 @@ printf '\n== fork-sandbox-k8s.sh wait: terminal-failure cleanup of the claude pr
 wait_teardown_ran() {
     grep -q 'delete pod/.*-claude-proxy service/.*-claude-proxy configmap/.*-claude-proxy-conf networkpolicy/.*-claude-proxy secret/.*-claude-token --ignore-not-found --wait=false' "$1"
 }
+wait_codex_teardown_ran() {
+    grep -q 'delete pod/.*-codex-proxy service/.*-codex-proxy configmap/.*-codex-proxy-conf networkpolicy/.*-codex-proxy secret/.*-codex-token --ignore-not-found --wait=false' "$1"
+}
 
 # 14. The success path (a completed sentinel) is unchanged: no teardown.
 wait_log14="$(newdir)/kubectl.log"; wait_out14="$(newdir)/out14.txt"; wait_err14="$(newdir)/err14.txt"
@@ -8242,7 +8245,7 @@ tmpdirs+=("$(dirname "$wait_log14")")
 K8S_STUB_RUN_COMPLETE=0 K8S_STUB_SENTINEL_RC=0 \
     waitstub_wait "$wait_log14" "$wait_out14" "$wait_err14" \
     --branch fs-k8s-test-wait-cleanup-success --timeout 5
-if ! wait_teardown_ran "$wait_log14"; then
+if ! wait_teardown_ran "$wait_log14" && ! wait_codex_teardown_ran "$wait_log14"; then
     ok "a completed wait (success path) tears nothing down"
 else
     no "a completed wait (success path) tears nothing down" "$(cat "$wait_log14")"
@@ -8259,6 +8262,7 @@ K8S_STUB_POD_PHASE=Failed \
     waitstub_wait "$wait_log15" "$wait_out15" "$wait_err15" \
     --branch fs-k8s-test-wait-cleanup-podfailed --timeout 5 || rc=$?
 if (( rc == 2 )) && wait_teardown_ran "$wait_log15" \
+    && wait_codex_teardown_ran "$wait_log15" \
     && ! grep -q 'delete job ' "$wait_log15" \
     && ! grep -q -- '-scripts' "$wait_log15" \
     && grep -q 'rm --branch fs-k8s-test-wait-cleanup-podfailed' "$wait_err15"; then
@@ -8397,7 +8401,7 @@ case " $* " in
             exit 0
         fi
         exit 1 ;;
-    *"-claude-proxy -- sh -c "*)
+    *"-claude-proxy -- sh -c "*|*"-codex-proxy -- sh -c "*)
         [[ -n "${K8S_STUB_EXEC_CAPTURE:-}" ]] && cat > "$K8S_STUB_EXEC_CAPTURE" || cat >/dev/null
         exit "${K8S_STUB_EXEC_RC:-0}" ;;
     *" apply -f -"*)
@@ -8418,7 +8422,7 @@ chmod +x "$keeper_stub_dir/kubectl"
 # as a prefix on the call, e.g. `K8S_STUB_EXEC_RC=1 keeper_run ...`), so
 # each scenario below controls exactly the knobs it needs.
 keeper_run() {
-    local run_dir="$1" branch="$2"
+    local run_dir="$1" branch="$2" wait_timeout="${3:-30}"
     keeper_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$keeper_log")")
     keeper_out="$(newdir)/out.txt"; keeper_err="$(newdir)/err.txt"
     tmpdirs+=("$(dirname "$keeper_out")")
@@ -8430,7 +8434,7 @@ keeper_run() {
         K8S_STUB_EXEC_RC="${K8S_STUB_EXEC_RC:-}" K8S_STUB_APPLY_RC="${K8S_STUB_APPLY_RC:-}" \
         K8S_STUB_EXEC_CAPTURE="$keeper_exec_capture" K8S_STUB_APPLY_CAPTURE="$keeper_apply_capture" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" \
-        "$k8s_sh" wait --branch "$branch" --timeout 30 --probe --run-dir "$run_dir" \
+        "$k8s_sh" wait --branch "$branch" --timeout "$wait_timeout" --probe --run-dir "$run_dir" \
         > "$keeper_out" 2> "$keeper_err" &
     keeper_wait_pid=$!
 }
@@ -8523,6 +8527,73 @@ else
     no "the keeper is gone once cmd_wait returns on completion: no push for a post-return change" \
         "before=$keeper_exec_calls_1 after=$keeper_exec_calls_3"
 fi
+
+# A Codex-first composition records harness=codex even when a later seat
+# uses Claude. Both credential paths must start their respective keepers.
+keeper_mixed_dir="$(newdir)"; tmpdirs+=("$keeper_mixed_dir")
+keeper_mixed_claude="$keeper_mixed_dir/credentials.json"
+jq -n --arg at mixed-claude-token --argjson exp "$keeper_future_ms" \
+    '{claudeAiOauth: {accessToken: $at, refreshToken: "rt", expiresAt: $exp}}' \
+    > "$keeper_mixed_claude"
+keeper_mixed_codex="$keeper_mixed_dir/auth.json"
+keeper_mixed_payload="$(printf '{"exp":2147483647}' | base64 | tr -d '\n')"
+printf '{"tokens":{"access_token":"fixture.%s.sig","account_id":"acct-fixture-keeper"}}\n' \
+    "$keeper_mixed_payload" > "$keeper_mixed_codex"
+printf 'harness=codex\nCLAUDE_CREDENTIAL_PATH=%s\nCODEX_AUTH_PATH=%s\n' \
+    "$keeper_mixed_claude" "$keeper_mixed_codex" > "$keeper_mixed_dir/run.env"
+keeper_mixed_sentinel="$(newdir)/sentinel"; tmpdirs+=("$(dirname "$keeper_mixed_sentinel")")
+K8S_STUB_SENTINEL_FILE="$keeper_mixed_sentinel" \
+    keeper_run "$keeper_mixed_dir" fs-k8s-test-keeper-mixed
+sleep 1.5
+if grep -q -- '-claude-proxy -- sh -c' "$keeper_log" \
+    && grep -q -- '-codex-proxy -- sh -c' "$keeper_log" \
+    && ! grep -qF 'no Claude credential path' "$keeper_err"; then
+    ok "a Codex-first mixed run starts both proxy keepers"
+else
+    no "a Codex-first mixed run starts both proxy keepers" \
+        "log=$(cat "$keeper_log") err=$(cat "$keeper_err")"
+fi
+printf '0\n' > "$keeper_mixed_sentinel"
+wait "$keeper_wait_pid" || true
+
+keeper_codex_dir="$(newdir)"; tmpdirs+=("$keeper_codex_dir")
+keeper_codex_auth="$keeper_codex_dir/auth.json"
+printf '{"tokens":{"access_token":"fixture-one.%s.sig","account_id":"acct-fixture-keeper"}}\n' \
+    "$keeper_mixed_payload" > "$keeper_codex_auth"
+printf 'harness=codex\nCODEX_AUTH_PATH=%s\n' "$keeper_codex_auth" \
+    > "$keeper_codex_dir/run.env"
+keeper_codex_sentinel="$(newdir)/sentinel"
+tmpdirs+=("$(dirname "$keeper_codex_sentinel")")
+K8S_STUB_SENTINEL_FILE="$keeper_codex_sentinel" \
+    keeper_run "$keeper_codex_dir" fs-k8s-test-keeper-codex 80
+sleep 1.5
+keeper_codex_conf="$(jq -r '.data["upstream-key.conf"]' "$keeper_apply_capture" \
+    | base64 -d)"
+if grep -qF 'set $upstream_key "fixture-one.' <<< "$keeper_codex_conf" \
+    && grep -qF 'set $upstream_account_id "acct-fixture-keeper";' \
+        <<< "$keeper_codex_conf" \
+    && ! grep -qF 'acct-fixture-keeper' "$keeper_log"; then
+    ok "Codex keeper pushes both private values into the proxy and Secret"
+else
+    no "Codex keeper pushes both private values into the proxy and Secret"
+fi
+jq --arg payload "$keeper_mixed_payload" \
+    '.tokens.access_token = ("fixture-two." + $payload + ".sig")' "$keeper_codex_auth" \
+    > "$keeper_codex_auth.new"
+mv -f "$keeper_codex_auth.new" "$keeper_codex_auth"
+sleep 31
+keeper_codex_conf="$(jq -r '.data["upstream-key.conf"]' "$keeper_apply_capture" \
+    | base64 -d)"
+if grep -qF 'set $upstream_key "fixture-two.' <<< "$keeper_codex_conf" \
+    && grep -qF 'set $upstream_account_id "acct-fixture-keeper";' \
+        <<< "$keeper_codex_conf" \
+    && [[ "$(grep -c -- '-codex-proxy -- sh -c' "$keeper_log")" == 2 ]]; then
+    ok "Codex token refresh preserves the account id in both key pushes"
+else
+    no "Codex token refresh preserves the account id in both key pushes"
+fi
+printf '0\n' > "$keeper_codex_sentinel"
+wait "$keeper_wait_pid" || true
 
 # 2. A failed nginx -t (K8S_STUB_EXEC_RC=1) must leave the wait running --
 # a push failure is never a reason to abort it -- print a warning, and
@@ -12528,6 +12599,34 @@ if grep -qF ': "${HARNESS:=pi}"' "$entrypoint_sh" \
 else
     no "entrypoint defaults HARNESS to pi and validates it against pi|claude" \
         "missing HARNESS default or pi|claude case arm in $entrypoint_sh"
+fi
+
+# HARNESS=codex is accepted only for a composed (RUN_DIR) pod: the legacy
+# single-harness pod has no Codex leg. Run the real validation block.
+harness_case_file="$(newdir)/harness-case.sh"
+tmpdirs+=("$(dirname "$harness_case_file")")
+{
+    echo 'set -euo pipefail'
+    sed -n '/^: "${HARNESS:=pi}"$/,/^esac$/p' "$entrypoint_sh"
+    echo 'echo HARNESS_OK'
+} > "$harness_case_file"
+hc_out="$(env -u RUN_DIR HARNESS=codex bash "$harness_case_file" 2>&1)" || true
+if ! grep -qF HARNESS_OK <<< "$hc_out" && grep -qF 'requires RUN_DIR' <<< "$hc_out"; then
+    ok "entrypoint refuses HARNESS=codex without RUN_DIR"
+else
+    no "entrypoint refuses HARNESS=codex without RUN_DIR" "out=$hc_out"
+fi
+hc_out="$(RUN_DIR=/work/run HARNESS=codex bash "$harness_case_file" 2>&1)" || true
+if grep -qF HARNESS_OK <<< "$hc_out"; then
+    ok "entrypoint accepts HARNESS=codex in a composed (RUN_DIR) pod"
+else
+    no "entrypoint accepts HARNESS=codex in a composed (RUN_DIR) pod" "out=$hc_out"
+fi
+hc_out="$(RUN_DIR=/work/run HARNESS=bogus bash "$harness_case_file" 2>&1)" || true
+if ! grep -qF HARNESS_OK <<< "$hc_out"; then
+    ok "entrypoint still refuses an unknown HARNESS"
+else
+    no "entrypoint still refuses an unknown HARNESS" "out=$hc_out"
 fi
 
 # CLAUDE_PROXY_BASE_URL is required only for HARNESS=claude.
@@ -18990,6 +19089,8 @@ rd_make_fixture() {
     case "$mix" in
         pi) printf '{"steps":[{"action":"code","harness":"pi","model":"z-ai/glm-4.6"}]}' > "$dir/pipeline.json" ;;
         claude) printf '{"steps":[{"action":"maintain","harness":"claude","model":"sonnet"}]}' > "$dir/pipeline.json" ;;
+        codex) printf '{"steps":[{"action":"code","harness":"codex","model":"gpt-5.6-sol"}]}' > "$dir/pipeline.json" ;;
+        mixed) printf '{"steps":[{"action":"code","harness":"codex","model":"gpt-5.6-sol"},{"action":"maintain","harness":"claude","model":"sonnet","fix":{"harness":"codex","model":"gpt-5.6-sol"}}]}' > "$dir/pipeline.json" ;;
     esac
     printf '%s' "$dir"
 }
@@ -19084,6 +19185,114 @@ else
     no "submit --dry-run --run-dir with any claude seat in pipeline.json creates the claude token Secret and CLAUDE_PROXY_BASE_URL, even with --harness pi" \
         "not found in $rd_claude_dry_out"
 fi
+
+# A fixture token exists only on the host. Dry-run must render a proxy
+# Secret reference, never its contents or an agent-container mount.
+rd_codex_home="$(newdir)"; tmpdirs+=("$rd_codex_home")
+mkdir -p "$rd_codex_home"
+rd_codex_token='fixture-codex-access-never-in-pod'
+rd_codex_account='acct-fixture-never-in-pod'
+printf '{"auth_mode":"chatgpt","tokens":{"access_token":"%s","account_id":"%s","refresh_token":"fixture-refresh-never-in-pod"}}\n' \
+    "$rd_codex_token" "$rd_codex_account" > "$rd_codex_home/auth.json"
+rd_codex_dry="$(rd_make_fixture codex)"; tmpdirs+=("$rd_codex_dry")
+rd_codex_out="$(newdir)/codex.yaml"; tmpdirs+=("$(dirname "$rd_codex_out")")
+if CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-rd-codex \
+    --harness codex --model gpt-5.6-sol --run-dir "$rd_codex_dry" \
+    "$proj_dir" "$handoff_file" > "$rd_codex_out" 2>&1; then
+    ok "a composed Codex seat renders on --k8s"
+else
+    no "a composed Codex seat renders on --k8s" "$(cat "$rd_codex_out")"
+fi
+if grep -q 'codex-proxy' "$rd_codex_out" \
+    && grep -q 'CODEX_PROXY_BASE_URL' "$rd_codex_out" \
+    && grep -q 'secretName: .*codex-token' "$rd_codex_out"; then
+    ok "Codex render has a per-run proxy, URL and proxy-only token Secret"
+else
+    no "Codex render has a per-run proxy, URL and proxy-only token Secret"
+fi
+codex_render_conf="$(sed -n '/^  nginx.conf: |$/,/^---$/p' "$rd_codex_out")"
+if [[ "$(grep -cF 'location = /v1/responses' <<< "$codex_render_conf")" == 2 ]] \
+    && grep -qF 'proxy_pass $upstream/backend-api/codex/responses$is_args$args;' \
+        <<< "$codex_render_conf" \
+    && grep -qF 'proxy_pass $upstream/backend-api/codex/responses/compact$is_args$args;' \
+        <<< "$codex_render_conf" \
+    && [[ "$(grep -cF 'proxy_set_header ChatGPT-Account-Id "$upstream_account_id";' \
+        <<< "$codex_render_conf")" == 2 ]] \
+    && [[ "$(grep -cF 'proxy_set_header Authorization "Bearer $upstream_key";' \
+        <<< "$codex_render_conf")" == 2 ]] \
+    && grep -qF 'return 403;' <<< "$codex_render_conf" \
+    && ! grep -qF 'api.openai.com' <<< "$codex_render_conf"; then
+    ok "rendered Codex proxy forwards only Responses routes with private bearer and account id"
+else
+    no "rendered Codex proxy forwards only Responses routes with private bearer and account id"
+fi
+if CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" run --dry-run --branch fs-k8s-test-rd-codex-default \
+    --harness codex --run-dir "$rd_codex_dry" \
+    "$proj_dir" "$handoff_file" > /dev/null 2>&1; then
+    ok "a composed Codex run needs no phantom top-level model"
+else
+    no "a composed Codex run needs no phantom top-level model"
+fi
+if grep -qF "$rd_codex_token" "$rd_codex_out" \
+    || grep -qF "$rd_codex_account" "$rd_codex_out" \
+    || grep -qF 'fixture-refresh-never-in-pod' "$rd_codex_out"; then
+    no "Codex render contains no real token, account id or refresh token"
+else
+    ok "Codex render contains no real token, account id or refresh token"
+fi
+if awk '/^kind: Job$/{job=1} job && /secretName:.*codex-token/{found=1} END{exit !found}' \
+    "$rd_codex_out"; then
+    no "Codex token Secret is not mounted in the Job"
+else
+    ok "Codex token Secret is not mounted in the Job"
+fi
+refuses "a Codex token Secret cannot be mounted as context" \
+    "suffix reserved for the per-run Codex token Secrets" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-codex-context --harness pi --model z-ai/glm-4.6 \
+    --context-secret sbx-foo-codex-token "$proj_dir" "$handoff_file"
+rd_mixed_dry="$(rd_make_fixture mixed)"; tmpdirs+=("$rd_mixed_dry")
+rd_mixed_out="$(newdir)/mixed.yaml"; tmpdirs+=("$(dirname "$rd_mixed_out")")
+CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-rd-mixed \
+    --harness codex --model gpt-5.6-sol --run-dir "$rd_mixed_dry" \
+    "$proj_dir" "$handoff_file" > "$rd_mixed_out" 2>&1
+if grep -q 'CLAUDE_PROXY_BASE_URL' "$rd_mixed_out" \
+    && grep -q 'CODEX_PROXY_BASE_URL' "$rd_mixed_out"; then
+    ok "a mixed pipeline renders both per-run proxy arrangements"
+else
+    no "a mixed pipeline renders both per-run proxy arrangements" "$(cat "$rd_mixed_out")"
+fi
+rd_codex_bin="$(newdir)"; tmpdirs+=("$rd_codex_bin")
+cat > "$rd_codex_bin/codex" <<'STUB'
+#!/usr/bin/env bash
+printf 'placeholder=%s\n' "${FORK_SANDBOX_CODEX_PLACEHOLDER:-}"
+printf 'auth_json=%s\n' "${CODEX_AUTH_JSON:-<none>}"
+printf 'arg=%s\n' "$@"
+STUB
+chmod +x "$rd_codex_bin/codex"
+rd_codex_leg_out="$(newdir)/leg.txt"; tmpdirs+=("$(dirname "$rd_codex_leg_out")")
+PATH="$rd_codex_bin:$PATH" CODEX_PROXY_BASE_URL=http://codex-proxy.invalid/v1 \
+    "$repo_dir/scripts/fork-sandbox-k8s-leg.sh" --harness codex \
+    --model gpt-5.6-sol --clone "$proj_dir" -- \
+    -c model_reasoning_effort=high > "$rd_codex_leg_out"
+if grep -q '^placeholder=sandbox$' "$rd_codex_leg_out" \
+    && grep -q '^auth_json=<none>$' "$rd_codex_leg_out" \
+    && grep -q 'model_providers.fork_sandbox.base_url="http://codex-proxy.invalid/v1"' \
+        "$rd_codex_leg_out" \
+    && grep -q '^arg=model_reasoning_effort=high$' "$rd_codex_leg_out"; then
+    ok "the Codex leg uses a placeholder, proxy URL and seat effort"
+else
+    no "the Codex leg uses a placeholder, proxy URL and seat effort" \
+        "$(cat "$rd_codex_leg_out")"
+fi
+refuses "legacy --harness codex remains refused by name" \
+    "--harness codex requires a composed --run-dir run" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-legacy-codex --harness codex --model gpt-5.6-sol \
+    "$proj_dir" "$handoff_file"
 
 # Unlike an ordinary --dry-run (which creates nothing of its own), a
 # --dry-run --run-dir must NOT remove DIR: validate_run_dir_flag's own
@@ -20269,6 +20478,9 @@ check "leg wrapper (pi): an id absent from the model map is passed through uncha
     "yes" "$(grep -qF -- '--model some-other/model ' "$leg_record" && echo yes || echo no)"
 
 # Refusals, by name.
+refuses "leg wrapper: --model without a value is refused by name" \
+    "--model requires a model id" \
+    "$leg_sh" --harness claude --clone "$leg_clone" --model
 refuses "leg wrapper: an unknown --harness is refused by name" \
     "codex" env PATH="$leg_stub_dir:$PATH" "$leg_sh" --harness codex --model m --clone "$leg_clone" --
 refuses "leg wrapper: a claude leg with no CLAUDE_PROXY_BASE_URL is refused by name" \

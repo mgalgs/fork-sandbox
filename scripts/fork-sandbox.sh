@@ -515,8 +515,8 @@
 #                        with the arguments below. Defaults --harness to pi;
 #                        --harness claude is also accepted, talking through
 #                        a per-run proxy that swaps in the operator's own
-#                        token. codex has no sandboxed path in the cluster
-#                        and is refused if named explicitly. Most other
+#                        token. Composed codex seats use their own per-run
+#                        proxy; legacy --harness codex remains refused. Most other
 #                        flags describe LOCAL sandbox machinery this run
 #                        never touches and are refused by name rather than
 #                        silently dropped -- see
@@ -1729,6 +1729,7 @@ fi
 # fork-sandbox-resume-lib.sh). self is this same script, resolved once, so
 # the resume orchestrator's detached worker can re-invoke it as a plain
 # (non---resume) run without guessing its own path.
+# shellcheck disable=SC2034  # read by fork-sandbox-resume-lib.sh
 self="$(readlink -f "${BASH_SOURCE[0]}")"
 fs_resume_state_dir="" fs_resume_base=""
 fs_resume_fwd=()
@@ -2477,7 +2478,8 @@ if [[ -n "$preset_name" ]]; then
     # non-read-only preset carrying a maintain step (2-step code+maintain or
     # 3-step code+review+maintain) cannot be honoured there. On --k8s only,
     # treat it as composed instead, exactly like any other preset the legacy
-    # path cannot run: every check and build step below keys off
+    # path cannot run. Codex seats also need the composed proxy, including
+    # a Codex fix seat on a review step. Every check and build step keys off
     # preset_is_legacy_shaped, not a separate "on --k8s" bit, so flipping it
     # here -- before the legacy-only translation just below ever reads a
     # maintain step's agent into the scalar maintainer_loop_arg/
@@ -2486,10 +2488,13 @@ if [[ -n "$preset_name" ]]; then
     # "cannot be combined with preset") apply to it too, the same as any
     # other composed preset. Local dispatch is untouched: preset_is_legacy_
     # shaped only changes here when k8s_mode is already true.
-    if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true \
-        && "$preset_read_only" != true ]]; then
+    if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true ]]; then
         for ((preset_k8s_shape_k = 1; preset_k8s_shape_k <= preset_step_count; preset_k8s_shape_k++)); do
-            if [[ "${preset_step_action[$preset_k8s_shape_k]}" == maintain ]]; then
+            preset_k8s_agent="${preset_step_agent[$preset_k8s_shape_k]}"
+            if [[ ( "${preset_step_action[$preset_k8s_shape_k]}" == maintain \
+                    && "$preset_read_only" != true ) \
+                || "${preset_agent_harness[$preset_k8s_agent]}" == codex \
+                || "${preset_step_fix_harness[$preset_k8s_shape_k]:-}" == codex ]]; then
                 preset_is_legacy_shaped=false
                 break
             fi
@@ -3533,12 +3538,12 @@ fi
 # already resolved above, exactly as a local run resolves them, so this
 # reuses that work rather than re-implementing it.
 if [[ "$k8s_mode" == true ]]; then
-    # Check this before the general codex-on-k8s refusal: the flag has no
+    # Check this before the legacy codex-on-k8s refusal: the flag has no
     # k8s path regardless of harness, and must not disappear behind it.
     if [[ -n "$codex_extra_args" ]]; then
         echo "Error: --codex-args is not supported with --k8s. It passes flags" >&2
-        echo "to codex exec, and --k8s does not run codex locally or forward" >&2
-        echo "its invocation to the pod." >&2
+        echo "to codex exec, and the cluster invocation has no route for" >&2
+        echo "this command-line flag. Use a composed agent's codex-args key." >&2
         exit 1
     fi
     # A composed (non-legacy-shaped) pipeline runs through the one shared
@@ -3552,7 +3557,7 @@ if [[ "$k8s_mode" == true ]]; then
     # name nothing) can tell the two apart. In place of one blanket
     # refusal, each composed seat (every step, and every step's fix seat
     # where one applies) is checked against exactly what the pod cannot
-    # honor: codex, a sealed/pi-local network (the cluster enforces
+    # honor: a sealed/pi-local network (the cluster enforces
     # isolation with NetworkPolicy instead, a separate axis this key does
     # not cover), and a claude or pi seat with no model (the pod's
     # entrypoint has no per-seat model discovery for a composed run yet).
@@ -3566,12 +3571,6 @@ if [[ "$k8s_mode" == true ]]; then
             k8s_seat_model="${preset_agent_model[$k8s_seat_agent]}"
             k8s_seat_network="${preset_agent_network[$k8s_seat_agent]}"
             [[ "$k8s_seat_harness" == "claude" ]] && composed_has_claude_seat=true
-            if [[ "$k8s_seat_harness" == "codex" ]]; then
-                echo "Error: --k8s cannot run step $k8s_seat_k (agent '$k8s_seat_agent'): it is" >&2
-                echo "seated on codex, which has no sandboxed path in the cluster (not" >&2
-                echo "yet supported)." >&2
-                exit 1
-            fi
             if [[ "$k8s_seat_network" == "sealed" || "$k8s_seat_harness" == "pi-local" ]]; then
                 echo "Error: --k8s cannot run step $k8s_seat_k (agent '$k8s_seat_agent'): a" >&2
                 echo "cluster pod still reaches the in-cluster model proxy, so a sealed" >&2
@@ -3601,12 +3600,6 @@ if [[ "$k8s_mode" == true ]]; then
                 k8s_seat_fix_model="${preset_step_fix_model[$k8s_seat_k]}"
                 k8s_seat_fix_network="${preset_step_fix_network[$k8s_seat_k]}"
                 [[ "$k8s_seat_fix_harness" == "claude" ]] && composed_has_claude_seat=true
-                if [[ "$k8s_seat_fix_harness" == "codex" ]]; then
-                    echo "Error: --k8s cannot run step $k8s_seat_k's fix seat: it is seated on" >&2
-                    echo "codex, which has no sandboxed path in the cluster (not yet" >&2
-                    echo "supported)." >&2
-                    exit 1
-                fi
                 if [[ "$k8s_seat_fix_network" == "sealed" || "$k8s_seat_fix_harness" == "pi-local" ]]; then
                     echo "Error: --k8s cannot run step $k8s_seat_k's fix seat: a cluster pod" >&2
                     echo "still reaches the in-cluster model proxy, so a sealed (pi-local)" >&2
@@ -3630,9 +3623,8 @@ if [[ "$k8s_mode" == true ]]; then
     if [[ "$k8s_runner_mode" != true && "$harness" != "pi" && "$harness" != "claude" ]]; then
         echo "Error: --k8s only supports --harness pi or claude. A cluster run" >&2
         echo "is pi talking to a model proxy that holds the provider key, or" >&2
-        echo "claude talking through a per-run proxy that swaps in the" >&2
-        echo "operator's own token; codex has no sandboxed path in the" >&2
-        echo "cluster (not yet supported)." >&2
+        echo "claude talking through a per-run proxy. Legacy --harness codex" >&2
+        echo "does not use the composed run's per-run Codex proxy path." >&2
         exit 1
     fi
     # A cluster pod still reaches the in-cluster model proxy regardless of

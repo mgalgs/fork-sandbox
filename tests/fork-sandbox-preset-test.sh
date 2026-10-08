@@ -667,6 +667,10 @@ k8s_composed_dryrun() {
 
 k8s_composed_dryrun "a composed pipeline preset dispatches through --k8s" \
     --preset composed --k8s
+for codex_spec in csol csol-rsonnet1 csol-rsonnet1-mastra1; do
+    k8s_composed_dryrun "Codex pipeline $codex_spec uses the composed cluster runner" \
+        --pipeline "$codex_spec" --k8s
+done
 run --preset composed --review-only --checkout HEAD >/dev/null 2>"$err" || true
 contains "--review-only accepts a preset whose remaining steps are several read-only steps" \
     "$(cat "$err")" "composed pipeline, 3 steps, read-only"
@@ -4879,16 +4883,15 @@ refuses "--k8s + --session-state against a composed preset names the flag" \
     "a composed step's seat has no transcript store" \
     --preset composed-cargs --k8s --session-state "$composed_session_state_dir"
 
-# A composed shape --k8s cannot honor is refused by name at launch,
-# before any run directory exists -- composed-codex-step.yaml and
-# composed-codex-fix.yaml (above) already prove their LOCAL shapes launch;
-# --k8s is the only thing that refuses them.
-refuses "a composed step seated on codex is refused by name on --k8s" \
-    "seated on codex, which has no sandboxed path in the cluster" \
-    --preset composed-codex-step --k8s
-refuses "a composed step's fix seat on codex is refused by name on --k8s" \
-    "cannot run step 3's fix seat: it is seated on" \
-    --preset composed-codex-fix --k8s
+# The same resolved seats reach the composed cluster runner.
+for codex_preset in composed-codex-step composed-codex-fix; do
+    if HOME="$launcher_home" "$launcher" --dry-run --preset "$codex_preset" --k8s \
+        "$proj" "$handoff" > /dev/null 2>"$err"; then
+        ok "$codex_preset is accepted on --k8s"
+    else
+        no "$codex_preset is accepted on --k8s" "$(cat "$err")"
+    fi
+done
 
 cat > "$presets_dir/composed-k8s-sealed.yaml" <<'EOF'
 agents:

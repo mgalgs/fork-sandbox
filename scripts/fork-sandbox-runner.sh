@@ -865,6 +865,7 @@ trap 'fs_signal_leg_shutdown; run_cleanup; release_clone_lock' EXIT
 _fs_codex_cred_written=()
 _fs_write_codex_cred() {
     local ch="$1" cf="$2" p
+    [[ "${k8s_runner_mode:-false}" == true ]] && return 0
     [[ "$ch" == codex && -n "$cf" ]] || return 0
     for p in "${_fs_codex_cred_written[@]}"; do
         [[ "$p" == "$cf" ]] && return 0

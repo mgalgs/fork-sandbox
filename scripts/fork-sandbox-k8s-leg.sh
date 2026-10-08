@@ -12,7 +12,7 @@
 # and classifies output the same way for every leg, local or pod) set
 # them up, and the exit code is the harness's own, never this script's.
 #
-# Usage: fork-sandbox-k8s-leg.sh --harness claude|pi --model MODEL \
+# Usage: fork-sandbox-k8s-leg.sh --harness claude|pi|codex --model MODEL \
 #     --clone DIR -- [EXTRA_ARG...]
 #
 # The prompt arrives on this script's own stdin, unread here -- `exec`
@@ -30,14 +30,20 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: fork-sandbox-k8s-leg.sh --harness claude|pi --model MODEL --clone DIR -- [EXTRA_ARG...]" >&2
+    echo "Usage: fork-sandbox-k8s-leg.sh --harness claude|pi|codex --model MODEL --clone DIR -- [EXTRA_ARG...]" >&2
 }
 
 harness="" model="" clone_dir=""
 while (( $# )); do
     case "$1" in
         --harness) harness="${2:?--harness requires claude or pi}"; shift 2 ;;
-        --model) model="${2:?--model requires a model id}"; shift 2 ;;
+        --model)
+            if (( $# < 2 )); then
+                echo "Error: --model requires a model id." >&2
+                usage
+                exit 1
+            fi
+            model="$2"; shift 2 ;;
         --clone) clone_dir="${2:?--clone requires a directory}"; shift 2 ;;
         --) shift; break ;;
         *) echo "Error: unknown option '$1'." >&2; usage; exit 1 ;;
@@ -45,7 +51,11 @@ while (( $# )); do
 done
 
 [[ -n "$harness" ]] || { echo "Error: --harness is required." >&2; usage; exit 1; }
-[[ -n "$model" ]] || { echo "Error: --model is required." >&2; usage; exit 1; }
+if [[ -z "$model" && "$harness" != codex ]]; then
+    echo "Error: --model is required for $harness." >&2
+    usage
+    exit 1
+fi
 [[ -n "$clone_dir" ]] || { echo "Error: --clone is required." >&2; usage; exit 1; }
 cd -- "$clone_dir"
 
@@ -110,8 +120,28 @@ case "$harness" in
         # reconciling it with the host's.
         exec pi --provider proxy --model "$pi_model" --mode json -p "$@"
         ;;
+    codex)
+        : "${CODEX_PROXY_BASE_URL:?CODEX_PROXY_BASE_URL must be set for a codex leg}"
+        # A custom Responses provider takes a fixed placeholder bearer.
+        # The per-run proxy replaces it with the host's access token.
+        # This home is wiped between legs by leg-loop.sh; no real Codex
+        # auth.json is installed here or mounted into this container.
+        codex_model_args=()
+        [[ -n "$model" ]] && codex_model_args=(--model "$model")
+        exec env FORK_SANDBOX_CODEX_PLACEHOLDER=sandbox \
+            codex exec --json --dangerously-bypass-approvals-and-sandbox \
+            --ignore-rules "${codex_model_args[@]}" \
+            -c 'model_provider="fork_sandbox"' \
+            -c 'model_providers.fork_sandbox.name="fork-sandbox"' \
+            -c "model_providers.fork_sandbox.base_url=\"$CODEX_PROXY_BASE_URL\"" \
+            -c 'model_providers.fork_sandbox.env_key="FORK_SANDBOX_CODEX_PLACEHOLDER"' \
+            -c 'model_providers.fork_sandbox.wire_api="responses"' \
+            -c 'model_providers.fork_sandbox.requires_openai_auth=false' \
+            -c 'model_providers.fork_sandbox.supports_websockets=false' \
+            "$@" -
+        ;;
     *)
-        echo "Error: --harness must be 'claude' or 'pi', got '$harness'." >&2
+        echo "Error: --harness must be 'claude', 'pi' or 'codex', got '$harness'." >&2
         exit 1
         ;;
 esac

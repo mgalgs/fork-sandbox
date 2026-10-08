@@ -1,0 +1,250 @@
+# Per-run Codex Responses proxy. Only this run's agent pod may reach it.
+# The real access token is mounted only here; the agent uses a placeholder.
+# The host keeper replaces upstream-key.conf and reloads nginx on refresh.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: __RUN_NAME__-codex-proxy-conf
+  namespace: __NAMESPACE__
+  labels:
+    fork-sandbox/branch: __RUN_NAME__
+    __EXTRA_LABELS__: "true"
+data:
+  nginx.conf: |
+    worker_processes 1;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        resolver kube-dns.kube-system.svc.__CLUSTER_DOMAIN__ valid=10s;
+        client_body_temp_path /tmp/client_body;
+        proxy_temp_path /tmp/proxy;
+        fastcgi_temp_path /tmp/fastcgi;
+        uwsgi_temp_path /tmp/uwsgi;
+        scgi_temp_path /tmp/scgi;
+
+        # nginx's 1 MiB default. Codex POSTs the conversation
+        # (system prompt, tool defs, every prior turn and tool result) on
+        # every Responses call, so a long-running session crosses 1 MiB
+        # well before it exhausts its context window -- the default would
+        # turn into a mid-run, unrecoverable 413.
+        client_max_body_size 0;
+
+        limit_req_zone $binary_remote_addr zone=fork_sandbox:10m rate=5r/s;
+
+        server {
+            listen 8080;
+
+            # Defines $upstream_key. Read from the writable emptyDir a
+            # keeper process can replace live, never from this ConfigMap --
+            # see the header above.
+            include /etc/nginx/key/upstream-key.conf;
+
+            # Deny by default. Responses and its compaction endpoint are
+            # the only model routes this proxy serves.
+            location / {
+                return 403;
+            }
+
+            location = /v1/responses {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set $upstream https://chatgpt.com;
+                proxy_pass $upstream/backend-api/codex/responses$is_args$args;
+
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "chatgpt.com";
+                proxy_set_header Host "chatgpt.com";
+
+                # Overwrites whatever placeholder bearer Codex sent,
+                # hiding it from the upstream request entirely.
+                proxy_set_header Authorization "Bearer $upstream_key";
+                proxy_set_header ChatGPT-Account-Id "$upstream_account_id";
+                proxy_hide_header Authorization;
+
+                # The response is a long-lived, unbuffered SSE stream.
+                proxy_http_version 1.1;
+                proxy_buffering off;
+                proxy_read_timeout 600s;
+            }
+
+            location = /v1/responses/compact {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+                set $upstream https://chatgpt.com;
+                proxy_pass $upstream/backend-api/codex/responses/compact$is_args$args;
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "chatgpt.com";
+                proxy_set_header Host "chatgpt.com";
+                proxy_set_header Authorization "Bearer $upstream_key";
+                proxy_set_header ChatGPT-Account-Id "$upstream_account_id";
+                proxy_hide_header Authorization;
+                proxy_http_version 1.1;
+                proxy_buffering off;
+                proxy_read_timeout 600s;
+            }
+
+        }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __RUN_NAME__-codex-proxy
+  namespace: __NAMESPACE__
+  labels:
+    app: fork-sandbox-proxy
+    fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/role: codex-proxy
+    __EXTRA_LABELS__: "true"
+spec:
+  restartPolicy: Always
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    # Seeds the writable "key" emptyDir from the Secret's initial value,
+    # once, before nginx ever starts -- see the file header for why the
+    # main container never mounts the Secret at all. Same image and
+    # non-root securityContext as the main container; it only needs to
+    # read the Secret mount and write the emptyDir, so
+    # readOnlyRootFilesystem stays true.
+    - name: seed-key
+      image: nginx:1.27-alpine
+      command:
+        - sh
+        - -c
+        - cp /etc/nginx/key-secret/upstream-key.conf /etc/nginx/key/upstream-key.conf
+          && chmod 600 /etc/nginx/key/upstream-key.conf
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: key-secret
+          mountPath: /etc/nginx/key-secret
+          readOnly: true
+        - name: key
+          mountPath: /etc/nginx/key
+  containers:
+    - name: nginx
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 8080
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: conf
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+          readOnly: true
+        # Writable, unlike every other mount here: a keeper process on the
+        # host (k8s_push_codex_key in fork-sandbox-k8s.sh) execs into this
+        # container and replaces upstream-key.conf in place -- see the
+        # file header. No subPath, so `nginx -s reload` sees the same
+        # directory the keeper just wrote into.
+        - name: key
+          mountPath: /etc/nginx/key
+        - name: tmp
+          mountPath: /tmp
+        - name: run
+          mountPath: /var/run
+  volumes:
+    - name: conf
+      configMap:
+        name: __RUN_NAME__-codex-proxy-conf
+    - name: key-secret
+      secret:
+        secretName: __RUN_NAME__-codex-token
+    - name: key
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: run
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __RUN_NAME__-codex-proxy
+  namespace: __NAMESPACE__
+  labels:
+    app: fork-sandbox-proxy
+    fork-sandbox/branch: __RUN_NAME__
+    __EXTRA_LABELS__: "true"
+spec:
+  selector:
+    fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/role: codex-proxy
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: __RUN_NAME__-codex-proxy
+  namespace: __NAMESPACE__
+  labels:
+    fork-sandbox/branch: __RUN_NAME__
+    __EXTRA_LABELS__: "true"
+spec:
+  podSelector:
+    matchLabels:
+      fork-sandbox/role: codex-proxy
+      fork-sandbox/branch: __RUN_NAME__
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fork-sandbox-agent
+              fork-sandbox/branch: __RUN_NAME__
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
