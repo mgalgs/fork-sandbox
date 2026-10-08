@@ -29,7 +29,8 @@ does on a workstation.
 
   Treat that as cluster-admin-only: `kubectl exec` into this pod reaches
   every Secret the pod's ServiceAccount can read (see "Security posture"
-  below), not just the mail store.
+  below), not just the mail store. A team that wants to reach the store without
+  exec uses the mail API's team access (see "The mail API" below).
 
 ## Setup
 
@@ -67,6 +68,7 @@ Do these in order.
    | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
    | `K8S_POSTMASTER_HOOKS_SECRET` | no | the name of a Secret you create in the namespace, to hand your hooks credentials. Install never creates or reads it, only references it. Must be a DNS-1123 subdomain name. See "Hooks". |
    | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |
+   | `K8S_MAIL_TEAM_SUBJECTS` | no | who may use the mail API's shared team token: comma-separated `user:<name>` and `group:<name>`, no spaces. When set, install binds Role `fork-sandbox-mail-team` to exactly those subjects; unset (the default) renders the Role and no binding. Only meaningful with `K8S_MAIL_API_TOKENS_FILE`. See "Team access" in [mail-api.md](mail-api.md). |
    | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` | no | laptop path to a claude credentials JSON; when set, claude seats are accepted in the cluster. See "Claude seats in a cluster postmaster". |
 
    The rest of `k8s.env` (`K8S_CONTEXT`, `K8S_NAMESPACE`, and the rest) is
@@ -197,6 +199,20 @@ To enable it:
    `fork-sandbox-mail-api`. With the key unset, install strips all three
    and prints one note that the API is not deployed.
 
+**Team access.** With the API enabled, install also creates a shared,
+operator-role "team" token, so any teammate with Kubernetes access to the
+namespace can use `fork-sandbox mail --remote` after one setup command, with
+no token to mint or hand over. The raw token lives in Secret
+`fork-sandbox-mail-api-team-token`; its hash is served beside the tokens-file
+entries, which keep working unchanged. Install creates the Secret only when it
+is absent and never rotates it on a re-install (so re-running install cannot
+lock the team out); `install --postmaster --rotate-team-token` is the one way
+to replace it, and it rolls the pod. Role `fork-sandbox-mail-team` grants only a
+port-forward to the API and `get` on that one Secret, and K8S_MAIL_TEAM_SUBJECTS
+binds it. The tokens file must still have at least one entry. Onboarding,
+what the token can do, rotation and clearing a flag are in "Team access" in
+[mail-api.md](mail-api.md).
+
 **Rotation.** Edit the tokens file and re-run `install --postmaster`. The
 server reads its tokens once at startup; the Secret is part of the
 `checksum/pm-config` annotation, so a changed file rolls the pod.
@@ -214,6 +230,10 @@ afterward, or keep it under a supervisor that does (see the operations note
 `K8S_MAIL_API_TOKEN_FILE=<file holding the raw token>` in `k8s.env` and use
 `fork-sandbox mail --remote <verb> ...` (and `fork-sandbox postmaster
 --remote <verb> ...`).
+
+**From a laptop, with team access**, there is nothing to forward by hand:
+`fork-sandbox mail-forward --setup` and then `fork-sandbox mail --remote ...`
+start and supervise the forward themselves.
 
 **In-cluster callers** use `http://fork-sandbox-mail-api.<namespace>.svc`.
 Seat pods cannot reach it: the agent NetworkPolicy pins their egress.
@@ -258,7 +278,8 @@ read-only at `/etc/fork-sandbox/hook-secret` in the postmaster container
 only, and `FS_HOOK_SECRET_DIR` is set to that path in every hook's
 environment. The value must be a DNS-1123 subdomain name. Install also
 refuses its own Secret names, `fork-sandbox-upstream-key`,
-`fork-sandbox-postmaster-git` and `fork-sandbox-mail-api-tokens`, so a typo
+`fork-sandbox-postmaster-git`, `fork-sandbox-mail-api-tokens` and
+`fork-sandbox-mail-api-team-token`, so a typo
 cannot hand a hook the provider key.
 
 ## Claude seats in a cluster postmaster
@@ -423,6 +444,12 @@ by label when a run finishes or is removed).
 The practical consequence: `kubectl exec` into the postmaster pod reaches
 every credential the ServiceAccount can read, not just the mail store.
 Keep that to cluster admins.
+
+The team Role `fork-sandbox-mail-team` is narrower than that: a teammate bound
+to it can port-forward to the pods of the namespace and read the one team-token
+Secret, and nothing else. That token is an operator token for the mail API, so
+treat whoever can read it as an operator of the mail store; RBAC cannot make
+it per-person.
 
 Hooks run in the postmaster pod, in the same trust tier as handlers,
 beside the credentials the postmaster already holds.

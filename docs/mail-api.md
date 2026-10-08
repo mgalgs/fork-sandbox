@@ -15,7 +15,8 @@ It is plain HTTP. It is meant for in-cluster traffic and
 fronts it itself.
 
 The server is `scripts/fork-sandbox-mail-api.py`, run as `fork-sandbox
-mail-api serve` or `fork-sandbox mail-api mint`. The client is
+mail-api serve` or `fork-sandbox mail-api mint`. A teammate with Kubernetes
+access to the cluster reaches it with no token of their own: see "Team access". The client is
 `scripts/fork-sandbox-mail-remote.py`, which `fork-sandbox mail --remote
 <verb> ...` and `fork-sandbox postmaster --remote <verb> ...` run
 underneath, so a laptop and a CI job invoke the identical command line.
@@ -72,6 +73,14 @@ entry with `hmac.compare_digest`.
   `@name`s it may use as `--from` (matched against mail's address
   pattern), or `-` for none. Its `caps` field is a subset of `read`,
   `grant`, `seen`, `target` and `upstream`, or `-`.
+
+A file named `team-token-sha256` beside the tokens file, holding one SHA-256
+hex digest, adds one more entry: an operator labelled `team`, for the shared
+team token (see "Team access" below). It exists only in the cluster, where
+`install --postmaster` puts it; with no such file nothing changes, and a
+tokens-file entry labelled `team` is then refused as a duplicate label.
+`check --team-hash <hex>` validates a digest the way `serve` would read the
+file.
 
 `serve` reads this file once, at startup; rotating a token means rewriting
 the file and restarting the server. It refuses to start (exit 2, one line
@@ -270,7 +279,9 @@ lines, parsed by hand, never sourced as shell):
 | `FORK_SANDBOX_MAIL_API_RETRY_SECONDS` | `K8S_MAIL_API_RETRY_SECONDS` | the retry budget in whole seconds; default `300`, `0` turns retries off |
 
 A missing URL or token file, or an empty token, is a one-line error naming
-both the environment variable and the `k8s.env` key, and the shim exits 2.
+both the environment variable and the `k8s.env` key, and the shim exits 2. With
+neither set, a machine that has run `mail-forward --setup` configures itself
+instead (see "Team access"); an explicit setting always takes precedence.
 Trailing whitespace in the token file is stripped.
 
 The client's request has no proxy and follows no redirect, so the token
@@ -309,6 +320,102 @@ invocation (see "Idempotency keys"), so a retry after a lost reply returns
 the first result, with the same message id, instead of delivering a second
 message. Read-only verbs send no key. Against a server that predates the
 key, retries are at-least-once.
+
+## Team access
+
+A teammate who already has Kubernetes access to the postmaster's namespace can
+read panel threads and post into them with no token to ask for and nothing to
+mint. The team is fully trusted, so that Kubernetes access *is* the
+authorization.
+
+**Onboarding is one command**, run once per machine:
+
+    fork-sandbox mail-forward --setup --context example-cluster \
+        --namespace example-ns --name @alice
+
+It records the kube context, the namespace and your own `@name` in
+`mail-team.env` under `${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}`,
+after checking that your credentials can read the team token (`--no-verify`
+skips that; `--port N` picks the local port, default 18765). The context is
+always the one you name: the client never falls back to your kubeconfig's
+current context, which on a laptop is often a production cluster, and never
+runs `kubectl` without `--context`. From then on:
+
+    fork-sandbox mail --remote tree <thread>
+    fork-sandbox mail --remote send --to @reviewer --subject "..." --body note.md
+    fork-sandbox postmaster --remote status
+
+**What `--remote` does for you.** With no `FORK_SANDBOX_MAIL_API_URL` or token
+file configured (those always win), it starts, or reuses, one background
+`kubectl port-forward` to the mail API on a stable loopback port. The forward
+outlives the command, so the next call finds it, and a lock keeps concurrent
+first calls from starting two; there is never one per call. When the
+postmaster pod is replaced the forward dies with it: the next call starts a
+fresh one, and a call in flight does the same before each retry. It reads the
+team token with your own kube credentials on each call and holds it in memory
+only; no file on your machine ever holds it (the state directory,
+`${XDG_STATE_HOME:-$HOME/.local/state}/fork-sandbox/mail-forward/`, keeps the
+forward's pid and port, a lock and kubectl's log). A 401, after a rotation,
+is retried once with a freshly read token. `send` and `reply` with no
+`--from` use the `@name` you gave at setup; an explicit `--from` wins.
+
+    fork-sandbox mail-forward --status    # running (exit 0) or not (exit 1)
+    fork-sandbox mail-forward --stop      # end the forward; the next call restarts it
+
+**What the team token can do: everything an operator can.** It is an
+operator-role token (label `team`), so it passes every check in the allowlist
+table: any `--from`, any grant flag, any thread, `postmaster flag` and
+`unflag`. Its `--from` identities are not limited either. Everything in
+"Who may post as which name" applies to it as to any operator token,
+including the hop-budget limit. There is one team token, shared; there are no
+per-person tokens and no per-person revocation. Whoever can read the Secret
+can use it.
+
+**Clearing a flag.** Only names on the operator list
+(`K8S_POSTMASTER_OPERATORS`, default `@operator`) carry the postmaster's rule 1
+in the cluster, and the team token may post as any of them. A teammate clears
+a NEEDS-OPERATOR flag by replying into the thread as one:
+
+    fork-sandbox mail --remote reply --from @operator --reply-to <message-id> \
+        --body note.md
+
+Your own `@name` does not clear it, which is the point of the list.
+`fork-sandbox postmaster --remote unflag <thread>` is the explicit form.
+
+**The cluster side** is `install --postmaster` with the mail API enabled
+(`K8S_MAIL_API_TOKENS_FILE`; see [cluster-postmaster.md](cluster-postmaster.md)):
+
+- It creates Secret `fork-sandbox-mail-api-team-token` (key `token`) if it is
+  absent, and never rotates it on a re-install, so re-running install cannot
+  lock the team out. The tokens Secret also gets the token's hash as
+  `team-token-sha256`, which `serve` reads (above). The raw token is never in
+  the pod.
+- It renders Role `fork-sandbox-mail-team`: `get` on the one Service
+  `fork-sandbox-mail-api`, `get` and `list` on pods, `create` on
+  `pods/portforward`, and `get` on the one Secret, nothing else. RBAC cannot
+  narrow pods by name or label (the postmaster pod's name changes with every
+  rollout), so the pod and port-forward rules are namespace-wide, the least a
+  port-forward to a Service takes. The Role is bound to nobody by default.
+  `K8S_MAIL_TEAM_SUBJECTS` in `k8s.env` (`user:<name>` and `group:<name>`,
+  comma-separated) adds a RoleBinding to exactly those subjects; leave it unset
+  for a team whose members are already cluster admins.
+- The server image must be new enough to know the team entry. An older
+  `serve` ignores the hash and answers the team token with 401; rebuild the
+  postmaster image and set `K8S_POSTMASTER_IMAGE` first.
+
+**Rotating the team token** is its own operation:
+
+    scripts/fork-sandbox-k8s.sh install --postmaster --rotate-team-token
+
+It replaces the Secret with a new token and rolls the postmaster pod (the hash
+is part of the pod's config checksum), after which the old token stops
+working. Teammates do nothing: every call reads the Secret afresh. Rotate when
+someone who could read the Secret leaves, or when the token may have leaked.
+
+If a call fails, `kubectl port-forward` is the usual suspect: a local port held
+by something else is reported by name (`--port` at setup picks another), and a
+`forbidden` from kubectl means the Role is not bound to you, which is the
+cluster admin's to fix.
 
 ## Running the server
 
