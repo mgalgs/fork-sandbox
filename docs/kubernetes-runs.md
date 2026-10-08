@@ -1086,8 +1086,6 @@ have to stat the run directory separately to find out.
 
 **What is refused, by name, before anything is staged:**
 
-- A step or fix seat on codex — codex has no sandboxed path in the
-  cluster yet (see "Deliberately not done" below).
 - A step or fix seat with `network: sealed`, or the `pi-local` alias — a
   cluster pod still reaches the in-cluster model proxy, so a sealed claim
   would be false there; cluster isolation is enforced by NetworkPolicy
@@ -2122,6 +2120,33 @@ and the review leg can run different harnesses on the same pod, and
 `fork-sandbox.sh`'s own `--k8s` gate for why `--review-harness pi` must be
 named rather than inferred.
 
+### 1c. proxy, per-run, for codex — **Status: built for composed seats.**
+
+A composed `--k8s` pipeline may seat Codex in any step or fix seat. The leg
+uses a custom Responses provider with a placeholder bearer and the run's
+`CODEX_PROXY_BASE_URL`. The agent Pod receives no real Codex token, account
+id, refresh token or `auth.json`. Codex `turn.completed` usage reaches the
+run log through the ordinary runner.
+
+A separate per-run proxy forwards only Responses and compaction requests to
+`https://chatgpt.com/backend-api/codex`. It overwrites Authorization and
+`ChatGPT-Account-Id` with the host sign-in access token and account id from
+its private key volume. The host keeper refreshes auth and pushes both values
+together; the per-run Secret seeds the proxy and is never mounted by the agent.
+The proxy and Secret are removed at run teardown. A mixed pipeline has
+separate Claude and Codex proxies and network policies.
+
+A live call to `api.openai.com/v1/responses` with a ChatGPT sign-in token
+failed with `401` and `Missing scopes: api.responses.write`. A host Codex
+0.158.0 custom-provider probe against the ChatGPT backend succeeded with
+an isolated home, the bearer and account header, and a normal `turn.completed`.
+See [the feasibility note](codex-k8s-feasibility.md).
+
+Legacy-shaped presets containing a Codex seat use the composed runner on
+`--k8s`. Bare `--k8s --harness codex` remains refused; its single-leg path
+does not use the proxy. The top-level `--codex-args` flag remains refused;
+a composed agent's `codex-args` key is passed to its seat.
+
 ### 2. direct — **Status: designed, not built.**
 
 A self-hosted OpenAI-compatible endpoint — vLLM, Ollama, and similar all speak
@@ -3105,12 +3130,8 @@ Scoped out of v1 on purpose, not overlooked:
   `docs/k8s-platform.md`.
 - **`--review-only` on Kubernetes.** It is refused with `--k8s` until the
   cluster path can review an existing checkout.
-- **The codex harness inside a pod.** `--harness claude` now has its own
-  sealed-egress story (the per-run proxy — see "Model access" above), so
-  the reasoning that used to cover both no longer applies to it; codex has
-  no sandboxed credential path built at all, for either run mode. Same
-  reason a composed `--k8s` run refuses a codex seat or fix seat by name
-  (see "Composed pipelines on `--k8s`" above).
+- **Legacy `--k8s --harness codex`.** The composed-run Codex proxy does not
+  change the single-harness entrypoint, so this command stays refused.
 - **The tidy-history leg in a pod.** A composed `--k8s` run's own fetch
   seam means the pod never reaches it; see "Composed pipelines on
   `--k8s`" above for the recorded skip and why publishing a rewrite from a
