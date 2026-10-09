@@ -5022,9 +5022,25 @@ k8s_tail_diagnostic_log() {
         --request-timeout="${remaining}s" 2>/dev/null | sed 's/^/      /' >&2
 }
 
+# A composed pod's agent container is its runner. A terminated runner cannot
+# dispatch another leg; a previous termination followed by CrashLoopBackOff
+# is equally terminal for this run. Other waiting states (image pulls and
+# startup) are deliberately left to the normal readiness budget.
+k8s_runner_dead_json() {
+    jq -e '
+        [.status.containerStatuses[]? | select(.name == "agent") |
+            select(.state.terminated != null or
+                (.state.waiting.reason == "CrashLoopBackOff" and
+                 .lastState.terminated != null))] | length > 0
+    ' >/dev/null 2>&1
+}
+
 k8s_report_unready_pod() {
-    local pod="$1" ready_checks="${2:-}" pod_json
-    if ! pod_json="$(kubectl get pod "$pod" -o json --request-timeout=60s 2>/dev/null)"; then
+    local pod="$1" ready_checks="${2:-}" runner_dead="${3:-false}" pod_json
+    local request_timeout=60
+    [[ "$runner_dead" == true ]] && request_timeout=10
+    if ! pod_json="$(kubectl get pod "$pod" -o json \
+        --request-timeout="${request_timeout}s" 2>/dev/null)"; then
         echo "fork-sandbox-k8s: could not read pod $pod's status for diagnostics." >&2
         return 0
     fi
@@ -5039,7 +5055,11 @@ k8s_report_unready_pod() {
         echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe pod $pod" >&2
         return 0
     fi
-    echo "fork-sandbox-k8s: pod $pod did not become Ready in time. Unready container(s):" >&2
+    if [[ "$runner_dead" == true ]]; then
+        echo "fork-sandbox-k8s: pod $pod's runner died. Container state(s):" >&2
+    else
+        echo "fork-sandbox-k8s: pod $pod did not become Ready in time. Unready container(s):" >&2
+    fi
 
     local -a also_tail=()
     local service_ready_started
@@ -7680,9 +7700,34 @@ EOF
         exit 1
     fi
 
-    local pod_wait_rc=0
-    kubectl wait --for=condition=Ready "pod" -l "job-name=$safe_name" --timeout="${pod_remaining}s" \
-        || pod_wait_rc=$?
+    local pod_wait_rc=0 runner_status="" wait_slice
+    if [[ -n "$run_dir_flag" ]]; then
+        # A single long kubectl wait cannot notice a runner that exits while
+        # a leg or init container keeps the pod unready. Bound each wait so
+        # the runner state is checked every few seconds.
+        while true; do
+            wait_slice=$(( pod_remaining < 5 ? pod_remaining : 5 ))
+            kubectl wait --for=condition=Ready pod -l "job-name=$safe_name" \
+                --timeout="${wait_slice}s" >/dev/null 2>&1 && break
+            runner_status="$(kubectl get pod "$pod_name" -o json \
+                --request-timeout=5s 2>/dev/null || true)"
+            if [[ -n "$runner_status" ]] && k8s_runner_dead_json <<< "$runner_status"; then
+                k8s_report_unready_pod "$pod_name" "$services_ready_checks" true
+                printf '2\n' > "$run_dir/exit-code"
+                fs_record_run_log "$run_dir"
+                exit 2
+            fi
+            pod_elapsed=$(( $(date +%s) - pod_start ))
+            pod_remaining=$(( pod_budget - pod_elapsed ))
+            if (( pod_remaining <= 0 )); then
+                pod_wait_rc=1
+                break
+            fi
+        done
+    else
+        kubectl wait --for=condition=Ready pod -l "job-name=$safe_name" \
+            --timeout="${pod_remaining}s" || pod_wait_rc=$?
+    fi
     if (( pod_wait_rc != 0 )); then
         # Pod events are not retained on every cluster, so the container
         # status and log -- still readable on this live, not-yet-reaped
@@ -8460,6 +8505,7 @@ cmd_wait() {
     fi
     local -a probe_kubectl_opts=()
     [[ "$probe" == true ]] && probe_kubectl_opts=(--request-timeout="${probe_req_timeout}s")
+    local -a runner_kubectl_opts=(--request-timeout="${probe_req_timeout}s")
 
     if [[ "$probe" == true ]]; then
         if ! pod_name="$(k8s_probe_find_pod "$safe_name" "$legacy_name" "$probe_req_timeout")"; then
@@ -8546,6 +8592,11 @@ cmd_wait() {
     fi
 
     local start_ts now elapsed last_report_ts run_complete phase job_failed
+    local runner_mode=false runner_status=""
+    if [[ -n "$run_dir" && -f "$run_dir/run.env" ]] \
+        && [[ "$(read_env_value "$run_dir/run.env" RUNNER || true)" == 1 ]]; then
+        runner_mode=true
+    fi
     start_ts=$(date +%s)
     last_report_ts=$start_ts
     run_complete=""
@@ -8555,6 +8606,20 @@ cmd_wait() {
         # completed run needs no second round trip.
         if run_complete="$(kubectl exec "${probe_kubectl_opts[@]}" -c agent "$pod_name" -- cat /work/.run-complete 2>/dev/null)"; then
             break
+        fi
+
+        if [[ "$runner_mode" == true ]]; then
+            runner_status="$(kubectl get pod "${runner_kubectl_opts[@]}" \
+                "$pod_name" -o json 2>/dev/null || true)"
+            if [[ -n "$runner_status" ]] && k8s_runner_dead_json <<< "$runner_status"; then
+                if [[ "$probe" != true ]]; then
+                    k8s_report_unready_pod "$pod_name" "" true
+                    printf '2\n' > "$run_dir/exit-code"
+                    cmd_rm --branch "$branch" || true
+                    wait_terminal_teardown=true
+                fi
+                exit 2
+            fi
         fi
 
         # A pod that dies before writing the sentinel (OOM, crash, image
@@ -10066,10 +10131,10 @@ k8s_run_tail() {
         # run directory cmd_submit created would otherwise carry no
         # summary.json and no row in the durable run log: exactly the "a
         # seat is silently failing" case this log exists to surface.
-        # cmd_wait's own error already told the operator the job and pod
-        # are left in place for inspection, so this does not attempt any of
-        # collect's pod reads (outbox, evidence, fetch) against a pod that
-        # is dead -- it records only what submit already knew, via
+        # cmd_wait already reported the terminal failure (and reaped the
+        # per-run objects if the runner died), so this does not attempt
+        # collect's pod reads (outbox, evidence, fetch) against a dead or
+        # absent pod -- it records only what submit already knew, via
         # record's own run.env fallback for a run directory with no
         # summary.json. exit_code stays absent (record's null): none is
         # known.

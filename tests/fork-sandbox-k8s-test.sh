@@ -23275,5 +23275,121 @@ while kill -0 "$hbfifo_loop_pid" 2>/dev/null && (( $(date +%s) < hbfifo_shutdown
 done
 kill -KILL "$hbfifo_loop_pid" 2>/dev/null || true
 
+printf '\n== composed k8s runner death during readiness and wait ==\n'
+runner_stub="$(newdir)"; tmpdirs+=("$runner_stub")
+cat > "$runner_stub/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *" push "*) exit 0 ;; esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$runner_stub/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *" apply "*) cat >/dev/null; exit 0 ;;
+    *" get pod -l job-name="*"-o name"*) echo pod/stub-pod; exit 0 ;;
+    *" get pod -l job-name="*"-o jsonpath="*) echo stub-pod; exit 0 ;;
+    *" get pod stub-pod -o json"*|*" get pod --request-timeout="*" stub-pod -o json"*)
+        if [[ "$RUNNER_CASE" == slow ]]; then
+            echo '{"status":{"containerStatuses":[{"name":"agent","ready":false,"state":{"running":{}}}],"initContainerStatuses":[{"name":"service-ready","ready":false,"state":{"running":{}}}]}}'
+        elif [[ "$RUNNER_CASE" == crash ]]; then
+            echo '{"status":{"containerStatuses":[{"name":"agent","ready":false,"restartCount":2,"state":{"waiting":{"reason":"CrashLoopBackOff"}},"lastState":{"terminated":{"reason":"Error","exitCode":7}}}]}}'
+        else
+            echo '{"status":{"containerStatuses":[{"name":"agent","ready":false,"restartCount":0,"state":{"terminated":{"reason":"Error","exitCode":7}}}]}}'
+        fi
+        exit 0 ;;
+    *" wait "*)
+        if [[ "$RUNNER_CASE" == slow ]]; then
+            n=$(cat "$K8S_STUB_COUNTER" 2>/dev/null || echo 0)
+            echo $(( n + 1 )) > "$K8S_STUB_COUNTER"
+            (( n > 0 )) && exit 0
+        fi
+        [[ "$RUNNER_CASE" == after ]] && exit 0
+        exit 1 ;;
+    *" logs stub-pod -c agent "*)
+        echo 'leaked-context-secret-marker-should-never-print'; exit 0 ;;
+    *" exec "*" cat /work/.run-complete"*) exit 1 ;;
+    *" exec "*) cat >/dev/null; exit 0 ;;
+    *" get pod "*" -o jsonpath={.status.phase}"*) echo Running; exit 0 ;;
+    *" get job "*) exit 0 ;;
+    *" delete "*) exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$runner_stub/git" "$runner_stub/kubectl"
+for runner_case in before after crash slow; do
+    runner_home="$(newdir)"; tmpdirs+=("$runner_home")
+    runner_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+    tmpdirs+=("$runner_dir")
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$runner_dir/run.sh"
+    chmod +x "$runner_dir/run.sh"
+    printf '{"steps":[{"action":"code","harness":"pi","model":"z-ai/glm-4.6"}]}' \
+        > "$runner_dir/pipeline.json"
+    printf 'version=1\nstarted_at=%s\n' "$(date +%s)" > "$runner_dir/run.env"
+    runner_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$runner_log")")
+    runner_out="$(newdir)/out.txt"; tmpdirs+=("$(dirname "$runner_out")")
+    runner_counter="$(newdir)/counter"; tmpdirs+=("$(dirname "$runner_counter")")
+    runner_rc=0
+    runner_verb=run
+    [[ "$runner_case" == slow ]] && runner_verb=submit
+    HOME="$runner_home" PATH="$runner_stub:$repo_dir/scripts:$PATH" \
+        K8S_STUB_LOG="$runner_log" K8S_STUB_COUNTER="$runner_counter" \
+        RUNNER_CASE="$runner_case" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        timeout 15s "$k8s_sh" "$runner_verb" \
+        --branch "fs-k8s-runner-$runner_case" --harness pi \
+        --model z-ai/glm-4.6 --run-dir "$runner_dir" "$proj_dir" "$handoff_file" \
+        > "$runner_out" 2>&1 || runner_rc=$?
+    if [[ "$runner_case" == slow ]]; then
+        if grep -q 'pushing .* to pod' "$runner_out" \
+            && ! grep -q "runner died" "$runner_out"; then
+            ok "a slow running runner survives a failed Ready poll"
+        else
+            no "a slow running runner survives a failed Ready poll" "$(cat "$runner_out")"
+        fi
+    else
+        runner_json="$(HOME="$runner_home" "$status_sh" --json "$runner_dir" 2>/dev/null || true)"
+        runner_row="$(tail -1 "$runner_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+        if (( runner_rc == 2 )) && [[ "$runner_json" == *'"state": "failed"'* ]] \
+            && [[ -n "$runner_row" ]] && grep -q 'agent.*last-exit-code=7' "$runner_out" \
+            && grep -q 'log tail omitted: the agent container' "$runner_out" \
+            && ! grep -q 'leaked-context-secret-marker-should-never-print' "$runner_out"; then
+            ok "a $runner_case runner death fails with status and exit code without leaking its log"
+        else
+            no "a $runner_case runner death fails with status and exit code without leaking its log" \
+                "rc=$runner_rc status=$runner_json row=$runner_row out=$(cat "$runner_out")"
+        fi
+        if { grep -q 'delete job,pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=' "$runner_log" \
+            || { grep -q 'delete job fork-sandbox-agent-fs-k8s-runner-' "$runner_log" \
+                && grep -q 'delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=' "$runner_log"; }; }; then
+            ok "a $runner_case runner death tears down all per-run objects"
+        else
+            no "a $runner_case runner death tears down all per-run objects" "$(cat "$runner_log")"
+        fi
+    fi
+done
+
+# A probe with a runner run directory uses the caller's shorter timeout
+# on the runner-status read, with no later flag overriding it.
+runner_probe_dir="$(newdir)"; tmpdirs+=("$runner_probe_dir")
+printf 'RUNNER=1\n' > "$runner_probe_dir/run.env"
+runner_probe_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$runner_probe_log")")
+runner_probe_out="$(newdir)/out.txt"; tmpdirs+=("$(dirname "$runner_probe_out")")
+runner_probe_rc=0
+HOME="$runner_home" PATH="$runner_stub:$repo_dir/scripts:$PATH" \
+    K8S_STUB_LOG="$runner_probe_log" RUNNER_CASE=after \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    timeout 10s "$k8s_sh" wait --branch fs-k8s-runner-probe \
+    --run-dir "$runner_probe_dir" --probe --timeout 3 \
+    > "$runner_probe_out" 2>&1 || runner_probe_rc=$?
+runner_probe_read="$(grep -F 'get pod --request-timeout=3s stub-pod -o json' \
+    "$runner_probe_log" || true)"
+if (( runner_probe_rc == 2 )) && [[ -n "$runner_probe_read" ]] \
+    && [[ "$runner_probe_read" != *'--request-timeout=10s'* ]]; then
+    ok "a runner probe uses its three-second request timeout once"
+else
+    no "a runner probe uses its three-second request timeout once" \
+        "rc=$runner_probe_rc log=$(cat "$runner_probe_log") out=$(cat "$runner_probe_out")"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
