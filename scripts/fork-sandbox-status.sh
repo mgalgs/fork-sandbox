@@ -1051,6 +1051,31 @@ commits_from_summary() {
     printf '%s' "$n"
 }
 
+# The cluster collector writes summary.json even when no summary.txt exists
+# (notably for a reply-only resume). Prefer the text when present, as local
+# runs always have, and render the collector's structured record otherwise.
+print_run_summary() {
+    local summary_json reply_path has_reply
+    if resolve_run_file summary.txt 2>/dev/null; then
+        tr -d '\000-\010\013-\037\177' < "$RUN_FILE_PATH"
+        return 0
+    fi
+    [[ "$network" == "cluster" ]] || return 1
+    summary_json="$(run_file_read summary.json 2>/dev/null)" || return 1
+    reply_path="$run_dir/outbox/reply.md"
+    has_reply=false
+    [[ -f "$reply_path" ]] && has_reply=true
+    printf '%s' "$summary_json" | jq -er --arg reply_file "$reply_path" \
+        --argjson has_reply "$has_reply" '
+        def clean: tostring | gsub("[[:cntrl:]]"; "");
+        if type != "object" then error("summary is not an object") else
+            "branch: \((.branch // "unknown") | clean)\n" +
+            "commits: \((.commits // "unknown") | clean)\n" +
+            "state: \(if (.exit_code | type) == "number" and .exit_code == 0 then "done" else "failed" end), exit: \((.exit_code // "unknown") | clean)" +
+            (if $has_reply then "\nreply file: \($reply_file | clean)" else "" end)
+        end' 2>/dev/null
+}
+
 # Summed across every leg, so a commit made by a fix leg is not invisible
 # (and, as in event_count, the continuation legs' copy is skipped).
 commit_count() {
@@ -1340,10 +1365,7 @@ case "$mode" in
         print_status_block
         state="$(run_state)"
         if [[ "$state" == "done" || "$state" == "failed" ]]; then
-            # summary.txt is collect's own pull-back on a composed --k8s
-            # run -- the same untrusted-stranger bytes the verdict readers
-            # above already strip control characters from.
-            if summary="$(run_file_read summary.txt 2>/dev/null | tr -d '\000-\010\013-\037\177')"; then
+            if summary="$(print_run_summary)"; then
                 printf '\n%s\n' "$summary"
             fi
             if ! print_plan_report; then
@@ -1426,7 +1448,14 @@ case "$mode" in
                     # write: the Monitor tool turns each burst of output into
                     # its own notification.
                     waited=0
-                    while [[ ! -f "$run_dir/summary.txt" ]] && (( waited < 120 )); do
+                    summary_wait=120
+                    if [[ "$network" == "cluster" ]]; then
+                        summary_wait="${FS_STATUS_CLUSTER_SUMMARY_WAIT_SECONDS:-120}"
+                        [[ "$summary_wait" =~ ^[0-9]+$ ]] || summary_wait=120
+                    fi
+                    while [[ ! -f "$run_dir/summary.txt" ]] \
+                            && { [[ "$network" != "cluster" ]] || [[ ! -f "$run_dir/summary.json" ]]; } \
+                            && (( waited < summary_wait )); do
                         sleep 2
                         waited=$(( waited + 2 ))
                     done
@@ -1435,7 +1464,7 @@ case "$mode" in
                         flush_result_if_terminal_only "$EVENT_FILE_COUNT"
                         printf 'finished: %s, exit %s, after %s\n' \
                             "$state" "$(exit_code)" "$(elapsed_human)"
-                        if summary="$(run_file_read summary.txt 2>/dev/null | tr -d '\000-\010\013-\037\177')"; then
+                        if summary="$(print_run_summary)"; then
                             printf '%s\n' "$summary"
                         else
                             printf 'No summary was written, so the branch was probably never fetched.\n'

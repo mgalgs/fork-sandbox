@@ -193,6 +193,41 @@ out="$(cat "$burst_out")"
 [[ "$out" == *"early account"* && "$out" == *"finished: done, exit 0, "* && "$out" == *"late summary"* ]] \
     || { echo "monitor-terminal burst incomplete: $out"; exit 1; }
 
+# A cluster collector can finish with only summary.json. Both monitor modes
+# and plain status use its fields, and the monitor must not wait 120 seconds.
+new_run_dir
+printf 'network=cluster\n' >> "$rd_new/run.env"
+printf '0\n' > "$rd_new/exit-code"
+mkdir -p "$rd_new/outbox"
+printf 'reply\n' > "$rd_new/outbox/reply.md"
+printf '{"branch":"topic\\u001b[31m","commits":2,"exit_code":0}\n' > "$rd_new/summary.json"
+for view in --monitor --monitor-terminal; do
+    out="$(timeout 5 "$status" "$view" "$rd_new" 2>&1)" \
+        || { echo "$view waited for summary.txt: $out"; exit 1; }
+    [[ "$out" == *"branch: topic[31m"* && "$out" == *"commits: 2"* \
+        && "$out" == *"state: done, exit: 0"* \
+        && "$out" == *"reply file: $rd_new/outbox/reply.md"* \
+        && "$out" != *"probably never fetched"* && "$out" != *$'\033'* ]] \
+        || { echo "$view cluster summary wrong: $out"; exit 1; }
+done
+out="$("$status" "$rd_new")"
+[[ "$out" == *"branch: topic[31m"* && "$out" == *"commits: 2"* ]] \
+    || { echo "plain status omitted the cluster summary: $out"; exit 1; }
+printf 'text summary wins\n' > "$rd_new/summary.txt"
+out="$(timeout 5 "$status" --monitor-terminal "$rd_new")"
+[[ "$out" == *"text summary wins"* && "$out" != *"branch: topic"* ]] \
+    || { echo "cluster summary.txt was not preferred: $out"; exit 1; }
+
+# A cluster run with no summary still reports the original fallback after a
+# bounded wait. The test shortens only this cluster wait.
+new_run_dir
+printf 'network=cluster\n' >> "$rd_new/run.env"
+printf '1\n' > "$rd_new/exit-code"
+out="$(FS_STATUS_CLUSTER_SUMMARY_WAIT_SECONDS=2 timeout 5 "$status" --monitor-terminal "$rd_new" 2>&1)" \
+    || { echo "cluster missing-summary wait was not bounded: $out"; exit 1; }
+[[ "$out" == *"probably never fetched"* ]] \
+    || { echo "cluster missing-summary fallback changed: $out"; exit 1; }
+
 # 4d. On a multi-leg run events.jsonl is only the code leg, so its result
 # event is labelled as the code leg's rather than read as the run's end.
 new_run_dir
