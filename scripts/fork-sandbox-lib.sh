@@ -2612,7 +2612,7 @@ fs_balance_claude_credential() {
         printf '%s\n' "$hook_out"
         return 0
     elif (( hook_rc == 2 )); then
-        echo "Error: $hook_bin found no routable credential (its" >&2
+        echo "Error: headroom: no candidate -- $hook_bin found no routable credential (its" >&2
         echo "considered answer, exit 2) -- every candidate in the pool" >&2
         echo "looked unhealthy. Pin one by hand with --claude-credentials" >&2
         echo "to override, or fix the accounts and retry." >&2

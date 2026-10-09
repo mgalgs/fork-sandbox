@@ -5039,7 +5039,11 @@ pm_harvest_run() {
             local log_key=""
             pm_wake_exit_record "$tid" "$agent" "$rid" "$exit_code" "$run_dir" "$backend" \
                 && log_key="log=$rid"
-            pm_flag_unless_closed "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete" "" "$log_key"
+            local failure_reason="wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
+            if [[ -f "$run_dir/launch.log" ]] && grep -q 'headroom: no candidate' "$run_dir/launch.log"; then
+                failure_reason="wake for $agent failed: headroom: no candidate (run $rid)"
+            fi
+            pm_flag_unless_closed "$tid" "$failure_reason" "" "$log_key"
             # A crash's own summary.json, when present and id-shaped, is
             # exactly as trustworthy as the success path's (it may be the
             # id a --refresh-at mid-run credential rollover resumed onto) --

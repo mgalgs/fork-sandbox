@@ -273,6 +273,7 @@ hook_exit2="$(fake_hook noroute 'exit 2')"
 err="$(PATH="$hook_exit2:$PATH" run_balance 2>&1 1>/dev/null)"; rc=$?
 if (( rc != 0 )); then
     contains "exit 2 (no routable candidate) is a hard error" "no routable credential" "$err"
+    contains "exit 2 names the postmaster wake failure cause" "headroom: no candidate" "$err"
     contains "exit 2's error names the --claude-credentials override" "--claude-credentials" "$err"
 else
     no "exit 2 (no routable candidate) is a hard error" "exited 0: $err"

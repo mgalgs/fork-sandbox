@@ -254,6 +254,7 @@ for (( _i = 0; _i < ${#args[@]}; _i++ )); do
 done
 if (( is_k8s )); then
     rc="${STUB_K8S_EXIT:-0}"
+    [[ -z "${STUB_K8S_NO_CANDIDATE:-}" ]] || echo 'Error: headroom: no candidate' >&2
     # STUB_K8S_EXIT_MAP ("agent=rc agent=rc") overrides rc per seat, keyed
     # on the agent name inside the wake's --branch.
     for _i in "${!args[@]}"; do
@@ -5934,6 +5935,19 @@ check "k8s case5c: no Job-timeout wording without a Job" 0 \
     "$( [[ "$(cat "$PM_STATE_DIR/needs-operator/$k5c_tid" 2>/dev/null)" == *"timed out waiting on its Job"* ]] && echo 1 || echo 0 )"
 contains "k8s case5c: a retry was scheduled, same as any other failure" \
     "$(cat "$PM_STATE_DIR/retries/$k5c_tid/karen" 2>/dev/null)" "STATE=pending"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+k5head_mid="$(send_msg '@carol' '@karen' 'low pool topic' 'first' 8)"
+k5head_tid="$(thread_of "$k5head_mid")"
+STUB_K8S_EXIT=1 STUB_K8S_NO_RUNDIR=1 STUB_K8S_NO_REPLY=1 \
+    STUB_K8S_NO_CANDIDATE=1 once
+contains "k8s headroom: no candidate is named in the wake flag" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k5head_tid" 2>/dev/null)" \
+    'headroom: no candidate'
+contains "k8s headroom: failure follows the retry path" \
+    "$(cat "$PM_STATE_DIR/retries/$k5head_tid/karen" 2>/dev/null)" 'STATE=pending'
 
 # ---- case 5d: rc 1 after a completed run (the agent's own exit 1) ----
 # fork-sandbox-k8s.sh run exits with the agent's code once collect has
