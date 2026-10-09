@@ -40,6 +40,13 @@ Install validates the pool and all token files before rendering.
 | Hook plugin | `PATH` or beside launcher | Executables from `K8S_POSTMASTER_HEADROOM_DIR` on pod `PATH` |
 | Single credential | `CLAUDE_CREDENTIALS` | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` |
 
+On a postmaster spawn, the hook also receives `FS_BALANCE_THREAD` (thread
+id), `FS_BALANCE_AGENT` (seat address), and
+`FS_BALANCE_ROOT_HEADERS_FILE` (path to a file containing the root message's
+headers). A policy may inspect a thread header to choose an account. The
+repository passes these values through without interpreting them. They are
+unset outside postmaster spawns; the hook argv contract is unchanged.
+
 ## Precedence
 
 For any run with at least one `--harness claude` leg:

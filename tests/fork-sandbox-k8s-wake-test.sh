@@ -283,7 +283,8 @@ STUB
         --outbox-dir "$root/wake/outbox"
     write_nul "$root/wake/env" "GOOD_VAR=hello"
     dump="$root/env-dump-stale.txt"
-    ( export FORK_SANDBOX_STALE=old-value
+    ( export FORK_SANDBOX_STALE=old-value FS_BALANCE_THREAD=old-thread \
+        FS_BALANCE_AGENT=old-agent FS_BALANCE_ROOT_HEADERS_FILE=old-file
       STUB_ENV_DUMP="$dump" STUB_K8S_LAUNCH_RC=0 \
         "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" ) >/dev/null
     if [[ -f "$dump" ]]; then
@@ -292,6 +293,11 @@ STUB
             *"FORK_SANDBOX_STALE"*) no "stale env: inherited FORK_SANDBOX_* scrubbed" \
                 "FORK_SANDBOX_STALE leaked into launcher env" ;;
             *) ok "stale env: inherited FORK_SANDBOX_* scrubbed" ;;
+        esac
+        case "$(cat -- "$dump")" in
+            *"FS_BALANCE_"*) no "stale env: balance context absent outside postmaster spawn" \
+                "FS_BALANCE_* leaked into launcher env" ;;
+            *) ok "stale env: balance context absent outside postmaster spawn" ;;
         esac
     else
         no "stale env: dump written" "$dump missing"

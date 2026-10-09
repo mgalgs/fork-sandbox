@@ -3643,6 +3643,16 @@ pm_spawn_wake() {
             pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (move)"
         fi
     fi
+    # A hook may inspect the root message's headers, but the postmaster
+    # never interprets them as account policy. Keep the file with this wake.
+    mkdir -p -- "$HANDOFFS"
+    local balance_headers="$HANDOFFS/$run_id.headers" root_message
+    for root_message in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -f "$root_message" ]] || continue
+        sed '/^$/,$d' "$root_message" > "$balance_headers"
+        break
+    done
+    [[ -f "$balance_headers" ]] || : > "$balance_headers"
     mkdir -p -- "$SEQ"
     local seq
     seq="$(pm_next_seq "$tid")"
@@ -3651,7 +3661,6 @@ pm_spawn_wake() {
     local via
     via="$(pm_wake_via "$mid" "$agent")"
 
-    mkdir -p -- "$HANDOFFS"
     local handoff_file="$HANDOFFS/$run_id.md"
     if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$is_retry"; then
         pm_flag "$tid" "handoff render failed for $agent: $mid"
@@ -3787,8 +3796,12 @@ pm_spawn_wake() {
         # FORK_SANDBOX_CONFIG_DIR must be re-supplied explicitly.
         local env_file="$wake_dir/env" k
         : > "$env_file"
-        printf 'PATH=%s\0' "$PATH" >> "$env_file"
-        printf 'HOME=%s\0' "$HOME" >> "$env_file"
+        {
+            printf 'PATH=%s\0' "$PATH"
+            printf 'HOME=%s\0' "$HOME"
+            printf 'FS_BALANCE_THREAD=%s\0FS_BALANCE_AGENT=%s\0FS_BALANCE_ROOT_HEADERS_FILE=%s\0' \
+                "$tid" "$agent" "$balance_headers"
+        } >> "$env_file"
         while IFS= read -r k; do
             [[ -n "$k" ]] || continue
             printf '%s=%s\0' "$k" "${!k}" >> "$env_file"
@@ -3881,7 +3894,9 @@ pm_spawn_wake() {
 
     local launch_out rc run_dir
     set +e
-    launch_out="$("$FORK_SANDBOX" "${spawn_args[@]}" "$project" "$handoff_file" 2>&1)"
+    launch_out="$(env FS_BALANCE_THREAD="$tid" FS_BALANCE_AGENT="$agent" \
+        FS_BALANCE_ROOT_HEADERS_FILE="$balance_headers" \
+        "$FORK_SANDBOX" "${spawn_args[@]}" "$project" "$handoff_file" 2>&1)"
     rc=$?
     set -e
     run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"

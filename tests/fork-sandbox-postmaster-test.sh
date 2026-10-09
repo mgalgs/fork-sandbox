@@ -231,6 +231,12 @@ cat > "$STUB_BIN/fork-sandbox.sh" <<'STUB'
 set -euo pipefail
 printf -- '----CALL----\n' >> "$STUB_ARGV_LOG"
 for a in "$@"; do printf '%s\n' "$a" >> "$STUB_ARGV_LOG"; done
+if [[ -n "${STUB_BALANCE_LOG:-}" ]]; then
+    printf 'thread=%s agent=%s headers=%s\n' "${FS_BALANCE_THREAD:-}" \
+        "${FS_BALANCE_AGENT:-}" "${FS_BALANCE_ROOT_HEADERS_FILE:-}" >> "$STUB_BALANCE_LOG"
+    [[ -f "${FS_BALANCE_ROOT_HEADERS_FILE:-}" ]] && \
+        cat "$FS_BALANCE_ROOT_HEADERS_FILE" >> "$STUB_BALANCE_LOG"
+fi
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
 
 # A `--k8s` invocation stands in for the whole `fork-sandbox-k8s.sh run`
@@ -986,12 +992,17 @@ printf '\n== spawn: INBOX recorded in the run env file ==\n'
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 
+STUB_BALANCE_LOG="$work/balance-local.log"
+export STUB_BALANCE_LOG
 send_msg '@bob' '@alice' 'inbox key' 'body' 8 >/dev/null
 once
 run_env="$(env_file_for_agent alice)"
 run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
 check "spawn: INBOX recorded in the run's env file" "INBOX=$run_dir/inbox" \
     "$(grep '^INBOX=' "$run_env")"
+contains "spawn: thread context reaches local launcher" "$(cat "$STUB_BALANCE_LOG")" "agent=alice"
+contains "spawn: root headers reach local launcher" "$(cat "$STUB_BALANCE_LOG")" "Subject: inbox key"
+unset STUB_BALANCE_LOG
 
 # ============================================================
 printf '\n== X-Hops 0 gate: no spawn, thread flagged ==\n'
@@ -5071,6 +5082,14 @@ PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 k1_mid="$(send_msg '@carol' '@karen' 'k8s topic' 'hello karen' 8)"
 k1_tid="$(thread_of "$k1_mid")"
 once
+ k1_env="$(latest_env_for_agent karen)"
+ k1_wake_dir="$(env_val "$k1_env" RUN_DIR)"
+check "k8s case1: thread context in wake env" 1 \
+    "$(tr '\0' '\n' < "$k1_wake_dir/env" | grep -c "^FS_BALANCE_THREAD=$k1_tid$")"
+check "k8s case1: seat address in wake env" 1 \
+    "$(tr '\0' '\n' < "$k1_wake_dir/env" | grep -c '^FS_BALANCE_AGENT=karen$')"
+k1_headers="$(tr '\0' '\n' < "$k1_wake_dir/env" | sed -n 's/^FS_BALANCE_ROOT_HEADERS_FILE=//p')"
+contains "k8s case1: root headers file is readable" "$(cat "$k1_headers")" "Subject: k8s topic"
 check "k8s case1: --k8s is in argv" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 check "k8s case1: --outbox-dir is in argv" 1 "$(grep -c -- '^--outbox-dir$' "$STUB_ARGV_LOG")"
 check "k8s case1: --thread-dir is in argv" 1 "$(grep -c -- '^--thread-dir$' "$STUB_ARGV_LOG")"

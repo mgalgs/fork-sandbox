@@ -24,9 +24,10 @@
 #   env       NUL-delimited KEY=VALUE records to export before running.
 #             Parsed strictly: a record is honored only when KEY matches
 #             ^[A-Za-z_][A-Za-z0-9_]*$ -- never sourced or eval'd. Every
-#             inherited FORK_SANDBOX_* variable is unset first, so a value
-#             left over in a long-lived tmux server's own environment can
-#             never outlive the postmaster that used to set it.
+#             inherited FORK_SANDBOX_* variable and the three FS_BALANCE_*
+#             context variables are unset first, so values left over in a
+#             long-lived tmux server's environment cannot outlive the
+#             postmaster that set them.
 #
 # Foreground mode (no --detach) blocks until the launch finishes and
 # leaves, in <wake-dir>:
@@ -146,6 +147,7 @@ fs_k8s_wake_branch_from_argv() {
 # unnoticed.
 fs_k8s_wake_apply_env() {
     local wake_dir="$1" stale_var
+    unset FS_BALANCE_THREAD FS_BALANCE_AGENT FS_BALANCE_ROOT_HEADERS_FILE
     for stale_var in "${!FORK_SANDBOX_@}"; do
         unset "$stale_var"
     done
