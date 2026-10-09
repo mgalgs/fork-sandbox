@@ -7040,6 +7040,7 @@ printf '\n== fork-sandbox-k8s.sh run: poll/fetch/pull-back vs stubbed kubectl ==
 # -- RC is independent of the streaming, which is what lets a test pair a
 # large stream with EPIPE's status.
 runstub_dir="$(newdir)"; tmpdirs+=("$runstub_dir")
+status_sh="$repo_dir/scripts/fork-sandbox-status.sh"
 cat > "$runstub_dir/git" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
@@ -7128,8 +7129,9 @@ case " $* " in
         # collect (first and re-collect alike).
         printf '%s\n' "${K8S_STUB_BASE_SHA:-}"
         exit 0 ;;
-    *" delete "*) exit 0 ;;
+    *" delete "*) exit "${K8S_STUB_DELETE_RC:-0}" ;;
     *" logs "*) printf 'stub pod log: entrypoint narration\n'; exit 0 ;;
+    *" tar cf - --files-from="*) exit "${K8S_STUB_WORK_RC:-0}" ;;
     *" tar cf - -C /work/outbox "*)
         # Serve the fixture stream whenever K8S_STUB_OUTBOX_DIR is set,
         # independently of the exit status -- a kubectl exec that dies of
@@ -7816,14 +7818,127 @@ K8S_STUB_OUTBOX_DIR="$runstub_dead_outbox" K8S_STUB_OUTBOX_RC=0 \
     "$proj_dir" "$handoff_file" || rc=$?
 if (( rc == 3 )) \
     && grep -q 'SUSPICIOUS: this run produced nothing' "$runstub_out6" \
+    && grep -q 'Proxy credentials were removed' "$runstub_out6" \
     && ! grep -q 'run complete' "$runstub_out6" \
     && ! grep -q 'delete job' "$runstub_log6" \
     && grep -qF -- "fork-sandbox-k8s.sh rm --branch fs-k8s-test-run-dead" "$runstub_out6" \
-    && grep -q 'outbox: empty of agent files (only 1 operator metadata file(s))' "$runstub_out6"; then
+    && grep -q 'outbox: empty of agent files (only 1 operator metadata file(s))' "$runstub_out6" \
+    && [[ "$(cat "$(sed -n 's/^  run dir:  *//p' "$runstub_out6" | head -1)/exit-code" 2>/dev/null)" == 3 ]] \
+    && [[ "$(jq -r '.exit_code' "$(sed -n 's/^  run dir:  *//p' "$runstub_out6" | head -1)/summary.json" 2>/dev/null)" == 3 ]]; then
     ok "a dead run through run exits 3, keeps the job, and names the manual rm"
 else
     no "a dead run through run exits 3, keeps the job, and names the manual rm" \
         "rc=$rc log=$(grep delete "$runstub_log6") out=$(cat "$runstub_out6")"
+fi
+
+# A failed evidence read exits from collect with code 3.
+runstub_log6b="$(newdir)/kubectl.log"; runstub_out6b="$(newdir)/out6b.txt"
+tmpdirs+=("$(dirname "$runstub_log6b")" "$(dirname "$runstub_out6b")")
+rc=0
+K8S_STUB_WORK_RC=1 runstub_run "$runstub_log6b" "$runstub_out6b" \
+    --branch fs-k8s-test-run-nocapture --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || rc=$?
+runstub_rd6b="$(sed -n 's/^  run dir:  *//p' "$runstub_out6b" | head -1)"
+if (( rc == 3 )) && [[ -n "$runstub_rd6b" && -d "$runstub_rd6b" ]] \
+    && [[ "$(cat "$runstub_rd6b/exit-code" 2>/dev/null)" == 3 ]] \
+    && [[ "$(jq -r '.exit_code' "$runstub_rd6b/summary.json" 2>/dev/null)" == 3 ]] \
+    && [[ "$("$status_sh" --json "$runstub_rd6b" 2>/dev/null | jq -r '.state')" == failed ]] \
+    && grep -q 'LEFT IN PLACE' "$runstub_out6b" \
+    && ! grep -q 'run complete' "$runstub_out6b" \
+    && ! grep -q 'delete job' "$runstub_log6b"; then
+    ok "a failed evidence capture exits 3 and status reports failure"
+else
+    no "a failed evidence capture exits 3 and status reports failure" \
+        "rc=$rc run_dir=$runstub_rd6b out=$(cat "$runstub_out6b")"
+fi
+
+# Even when every delete fails, collect must attempt the proxy/token label
+# cleanup and return the failure to both the caller and status files.
+runstub_log6c="$(newdir)/kubectl.log"; runstub_out6c="$(newdir)/out6c.txt"
+tmpdirs+=("$(dirname "$runstub_log6c")" "$(dirname "$runstub_out6c")")
+rc=0
+K8S_STUB_DELETE_RC=9 runstub_run "$runstub_log6c" "$runstub_out6c" \
+    --branch fs-k8s-test-run-delete-fail --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || rc=$?
+runstub_rd6c="$(sed -n 's/^  run dir:  *//p' "$runstub_out6c" | head -1)"
+if (( rc == 9 )) && [[ -n "$runstub_rd6c" && -d "$runstub_rd6c" ]] \
+    && [[ "$(cat "$runstub_rd6c/exit-code" 2>/dev/null)" == 9 ]] \
+    && [[ "$(jq -r '.exit_code' "$runstub_rd6c/summary.json" 2>/dev/null)" == 9 ]] \
+    && [[ "$("$status_sh" --json "$runstub_rd6c" 2>/dev/null | jq -r '.state')" == failed ]] \
+    && grep -q 'delete pod,service,secret,configmap,networkpolicy' "$runstub_log6c" \
+    && grep -q 'removal failed for branch' "$runstub_out6c" \
+    && ! grep -q 'removed job and configmap for branch' "$runstub_out6c"; then
+    ok "failed teardown attempts credential removal and records collect failure"
+else
+    no "failed teardown attempts credential removal and records collect failure" \
+        "rc=$rc run_dir=$runstub_rd6c out=$(cat "$runstub_out6c")"
+fi
+
+# A failed cleanup of old refresh evidence is a capture failure. Collect
+# still fetches the branch and records a terminal failure without reaping.
+runstub_fail_dir="$(newdir)"; tmpdirs+=("$runstub_fail_dir")
+cat > "$runstub_fail_dir/rm" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *"/evidence/refresh.json"*) exit 17 ;;
+esac
+exec /usr/bin/rm "$@"
+STUB
+chmod +x "$runstub_fail_dir/rm"
+runstub_fail_log="$(newdir)/kubectl.log"; runstub_fail_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$runstub_fail_log")" "$(dirname "$runstub_fail_out")")
+rc=0
+PATH="$runstub_fail_dir:$PATH" runstub_run "$runstub_fail_log" "$runstub_fail_out" \
+    --branch fs-k8s-test-run-collect-errexit --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || rc=$?
+runstub_fail_rd="$(sed -n 's/^  run dir:  *//p' "$runstub_fail_out" | head -1)"
+if (( rc == 3 )) && [[ -n "$runstub_fail_rd" && -d "$runstub_fail_rd" ]] \
+    && [[ "$(cat "$runstub_fail_rd/exit-code" 2>/dev/null)" == 3 ]] \
+    && [[ "$(jq -r '.exit_code' "$runstub_fail_rd/summary.json" 2>/dev/null)" == 3 ]] \
+    && [[ "$("$status_sh" --json "$runstub_fail_rd" 2>/dev/null | jq -r '.state')" == failed ]] \
+    && grep -q 'could not remove the previous refresh.json' "$runstub_fail_out" \
+    && grep -q 'fetch' "$runstub_fail_log" \
+    && ! grep -q 'run complete' "$runstub_fail_out" \
+    && ! grep -q 'delete job' "$runstub_fail_log"; then
+    ok "failed refresh cleanup fetches the branch and records failed capture"
+else
+    no "failed refresh cleanup fetches the branch and records failed capture" \
+        "rc=$rc out=$(cat "$runstub_fail_out")"
+fi
+
+# A hard failure in summary finalization still exercises errexit inside
+# collect. Its ERR handler publishes the same code on both status files.
+runstub_hard_dir="$(newdir)"; tmpdirs+=("$runstub_hard_dir")
+cat > "$runstub_hard_dir/mv" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *"/summary.json.part "*"/summary.json"*)
+        if [[ ! -e "$K8S_STUB_MV_FAILED_ONCE" ]]; then
+            : > "$K8S_STUB_MV_FAILED_ONCE"
+            exit 17
+        fi ;;
+esac
+exec /usr/bin/mv "$@"
+STUB
+chmod +x "$runstub_hard_dir/mv"
+runstub_hard_log="$(newdir)/kubectl.log"; runstub_hard_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$runstub_hard_log")" "$(dirname "$runstub_hard_out")")
+rc=0
+K8S_STUB_MV_FAILED_ONCE="$runstub_hard_dir/failed-once" \
+    PATH="$runstub_hard_dir:$PATH" runstub_run "$runstub_hard_log" "$runstub_hard_out" \
+    --branch fs-k8s-test-run-collect-hard-fail --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || rc=$?
+runstub_hard_rd="$(sed -n 's/^  run dir:  *//p' "$runstub_hard_out" | head -1)"
+if (( rc == 17 )) && [[ -n "$runstub_hard_rd" && -d "$runstub_hard_rd" ]] \
+    && [[ "$(cat "$runstub_hard_rd/exit-code" 2>/dev/null)" == 17 ]] \
+    && [[ "$(jq -r '.exit_code' "$runstub_hard_rd/summary.json" 2>/dev/null)" == 17 ]] \
+    && [[ "$("$status_sh" --json "$runstub_hard_rd" 2>/dev/null | jq -r '.state')" == failed ]] \
+    && ! grep -q 'run complete' "$runstub_hard_out" \
+    && ! grep -q 'delete job' "$runstub_hard_log"; then
+    ok "an unexpected summary write failure exits and publishes failed status"
+else
+    no "an unexpected summary write failure exits and publishes failed status" \
+        "rc=$rc out=$(cat "$runstub_hard_out")"
 fi
 
 # 7. A pod that dies before writing the sentinel: cmd_wait itself fails
@@ -9325,22 +9440,22 @@ fi
 # reaped: a loud block, the manual rm command, and no delete in the log.
 collect_log15="$(newdir)/kubectl.log"; collect_out15="$(newdir)/out15.txt"; collect_dest15="$(newdir)/outbox-15"
 tmpdirs+=("$(dirname "$collect_log15")" "$(dirname "$collect_dest15")")
-if K8S_STUB_WORK_RC=1 K8S_STUB_WORK_STDERR='stub-kubectl says: transcript read exploded' K8S_STUB_OUTBOX_RC=0 \
+collect_rc15=0
+K8S_STUB_WORK_RC=1 K8S_STUB_WORK_STDERR='stub-kubectl says: transcript read exploded' K8S_STUB_OUTBOX_RC=0 \
     collectstub_collect "$collect_log15" "$collect_out15" \
-    --branch fs-k8s-test-collect-nocapture --outbox-dir "$collect_dest15" "$proj_dir"; then
-    if grep -q 'could not read the transcript from pod' "$collect_out15" \
+    --branch fs-k8s-test-collect-nocapture --outbox-dir "$collect_dest15" "$proj_dir" || collect_rc15=$?
+if (( collect_rc15 == 3 )) \
+    && grep -q 'could not read the transcript from pod' "$collect_out15" \
         && grep -q 'stub-kubectl says: transcript read exploded' "$collect_out15" \
-        && grep -q 'LEFT IN PLACE rather than' "$collect_out15" \
+        && grep -q 'LEFT IN PLACE' "$collect_out15" \
         && grep -qF -- "fork-sandbox-k8s.sh rm --branch fs-k8s-test-collect-nocapture" "$collect_out15" \
         && grep -q 'fetched into' "$collect_out15" \
-        && ! grep -q 'delete job' "$collect_log15"; then
-        ok "a failed evidence capture leaves the run in place with the manual rm command"
-    else
-        no "a failed evidence capture leaves the run in place with the manual rm command" \
-            "log=$(grep delete "$collect_log15") out=$(cat "$collect_out15")"
-    fi
+        && ! grep -q 'delete job' "$collect_log15" \
+        && grep -q 'secret/' "$collect_log15"; then
+    ok "a failed evidence capture fails, removes proxy credentials, and keeps the Job"
 else
-    no "a failed evidence capture leaves the run in place with the manual rm command" "collect exited nonzero: $(cat "$collect_out15")"
+    no "a failed evidence capture fails, removes proxy credentials, and keeps the Job" \
+        "rc=$collect_rc15 log=$(grep delete "$collect_log15") out=$(cat "$collect_out15")"
 fi
 
 # 16. --keep keeps working unchanged even when the capture failed: the old
@@ -9384,22 +9499,21 @@ fi
 # leave a run reaped with no record of what it did at all.
 collect_log18="$(newdir)/kubectl.log"; collect_out18="$(newdir)/out18.txt"; collect_dest18="$(newdir)/outbox-18"
 tmpdirs+=("$(dirname "$collect_log18")" "$(dirname "$collect_dest18")")
-if K8S_STUB_POD_SPEC='stub-pod (not the JSON the capture assumes)' K8S_STUB_OUTBOX_RC=0 \
+collect_rc18=0
+K8S_STUB_POD_SPEC='stub-pod (not the JSON the capture assumes)' K8S_STUB_OUTBOX_RC=0 \
     collectstub_collect "$collect_log18" "$collect_out18" \
-    --branch fs-k8s-test-collect-badspec --outbox-dir "$collect_dest18" "$proj_dir"; then
-    if grep -q 'could not read the container names' "$collect_out18" \
-        && grep -q 'LEFT IN PLACE rather than' "$collect_out18" \
+    --branch fs-k8s-test-collect-badspec --outbox-dir "$collect_dest18" "$proj_dir" || collect_rc18=$?
+if (( collect_rc18 == 3 )) \
+    && grep -q 'could not read the container names' "$collect_out18" \
+        && grep -q 'LEFT IN PLACE' "$collect_out18" \
         && grep -qF -- "fork-sandbox-k8s.sh rm --branch fs-k8s-test-collect-badspec" "$collect_out18" \
         && grep -q 'fetched into' "$collect_out18" \
         && ! grep -q 'delete job' "$collect_log18" \
         && [[ ! -e "$(dirname -- "$collect_dest18")/evidence/pod-log-agent.log" ]]; then
-        ok "an unreadable pod spec warns and leaves the run in place"
-    else
-        no "an unreadable pod spec warns and leaves the run in place" \
-            "log=$(grep delete "$collect_log18") out=$(cat "$collect_out18")"
-    fi
+    ok "an unreadable pod spec fails and leaves the Job in place"
 else
-    no "an unreadable pod spec warns and leaves the run in place" "collect exited nonzero: $(cat "$collect_out18")"
+    no "an unreadable pod spec fails and leaves the Job in place" \
+        "rc=$collect_rc18 log=$(grep delete "$collect_log18") out=$(cat "$collect_out18")"
 fi
 
 # 19. An outbox the extraction guard REFUSES is undecidable, not a
@@ -9631,8 +9745,11 @@ printf '%s\n' '{"ended":"cap","continuations":[]}' > "$refresh_sum_work/refresh.
 refresh_sum_reuse="$(newdir)/outbox-reuse"; tmpdirs+=("$(dirname "$refresh_sum_reuse")")
 refresh_sum_case reuse1 100000 "$refresh_sum_work" "$refresh_sum_reuse" || true
 rm -f -- "$refresh_sum_work/refresh.json"
-if [[ "$(jq -r '.refresh' "$refresh_sum_rd/summary.json")" == cap ]] \
-    && refresh_sum_case reuse2 100000 "$refresh_sum_work" "$refresh_sum_reuse" \
+refresh_reuse_rc=0
+refresh_sum_case reuse2 100000 "$refresh_sum_work" "$refresh_sum_reuse" || refresh_reuse_rc=$?
+if [[ "$(jq -r '.refresh' "$refresh_sum_rd/summary.json")" != cap ]] \
+    && (( refresh_reuse_rc == 3 )) \
+    && [[ "$(cat "$refresh_sum_rd/exit-code")" == 3 ]] \
     && [[ "$(jq -r 'has("refresh") or has("continuations")' "$refresh_sum_rd/summary.json")" == false ]] \
     && grep -q 'no usable refresh.json' "$refresh_sum_out"; then
     ok "collect: a refresh.json from an earlier collect is not reused when this pod has none"
@@ -23364,6 +23481,15 @@ for runner_case in before after crash slow; do
             ok "a $runner_case runner death tears down all per-run objects"
         else
             no "a $runner_case runner death tears down all per-run objects" "$(cat "$runner_log")"
+        fi
+        if [[ -s "$runner_dir/evidence/pod-log-agent.log" ]] \
+            && grep -q 'leaked-context-secret-marker-should-never-print' \
+                "$runner_dir/evidence/pod-log-agent.log" \
+            && grep -q "agent log saved to $runner_dir/evidence/pod-log-agent.log" \
+                "$runner_out"; then
+            ok "a $runner_case runner death saves the agent log before teardown"
+        else
+            no "a $runner_case runner death saves the agent log before teardown"
         fi
     fi
 done

@@ -165,7 +165,7 @@ case " $* " in
             case "$arg" in
                 refs/heads/*:refs/heads/*)
                     tip="$base"
-                    if [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
+                    if [[ "${K8S_STUB_FETCH_REF:-}" == 1 ]]; then
                         parent="$(git -C . rev-parse -q --verify "$base" 2>/dev/null || true)"
                         if [[ -n "$parent" ]]; then
                             tip="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
@@ -237,7 +237,8 @@ chmod +x "$stub_bin/kubectl"
 
 run_fs() {
     HOME="$launcher_home" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
-    K8S_STUB_FETCH_REF=1 K8S_STUB_OUTBOX_DIR="$outbox_fixture" \
+    K8S_STUB_FETCH_REF="${K8S_STUB_FETCH_REF_OVERRIDE:-1}" \
+    K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR_OVERRIDE:-$outbox_fixture}" \
     K8S_STUB_EVIDENCE_DIR="$evidence_fixture" \
     timeout 60 "$launcher" "$@"
 }
@@ -511,6 +512,11 @@ for _ in $(seq 1 100); do
 done
 check "failed submit: status reaches failed" "failed" \
     "$("$status_sh" --json "$rd4" 2>/dev/null | jq -r '.state' 2>/dev/null)"
+if [[ -s "$rd4/resume-client.log" ]]; then
+    ok "failed inner client leaves its log in the run directory"
+else
+    no "failed inner client leaves its log in the run directory"
+fi
 
 stale_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
 tmpdirs+=("$stale_dir")
@@ -549,7 +555,7 @@ if [[ -s "$shared_rd2/outbox/reply.md" ]] \
 else
     no "shared outbox: refused extraction reused the earlier reply"
 fi
-check "shared outbox: a refused extraction still replies, with the rendered account" "replied" \
+check "shared outbox: a refused evidence capture reports failure" "failed" \
     "$("$status_sh" --json "$shared_rd2" 2>/dev/null | jq -r '.state' 2>/dev/null)"
 if [[ ! -e "$shared_rd2/events.jsonl" ]]; then
     ok "shared evidence: refused extraction is not mirrored into this run"
@@ -557,7 +563,50 @@ else
     no "shared evidence: refused extraction was mirrored into this run"
 fi
 
-tmpdirs+=("$rd1" "$rd2" "$rd_failed" "$rd3" "$shared_rd1" "$shared_rd2")
+printf '\n== --resume --k8s: reply-only and empty notes ==\n'
+empty_outbox="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-empty-outbox.XXXXXX)"
+reply_state="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-reply-state.XXXXXX)"
+reply_note="$notes_dir/reply-note.md"; printf 'answer only\n' > "$reply_note"
+printf '%s\n' '{"type":"result","subtype":"success","result":"The answer is 42."}' \
+    > "$evidence_fixture/events.jsonl"
+deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
+reply_rd="$(K8S_STUB_BASE_SHA="$proj_head" K8S_STUB_FETCH_REF_OVERRIDE=0 \
+    K8S_STUB_OUTBOX_DIR_OVERRIDE="$empty_outbox" run_fs --resume "$reply_state" \
+    --k8s --harness claude --model claude-sonnet-5 "$proj_dir" "$reply_note")"
+wait_for_summary "$reply_rd" || no "reply-only note completed"
+if wait_for_teardown "$deletes_before" "$reply_rd" \
+    && [[ "$(cat "$reply_rd/exit-code" 2>/dev/null)" == 0 ]] \
+    && [[ "$("$status_sh" --json "$reply_rd" | jq -r '.state')" == replied ]] \
+    && grep -q 'The answer is 42.' "$reply_rd/outbox/reply.md"; then
+    ok "reply-only note tears down and reports its reply"
+else
+    no "reply-only note tears down and reports its reply"
+fi
+printf '%s\n' '{"type":"system","subtype":"init"}' > "$evidence_fixture/events.jsonl"
+empty_note="$notes_dir/empty-note.md"; printf 'empty turn\n' > "$empty_note"
+empty_base_tip="$(git -C "$proj_dir" rev-parse "$branch1")"
+deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
+empty_rd="$(K8S_STUB_BASE_SHA="$empty_base_tip" K8S_STUB_FETCH_REF_OVERRIDE=0 \
+    K8S_STUB_OUTBOX_DIR_OVERRIDE="$empty_outbox" run_fs --resume "$reply_state" \
+    --base "$branch1" --k8s --harness claude --model claude-sonnet-5 \
+    "$proj_dir" "$empty_note")"
+wait_for_summary "$empty_rd" || no "empty note completed"
+for _ in $(seq 1 100); do
+    [[ -s "$empty_rd/resume-client.log" ]] && break
+    sleep 0.2
+done
+if [[ "$(cat "$empty_rd/exit-code" 2>/dev/null)" == 3 ]] \
+    && [[ "$("$status_sh" --json "$empty_rd" | jq -r '.state')" == failed ]] \
+    && [[ "$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)" == "$deletes_before" ]] \
+    && grep -q 'secret/' "$K8S_STUB_LOG" \
+    && grep -q 'SUSPICIOUS' "$empty_rd/resume-client.log"; then
+    ok "empty note is flagged, keeps the Job, and removes proxy credentials"
+else
+    no "empty note is flagged, keeps the Job, and removes proxy credentials"
+fi
+
+tmpdirs+=("$rd1" "$rd2" "$rd_failed" "$rd3" "$shared_rd1" "$shared_rd2" \
+    "$reply_rd" "$empty_rd")
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

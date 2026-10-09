@@ -7386,6 +7386,7 @@ EOF
         # the same three flags, for a reader's sake, not because anything
         # parses them positionally.
         [[ -z "$session_state" ]] || printf 'session_state=%s\n' "$session_state"
+        [[ "${FORK_SANDBOX_RESUME_NOTE:-}" == 1 ]] && printf 'resume_note=1\n'
         [[ -z "$resume_session" ]] || printf 'resume_session=%s\n' "$resume_session"
         [[ -z "$session_id_arg" ]] || printf 'session_id=%s\n' "$session_id_arg"
         # Absent when refresh is off: cmd_collect reads a missing
@@ -7713,6 +7714,7 @@ EOF
                 --request-timeout=5s 2>/dev/null || true)"
             if [[ -n "$runner_status" ]] && k8s_runner_dead_json <<< "$runner_status"; then
                 k8s_report_unready_pod "$pod_name" "$services_ready_checks" true
+                k8s_capture_failed_agent_log "$pod_name" "$run_dir" false
                 printf '2\n' > "$run_dir/exit-code"
                 fs_record_run_log "$run_dir"
                 exit 2
@@ -8073,23 +8075,27 @@ cmd_rm() {
     [[ -n "$branch" ]] || { echo "Error: rm requires --branch." >&2; exit 1; }
     fs_reject_unsafe_chars "$branch" || exit 1
 
-    local safe_name legacy_name
+    local safe_name legacy_name delete_rc=0
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
     legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
-    kubectl delete job "$safe_name" --ignore-not-found
-    kubectl delete configmap "$safe_name-scripts" --ignore-not-found
+    kubectl delete job "$safe_name" --ignore-not-found || delete_rc=$?
+    kubectl delete configmap "$safe_name-scripts" --ignore-not-found || delete_rc=$?
     if [[ "$legacy_name" != "$safe_name" ]]; then
-        kubectl delete job "$legacy_name" --ignore-not-found
-        kubectl delete configmap "$legacy_name-scripts" --ignore-not-found
+        kubectl delete job "$legacy_name" --ignore-not-found || delete_rc=$?
+        kubectl delete configmap "$legacy_name-scripts" --ignore-not-found || delete_rc=$?
     fi
     # Additionally, by label: the claude-proxy Pod, Service, ConfigMap,
     # Secret and NetworkPolicy, none of which the two deletes above name --
     # harmless on a pi run, which never created anything carrying this
     # label beyond the scripts ConfigMap already deleted above.
-    kubectl delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch="$safe_name" --ignore-not-found
+    kubectl delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch="$safe_name" --ignore-not-found || delete_rc=$?
     if [[ "$legacy_name" != "$safe_name" ]]; then
         kubectl delete pod,service,secret,configmap,networkpolicy \
-            -l fork-sandbox/branch="$legacy_name" --ignore-not-found
+            -l fork-sandbox/branch="$legacy_name" --ignore-not-found || delete_rc=$?
+    fi
+    if (( delete_rc != 0 )); then
+        echo "fork-sandbox-k8s: removal failed for branch $branch; retry with rm --branch $branch" >&2
+        return "$delete_rc"
     fi
     echo "fork-sandbox-k8s: removed job and configmap for branch $branch" >&2
 }
@@ -8296,9 +8302,10 @@ k8s_claude_keeper_stop() {
 #
 # Deletes this run's claude proxy (every object manifests/k8s/31-claude-
 # proxy.yaml renders) and its claude-token Secret, by name. A no-op for a
-# pi run. Called only from cmd_wait's EXIT trap after a terminal failure:
-# nothing will refresh that token again. Never on a timeout, where the
-# still-running pod needs the proxy. When 31-claude-proxy.yaml gains an
+# pi run. Called from cmd_wait's EXIT trap after a terminal failure and
+# from cmd_collect when a completed run is kept for inspection: nothing
+# will refresh that token again. Never on a timeout, where the still-running
+# pod needs the proxy. When 31-claude-proxy.yaml gains an
 # object, add it here too.
 #
 # Output goes to stderr only: stdout is cmd_wait's exit-code channel. A
@@ -8433,7 +8440,7 @@ k8s_teardown_codex_proxy() {
 # the exact path pm_wake_exit_record (fork-sandbox-postmaster.sh) already
 # reads for a k8s wake's own failure tail.
 k8s_capture_failed_agent_log() {
-    local pod_name="$1" run_dir="$2" log_tmp="" err_tmp=""
+    local pod_name="$1" run_dir="$2" print_tail="${3:-true}" log_tmp="" err_tmp=""
     # Every step is guarded: the caller runs this right before its terminal
     # exit 2, under set -e, and a failure here must not turn that into 1.
     if ! log_tmp="$(mktemp)" || ! err_tmp="$(mktemp)"; then
@@ -8448,12 +8455,16 @@ k8s_capture_failed_agent_log() {
         return 0
     fi
     rm -f -- "$err_tmp"
-    echo "fork-sandbox-k8s: $pod_name's agent log (last 40 lines):" >&2
-    tail -n 40 -- "$log_tmp" | sed 's/^/    /' >&2 || true
+    if [[ "$print_tail" == true ]]; then
+        echo "fork-sandbox-k8s: $pod_name's agent log (last 40 lines):" >&2
+        tail -n 40 -- "$log_tmp" | sed 's/^/    /' >&2 || true
+    fi
     if [[ -n "$run_dir" ]]; then
         if ! { mkdir -p -- "$run_dir/evidence" \
             && cp -- "$log_tmp" "$run_dir/evidence/pod-log-agent.log"; } 2>/dev/null; then
             echo "fork-sandbox-k8s: could not save the agent log to $run_dir/evidence." >&2
+        else
+            echo "fork-sandbox-k8s: agent log saved to $run_dir/evidence/pod-log-agent.log" >&2
         fi
     fi
     rm -f -- "$log_tmp"
@@ -8614,6 +8625,7 @@ cmd_wait() {
             if [[ -n "$runner_status" ]] && k8s_runner_dead_json <<< "$runner_status"; then
                 if [[ "$probe" != true ]]; then
                     k8s_report_unready_pod "$pod_name" "" true
+                    k8s_capture_failed_agent_log "$pod_name" "$run_dir" false
                     printf '2\n' > "$run_dir/exit-code"
                     cmd_rm --branch "$branch" || true
                     wait_terminal_teardown=true
@@ -8808,6 +8820,25 @@ fs_record_run_log() {
     fi
 }
 
+# Preserve a terminal status when errexit stops collect before its normal
+# summary and exit-code writes. The exit-code sentinel is written last so a
+# status reader never sees it ahead of the summary.
+fs_collect_unexpected_failure() {
+    local rc="$1" run_dir="$2"
+    trap - ERR
+    if [[ -n "$run_dir" && -d "$run_dir" ]]; then
+        if [[ -s "$run_dir/summary.json" ]] \
+            && jq --argjson rc "$rc" '.exit_code = $rc' \
+                "$run_dir/summary.json" > "$run_dir/summary.json.part"; then
+            mv -f -- "$run_dir/summary.json.part" "$run_dir/summary.json" || true
+        else
+            printf '{"exit_code":%s}\n' "$rc" > "$run_dir/summary.json" || true
+        fi
+        printf '%s\n' "$rc" > "$run_dir/exit-code" || true
+    fi
+    exit "$rc"
+}
+
 # cmd_run's collect phase, standalone: read the review loop's outcome (when
 # --review-loop N is given and non-zero), pull the pod's /work/outbox back,
 # fetch the branch into the named project, and remove the Job and pod unless
@@ -8816,6 +8847,7 @@ fs_record_run_log() {
 # composes this verb.
 cmd_collect() {
     local keep=false branch="" outbox_dir="" outbox_max_arg="" review_loop_cap=""
+    local zero_harvest=false reply_harvest=false
     local run_dir=""
     while (( $# )); do
         case "$1" in
@@ -8857,6 +8889,8 @@ cmd_collect() {
         echo "have already been fetched and removed, or the run never started." >&2
         exit 1
     fi
+
+    trap 'fs_collect_unexpected_failure "$?" "$run_dir"' ERR
 
     # The review loop's outcome, when this run carried one. This is the
     # ONLY place a bad loop outcome ever surfaces: the agent's exit code
@@ -9064,7 +9098,12 @@ cmd_collect() {
     # An earlier collect's refresh.json must not stand in for this pod's:
     # summary.json reads it below, and a pod with no record (or a failed
     # capture) has to leave the refresh keys absent, not inherit old ones.
-    rm -f -- "$evidence_dir/refresh.json"
+    local refresh_cleanup_ok=true
+    if ! rm -f -- "$evidence_dir/refresh.json"; then
+        echo "fork-sandbox-k8s: warning: could not remove the previous refresh.json from $evidence_dir; evidence not captured in full." >&2
+        evidence_ok=false
+        refresh_cleanup_ok=false
+    fi
     local events_tar events_err events_rc=0
     events_tar="$(mktemp)"
     events_err="$(mktemp)"
@@ -9766,7 +9805,9 @@ cmd_collect() {
             # redirection's own "No such file or directory" to the
             # real stderr, past the `2>/dev/null` that only covers jq's
             # own stderr, not the shell's).
-            run_log_refresh_docs="$(jq -s '.' < "$evidence_dir/refresh.json" 2>/dev/null)" || true
+            if [[ "$refresh_cleanup_ok" == true ]]; then
+                run_log_refresh_docs="$(jq -s '.' < "$evidence_dir/refresh.json" 2>/dev/null)" || true
+            fi
             if [[ "$(printf '%s' "$run_log_refresh_docs" | jq 'length' 2>/dev/null)" == 1 ]] \
                     && [[ "$(printf '%s' "$run_log_refresh_docs" | jq -r '.[0] | type' 2>/dev/null)" == object ]] \
                     && run_log_refresh_json="$(printf '%s' "$run_log_refresh_docs" | jq -ce '.[0] | select((.ended | type == "string") and (.continuations | type == "array")) | {refresh: .ended, continuations: [.continuations[] | {leg, exit, handoff, handoff_stale}]}' 2>/dev/null)" \
@@ -9830,6 +9871,29 @@ cmd_collect() {
             :
         elif [[ "${agent_exit_code:-0}" == "0" ]]; then
             run_log_exit_code=1
+        fi
+        # A resumed conversational note can answer in the transcript
+        # without committing or writing an outbox artifact. Inspect the
+        # result event's actual text, not reply.md: status supplies fallback
+        # prose even for a session that answered nothing.
+        if [[ "$agent_exit_code" == 0 && "$zero_commits" == true \
+            && "$outbox_ok" == true ]] && (( outbox_agent_count == 0 )); then
+            local transcript_reply=""
+            if [[ "$(read_env_value "$run_dir/run.env" resume_note || true)" == 1 \
+                && -s "$evidence_dir/events.jsonl" ]]; then
+                transcript_reply="$(jq -Rr 'fromjson? | select(.type == "result")
+                    | .result // empty | select(type == "string")
+                    | select(test("[^[:space:]]"))' \
+                    "$evidence_dir/events.jsonl" 2>/dev/null | tail -n 1)"
+            fi
+            if [[ -z "$transcript_reply" ]]; then
+                run_log_exit_code=3
+            else
+                reply_harvest=true
+            fi
+        fi
+        if [[ "$evidence_ok" == false && "$keep" != true ]]; then
+            run_log_exit_code=3
         fi
         # started_at/ended_at/duration_seconds: a plain --k8s run's
         # summary.json never carried these at all (the local run's own
@@ -10011,7 +10075,8 @@ cmd_collect() {
         # as the run's own outcome -- writing the agent's unoverridden code
         # here would let all of them report success for a run whose branch
         # never landed, while summary.json alone said otherwise.
-        if [[ -n "$agent_exit_code" && ! -e "$run_dir/exit-code" ]]; then
+        if [[ -n "$agent_exit_code" \
+            && ( ! -e "$run_dir/exit-code" || "$run_log_exit_code" != 0 ) ]]; then
             printf '%s\n' "$run_log_exit_code" > "$run_dir/exit-code" 2>/dev/null || true
         fi
     fi
@@ -10025,8 +10090,12 @@ cmd_collect() {
     # read succeeded: a refused or failed outbox read cannot establish
     # "empty of anything the agent wrote", and an undecidable check must
     # not report a suspicion.
-    if [[ "$agent_exit_code" == "0" && "$zero_commits" == true && "$outbox_ok" == true ]] \
+    if [[ "$agent_exit_code" == 0 && "$zero_commits" == true \
+        && "$outbox_ok" == true && "$reply_harvest" == false ]] \
         && (( outbox_agent_count == 0 )); then
+        zero_harvest=true
+    fi
+    if [[ "$zero_harvest" == true ]]; then
         echo "fork-sandbox-k8s: ################################################" >&2
         echo "fork-sandbox-k8s: *** SUSPICIOUS: this run produced nothing." >&2
         echo "fork-sandbox-k8s: *** The agent exited 0, the fetch brought back zero" >&2
@@ -10037,35 +10106,61 @@ cmd_collect() {
         echo "fork-sandbox-k8s: *** KEPT for inspection rather than reaped, and this" >&2
         echo "fork-sandbox-k8s: *** run exits non-zero. The agent's own transcript, when" >&2
         echo "fork-sandbox-k8s: *** captured, explains the exit:" >&2
+        if [[ "$keep" != true ]]; then
+            echo "fork-sandbox-k8s: *** Proxy credentials were removed." >&2
+        fi
         echo "fork-sandbox-k8s: ***   $evidence_dir/events.jsonl" >&2
         echo "fork-sandbox-k8s: *** Clean up with:" >&2
         echo "fork-sandbox-k8s: ***   fork-sandbox-k8s.sh rm --branch $branch" >&2
         echo "fork-sandbox-k8s: ################################################" >&2
         # 3, distinct from the agent's exit code (0) and from the wait's
         # 1/2 codes: the agent's work exited 0; the RUN produced nothing.
+        [[ "$keep" == true ]] || {
+            k8s_teardown_claude_proxy "$safe_name" || true
+            k8s_teardown_codex_proxy "$safe_name" || true
+        }
         exit 3
     fi
 
     if [[ "$keep" == true ]]; then
         echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
     elif [[ "$evidence_ok" == false ]]; then
+        k8s_teardown_claude_proxy "$safe_name" || true
+        k8s_teardown_codex_proxy "$safe_name" || true
         # Not reaped: reaping now destroys the only record of what this
         # run did, and a rule that leaves resources behind must say so
         # and say how to remove them -- a namespaced pods limit turns an
         # unexplained leftover into a quota-exhaustion bug otherwise.
         echo "fork-sandbox-k8s: ################################################" >&2
         echo "fork-sandbox-k8s: *** This run's evidence could not be captured in full," >&2
-        echo "fork-sandbox-k8s: *** so its resources are being LEFT IN PLACE rather than" >&2
-        echo "fork-sandbox-k8s: *** reaped. Reaping now would destroy the only record of" >&2
-        echo "fork-sandbox-k8s: *** what the run did; whatever still remains in the pod" >&2
-        echo "fork-sandbox-k8s: *** is worth inspecting first:" >&2
+        echo "fork-sandbox-k8s: *** so its Job, pod and scripts are LEFT IN PLACE." >&2
+        echo "fork-sandbox-k8s: *** Proxy credentials were removed. Reaping would destroy" >&2
+        echo "fork-sandbox-k8s: *** the only record of what the run did. The pod" >&2
+        echo "fork-sandbox-k8s: *** may still have evidence worth inspecting:" >&2
         echo "fork-sandbox-k8s: ***   kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE logs $pod_name" >&2
         echo "fork-sandbox-k8s: *** Remove them by hand when you are done:" >&2
         echo "fork-sandbox-k8s: ***   fork-sandbox-k8s.sh rm --branch $branch" >&2
         echo "fork-sandbox-k8s: ################################################" >&2
+        exit 3
     else
-        cmd_rm --branch "$branch"
+        local rm_rc=0
+        cmd_rm --branch "$branch" || rm_rc=$?
+        if (( rm_rc != 0 )); then
+            if [[ -n "$run_dir" ]]; then
+                printf '%s\n' "$rm_rc" > "$run_dir/exit-code"
+                if [[ -s "$run_dir/summary.json" ]]; then
+                    if jq --argjson rc "$rm_rc" '.exit_code = $rc' \
+                        "$run_dir/summary.json" > "$run_dir/summary.json.part"; then
+                        mv -f -- "$run_dir/summary.json.part" "$run_dir/summary.json"
+                    else
+                        rm -f -- "$run_dir/summary.json.part"
+                    fi
+                fi
+            fi
+            exit "$rm_rc"
+        fi
     fi
+    trap - ERR
 }
 
 # Records this process as the one watching $1 (a run dir) through to
@@ -10111,9 +10206,8 @@ k8s_run_tail() {
     # from its stdout. An `exit` inside a subshell stops only the
     # subshell, so a dead-pod, timeout or malformed-sentinel failure would
     # otherwise be swallowed and the run would carry on with an empty code:
-    # propagate it explicitly. cmd_collect below is NOT captured -- it is
-    # called normally, so its own exit paths behave exactly as they did
-    # inline before this extraction.
+    # propagate it explicitly. Collect's own exit paths behave exactly as
+    # they did when the collection body lived inline here.
     local agent_rc wait_rc=0
     local -a wait_argv=(--branch "$branch" --timeout "$timeout")
     # Threaded through so cmd_wait can find CLAUDE_CREDENTIAL_PATH in
@@ -10168,9 +10262,7 @@ k8s_run_tail() {
     [[ -n "$run_dir" ]] && collect_argv+=(--run-dir "$run_dir")
     cmd_collect "${collect_argv[@]}" "$project_path"
 
-    # cmd_collect's own exit status is not captured (see the comment
-    # above this function's wait, on why) -- but $agent_rc alone is not
-    # this run's real outcome either: a lost fast-forward race makes
+    # $agent_rc alone is not this run's real outcome: a lost fast-forward race can make
     # collect overwrite $run_dir/exit-code with a failure even when the
     # agent itself exited 0 (see that write, inside cmd_collect). Read
     # the corrected value back rather than report the agent's raw code

@@ -256,7 +256,7 @@ fs_resume_main() {
         trap 'flock -u "$lock_fd" 2>/dev/null; exec {lock_fd}>&- 2>/dev/null' EXIT
         local rd=""
         if [[ "$is_k8s" == true ]]; then
-            "$self" "${inner[@]}" > "$worker_log" 2>&1 &
+            FORK_SANDBOX_RESUME_NOTE=1 "$self" "${inner[@]}" > "$worker_log" 2>&1 &
             local worker_pid=$!
             local tries=0
             while (( tries < 220 )); do
@@ -281,6 +281,7 @@ fs_resume_main() {
             if ! wait "$worker_pid" 2>/dev/null; then
                 [[ -z "$rd" || -e "$rd/exit-code" || -e "$rd/summary.json" ]] \
                     || printf '1\n' > "$rd/exit-code"
+                [[ -z "$rd" ]] || cp -- "$worker_log" "$rd/resume-client.log" 2>/dev/null || true
             fi
         else
             # `|| true`: under set -e, the inner run exiting nonzero (a
