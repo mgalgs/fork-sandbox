@@ -2954,8 +2954,11 @@ container is called `leg`.
 | `K8S_AGENT_REQUESTS_MEMORY` | unset (see below: the limit, else `LimitRange` `512Mi`) | integer, optional suffix: `512Mi`, `6G` |
 | `K8S_AGENT_LIMITS_CPU`      | unset (`LimitRange`: `1`)    | cpu quantity                        |
 | `K8S_AGENT_LIMITS_MEMORY`   | unset (`LimitRange`: `2Gi`)  | integer, optional suffix            |
+| `K8S_AGENT_PRIORITY_CLASS` | unset | existing PriorityClass name (DNS-1123 subdomain) |
 
-Each key is independent: an unset key renders no field, so with none set
+`K8S_AGENT_PRIORITY_CLASS` sets `priorityClassName` on every agent Job pod and on separate per-run Claude or Codex proxy Pods. Unset omits the field. Create the PriorityClass in the cluster first; `install` only checks for it and warns if missing.
+
+Each resource key is independent: an unset key renders no field, so with none set
 both pod shapes are rendered exactly as before, and setting only
 `K8S_AGENT_LIMITS_MEMORY` renders only that limit. What the admitted pod
 gets for the field that was left out is not the same everywhere, though. The

@@ -13,7 +13,7 @@ divide, so neither can resolve as a fleet seat.
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
 harness/model/network/thinking/description/wake-on-cc/refresh-at/triage/
-preset/handler/command overrides), `lists` (name -> `members`, a list of
+preset/handler/command/services overrides), `lists` (name -> `members`, a list of
 agent names), and an optional top-level `triage` block (harness/model for
 the wake classifier's own sandbox seat -- absent means triage is off
 fleet-wide. No `network` field: the classifier's own launch path fixes
@@ -63,6 +63,9 @@ job, not a sealed harness's), or that resolves any preset (the cluster
 path is single-leg only in this phase, no maintainer tier, no repeat, no
 composed pipeline).
 
+`services` is fleet.yaml-only and takes a YAML boolean. It controls
+whether a k8s postmaster wake launches the project's per-run services.
+
 `wake-when` is fleet.yaml-only as well: a suffix (^[a-z0-9][a-z0-9._-]*$)
 naming the postmaster's per-seat wake gate, $HOOKS_DIR/wake-when.<suffix>
 (see docs/agent-mail.md). Unlike `grant` it is legal on a handler seat: the
@@ -109,7 +112,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (seventeen lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (eighteen lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -126,6 +129,7 @@ routine instead of two.
     agent\t<name>\tgrant\t<value>
     agent\t<name>\treview-target\t<value>
     agent\t<name>\twake-when\t<value>
+    agent\t<name>\tservices\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -188,7 +192,7 @@ WAKE_WHEN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
           "handler", "command", "backend", "endpoint", "grant",
-          "review-target", "wake-when")
+          "review-target", "wake-when", "services")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
@@ -201,7 +205,7 @@ FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
 # all), which applies to a handler exactly as it does an LLM seat.
 LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
                     "persona", "refresh-at", "preset", "backend",
-                    "endpoint", "grant", "review-target")
+                    "endpoint", "grant", "review-target", "services")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -649,6 +653,8 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["network"] = check_network(v, path, errors)
+            elif prop == "services":
+                agent["services"] = check_wake_on_cc(value, path, errors)
             elif prop == "wake-on-cc":
                 agent["wake-on-cc"] = check_wake_on_cc(value, path, errors)
             elif prop == "triage":

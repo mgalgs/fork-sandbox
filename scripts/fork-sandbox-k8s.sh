@@ -247,6 +247,9 @@
 # .agents/sandbox-services/ relative to REF disables them too -- both cases
 # warn naming why. See docs/kubernetes-runs.md's "Per-run services" section.
 #
+# --no-services (submit, run): skip the project's per-run services, even
+# when running HEAD without --checkout.
+#
 # --session-state DIR / --resume-session ID / --session-id ID (submit, run):
 # give this run the same harness conversation across many k8s wakes,
 # exactly what a local run's own --session-state gives a persistent seat.
@@ -736,6 +739,9 @@
 #                         unset. The namespace quota must leave room for
 #                         concurrent seats at that size: see
 #                         K8S_QUOTA_LIMITS_MEMORY above.
+#   K8S_AGENT_PRIORITY_CLASS=
+#                         optional existing PriorityClass for agent Jobs
+#                         and per-run proxy Pods; DNS-1123 subdomain.
 #   K8S_QUOTA_WAIT_SECONDS=
 #                         how long submit waits, in total, for room in
 #                         that quota when a create is refused ("exceeded
@@ -812,6 +818,8 @@
 #                         also accepted (for a StorageClass/CSI driver
 #                         that does not support RWOP yet). Any other value
 #                         is refused.
+#   K8S_POSTMASTER_SEAT_SERVICES=
+#                         true (default) or false; fleet.yaml services overrides.
 #   K8S_POSTMASTER_OPERATORS=
 #                         comma-separated @names (no spaces) that carry
 #                         rule-1 authority in the cluster postmaster: only
@@ -1109,6 +1117,7 @@ K8S_AGENT_REQUESTS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_CPU || tr
 K8S_AGENT_REQUESTS_MEMORY="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_MEMORY || true)"
 K8S_AGENT_LIMITS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_LIMITS_CPU || true)"
 K8S_AGENT_LIMITS_MEMORY="$(read_env_value "$k8s_env" K8S_AGENT_LIMITS_MEMORY || true)"
+K8S_AGENT_PRIORITY_CLASS="$(read_env_value "$k8s_env" K8S_AGENT_PRIORITY_CLASS || true)"
 # The namespace LimitRange's numbers (manifests/k8s/00-namespace.yaml), for
 # the early checks on those keys; the test suite pins them to the manifest.
 K8S_LIMITRANGE_MAX_CPU=4
@@ -1322,6 +1331,11 @@ if [[ "${1-}" != check-grant && ! "$K8S_QUOTA_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]];
 fi
 if [[ "${1-}" != check-grant ]]; then
     k8s_validate_agent_resources
+    local_priority_class_re='^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+    if [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && { (( ${#K8S_AGENT_PRIORITY_CLASS} > 253 )) || [[ ! "$K8S_AGENT_PRIORITY_CLASS" =~ $local_priority_class_re ]]; }; then
+        echo "Error: K8S_AGENT_PRIORITY_CLASS must be a DNS-1123 subdomain." >&2
+        exit 1
+    fi
 fi
 
 # None of these keys feed check-grant's extracted validators (which read
@@ -1339,7 +1353,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
         "$K8S_LEG_VOLUME_SIZE_LIMIT" \
         "$K8S_AGENT_REQUESTS_CPU" "$K8S_AGENT_REQUESTS_MEMORY" \
-        "$K8S_AGENT_LIMITS_CPU" "$K8S_AGENT_LIMITS_MEMORY" \
+        "$K8S_AGENT_LIMITS_CPU" "$K8S_AGENT_LIMITS_MEMORY" "$K8S_AGENT_PRIORITY_CLASS" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
         "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
@@ -3438,6 +3452,10 @@ cmd_install() {
         exit 1
     fi
 
+    if [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && ! $dry_run && ! kubectl get priorityclass "$K8S_AGENT_PRIORITY_CLASS" >/dev/null 2>&1; then
+        echo "Warning: priority class $K8S_AGENT_PRIORITY_CLASS does not exist in the cluster." >&2
+    fi
+
     # The quota keys are substituted into a YAML manifest with no quoting
     # of their own, so these anchored shape checks are what keep a value
     # from injecting YAML (a newline, `: `, a quote or a `|` matches none
@@ -5348,7 +5366,7 @@ k8s_job_quota_blocked() {
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
-    local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
+    local pi_args="" services_trust_ref="" no_services=false task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir="" image_flag="" run_dir_flag=""
     # Recorded in run.env for `resume` only; submit itself acts on none.
     local outbox_dir="" keep=false run_timeout=3600
@@ -5371,6 +5389,7 @@ cmd_submit() {
             --allow-existing-branch) allow_existing_branch=true; shift ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
+            --no-services) no_services=true; shift ;;
             --extra-ref) extra_refs_raw+=("${2:?--extra-ref requires NAME=SHA}"); shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
@@ -6119,7 +6138,7 @@ cmd_submit() {
     # pod_budget (below) must cover at least this, and the service-ready
     # initContainer is rendered only when this is non-empty.
     local services_ready_checks="" services_ready_max=0
-    if git -C "$origin_repo" cat-file -e \
+    if ! $no_services && git -C "$origin_repo" cat-file -e \
             "${services_rev}:.agents/sandbox-services/services.yaml" 2>/dev/null; then
         # --services-trust-ref gates this exactly as the local path's hook
         # is gated (fork-sandbox.sh:3546-3604): a checkout that changed
@@ -6424,6 +6443,8 @@ cmd_submit() {
     # separate per-run Pod rather than a sidecar or the shared proxy.
     # __RUN_NAME__ is this run's own $safe_name, the same object-name
     # component the agent Job and its ConfigMap use.
+    local priority_class_line=""
+    [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && priority_class_line=$'\n'"      priorityClassName: $K8S_AGENT_PRIORITY_CLASS"
     local claude_proxy_rendered=""
     if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         local claude_proxy_template
@@ -6458,6 +6479,10 @@ cmd_submit() {
         extra_labels_proxy_block="$(render_extra_labels_block 4)"
         [[ -n "$extra_labels_proxy_block" ]] && extra_labels_proxy_block+=$'\n'
         claude_proxy_rendered="${claude_proxy_rendered//$extra_labels_marker/$extra_labels_proxy_block}"
+        [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && claude_proxy_rendered="${claude_proxy_rendered/spec:
+  restartPolicy:/spec:
+  priorityClassName: $K8S_AGENT_PRIORITY_CLASS
+  restartPolicy:}"
     fi
     local codex_proxy_rendered=""
     if (( pipeline_has_codex )); then
@@ -6477,6 +6502,10 @@ cmd_submit() {
         codex_label_block="$(render_extra_labels_block 4)"
         [[ -n "$codex_label_block" ]] && codex_label_block+=$'\n'
         codex_proxy_rendered="${codex_proxy_rendered//$codex_label_marker/$codex_label_block}"
+        [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && codex_proxy_rendered="${codex_proxy_rendered/spec:
+  restartPolicy:/spec:
+  priorityClassName: $K8S_AGENT_PRIORITY_CLASS
+  restartPolicy:}"
     fi
 
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
@@ -7170,7 +7199,7 @@ spec:
         app: fork-sandbox-agent
         fork-sandbox/branch: $safe_name${extra_labels_8}
     spec:
-      restartPolicy: Never${services_grace_env}
+      restartPolicy: Never${priority_class_line}${services_grace_env}
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -10450,7 +10479,7 @@ cmd_resume() {
 cmd_run() {
     local dry_run=false keep=false timeout="" timeout_given=false branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" context_secret="" harness="" review_model="" endpoint=""
-    local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
+    local checkout_ref="" pi_args="" services_trust_ref="" no_services=false task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir="" image_flag="" run_dir_flag=""
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
@@ -10465,6 +10494,7 @@ cmd_run() {
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
+            --no-services) no_services=true; shift ;;
             --extra-ref) extra_refs_raw+=("${2:?--extra-ref requires NAME=SHA}"); shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
@@ -10651,6 +10681,7 @@ cmd_run() {
     # rev-parse check itself, before anything is created.
     [[ -n "$checkout_ref" ]] && submit_argv+=(--checkout "$checkout_ref")
     [[ -n "$services_trust_ref" ]] && submit_argv+=(--services-trust-ref "$services_trust_ref")
+    $no_services && submit_argv+=(--no-services)
     [[ -n "$task_meta" ]] && submit_argv+=(--task-meta "$task_meta")
     $allow_existing_branch && submit_argv+=(--allow-existing-branch)
     # Unconditional, unlike the scalar flags above: an empty labels_raw

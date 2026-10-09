@@ -3684,12 +3684,6 @@ if [[ "$k8s_mode" == true ]]; then
         echo "wake to reuse." >&2
         exit 1
     fi
-    if [[ "$no_services" == true ]]; then
-        echo "Error: --no-services is not supported with --k8s. There is no" >&2
-        echo "per-run services mechanism on the cluster path to skip in the" >&2
-        echo "first place." >&2
-        exit 1
-    fi
     if [[ "$keep_session" == true ]]; then
         echo "Error: --keep-session is not supported with --k8s. It holds open" >&2
         echo "the detached tmux session a local run starts on the end of the" >&2
@@ -3900,6 +3894,7 @@ if [[ "$k8s_mode" == true ]]; then
     [[ -n "$checkout_ref" ]] && k8s_argv+=(--checkout "$checkout_ref")
     $allow_existing_branch && k8s_argv+=(--allow-existing-branch)
     [[ -n "$services_trust_ref" ]] && k8s_argv+=(--services-trust-ref "$services_trust_ref")
+    $no_services && k8s_argv+=(--no-services)
     # Forwarded as the raw string, not the byte count already parsed above:
     # fork-sandbox-k8s.sh does its own parsing, so there is one source of
     # truth per process rather than a cross-process byte count to keep in

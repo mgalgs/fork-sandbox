@@ -5151,6 +5151,27 @@ k1b_env="$(latest_env_for_agent karen)"
 check "k8s case1b: .env RESUMED records the resumed session id" \
     "$k1_fixture_sid" "$(env_val "$k1b_env" RESUMED)"
 
+# Seat services override the postmaster's k8s.env default.
+k_services_saved_fleet="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+sed -i '/^  karen:$/a\    services: false' "$FORK_SANDBOX_FLEET_FILE"
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@karen' 'no services' 'review' 8
+once
+check "k8s services: per-seat false passes --no-services" 1 "$(grep -c '^--no-services$' "$STUB_ARGV_LOG")"
+check "k8s services: per-seat false omits trust ref" 0 "$(grep -c '^--services-trust-ref$' "$STUB_ARGV_LOG")"
+sed -i '/^  karen:$/,/^  karl:$/s/^    services: false$/    services: true/' "$FORK_SANDBOX_FLEET_FILE"
+new_root K_SERVICES_CONFIG
+printf 'K8S_POSTMASTER_SEAT_SERVICES=false\n' > "$K_SERVICES_CONFIG/k8s.env"
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@karen' 'services override' 'review' 8
+FORK_SANDBOX_CONFIG_DIR="$K_SERVICES_CONFIG" once
+check "k8s services: per-seat true overrides env false" 0 "$(grep -c '^--no-services$' "$STUB_ARGV_LOG")"
+printf '%s\n' "$k_services_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@karen' 'services env default' 'review' 8
+FORK_SANDBOX_CONFIG_DIR="$K_SERVICES_CONFIG" once
+check "k8s services: env false passes --no-services" 1 "$(grep -c '^--no-services$' "$STUB_ARGV_LOG")"
+
 # ---- case 1c: lineage picks the newest RESOLVING branch, for the right
 # agent, skipping a deleted one ----
 # Hand-built RUNS/*.env + seq fixtures (marked harvested so the harvest

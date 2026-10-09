@@ -1276,6 +1276,22 @@ else
     ok "no K8S_AGENT_* keys set: no container in the Job has a resources stanza"
 fi
 
+if grep -q 'priorityClassName:' "$submit_out"; then
+    no "unset priority class omits pod field" "$(grep 'priorityClassName:' "$submit_out")"
+else
+    ok "unset priority class omits pod field"
+fi
+priority_render="$(agent_res_render "$(agent_res_cfg K8S_AGENT_PRIORITY_CLASS=review-seats)")"
+check "priority class renders on agent Job" 1 "$(grep -c '      priorityClassName: review-seats' <<< "$priority_render")"
+priority_bad_cfg="$(agent_res_cfg K8S_AGENT_PRIORITY_CLASS=Bad_Name)"
+if FORK_SANDBOX_CONFIG_DIR="$priority_bad_cfg" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-priority --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" >/dev/null 2>&1; then
+    no "invalid priority class is refused" "submit succeeded"
+else
+    ok "invalid priority class is refused"
+fi
+
 agent_res_all_out="$(agent_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_CPU=500m \
     K8S_AGENT_REQUESTS_MEMORY=1Gi K8S_AGENT_LIMITS_CPU=2 K8S_AGENT_LIMITS_MEMORY=6Gi)")"
 check "all four K8S_AGENT_* keys set render the full stanza on the agent container" \
@@ -1817,6 +1833,11 @@ claude_jobfail_name_out="$(newdir)/claude-jobfail-name.yaml"; tmpdirs+=("$(dirna
 HOME="$claude_jobfail_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-claude-jobfail --model claude-sonnet-5 --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_jobfail_name_out"
+priority_claude_out="$(HOME="$claude_jobfail_home" FORK_SANDBOX_CONFIG_DIR="$(agent_res_cfg K8S_AGENT_PRIORITY_CLASS=review-seats)" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-priority-claude --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" 2>/dev/null)"
+check "priority class follows agent to separate Claude proxy pod" 2 \
+    "$(grep -c 'priorityClassName: review-seats' <<< "$priority_claude_out")"
 claude_jobfail_safe_name="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$claude_jobfail_name_out")"
 claude_jobfail_stub_dir="$(newdir)"; tmpdirs+=("$claude_jobfail_stub_dir")
 claude_jobfail_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$claude_jobfail_log")")
@@ -11541,11 +11562,14 @@ refuses "--k8s --claude-args is refused" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --claude-args "--effort high" \
     unused-project unused-handoff
-refuses "--k8s --no-services is refused" \
-    "--no-services is not supported with --k8s" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --no-services \
-    unused-project unused-handoff
+    --branch fs-k8s-flag-test-no-services \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > /dev/null 2>/tmp/fs-k8s-no-services.err; then
+    ok "--k8s forwards --no-services"
+else
+    no "--k8s forwards --no-services" "$(cat /tmp/fs-k8s-no-services.err)"
+fi
 # --services-trust-ref is carried through to the dispatched run. A checked-out
 # service spec is disabled without the trust ref, so the rendered sidecar
 # proves the launcher passed this flag rather than merely accepting it.
@@ -14861,6 +14885,20 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     ok "submit --dry-run with a valid one-service spec exits 0"
 else
     no "submit --dry-run with a valid one-service spec exits 0" "$(cat /tmp/fs-k8s-test-svc1.err)"
+fi
+svc1_off_out="$(newdir)/svc1-off.yaml"; tmpdirs+=("$(dirname "$svc1_off_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run --no-services \
+    --branch fs-k8s-test-svc1-off --model moonshotai/kimi-k3 \
+    "$svc1_dir" "$handoff_file" > "$svc1_off_out" 2>/tmp/fs-k8s-test-svc1-off.err; then
+    ok "--no-services accepts a repo with a services spec"
+else
+    no "--no-services accepts a repo with a services spec" "$(cat /tmp/fs-k8s-test-svc1-off.err)"
+fi
+check "--no-services leaves only the egress-gate init container" 1 "$(svc_initcontainers_count "$svc1_off_out")"
+if grep -qF -- '- name: postgres' "$svc1_off_out"; then
+    no "--no-services omits the postgres sidecar" "found postgres in render"
+else
+    ok "--no-services omits the postgres sidecar"
 fi
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$svc1_out" 2>&1)"

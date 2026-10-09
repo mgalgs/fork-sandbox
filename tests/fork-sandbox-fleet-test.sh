@@ -538,7 +538,7 @@ check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PE
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
 # (wake-when) is empty, as it is for tuner.
-check "resolve: output is exactly seventeen lines" "17" "$("$fleet" resolve tuner | wc -l)"
+check "resolve: output is exactly eighteen lines" "18" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -1248,6 +1248,21 @@ printf '%s\n' "$saved_fleet_for_review_target" > "$FORK_SANDBOX_FLEET_FILE"
 
 printf '\n== wake-when ==\n'
 
+services_saved_fleet="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler: {harness: pi, backend: k8s, services: false}
+  tuner: {harness: pi, backend: k8s, services: true}
+EOF
+check "services: booleans pass check" 0 "$("$fleet" check >/dev/null 2>&1; echo $?)"
+check "services: false resolves as the final field" false "$("$fleet" resolve riffler | tail -n1)"
+check "services: true resolves as the final field" true "$("$fleet" resolve tuner | tail -n1)"
+bad "services: non-boolean is refused" "agents.riffler.services: must be a YAML boolean" <<'EOF'
+agents:
+  riffler: {backend: k8s, services: 'false'}
+EOF
+
+printf '%s\n' "$services_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"
 saved_fleet_for_wake_when="$(cat "$FORK_SANDBOX_FLEET_FILE")"
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
@@ -1675,6 +1690,14 @@ agents:
 lists:
   all-hands: {members: [alpha, beta, notifier]}
 EOF
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, backend: k8s, services: false}
+  beta: {harness: pi, backend: k8s, services: true}
+EOF
+cl_run --cluster
+check "cluster: services booleans pass" 0 "$cl_rc"
+
 cl_run --cluster
 check "cluster: an all-pi k8s fleet with a handler seat passes" "0" "$cl_rc"
 check "cluster: ... and prints nothing" "" "$cl_out"

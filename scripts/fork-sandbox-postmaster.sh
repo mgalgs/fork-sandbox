@@ -3480,7 +3480,7 @@ pm_spawn_wake() {
     fi
     local harness model thinking network persona_path description wake_on_cc \
           refresh_at triage preset handler command backend endpoint grant \
-          review_target wake_when
+          review_target wake_when seat_services
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
@@ -3508,7 +3508,7 @@ pm_spawn_wake() {
            read -r persona_path; read -r description; read -r wake_on_cc; \
            read -r refresh_at; read -r triage; read -r preset; read -r handler; \
            read -r command; read -r backend; read -r endpoint; read -r grant; \
-           read -r review_target; read -r wake_when; \
+           read -r review_target; read -r wake_when; read -r seat_services; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
@@ -3724,6 +3724,13 @@ pm_spawn_wake() {
         # above) -- the author's service definitions are not trusted
         # because they are under review, so --services-trust-ref is still
         # the project's own HEAD in either case, never the target.
+        local seat_services_default
+        seat_services_default="$(fs_read_env_value "${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/k8s.env" K8S_POSTMASTER_SEAT_SERVICES || true)"
+        case "${seat_services:-${seat_services_default:-true}}" in
+            false) spawn_args+=(--no-services) ;;
+            true) ;;
+            *) pm_flag "$tid" "invalid K8S_POSTMASTER_SEAT_SERVICES: expected true or false"; return 0 ;;
+        esac
         local checkout_branch=""
         if [[ -n "$rt_sha" ]]; then
             checkout_branch="$rt_sha"
@@ -3744,7 +3751,7 @@ pm_spawn_wake() {
             # .agents/sandbox-services/ relative to HEAD.
             local checkout_trust_ref
             checkout_trust_ref="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
-            [[ -n "$checkout_trust_ref" ]] && spawn_args+=(--services-trust-ref "$checkout_trust_ref")
+            [[ -n "$checkout_trust_ref" && "${seat_services:-${seat_services_default:-true}}" == true ]] && spawn_args+=(--services-trust-ref "$checkout_trust_ref")
         fi
         # An ADDITIONAL ref, not a checkout: the pod gets the announced
         # upstream commit as a local branch named `upstream`.
