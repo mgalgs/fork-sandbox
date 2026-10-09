@@ -137,6 +137,10 @@
 #                thread's upstream state (see UPSTREAM STATE below): every
 #                spawn path refuses, spends no budget and flags nothing.
 #                At route-pass time it names To: candidates only.
+#   review-history-missing thread, ref=<name> -- a prior review head
+#                (review-v<N> or head-<id>, see PRIOR HEADS) is not in the
+#                project repo and could not be pinned; it was left out of
+#                that k8s wake's --extra-ref flags. The wake is not flagged.
 #   grant-ignored thread -- a k8s seat woke on a thread whose root carries
 #                X-Grant: none (`mail send --no-grant`) although a grant
 #                file exists for it; the file was not forwarded (no
@@ -233,8 +237,27 @@
 # NOT waking while it is still absent -- and then passes
 # `--extra-ref upstream=<sha>` on to the seat's k8s launch, so the pod sees
 # the commit as a local branch named `upstream`. The seat's --checkout is
-# unchanged. No other seat gets the ref, and the postmaster keeps no
-# "answered" state: the persona decides whether it has answered the push.
+# unchanged. No other seat gets the `upstream` ref, and the postmaster keeps
+# no "answered" state: the persona decides whether it has answered the push.
+#
+# PRIOR HEADS
+#
+# So that any seat can `git range-diff old...new` without fetching, EVERY
+# `backend: k8s` seat gets, on every wake, one --extra-ref per prior head of
+# the thread, as a local branch in its pod (pm_review_history_refs; local
+# seats are unchanged). Two families, taken from the thread's own messages
+# (the archive is the record; no state file): `review-v<N>`, the review
+# target's sha at X-Version N, for every N below the current VERSION (the
+# messages stamped X-Review-Target-Set and X-Version); and
+# `head-<first 12 hex of the announcing Message-ID, hyphens removed>`, one
+# per X-Upstream-Head message from a non-fleet sender with a well-formed
+# value, the latest included. They follow `upstream=<sha>`. Each sha is
+# pinned in the project repo under refs/fork-sandbox/review/<thread-id>/
+# <name> the first time it is seen there (never moved), so a force-push
+# upstream and a gc cannot lose it. A sha the repo does not hold (only
+# possible for a thread older than this feature) is skipped with a
+# `review-history-missing` event; the wake goes ahead without it. A thread
+# with no review target and no upstream-head messages gets nothing new.
 #
 # A `sets` seat's `Version:` reply whose wake branch did not come back is
 # normally flagged; but when the thread's upstream-head file records exactly
@@ -2847,6 +2870,73 @@ pm_target_sha_present() {
     git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null
 }
 
+# Fills the array named $3 with the NAME=SHA pairs of thread $2's prior
+# review heads (see PRIOR HEADS in the header), for a k8s seat's
+# --extra-ref flags: `review-v<N>` for every review target version below
+# the current one (read from the thread's own messages stamped
+# X-Review-Target-Set and X-Version), then `head-<12 hex of the announcing
+# Message-ID, hyphens removed>` for every X-Upstream-Head message from a
+# non-fleet sender with a well-formed value. Each sha is pinned in the
+# project repo under refs/fork-sandbox/review/<tid>/<name> the first time it
+# is seen there (created, never moved), so a force-push and a gc cannot lose
+# it. A sha the repo does not hold is skipped with a review-history-missing
+# event: no fetch is attempted here (pm_fetch_wait_gate already fetched
+# every sha that was ever current), and the wake never fails over it.
+pm_review_history_refs() {
+    local project="$1" tid="$2"
+    local -n out_ref="$3"
+    # shellcheck disable=SC2034  # filled through the nameref by pm_review_history_add
+    out_ref=()
+    local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env" current=""
+    [[ -f "$rt_file" ]] && current="$(fs_pm_env_get "$rt_file" VERSION)"
+    [[ "$current" =~ ^[0-9]+$ ]] || current=""
+    local -A seen=()
+    local f set_value version value from sha name branch
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] || continue
+        if [[ -n "$current" ]]; then
+            set_value="$(pm_header "$f" X-Review-Target-Set)"
+            version="$(pm_header "$f" X-Version)"
+            sha="${set_value#* }"
+            if [[ -n "$set_value" && "$version" =~ ^[1-9][0-9]*$ ]] && (( version < current )) \
+                && [[ "$sha" =~ ^[0-9a-f]{40}$ && "$set_value" == "${set_value%% *} $sha" ]]; then
+                name="review-v$version"
+                pm_review_history_add "$project" "$tid" "$name" "$sha" seen "$3"
+            fi
+        fi
+        value="$(pm_header "$f" X-Upstream-Head)"
+        [[ -n "$value" ]] || continue
+        from="$(pm_header "$f" From)"
+        "$FLEET" resolve "${from#@}" >/dev/null 2>&1 && continue
+        branch="${value%% *}"
+        sha="${value#* }"
+        [[ "$value" == "$branch $sha" && -n "$branch" && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+        git check-ref-format --branch "$branch" >/dev/null 2>&1 || continue
+        name="$(pm_header "$f" Message-ID)"
+        name="head-$(printf '%s' "${name//-/}" | cut -c1-12)"
+        pm_review_history_add "$project" "$tid" "$name" "$sha" seen "$3"
+    done
+}
+
+# One entry of pm_review_history_refs: appends NAME=SHA to the array named
+# $6 unless the name is already in the assoc array named $5, pinning the sha
+# first and skipping (with an event) one the project repo does not hold.
+pm_review_history_add() {
+    local project="$1" tid="$2" name="$3" sha="$4"
+    local -n seen_ref="$5"
+    local -n list_ref="$6"
+    [[ -z "${seen_ref["$name"]:-}" ]] || return 0
+    seen_ref["$name"]=1
+    if ! git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null; then
+        pm_event "review-history-missing thread=${tid:0:8} ref=$name"
+        return 0
+    fi
+    local pin="refs/fork-sandbox/review/$tid/$name"
+    git -C "$project" rev-parse --verify --quiet "$pin" >/dev/null 2>&1 \
+        || git -C "$project" update-ref "$pin" "$sha" "" 2>/dev/null || true
+    list_ref+=("$name=$sha")
+}
+
 # Atomic tmp+mv write of one pending fetch-miss record (see FETCH MISS in the
 # header), $FETCH_WAIT/<tid>/<agent>.
 pm_fetch_wait_write() {
@@ -3834,6 +3924,14 @@ pm_spawn_wake() {
         # An ADDITIONAL ref, not a checkout: the pod gets the announced
         # upstream commit as a local branch named `upstream`.
         [[ -n "$uh_sha" ]] && spawn_args+=(--extra-ref "upstream=$uh_sha")
+        # And every prior review head of the thread, to every k8s seat, so
+        # `git range-diff old...new` needs no fetch (see PRIOR HEADS).
+        local -a history_refs=()
+        local history_ref
+        pm_review_history_refs "$project" "$tid" history_refs
+        for history_ref in "${history_refs[@]}"; do
+            spawn_args+=(--extra-ref "$history_ref")
+        done
 
         local wake_root="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}"
         mkdir -p -- "$wake_root"

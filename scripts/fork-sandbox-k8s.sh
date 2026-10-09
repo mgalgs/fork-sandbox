@@ -234,7 +234,8 @@
 # (space-separated NAME=SHA). Nothing else in the tooling passes it today
 # but the postmaster, which hands a review thread's `sets` seat the human
 # author's pushed commit as `upstream` (docs/agent-mail.md, "Upstream
-# moved"). It is deliberately not part of any fork-sandbox.sh preset.
+# moved") and every k8s seat the thread's prior review heads as
+# `review-v<N>` and `head-<id>` ("Prior heads in a seat's clone"). It is deliberately not part of any fork-sandbox.sh preset.
 #
 # --services-trust-ref REF (submit, run): the trusted base a per-run
 # services spec (.agents/sandbox-services/services.yaml) is diffed against

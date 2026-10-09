@@ -1053,7 +1053,9 @@ fleet agent** (a fleet seat's copy is ignored and logged as
    no "answered" state; the persona decides whether it has already
    answered the push. The seat's `--checkout` is unchanged (its lineage,
    or the review target before it has one) — `upstream` is an additional
-   ref, not a checkout. No other seat, `follow` included, gets it.
+   ref, not a checkout. No other seat, `follow` included, gets the
+   `upstream` ref (every k8s seat does get the thread's prior heads, a
+   separate mechanism: "Prior heads in a seat's clone" below).
 
 In the pod the commit is a **local branch named `upstream`**, created
 right after the clone from `origin/upstream`; the wake branch stays checked
@@ -1083,6 +1085,37 @@ every header line it is unquoted, while a body line reading
 Local (non-k8s) seats get no `upstream` branch: the postmaster only logs an
 `upstream-head-local-seat` event when a local `sets` seat wakes on a
 thread with an upstream-head file.
+
+### Prior heads in a seat's clone
+
+On a thread's later versions every seat must be able to
+`git range-diff old...new` without fetching, so **every `backend: k8s` seat
+gets, on every wake, one extra local branch per prior head of the thread**
+(the same `--extra-ref NAME=SHA` mechanism as `upstream`, which is kept
+exactly as above and comes first). Two families, both read from the
+thread's own messages — the archive is the record, there is no state file:
+
+- `review-v<N>`: the review target's sha at `X-Version` N, for every N
+  below the current `VERSION`. Source: the messages stamped
+  `X-Review-Target-Set` and `X-Version`; the current version's sha is the
+  seat's own checkout (or `upstream`), so there is no `review-v<current>`.
+- `head-<id>`: one per `X-Upstream-Head` message from a non-fleet sender
+  (the messages the postmaster acts on under "Upstream moved"), the latest
+  included. `<id>` is the first 12 hex digits of the announcing
+  Message-ID with its hyphens removed. These are not numbered: a consumer
+  maps announcing messages to its own version numbers.
+
+Names match `^[a-z][a-z0-9-]{0,30}$` and are unique within a wake. A thread
+with no review target and no upstream-head messages gets no new flags at
+all, and local (non-k8s) seats are unchanged.
+
+Each sha is **pinned** in the project repo under
+`refs/fork-sandbox/review/<thread-id>/<name>` the first time the postmaster
+sees it there (created once, never moved), so a force-push upstream and a
+gc cannot lose it. A sha the project repo does not hold and that cannot be
+pinned (possible only for a thread older than this feature) is skipped with
+a `review-history-missing thread=<8> ref=<name>` event; the wake goes ahead
+without that ref and nothing is flagged. No fetch is attempted to find it.
 
 ### Upstream closed: `mail reply --upstream-state closed|open`
 
@@ -1306,6 +1339,9 @@ woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
 line), `upstream-head` (thread, sha=<12 hex> — an upstream-moved announcement was
 recorded), `upstream-head-ignored` (thread, reason=fleet-sender|malformed),
 `upstream-head-local-seat` (thread, agent — see "Upstream moved" above),
+`review-history-missing` (thread, ref=<name> — a prior review head is not
+in the project repo and was left out of a k8s wake; see "Prior heads in a
+seat's clone"),
 `grant-ignored` (thread — a k8s seat woke on a `--no-grant` thread that
 has a grant file; the file was not forwarded),
 `upstream-state` (thread, state=closed|open, msg=<8 hex> — the thread's

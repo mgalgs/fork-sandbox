@@ -5109,6 +5109,9 @@ check "k8s case1: no --checkout on a first wake (no prior run to resolve)" 0 \
     "$(grep -c -- '^--checkout$' "$STUB_ARGV_LOG")"
 check "k8s case1: no --services-trust-ref on a first wake (no lineage checkout to anchor)" 0 \
     "$(grep -c -- '^--services-trust-ref$' "$STUB_ARGV_LOG")"
+check "k8s case1: a thread with no review target or head gets no --extra-ref" 0 \
+    "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+not_contains "k8s case1: and no review-history event" "$(cat "$work/once.out")" "review-history"
 k1_env="$(latest_env_for_agent karen)"
 check "k8s case1: .env BACKEND=k8s" k8s "$(env_val "$k1_env" BACKEND)"
 check "k8s case1: .env RESUMED is empty" "" "$(env_val "$k1_env" RESUMED)"
@@ -5418,6 +5421,11 @@ uh_commit() {
 uh_branch="feature/x"
 uh_sha="$(uh_commit "$uh_branch")"
 
+# extra_refs: every --extra-ref value in the argv log, one per line;
+# head_id <message-id>: the postmaster's name suffix for an announcement.
+extra_refs() { awk '$0=="--extra-ref"{getline; print}' "$STUB_ARGV_LOG"; }
+head_id() { local id="$1"; id="${id//-/}"; printf '%s' "${id:0:12}"; }
+
 # The announcer is '@ci-demo', a name that is not in the fleet: only a
 # non-fleet sender's header is acted on.
 # uh_kickoff <to>: opens a review thread (target = the rt1 commit) addressed
@@ -5460,7 +5468,10 @@ contains "upstream-head case 1: the event names the thread and short sha" \
     "$(cat "$work/once.out")" "pm upstream-head thread=$uh1_short sha=${uh_sha:0:12}"
 check "upstream-head case 1: ken's wake passes --extra-ref upstream=<sha>" \
     "upstream=$uh_sha" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
-check "upstream-head case 1: exactly one --extra-ref" 1 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+check "upstream-head case 1: ken also gets the announcing message's head ref, after upstream" \
+    "upstream=$uh_sha head-$(head_id "$uh1_reply")=$uh_sha" "$(extra_refs | paste -sd' ')"
+check "prior heads: the head ref is pinned in the project repo" "$uh_sha" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$uh1_tid/head-$(head_id "$uh1_reply")" 2>/dev/null)"
 check "upstream-head case 1: --checkout is unchanged (ken's lineage, not the upstream sha)" \
     "1" "$( [[ -n "$(argv_after --checkout "$STUB_ARGV_LOG")" && "$(argv_after --checkout "$STUB_ARGV_LOG")" != "$uh_sha" ]] && echo 1 || echo 0 )"
 check "upstream-head case 1: the thread is not flagged" 0 \
@@ -5474,6 +5485,8 @@ check "upstream-head case 1b: a later ordinary wake of ken still passes --extra-
     "upstream=$uh_sha" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
 check "upstream-head case 1b: the file is unchanged by an ordinary message" "$uh1_state" \
     "$(cat "$uh1_file")"
+check "prior heads: an ordinary wake still carries the same two refs" \
+    "upstream=$uh_sha head-$(head_id "$uh1_reply")=$uh_sha" "$(extra_refs | paste -sd' ')"
 
 # The newest announcement replaces the file wholesale.
 uh_sha2="$(uh_commit "$uh_branch-2")"
@@ -5487,6 +5500,19 @@ contains "upstream-head case 1c: MSGID moves to the newest message" "$uh1_state2
 check "upstream-head case 1c: still four keys (replaced, not appended)" 4 "$(grep -c '=' "$uh1_file")"
 check "upstream-head case 1c: the wake carries the newest sha" \
     "upstream=$uh_sha2" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+check "prior heads: every announcement's head ref rides along, latest included" \
+    "upstream=$uh_sha2 head-$(head_id "$uh1_reply")=$uh_sha head-$(head_id "$uh1_reply2")=$uh_sha2" \
+    "$(extra_refs | paste -sd' ')"
+check "prior heads: every name is well formed with a full sha" 0 \
+    "$(extra_refs | grep -cv -E '^[a-z][a-z0-9-]{0,30}=[0-9a-f]{40}$' || true)"
+check "prior heads: names are unique within a wake" "" "$(extra_refs | cut -d= -f1 | sort | uniq -d)"
+
+# A local seat on the same thread gets no extra ref.
+: > "$STUB_ARGV_LOG"
+reply_msg '@ci-demo' "$uh1_reply" 'for alice' --to '@alice' >/dev/null
+once
+check "prior heads: a local seat woke" 1 "$(grep -c -- '^--clone-dir$' "$STUB_ARGV_LOG")"
+check "prior heads: a local seat gets no --extra-ref" 0 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
 
 # ---- upstream-head case 2: a `follow` seat (kai) gets no extra ref, though
 # the thread's state file is written ----
@@ -5497,7 +5523,9 @@ once
 check "upstream-head case 2: the state file is written for the thread" 1 \
     "$( [[ -e "$PM_STATE_DIR/upstream-head/$uh2_tid.env" ]] && echo 1 || echo 0 )"
 check "upstream-head case 2: kai was woken" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
-check "upstream-head case 2: a follow seat gets NO --extra-ref" 0 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+check "upstream-head case 2: a follow seat gets no upstream ref, only the thread's head ref" 1 \
+    "$(extra_refs | grep -c '^head-')"
+check "upstream-head case 2: and exactly one ref" 1 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
 
 # ---- upstream-head case 3: a fleet sender's header is ignored and logged ----
 uh_kickoff ken; uh3_mid="$UH_MID"
@@ -5789,6 +5817,53 @@ check "status: budget is the thread's own" 2 "$(python3 -c 'import json,sys; pri
 check "status: budget_source is thread" thread "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["budget_source"])' "$uh10_json")"
 check "status: spawns is reset by the carry" 2 "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["spawns"])' "$uh10_json")"
 check "status: spawns_total is not" 4 "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["spawns_total"])' "$uh10_json")"
+
+# ---- prior heads survive a deleted branch and a gc: the pin keeps them ----
+ph_gc_branch="feature/gone-after-pin"
+ph_gc_sha="$(uh_commit "$ph_gc_branch")"
+uh_kickoff karen; ph_mid="$UH_MID"
+ph_tid="$(thread_of "$ph_mid")"
+ph_reply="$(reply_msg '@ci-demo' "$ph_mid" 'pushed a branch' --to '@karen' --upstream-head "$ph_gc_branch:$ph_gc_sha")"
+once
+check "prior heads: a non-sets seat gets the head ref" "head-$(head_id "$ph_reply")=$ph_gc_sha" "$(extra_refs)"
+check "prior heads: the head was pinned" "$ph_gc_sha" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$ph_tid/head-$(head_id "$ph_reply")" 2>/dev/null)"
+git -C "$PROJECT_DIR" update-ref -d "refs/heads/$ph_gc_branch"
+git -C "$PROJECT_DIR" reflog expire --expire=now --all
+git -C "$PROJECT_DIR" gc --prune=now -q 2>/dev/null
+check "prior heads: the pinned commit survives the branch's deletion and a gc" 0 \
+    "$(git -C "$PROJECT_DIR" cat-file -e "$ph_gc_sha^{commit}" 2>/dev/null; echo $?)"
+: > "$STUB_ARGV_LOG"
+reply_msg '@carol' "$ph_reply" 'next wake' --to '@karen' >/dev/null
+once
+check "prior heads: the next wake still carries the head ref" "head-$(head_id "$ph_reply")=$ph_gc_sha" "$(extra_refs)"
+not_contains "prior heads: and nothing is reported missing" "$(cat "$work/once.out")" "review-history-missing"
+
+# ---- a prior head the repo does not hold is skipped, never fatal ----
+ph_gone="$(printf 'c%.0s' {1..40})"
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+printf '%s\n' 'old thread' > "$work/body.tmp"
+ph2_mid="$("$MAIL" send --from '@carol' --to '@karen' --subject 'old thread topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "pm-old-branch:$ph_gone" 2>/dev/null)"
+ph2_tid="$(thread_of "$ph2_mid")"; ph2_short="${ph2_tid:0:8}"
+once
+printf 'BRANCH=pm-old-branch\nSHA=%s\nVERSION=2\nSET_BY=@ken\nSET_AT=2026-01-01T00:00:00Z\n' "$rt1_sha" \
+    > "$PM_STATE_DIR/review-target/$ph2_tid.env"
+ph2_reply="$(reply_msg '@ci-demo' "$ph2_mid" 'pushed a lost branch' --to '@karen' --upstream-head "feature/lost:$ph_gone")"
+: > "$STUB_ARGV_LOG"
+once
+check "prior heads: a missing sha does not stop the wake" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "prior heads: nothing is handed over for the missing shas" 0 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+contains "prior heads: the missing review version is reported" "$(cat "$work/once.out")" \
+    "pm review-history-missing thread=$ph2_short ref=review-v1"
+contains "prior heads: the missing head is reported" "$(cat "$work/once.out")" \
+    "pm review-history-missing thread=$ph2_short ref=head-$(head_id "$ph2_reply")"
+check "prior heads: the missing shas are not pinned" 0 \
+    "$(git -C "$PROJECT_DIR" for-each-ref "refs/fork-sandbox/review/$ph2_tid" | wc -l)"
+check "prior heads: and the thread is not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$ph2_tid" ]] && echo 1 || echo 0 )"
 
 # ---- case 2: a local seat on the same fleet spawns exactly as before ----
 
@@ -6585,6 +6660,22 @@ rt5_state="$(cat "$PM_STATE_DIR/review-target/$rt5_tid.env" 2>/dev/null)"
 contains "review-target case B1: state file VERSION advanced to 2" "$rt5_state" "VERSION=2"
 contains "review-target case B1: state file BRANCH updated to the wake's branch" "$rt5_state" "BRANCH=$rt5_branch"
 contains "review-target case B1: state file SHA updated to the wake's resolved sha" "$rt5_state" "SHA=$rt5_branch_sha"
+
+# ---- prior heads: B1's thread is at VERSION 2, so every k8s seat gets the
+# VERSION 1 target as review-v1 and no review-v2 ----
+for ph_seat in kai ken; do
+    : > "$STUB_ARGV_LOG"
+    reply_msg '@carol' "$rt5_mid" "plain message for $ph_seat" --to "@$ph_seat" >/dev/null
+    once
+    check "prior heads: $ph_seat was woken" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+    contains "prior heads: $ph_seat gets review-v1 at the first target's sha" \
+        "$(extra_refs)" "review-v1=$rt5_seed_sha"
+    not_contains "prior heads: $ph_seat gets no review-v2" "$(extra_refs)" "review-v2"
+done
+check "prior heads: review-v1 is pinned in the project repo" "$rt5_seed_sha" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$rt5_tid/review-v1" 2>/dev/null)"
+check "prior heads: without an announcement no seat gets an upstream ref" 0 \
+    "$(extra_refs | grep -c '^upstream=' || true)"
 
 # ---- review-target case B1b: a Version: reply whose branch tip is NOT a
 # descendant of the old target is accepted and recorded -- the human
