@@ -1282,7 +1282,7 @@ else
     ok "unset priority class omits pod field"
 fi
 priority_render="$(agent_res_render "$(agent_res_cfg K8S_AGENT_PRIORITY_CLASS=review-seats)")"
-check "priority class renders on agent Job" 1 "$(grep -c '      priorityClassName: review-seats' <<< "$priority_render")"
+check "priority class renders on agent Job" 1 "$(grep -c '      priorityClassName: "review-seats"' <<< "$priority_render")"
 priority_bad_cfg="$(agent_res_cfg K8S_AGENT_PRIORITY_CLASS=Bad_Name)"
 if FORK_SANDBOX_CONFIG_DIR="$priority_bad_cfg" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-priority --model moonshotai/kimi-k3 \
@@ -1837,7 +1837,7 @@ priority_claude_out="$(HOME="$claude_jobfail_home" FORK_SANDBOX_CONFIG_DIR="$(ag
     --branch fs-k8s-test-priority-claude --model claude-sonnet-5 --harness claude \
     "$proj_dir" "$handoff_file" 2>/dev/null)"
 check "priority class follows agent to separate Claude proxy pod" 2 \
-    "$(grep -c 'priorityClassName: review-seats' <<< "$priority_claude_out")"
+    "$(grep -c 'priorityClassName: "review-seats"' <<< "$priority_claude_out")"
 claude_jobfail_safe_name="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$claude_jobfail_name_out")"
 claude_jobfail_stub_dir="$(newdir)"; tmpdirs+=("$claude_jobfail_stub_dir")
 claude_jobfail_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$claude_jobfail_log")")
@@ -19574,6 +19574,31 @@ if grep -q 'CLAUDE_PROXY_BASE_URL' "$rd_mixed_out" \
     ok "a mixed pipeline renders both per-run proxy arrangements"
 else
     no "a mixed pipeline renders both per-run proxy arrangements" "$(cat "$rd_mixed_out")"
+fi
+if python3 -c 'import yaml' 2>/dev/null; then
+    for priority_name in 123 true null; do
+        priority_mixed_out="$(newdir)/priority-mixed.yaml"; tmpdirs+=("$(dirname "$priority_mixed_out")")
+        CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$(agent_res_cfg K8S_AGENT_PRIORITY_CLASS="$priority_name")" \
+            "$k8s_sh" submit --dry-run --branch fs-k8s-test-priority-mixed \
+            --harness codex --model gpt-5.6-sol --run-dir "$rd_mixed_dry" \
+            "$proj_dir" "$handoff_file" > "$priority_mixed_out" 2>/dev/null
+        priority_parsed="$(python3 - "$priority_mixed_out" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get('kind') in ('Job', 'Pod')]
+values = []
+for d in docs:
+    spec = d['spec']['template']['spec'] if d['kind'] == 'Job' else d['spec']
+    value = spec.get('priorityClassName')
+    values.append((d['kind'], value, type(value).__name__))
+print(sorted(values))
+PY
+)"
+        check "priority class $priority_name parses as a string on the Job and both proxy pods" \
+            "[('Job', '$priority_name', 'str'), ('Pod', '$priority_name', 'str'), ('Pod', '$priority_name', 'str')]" \
+            "$priority_parsed"
+    done
+else
+    printf '  SKIP  priority class parsed-manifest checks (python3 yaml module unavailable)\n'
 fi
 rd_codex_bin="$(newdir)"; tmpdirs+=("$rd_codex_bin")
 cat > "$rd_codex_bin/codex" <<'STUB'

@@ -6451,7 +6451,7 @@ cmd_submit() {
     # __RUN_NAME__ is this run's own $safe_name, the same object-name
     # component the agent Job and its ConfigMap use.
     local priority_class_line=""
-    [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && priority_class_line=$'\n'"      priorityClassName: $K8S_AGENT_PRIORITY_CLASS"
+    [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && priority_class_line=$'\n'"      priorityClassName: \"$K8S_AGENT_PRIORITY_CLASS\""
     local claude_proxy_rendered=""
     if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         local claude_proxy_template
@@ -6488,7 +6488,7 @@ cmd_submit() {
         claude_proxy_rendered="${claude_proxy_rendered//$extra_labels_marker/$extra_labels_proxy_block}"
         [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && claude_proxy_rendered="${claude_proxy_rendered/spec:
   restartPolicy:/spec:
-  priorityClassName: $K8S_AGENT_PRIORITY_CLASS
+  priorityClassName: \"$K8S_AGENT_PRIORITY_CLASS\"
   restartPolicy:}"
     fi
     local codex_proxy_rendered=""
@@ -6511,7 +6511,7 @@ cmd_submit() {
         codex_proxy_rendered="${codex_proxy_rendered//$codex_label_marker/$codex_label_block}"
         [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && codex_proxy_rendered="${codex_proxy_rendered/spec:
   restartPolicy:/spec:
-  priorityClassName: $K8S_AGENT_PRIORITY_CLASS
+  priorityClassName: \"$K8S_AGENT_PRIORITY_CLASS\"
   restartPolicy:}"
     fi
 
