@@ -22,7 +22,23 @@
 # agent CLIs, and a run gives them the user's access token. Build it yourself
 # from this file; there is no registry copy to trust.
 
-FROM node:22-bookworm-slim
+ARG BASE_IMAGE=node:22-bookworm-slim
+FROM ${BASE_IMAGE}
+
+# The supported custom bases are Debian-family images with apt. Diagnose an
+# incompatible base before apt's own (less useful) command-not-found failure.
+RUN set -eu; \
+    if ! command -v apt-get >/dev/null || ! command -v dpkg >/dev/null || [ ! -f /etc/os-release ]; then \
+        echo 'Error: sandbox base requires Debian-family apt (apt-get and dpkg), node >=22 and npm.' >&2; exit 1; \
+    fi; \
+    . /etc/os-release; \
+    case " ${ID:-} ${ID_LIKE:-} " in \
+        *' debian '*) ;; \
+        *) echo 'Error: sandbox base requires Debian-family apt, node >=22 and npm.' >&2; exit 1 ;; \
+    esac; \
+    if [ "$(id -u)" -ne 0 ]; then \
+        echo 'Error: sandbox base must build as root to install apt packages and node >=22 with npm.' >&2; exit 1; \
+    fi
 
 # bash, because the backend's generated bootstrap and the callers' shims are
 # bash. git and jq, because a run commits and the tooling reads JSON.
@@ -38,8 +54,8 @@ FROM node:22-bookworm-slim
 # routinely and which Debian leaves out of the slim base, and a seat that
 # finds it missing has been observed writing its own stand-in and reporting
 # the suite green -- a missing tool an agent can fake is worse than one it
-# cannot. The package name is not util-linux on Debian: bookworm ships
-# /usr/bin/column in bsdextrautils.
+# cannot. On bookworm and trixie, /usr/bin/column is in bsdextrautils,
+# not util-linux.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
@@ -55,7 +71,37 @@ RUN apt-get update \
         ripgrep \
         shellcheck \
         socat \
+        tar \
+        xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep an adequate node/npm from the base. Debian 13's nodejs package is too
+# old, so fetch a fixed node 22 release when needed. Check the tarball against
+# the official release's published SHA256 list before unpacking it.
+RUN set -eu; \
+    node_major=0; \
+    if command -v node >/dev/null 2>&1; then \
+        node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"; \
+    fi; \
+    case "$node_major" in ''|*[!0-9]*) node_major=0 ;; esac; \
+    if [ "$node_major" -lt 22 ] || ! command -v npm >/dev/null 2>&1; then \
+        case "$(dpkg --print-architecture)" in \
+            amd64) node_arch=x64 ;; \
+            arm64) node_arch=arm64 ;; \
+            *) echo 'Error: node >=22 and npm require an official Linux amd64 or arm64 tarball.' >&2; exit 1 ;; \
+        esac; \
+        node_version=v22.16.0; \
+        node_file="node-${node_version}-linux-${node_arch}.tar.xz"; \
+        node_url="https://nodejs.org/dist/${node_version}"; \
+        node_tmp="$(mktemp -d)"; \
+        curl -fsSLo "$node_tmp/SHASUMS256.txt" "$node_url/SHASUMS256.txt"; \
+        curl -fsSLo "$node_tmp/$node_file" "$node_url/$node_file"; \
+        awk -v file="$node_file" '$2 == file { print }' "$node_tmp/SHASUMS256.txt" > "$node_tmp/checksum"; \
+        [ -s "$node_tmp/checksum" ] || { echo "Error: published SHA256 missing for $node_file" >&2; exit 1; }; \
+        (cd "$node_tmp" && sha256sum -c checksum); \
+        tar -xJf "$node_tmp/$node_file" -C /usr/local --strip-components=1; \
+        rm -rf "$node_tmp"; \
+    fi
 
 # Each agent CLI is installed globally, into /usr/local, and NEVER into a home
 # directory: $HOME inside the sandbox is a fresh tmpfs, so anything under it

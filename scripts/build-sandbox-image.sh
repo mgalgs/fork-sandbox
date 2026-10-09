@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build-sandbox-image.sh -- Build the sandbox image the container backend runs
 #
-# Usage: build-sandbox-image.sh [--tag NAME] [--claude VER] [--codex VER] [--pi VER] [--no-cache]
+# Usage: build-sandbox-image.sh [--base IMAGE] [--tag NAME] [--claude VER] [--codex VER] [--pi VER] [--no-cache]
 #        build-sandbox-image.sh --postmaster --base IMAGE [--tag NAME] [--no-cache]
 #
 # The container backend gets its userland from an image rather than from the
@@ -11,6 +11,10 @@
 # --tag names the result (default fork-sandbox:latest). --claude, --codex and
 # --pi pin an agent CLI to a version, or leave it out entirely with "none";
 # each defaults to "latest".
+# --base on a sandbox build replaces its pinned base with a project's own
+# Debian-family, apt-based image (Debian 12/bookworm or 13/trixie at least).
+# The build requires node 22 or newer and npm; it installs pinned node 22
+# from verified upstream tarballs when either is missing or too old.
 #
 # On success it prints the line to put in your environment:
 #
@@ -20,8 +24,8 @@
 # --postmaster builds images/postmaster/Dockerfile instead: a thin layer
 # (ssh, kubectl, this checkout's scripts/share/manifests) over an already-
 # built sandbox image, for running fork-sandbox-postmaster.sh as a cluster
-# Deployment -- see docs/cluster-postmaster.md. --base names that sandbox
-# image and is required with --postmaster; this script reads no config file,
+# Deployment -- see docs/cluster-postmaster.md. In this mode --base names the
+# already-built sandbox image and is required; this script reads no config file,
 # so it cannot default --base the way K8S_IMAGE defaults it elsewhere.
 # --tag still overrides the default, which is
 # fork-sandbox-postmaster:<git short sha>, with -dirty appended when the
@@ -87,9 +91,6 @@ if [[ "$POSTMASTER" == true ]]; then
         echo "base image (--base) already decided those." >&2
         exit 1
     fi
-elif [[ "$BASE_SET" == true ]]; then
-    echo "Error: --base only applies to --postmaster." >&2
-    exit 1
 fi
 
 CLI="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
@@ -151,6 +152,10 @@ fi
 
 echo "Building $TAG from $dockerfile" >&2
 echo "  claude=$CLAUDE_VERSION codex=$CODEX_VERSION pi=$PI_VERSION" >&2
+
+if [[ "$BASE_SET" == true ]]; then
+    EXTRA+=(--build-arg "BASE_IMAGE=$BASE_IMAGE")
+fi
 
 "$CLI" build \
     --tag "$TAG" \

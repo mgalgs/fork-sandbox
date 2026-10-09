@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# build-sandbox-image-test.sh -- scripts/build-sandbox-image.sh's --postmaster
-# mode, and a pinned check that plain (non-postmaster) builds are unchanged
+# build-sandbox-image-test.sh -- scripts/build-sandbox-image.sh's build modes
+# and a pinned check that default builds are unchanged
 #
 # Usage: tests/build-sandbox-image-test.sh
 #
@@ -94,11 +94,18 @@ rm -f "$record"
 refuses "--postmaster --pi refuses" "do not apply to --postmaster" \
     run_build --postmaster --base registry.example/you/fork-sandbox:latest --pi 1.2.3
 
-printf '\n== plain build refuses --base ==\n'
+printf '\n== --base requires an image reference ==\n'
 rm -f "$record"
-refuses "plain build --base refuses" "only applies to --postmaster" \
-    run_build --base registry.example/you/fork-sandbox:latest
-check "plain build --base never calls docker build" "" "$([[ -s "$record" ]] && cat "$record" || true)"
+refuses "--base without an image refuses" "--base requires an image reference" run_build --base ''
+check "missing base never calls docker build" "" "$([[ -s "$record" ]] && cat "$record" || true)"
+
+printf '\n== help explains both --base meanings ==\n'
+help="$(run_build --help)"
+if [[ "$help" == *'--base on a sandbox build'* && "$help" == *'In this mode --base names the'* ]]; then
+    ok "help explains sandbox and postmaster bases"
+else
+    no "help explains sandbox and postmaster bases" "$help"
+fi
 
 printf '\n== --postmaster --base renders the expected build ==\n'
 rm -f "$record"
@@ -190,6 +197,27 @@ PI_VERSION=1.2.3
 $scratch/images/sandbox
 EOF
 check "plain build with flags still matches the expected argv shape" "$expected_argv2" "$argv"
+
+printf '\n== sandbox --base combines with build options ==\n'
+rm -f "$record"
+run_build --base debian:trixie-slim --tag mine:latest --claude none --codex 1.2.3 --pi none --no-cache >/dev/null 2>&1
+argv="$(cat "$record")"
+read -r -d '' expected_argv3 <<EOF || true
+build
+--tag
+mine:latest
+--build-arg
+CLAUDE_VERSION=none
+--build-arg
+CODEX_VERSION=1.2.3
+--build-arg
+PI_VERSION=none
+--no-cache
+--build-arg
+BASE_IMAGE=debian:trixie-slim
+$scratch/images/sandbox
+EOF
+check "sandbox --base passes image and all build options" "$expected_argv3" "$argv"
 
 printf '\n=== %d ok / %d fail ===\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -39,6 +39,14 @@ suites need a compiler, a database client or a browser should build its own
 image `FROM` it. Any image meeting the requirements above works; nothing in
 the backend knows about that particular one.
 
+To put the agent CLIs on a project's own base image instead, run
+`scripts/build-sandbox-image.sh --base IMAGE`. This supports Debian-family,
+apt-based images, including Debian 12 (bookworm) and 13 (trixie). If the base
+lacks node 22 or newer or npm, the build installs pinned node 22 from an
+official release tarball after checking its published SHA256. With
+`--postmaster`, `--base IMAGE` instead names an already-built sandbox image
+and is required; see [cluster-postmaster.md](cluster-postmaster.md).
+
 It is also a supply-chain surface worth naming as one. It holds the agent CLIs
 and a run hands them the user's credential, which is why there is no published
 copy to pull: you build the thing you trust.
