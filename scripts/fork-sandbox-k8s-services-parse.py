@@ -202,6 +202,8 @@ def positive_int(value, path, lo=None, hi=None):
     if isinstance(value, bool) or not isinstance(value, int):
         fail(f"{path}: expected an integer, got {type(value).__name__}")
     if lo is not None and value < lo or hi is not None and value > hi:
+        if hi is None:
+            fail(f"{path}: must be at least {lo}, got {value}")
         fail(f"{path}: must be between {lo} and {hi}, got {value}")
     return value
 

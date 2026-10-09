@@ -15110,6 +15110,15 @@ if [[ "$svc_diag_out" == *"FATAL: could not read pg_hba.conf"* ]]; then
 else
     no "timeout diagnostics include a log tail for the unready container" "$svc_diag_out"
 fi
+if grep -q '^--context=test-context -n fork-sandbox-test logs stub-pod -c postgres .*--tail=20' \
+    "$svc_diag_log" \
+    && grep -q '^--context=test-context -n fork-sandbox-test logs stub-pod -c postgres --previous .*--tail=20' \
+        "$svc_diag_log"; then
+    ok "timeout diagnostic log reads use the configured context and namespace"
+else
+    no "timeout diagnostic log reads use the configured context and namespace" \
+        "$(cat "$svc_diag_log")"
+fi
 # The current instance's own tail is empty here (it only just restarted),
 # so the crash log above can only have reached submit's output via the
 # separate `kubectl logs --previous` tail this restartCount=3 triggers.
@@ -15240,8 +15249,12 @@ case "$verb" in
             *"pod -l job-name="*"-o name"*) printf 'pod/stub-pod\n' ;;
             *"pod -l job-name="*"-o jsonpath="*) printf 'stub-pod' ;;
             *"pod stub-pod -o json"*)
+                if [[ "${K8S_STUB_WAITING:-}" == 1 ]]; then
+                    printf '%s\n' '{"status":{"initContainerStatuses":[{"name":"postgres","ready":false,"restartCount":0,"state":{"waiting":{"reason":"ImagePullBackOff"}}},{"name":"service-ready","ready":false,"restartCount":0,"state":{"waiting":{"reason":"PodInitializing"}}}]}}'
+                    exit 0
+                fi
                 cat <<'JSON'
-{"status":{"initContainerStatuses":[{"name":"egress-gate","ready":true,"restartCount":0},{"name":"postgres","ready":true,"restartCount":2,"lastState":{"terminated":{"reason":"Error","exitCode":1}}},{"name":"service-ready","ready":false,"restartCount":0,"lastState":{"terminated":{"reason":"Error","exitCode":1}}}],"containerStatuses":[{"name":"agent","ready":true,"restartCount":0}]}}
+{"status":{"initContainerStatuses":[{"name":"egress-gate","ready":true,"restartCount":0},{"name":"postgres","ready":true,"restartCount":2,"lastState":{"terminated":{"reason":"Error","exitCode":1}}},{"name":"service-ready","ready":false,"restartCount":1,"state":{"waiting":{"reason":"CrashLoopBackOff"}},"lastState":{"terminated":{"reason":"Error","exitCode":1}}}],"containerStatuses":[{"name":"agent","ready":true,"restartCount":0}]}}
 JSON
                 ;;
             *) printf 'stub-pod\n' ;;
@@ -15253,6 +15266,7 @@ JSON
         esac
         ;;
     logs)
+        if [[ "${K8S_STUB_SLOW_LOG:-}" == 1 ]]; then sleep 6; fi
         case "$*" in
             *"-c postgres"*" --previous"*) printf 'FATAL: password authentication failed for user "dev"\n' ;;
             *"-c postgres"*) ;; # current instance just restarted -- nothing logged yet
@@ -15277,6 +15291,12 @@ else
     no "timeout diagnostics name the failed service-ready checker" \
         "rc=$sidecar_diag_rc out=$sidecar_diag_out"
 fi
+if [[ "$sidecar_diag_out" == *"previous log tail (kubectl logs stub-pod -c service-ready --previous)"* ]] \
+    && [[ "$sidecar_diag_out" != *"service-ready check has not started"* ]]; then
+    ok "crashed service-ready retains its previous log while waiting to retry"
+else
+    no "crashed service-ready retains its previous log while waiting to retry" "$sidecar_diag_out"
+fi
 if [[ "$sidecar_diag_out" == *'FATAL: password authentication failed for user "dev"'* ]]; then
     ok "timeout diagnostics tail the ready-but-broken sidecar's own log too"
 else
@@ -15291,6 +15311,31 @@ else
     no "timeout diagnostics also tail the previous log for a restarted ready-but-broken sidecar" "$sidecar_diag_out"
 fi
 rm -f /tmp/fs-k8s-test-sidecar-diag.out
+
+waiting_diag_out="$(PATH="$sidecar_diag_stub_dir:$PATH" K8S_STUB_WAITING=1 \
+    K8S_STUB_LOG="$sidecar_diag_log" HOME="$sidecar_diag_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-waiting-diag --model moonshotai/kimi-k3 --harness pi \
+    "$sidecar_diag_dir" "$handoff_file" 2>&1 </dev/null)"
+if [[ "$waiting_diag_out" == *"service-ready check has not started"* ]] \
+    && [[ "$waiting_diag_out" != *"service-ready's own check"* ]]; then
+    ok "waiting service-ready has no log tail or failed-check blame"
+else
+    no "waiting service-ready has no log tail or failed-check blame" "$waiting_diag_out"
+fi
+
+slow_start="$(date +%s)"
+slow_diag_out="$(PATH="$sidecar_diag_stub_dir:$PATH" K8S_STUB_SLOW_LOG=1 \
+    K8S_STUB_LOG="$sidecar_diag_log" HOME="$sidecar_diag_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-slow-diag --model moonshotai/kimi-k3 --harness pi \
+    "$sidecar_diag_dir" "$handoff_file" 2>&1 </dev/null)"
+slow_elapsed=$(( $(date +%s) - slow_start ))
+if (( slow_elapsed <= 11 )) && [[ "$slow_diag_out" == *"service-ready"* ]]; then
+    ok "all diagnostic log tails share a short timeout"
+else
+    no "all diagnostic log tails share a short timeout" "elapsed=$slow_elapsed $slow_diag_out"
+fi
 
 printf '\n== per-run services: --services-trust-ref gates the spec like the local hook ==\n'
 svc_trust_dir="$(mktemp -d "$HOME/src/fs-k8s-svc-trust-test.XXXXXX")"; tmpdirs+=("$svc_trust_dir")
@@ -15516,6 +15561,17 @@ services:
     readyWhen:
       tcpPort: 5432
       startupSeconds: 700
+'
+svc_refuses "readyWhen.startupSeconds zero" \
+    "readyWhen.startupSeconds: must be at least 1, got 0" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    readyWhen:
+      tcpPort: 5432
+      startupSeconds: 0
 '
 svc_refuses "too many services" \
     "more than the 8 allowed" \

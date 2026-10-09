@@ -5001,9 +5001,9 @@ cmd_check_grant() {
 # ready=true the moment it starts even when the service inside never opens
 # its port. When that happens, the ONLY unready container is the separate
 # service-ready checker, and its own log says "connection refused" or
-# similar -- not why the service itself failed. So whenever service-ready
-# is unready, every sidecar it is checking is tailed too, regardless of
-# that sidecar's own (possibly misleading) ready status.
+# similar -- not why the service itself failed. Once service-ready has
+# started and is unready, every sidecar it is checking is tailed too,
+# regardless of that sidecar's own (possibly misleading) ready status.
 #
 # A container with restartCount > 0 has a lastState.terminated to go with
 # that count, but its CURRENT instance -- the one plain `kubectl logs`
@@ -5011,6 +5011,17 @@ cmd_check_grant() {
 # starting, or waiting out CrashLoopBackOff). Whenever restarts > 0, also
 # tail `kubectl logs --previous`: that is where the crash the restart count
 # and last-exit-code are reporting actually printed its output.
+k8s_tail_diagnostic_log() {
+    local deadline="$1" pod="$2" container="$3" previous="$4" remaining
+    remaining=$(( deadline - $(date +%s) ))
+    (( remaining > 0 )) || return 1
+    local -a args=(logs "$pod" -c "$container")
+    [[ "$previous" == 1 ]] && args+=(--previous)
+    "$FS_TIMEOUT" "${remaining}s" kubectl --context="$K8S_CONTEXT" -n "$K8S_NAMESPACE" \
+        "${args[@]}" --tail=20 \
+        --request-timeout="${remaining}s" 2>/dev/null | sed 's/^/      /' >&2
+}
+
 k8s_report_unready_pod() {
     local pod="$1" ready_checks="${2:-}" pod_json
     if ! pod_json="$(kubectl get pod "$pod" -o json --request-timeout=60s 2>/dev/null)"; then
@@ -5031,7 +5042,15 @@ k8s_report_unready_pod() {
     echo "fork-sandbox-k8s: pod $pod did not become Ready in time. Unready container(s):" >&2
 
     local -a also_tail=()
-    if [[ -n "$ready_checks" ]] && grep -qx 'service-ready' <<< "$unready"; then
+    local service_ready_started
+    service_ready_started="$(jq -r '
+        .status.initContainerStatuses[]? | select(.name == "service-ready")
+        | if (.state.running != null or .state.terminated != null
+            or .lastState.terminated != null)
+          then "yes" else "no" end
+    ' <<< "$pod_json" 2>/dev/null || true)"
+    if [[ -n "$ready_checks" && "$service_ready_started" == yes ]] \
+        && grep -qx 'service-ready' <<< "$unready"; then
         local entry svc_name
         for entry in $ready_checks; do
             svc_name="${entry%%:*}"
@@ -5039,7 +5058,8 @@ k8s_report_unready_pod() {
         done
     fi
 
-    local c restarts reason exit_code
+    local c restarts reason exit_code log_deadline
+    log_deadline=$(( $(date +%s) + 8 ))
     while IFS= read -r c; do
         [[ -n "$c" ]] || continue
         restarts="$(jq -r --arg c "$c" '
@@ -5057,20 +5077,20 @@ k8s_report_unready_pod() {
             | .[0].lastState.terminated.exitCode // .[0].state.terminated.exitCode // "n/a"
         ' <<< "$pod_json" 2>/dev/null || echo "n/a")"
         echo "  - $c: restarts=$restarts last-reason=$reason last-exit-code=$exit_code" >&2
-        if [[ "$c" == agent ]]; then
+        if [[ "$c" == service-ready && "$service_ready_started" != yes ]]; then
+            echo "    log tail omitted: the service-ready check has not started." >&2
+        elif [[ "$c" == agent ]]; then
             echo "    log tail omitted: the agent container is the one that may hold a" >&2
             echo "    mounted Secret (--context-secret or the claude-token), so its raw log" >&2
             echo "    is never printed here." >&2
         else
             echo "    log tail (kubectl logs $pod -c $c):" >&2
-            if ! kubectl logs "$pod" -c "$c" --tail=20 --request-timeout=60s 2>/dev/null \
-                    | sed 's/^/      /' >&2; then
+            if ! k8s_tail_diagnostic_log "$log_deadline" "$pod" "$c" 0; then
                 echo "      (no log captured yet)" >&2
             fi
             if [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > 0 )); then
                 echo "    previous log tail (kubectl logs $pod -c $c --previous):" >&2
-                if ! kubectl logs "$pod" -c "$c" --previous --tail=20 --request-timeout=60s 2>/dev/null \
-                        | sed 's/^/      /' >&2; then
+                if ! k8s_tail_diagnostic_log "$log_deadline" "$pod" "$c" 1; then
                     echo "      (no previous log captured)" >&2
                 fi
             fi
@@ -5078,7 +5098,7 @@ k8s_report_unready_pod() {
     done <<< "$unready"
 
     local a
-    for a in "${also_tail[@]}"; do
+    for a in ${also_tail[@]+"${also_tail[@]}"}; do
         restarts="$(jq -r --arg c "$a" '
             (.status.initContainerStatuses // []) + (.status.containerStatuses // [])
             | map(select(.name == $c)) | .[0].restartCount // 0
@@ -5087,14 +5107,12 @@ k8s_report_unready_pod() {
         echo "    did not pass -- $a carries no probe of its own, so a service that" >&2
         echo "    crashed or never opened its port still shows ready:" >&2
         echo "    log tail (kubectl logs $pod -c $a):" >&2
-        if ! kubectl logs "$pod" -c "$a" --tail=20 --request-timeout=60s 2>/dev/null \
-                | sed 's/^/      /' >&2; then
+        if ! k8s_tail_diagnostic_log "$log_deadline" "$pod" "$a" 0; then
             echo "      (no log captured yet)" >&2
         fi
         if [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > 0 )); then
             echo "    previous log tail (kubectl logs $pod -c $a --previous):" >&2
-            if ! kubectl logs "$pod" -c "$a" --previous --tail=20 --request-timeout=60s 2>/dev/null \
-                    | sed 's/^/      /' >&2; then
+            if ! k8s_tail_diagnostic_log "$log_deadline" "$pod" "$a" 1; then
                 echo "      (no previous log captured)" >&2
             fi
         fi
