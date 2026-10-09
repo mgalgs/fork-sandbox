@@ -23,6 +23,23 @@ also refused — two sources for one fact is a setup mistake, not something
 this repo resolves silently by picking a winner. Every one of these is a
 hard error at launch, before anything is created.
 
+## Cluster postmaster
+
+`k8s.env` uses `K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL` and
+`K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK` together, with
+`K8S_POSTMASTER_HEADROOM_DIR` supplying the executable plugin. The pool
+contains laptop paths at install; the pod receives the matching Secret mount
+paths as `CLAUDE_CREDENTIAL_POOL` and the same hook name as
+`CLAUDE_HEADROOM_HOOK`. The single-file alternative is
+`K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE`. These forms are mutually exclusive.
+Install validates the pool and all token files before rendering.
+
+| Setting | Local launch | Cluster postmaster |
+|---|---|---|
+| Pool paths | `claude.env`, local files | `k8s.env`, copied into one Secret as in-pod paths |
+| Hook plugin | `PATH` or beside launcher | Executables from `K8S_POSTMASTER_HEADROOM_DIR` on pod `PATH` |
+| Single credential | `CLAUDE_CREDENTIALS` | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` |
+
 ## Precedence
 
 For any run with at least one `--harness claude` leg:

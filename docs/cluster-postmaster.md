@@ -70,6 +70,10 @@ Do these in order.
    | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |
    | `K8S_MAIL_TEAM_SUBJECTS` | no | who may use the mail API's shared team token: comma-separated `user:<name>` and `group:<name>`, no spaces. When set, install binds Role `fork-sandbox-mail-team` to exactly those subjects; unset (the default) renders the Role and no binding. Only meaningful with `K8S_MAIL_API_TOKENS_FILE`. See "Team access" in [mail-api.md](mail-api.md). |
    | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` | no | laptop path to a claude credentials JSON; when set, claude seats are accepted in the cluster. See "Claude seats in a cluster postmaster". |
+   | `K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL` | no | colon-separated absolute laptop paths to Claude credential files; set with `K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK` instead of the single file. |
+   | `K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK` | no | plugin name selected from `K8S_POSTMASTER_HEADROOM_DIR`; required with the pool. |
+   | `K8S_POSTMASTER_HEADROOM_DIR` | no | laptop directory of executable headroom plugins, shipped as a ConfigMap and put on the postmaster's `PATH`. |
+
 
    The rest of `k8s.env` (`K8S_CONTEXT`, `K8S_NAMESPACE`, and the rest) is
    read the same way a laptop run reads it, since the whole file is copied
@@ -319,15 +323,28 @@ within 7 days: a cluster that never refreshes the token cannot afford one
 that expires soon, so mint a longer-lived one with `claude setup-token`
 instead.
 
-One token serves every claude seat in the cluster, and every seat bills
-that subscription. A claude seat's in-pod review loop still runs pi: `--k8s
+For several accounts, set `K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL` to
+colon-separated absolute laptop paths, `K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK`
+to a plugin name, and `K8S_POSTMASTER_HEADROOM_DIR` to the directory holding
+its executable `fork-sandbox-headroom-<name>`. The pool and hook must be set
+together and cannot be combined with `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE`.
+Install checks every token, ships one Secret with a key for each distinct file
+basename, and passes in-pod paths to the hook at each Claude wake. The hook's
+own credential, if needed, belongs in the existing `K8S_POSTMASTER_HOOKS_SECRET`.
+See [credential-balancing.md](credential-balancing.md) for the contract.
+
+With the single-file form, one token serves every claude seat in the cluster,
+and every seat bills that subscription. A claude seat's in-pod review loop still runs pi: `--k8s
 --harness claude` requires `--review-harness pi`, unchanged by this
 feature.
 
 **Rotation** is the same as any other config change: replace the file at
 `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` and re-run `install --postmaster`.
 The credential is part of the `checksum/pm-config` annotation, so a
-changed file rolls the pod.
+changed file rolls the pod. For a pool, replace one account's file and rerun
+install; its Secret key updates and the pod rolls. A leak of the Claude Secret
+exposes every account in the pool, while a leak of one source file exposes
+that account. Limit access to the Secret and source files accordingly.
 
 ## Operators
 

@@ -18694,6 +18694,8 @@ check "claude credentials: the mail-api container gets no mount" "0" \
 check "claude credentials: the postmaster container sets FORK_SANDBOX_CLUSTER_CLAUDE=1" \
     "FORK_SANDBOX_CLUSTER_CLAUDE=1" \
     "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_CLUSTER_CLAUDE=')"
+check "claude credentials: single-file render has no pool env" "0" \
+    "$(pm_hooks_env_of postmaster | grep -c '^CLAUDE_CREDENTIAL_POOL=\|^CLAUDE_HEADROOM_HOOK=')"
 check "claude credentials: the mail-api container gets no such env" "0" \
     "$(pm_hooks_env_of mail-api | grep -c 'CLUSTER_CLAUDE')"
 check "claude credentials: the config ConfigMap carries claude.env" \
@@ -18726,6 +18728,61 @@ check "no claude credentials: no Secret" "0" \
 check "no claude credentials: no marker lines left" "0" \
     "$(grep -cE '# (>>>|<<<) claude-credentials' <<< "$pm_api_out")"
 check "no claude credentials: no claude.env key" "0" "$(grep -c 'claude.env' <<< "$pm_api_out")"
+
+# A pool uses one Secret with one key per file and ships the named plugin.
+pm_cfg_pool="$(pm_api_cfg)"
+mkdir -p "$pm_cfg_pool/headroom" "$pm_cfg_pool/accounts"
+for name in alpha beta; do
+    jq -n --arg t "token-$name" --argjson e "$pm_claude_future_ms" \
+        '{claudeAiOauth: {accessToken: $t, expiresAt: $e}}' > "$pm_cfg_pool/accounts/$name.json"
+    chmod 600 "$pm_cfg_pool/accounts/$name.json"
+done
+cat > "$pm_cfg_pool/headroom/fork-sandbox-headroom-example" <<'HOOK'
+#!/bin/sh
+printf '%s\n' "$1"
+HOOK
+chmod 755 "$pm_cfg_pool/headroom/fork-sandbox-headroom-example"
+{
+    printf 'K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$pm_cfg_pool/accounts/alpha.json" "$pm_cfg_pool/accounts/beta.json"
+    printf 'K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK=example\n'
+    printf 'K8S_POSTMASTER_HEADROOM_DIR=%s/headroom\n' "$pm_cfg_pool"
+} >> "$pm_cfg_pool/k8s.env"
+pm_api_install "$pm_cfg_pool"
+check "claude pool: install exits 0" 0 "$pm_api_rc"
+check "claude pool: one Secret create with two keys" 1 \
+    "$(grep 'create secret generic fork-sandbox-postmaster-claude' "$pm_api_log" | grep -c -- '--from-file=alpha.json=.*--from-file=beta.json=')"
+check "claude pool: pod config carries in-pod candidates" \
+    'CLAUDE_CREDENTIAL_POOL=/etc/fork-sandbox/claude/alpha.json:/etc/fork-sandbox/claude/beta.json' \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-config") | .data["claude.env"]' <<< "$pm_api_out" | head -1)"
+check "claude pool: container exports in-pod candidates" \
+    'CLAUDE_CREDENTIAL_POOL=/etc/fork-sandbox/claude/alpha.json:/etc/fork-sandbox/claude/beta.json' \
+    "$(pm_hooks_env_of postmaster | grep '^CLAUDE_CREDENTIAL_POOL=')"
+check "claude pool: container exports hook name" 'CLAUDE_HEADROOM_HOOK=example' \
+    "$(pm_hooks_env_of postmaster | grep '^CLAUDE_HEADROOM_HOOK=')"
+check "claude pool: headroom plugin is shipped" 'fork-sandbox-headroom-example' \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-headroom") | .data | keys | .[]' <<< "$pm_api_out")"
+check "claude pool: headroom PATH mount" 'headroom /etc/fork-sandbox/headroom true' \
+    "$(pm_hooks_mounts_of postmaster | grep '^headroom ')"
+check "claude pool: cluster gate env is set" 'FORK_SANDBOX_CLUSTER_CLAUDE=1' \
+    "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_CLUSTER_CLAUDE=')"
+pm_pool_sum="$(pm_api_sum)"
+printf ' ' >> "$pm_cfg_pool/accounts/alpha.json"
+pm_api_install "$pm_cfg_pool"
+check "claude pool: changing one file changes checksum" 1 \
+    "$([[ "$(pm_api_sum)" != "$pm_pool_sum" ]] && echo 1 || echo 0)"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s/accounts/alpha.json\n' "$pm_cfg_pool" >> "$pm_cfg_pool/k8s.env"
+pm_api_refused "claude pool: excludes single file" 'mutually exclusive' "$pm_cfg_pool"
+sed -i '/^K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=/d' "$pm_cfg_pool/k8s.env"
+sed -i '/^K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK=/d' "$pm_cfg_pool/k8s.env"
+pm_api_refused "claude pool: hook required" 'must be set together' "$pm_cfg_pool"
+printf 'K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK=missing\n' >> "$pm_cfg_pool/k8s.env"
+pm_api_refused "claude pool: missing hook refused" 'headroom hook fork-sandbox-headroom-missing' "$pm_cfg_pool"
+sed -i 's/^K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK=missing$/K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK=example/' "$pm_cfg_pool/k8s.env"
+jq -n --arg t 'token-beta' --argjson e "$pm_claude_soon_ms" \
+    '{claudeAiOauth: {accessToken: $t, expiresAt: $e}}' > "$pm_cfg_pool/accounts/beta.json"
+pm_api_refused "claude pool: expiring token names its file" "$pm_cfg_pool/accounts/beta.json" "$pm_cfg_pool"
+check "claude pool: expiring token explains refusal" 1 \
+    "$([[ "$pm_api_err" == *"expires too soon"* ]] && echo 1 || echo 0)"
 
 # 14j. A real (non-dry-run) install against pm_cfg_claude (git + tokens +
 # claude credentials all present, so all three postmaster Secrets are

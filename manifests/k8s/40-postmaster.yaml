@@ -220,6 +220,12 @@ spec:
             - name: FORK_SANDBOX_CLUSTER_CLAUDE
               value: "1"
               # <<< claude-credentials env
+            # >>> claude-pool env
+            - name: CLAUDE_CREDENTIAL_POOL
+              value: "__PM_CLAUDE_POOL__"
+            - name: CLAUDE_HEADROOM_HOOK
+              value: "__PM_CLAUDE_HOOK__"
+              # <<< claude-pool env
             # >>> presets env
             - name: FORK_SANDBOX_PRESETS_DIR
               value: /etc/fork-sandbox/presets
@@ -289,6 +295,11 @@ spec:
               mountPath: /etc/fork-sandbox/claude
               readOnly: true
               # <<< claude-credentials volumeMount
+            # >>> headroom volumeMount
+            - name: headroom
+              mountPath: /etc/fork-sandbox/headroom
+              readOnly: true
+              # <<< headroom volumeMount
             # >>> presets volumeMount
             - name: presets
               mountPath: /etc/fork-sandbox/presets
@@ -430,6 +441,12 @@ spec:
             secretName: fork-sandbox-postmaster-claude
             defaultMode: 0440
             # <<< claude-credentials volume
+        # >>> headroom volume
+        - name: headroom
+          configMap:
+            name: fork-sandbox-postmaster-headroom
+            defaultMode: 0555
+            # <<< headroom volume
         # >>> presets volume
         - name: presets
           configMap:

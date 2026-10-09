@@ -890,6 +890,18 @@
 #                         "Claude seats in a cluster postmaster". Rotating
 #                         its content rolls the pod.
 #
+#   K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL=
+#                         colon-separated absolute laptop credential paths;
+#                         set with K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK,
+#                         instead of K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE.
+#                         Basenames must be unique Secret keys.
+#   K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK=
+#                         lowercase plugin name required with the pool.
+#   K8S_POSTMASTER_HEADROOM_DIR=
+#                         optional flat laptop directory of executables;
+#                         shipped to the pod PATH as a ConfigMap. Required
+#                         with a pool and its named executable.
+#
 # The provider key is NOT in this file. install reads it from
 # ~/.config/fork-sandbox/pi.env (OPENROUTER_API_KEY=...), the same file a
 # local --harness pi run reads, so there is one credential source shared
@@ -1136,6 +1148,9 @@ K8S_POSTMASTER_OPERATORS="${K8S_POSTMASTER_OPERATORS:-@operator}"
 K8S_POSTMASTER_HOOKS_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_HOOKS_SECRET || true)"
 K8S_MAIL_API_TOKENS_FILE="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_FILE || true)"
 K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE || true)"
+K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL || true)"
+K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK || true)"
+K8S_POSTMASTER_HEADROOM_DIR="$(read_env_value "$k8s_env" K8S_POSTMASTER_HEADROOM_DIR || true)"
 K8S_MAIL_TEAM_SUBJECTS="$(read_env_value "$k8s_env" K8S_MAIL_TEAM_SUBJECTS || true)"
 # Free-form labels for this run, populated by resolve_run_labels in
 # cmd_submit. Declared empty here (module-global) so build_extra_label_lines
@@ -1333,6 +1348,8 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_ACCESS_MODE" \
         "$K8S_POSTMASTER_OPERATORS" "$K8S_POSTMASTER_HOOKS_SECRET" \
         "$K8S_MAIL_API_TOKENS_FILE" "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
+        "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" "$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" \
+        "$K8S_POSTMASTER_HEADROOM_DIR" \
         "$K8S_MAIL_TEAM_SUBJECTS" \
         || exit 1
 fi
@@ -3620,7 +3637,7 @@ cmd_install() {
             FORK_SANDBOX_HANDLERS_DIR="$config_dir/handlers"
             FORK_SANDBOX_PRESETS_DIR="$config_dir/presets"
         )
-        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" || -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
             pm_fleet_env+=(FORK_SANDBOX_CLUSTER_CLAUDE=1)
         fi
         if ! env "${pm_fleet_env[@]}" "$script_dir/fork-sandbox-fleet.sh" check --cluster; then
@@ -3692,6 +3709,50 @@ cmd_install() {
                 pm_team_subjects_yaml+="  - kind: $pm_ts_k"$'\n'"    name: \"$pm_ts_name\""$'\n'"    apiGroup: rbac.authorization.k8s.io"$'\n'
             done
         fi
+        local -a pm_claude_pool=() pm_claude_secret_args=() pm_claude_pod_paths=()
+        local pm_claude_pool_value=""
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" && -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+            echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL and K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE are mutually exclusive." >&2
+            exit 1
+        fi
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" && -z "$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" ]] ||
+           [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" && -n "$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" ]]; then
+            echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL and K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK must be set together." >&2
+            exit 1
+        fi
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+            if [[ ! "$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+                echo "Error: K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK must be a lowercase plugin name." >&2
+                exit 1
+            fi
+            if [[ "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" == :* || "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" == *: || "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" == *::* ]]; then
+                echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL has an empty entry." >&2
+                exit 1
+            fi
+            local pm_entry pm_key
+            local -A pm_seen_keys=()
+            IFS=':' read -r -a pm_claude_pool <<< "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL"
+            for pm_entry in "${pm_claude_pool[@]}"; do
+                if [[ "$pm_entry" != /* || "$pm_entry" =~ [[:space:]] ]]; then
+                    echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL entries must be absolute paths without whitespace: $pm_entry" >&2
+                    exit 1
+                fi
+                fs_reject_unsafe_chars "$pm_entry" || exit 1
+                pm_key="$(basename -- "$pm_entry")"
+                if [[ ! "$pm_key" =~ ^[A-Za-z0-9._-]+$ || -n "${pm_seen_keys[$pm_key]:-}" ]]; then
+                    echo "Error: duplicate or invalid Claude pool basename: $pm_key" >&2
+                    exit 1
+                fi
+                pm_seen_keys[$pm_key]=1
+                pm_claude_secret_args+=(--from-file="$pm_key=$pm_entry")
+                pm_claude_pod_paths+=("/etc/fork-sandbox/claude/$pm_key")
+            done
+            pm_claude_pool_value="$(IFS=:; printf '%s' "${pm_claude_pod_paths[*]}")"
+            if [[ -z "$K8S_POSTMASTER_HEADROOM_DIR" || ! -d "$K8S_POSTMASTER_HEADROOM_DIR" || ! -x "$K8S_POSTMASTER_HEADROOM_DIR/fork-sandbox-headroom-$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" ]]; then
+                echo "Error: headroom hook fork-sandbox-headroom-$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK is missing or not executable in K8S_POSTMASTER_HEADROOM_DIR." >&2
+                exit 1
+            fi
+        fi
         # K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE, when set, ships a
         # long-lived claude OAuth token into the cluster postmaster (see
         # docs/cluster-postmaster.md, "Claude seats in a cluster postmaster").
@@ -3699,28 +3760,33 @@ cmd_install() {
         # check below is a boolean jq -e test against the file directly --
         # so there is nothing to accidentally echo. expiresAt is not
         # secret, so it alone is read out, to compute the 7-day floor.
-        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
-            require_secret_file "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" || exit 1
+        local -a pm_credentials_to_check=()
+        [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]] || pm_credentials_to_check+=("$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE")
+        pm_credentials_to_check+=("${pm_claude_pool[@]}")
+        local pm_credential_file pm_credential_source=K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE
+        [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]] || pm_credential_source='K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL entry'
+        for pm_credential_file in "${pm_credentials_to_check[@]}"; do
+            require_secret_file "$pm_credential_file" || exit 1
             if ! jq -e '(.claudeAiOauth.accessToken | type == "string" and length > 0)' \
-                "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" >/dev/null 2>&1; then
-                echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=" >&2
-                echo "'$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE' has no non-empty" >&2
+                "$pm_credential_file" >/dev/null 2>&1; then
+                echo "Error: $pm_credential_source=" >&2
+                echo "'$pm_credential_file' has no non-empty" >&2
                 echo ".claudeAiOauth.accessToken." >&2
                 exit 1
             fi
             if ! jq -e '(.claudeAiOauth.expiresAt | type == "number")' \
-                "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" >/dev/null 2>&1; then
-                echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=" >&2
-                echo "'$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE' has no numeric" >&2
+                "$pm_credential_file" >/dev/null 2>&1; then
+                echo "Error: $pm_credential_source=" >&2
+                echo "'$pm_credential_file' has no numeric" >&2
                 echo ".claudeAiOauth.expiresAt." >&2
                 exit 1
             fi
             local pm_claude_expires_at_ms pm_claude_min_expiry_ms
             pm_claude_expires_at_ms="$(jq -r '.claudeAiOauth.expiresAt | floor' \
-                "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE")"
+                "$pm_credential_file")"
             pm_claude_min_expiry_ms=$(( ($(date +%s) + 7 * 86400) * 1000 ))
             if (( pm_claude_expires_at_ms < pm_claude_min_expiry_ms )); then
-                echo "Error: the access token in K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" >&2
+                echo "Error: the access token in $pm_credential_source '$pm_credential_file'" >&2
                 echo "expires too soon for a cluster that never refreshes it -- the" >&2
                 echo "postmaster pod loads it once at start and holds it for every" >&2
                 echo "claude seat until this file is replaced and install is rerun." >&2
@@ -3728,7 +3794,7 @@ cmd_install() {
                 echo "docs/cluster-postmaster.md, 'Claude seats in a cluster postmaster'." >&2
                 exit 1
             fi
-        fi
+        done
         # The postmaster image ships no platform plugin beyond generic and
         # the Deployment sets no FORK_SANDBOX_K8S_PLATFORM, so a seat
         # submitted from inside the pod always resolves the generic
@@ -3752,9 +3818,9 @@ cmd_install() {
     # apply, so the 900 KiB total-size guard and the subdirectory refusal
     # both fail loudly before a single kubectl call.
     local -a pm_config_paths=() pm_config_args=()
-    local -a pm_personas_args=() pm_prompts_args=() pm_handlers_args=() pm_hooks_args=() pm_presets_args=()
-    local -a pm_personas_paths=() pm_prompts_paths=() pm_handlers_paths=() pm_hooks_paths=() pm_presets_paths=()
-    local pm_have_personas=false pm_have_prompts=false pm_have_handlers=false pm_have_hooks=false pm_have_presets=false
+    local -a pm_personas_args=() pm_prompts_args=() pm_handlers_args=() pm_hooks_args=() pm_presets_args=() pm_headroom_args=()
+    local -a pm_personas_paths=() pm_prompts_paths=() pm_handlers_paths=() pm_hooks_paths=() pm_presets_paths=() pm_headroom_paths=()
+    local pm_have_personas=false pm_have_prompts=false pm_have_handlers=false pm_have_hooks=false pm_have_presets=false pm_have_headroom=false
     if $postmaster; then
         pm_config_args=(--from-file="k8s.env=$k8s_env")
         pm_config_paths=("$k8s_env")
@@ -3765,14 +3831,20 @@ cmd_install() {
         # The operator's own $config_dir/claude.env, if any, is never
         # shipped -- it names laptop paths. This one line is the pod's
         # own, pointing at the mount the claude Secret (below) lands on.
-        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" || -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
             # A global, not a local, and :- in the trap: the apply path
             # returns from cmd_install, so a local is out of scope when the
             # EXIT trap fires, and set -u aborts the trap with exit 1.
             K8S_INSTALL_CLAUDE_ENV="$(mktemp)"
             trap 'rm -f -- "${K8S_INSTALL_CLAUDE_ENV:-}"' EXIT
-            printf 'CLAUDE_CREDENTIALS=/etc/fork-sandbox/claude/credentials.json\n' \
-                > "$K8S_INSTALL_CLAUDE_ENV"
+            if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+                printf 'CLAUDE_CREDENTIAL_POOL=%s\nCLAUDE_HEADROOM_HOOK=%s\n' \
+                    "$pm_claude_pool_value" \
+                    "$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" > "$K8S_INSTALL_CLAUDE_ENV"
+            else
+                printf 'CLAUDE_CREDENTIALS=/etc/fork-sandbox/claude/credentials.json\n' \
+                    > "$K8S_INSTALL_CLAUDE_ENV"
+            fi
             pm_config_args+=(--from-file="claude.env=$K8S_INSTALL_CLAUDE_ENV")
             pm_config_paths+=("$K8S_INSTALL_CLAUDE_ENV")
         fi
@@ -3801,6 +3873,13 @@ cmd_install() {
             pm_hooks_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
             pm_hooks_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
         fi
+        if [[ -n "$K8S_POSTMASTER_HEADROOM_DIR" ]]; then
+            [[ -d "$K8S_POSTMASTER_HEADROOM_DIR" ]] || { echo "Error: K8S_POSTMASTER_HEADROOM_DIR is not a directory." >&2; exit 1; }
+            pm_have_headroom=true
+            pm_collect_configmap_files "$K8S_POSTMASTER_HEADROOM_DIR" true headroom || exit 1
+            pm_headroom_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
+            pm_headroom_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
+        fi
         if [[ -d "$config_dir/presets" ]]; then
             pm_have_presets=true
             pm_collect_configmap_files "$config_dir/presets" false || exit 1
@@ -3811,7 +3890,7 @@ cmd_install() {
         local pm_total=0 pm_biggest_file="" pm_biggest_bytes=0 pm_path pm_bytes
         for pm_path in "${pm_config_paths[@]}" "${pm_personas_paths[@]}" \
             "${pm_prompts_paths[@]}" "${pm_handlers_paths[@]}" \
-            "${pm_hooks_paths[@]}" "${pm_presets_paths[@]}"; do
+            "${pm_hooks_paths[@]}" "${pm_presets_paths[@]}" "${pm_headroom_paths[@]}"; do
             pm_bytes="$("$FS_STAT" -c '%s' -- "$pm_path")"
             pm_total=$(( pm_total + pm_bytes ))
             if (( pm_bytes > pm_biggest_bytes )); then
@@ -4263,7 +4342,7 @@ cmd_install() {
     # cluster is contacted yet), the checksum over them, and the postmaster
     # manifest template with its placeholders filled and its absent
     # optional blocks stripped. Needs $manifests_dir, just computed above.
-    local pm_config_yaml="" pm_personas_yaml="" pm_prompts_yaml="" pm_handlers_yaml="" pm_hooks_yaml="" pm_presets_yaml=""
+    local pm_config_yaml="" pm_personas_yaml="" pm_prompts_yaml="" pm_handlers_yaml="" pm_hooks_yaml="" pm_presets_yaml="" pm_headroom_yaml=""
     local pm_config_checksum="" pm_file_rendered="" tag
     local pm_git_secret_yaml="" pm_tokens_secret_yaml="" pm_claude_secret_yaml=""
     if $postmaster; then
@@ -4277,6 +4356,8 @@ cmd_install() {
             "${pm_handlers_args[@]}" --dry-run=client -o yaml)"
         $pm_have_hooks && pm_hooks_yaml="$(kubectl create configmap fork-sandbox-postmaster-hooks \
             "${pm_hooks_args[@]}" --dry-run=client -o yaml)"
+        $pm_have_headroom && pm_headroom_yaml="$(kubectl create configmap fork-sandbox-postmaster-headroom \
+            "${pm_headroom_args[@]}" --dry-run=client -o yaml)"
         $pm_have_presets && pm_presets_yaml="$(kubectl create configmap fork-sandbox-postmaster-presets \
             "${pm_presets_args[@]}" --dry-run=client -o yaml)"
 
@@ -4301,15 +4382,18 @@ cmd_install() {
                 --from-literal="team-token-sha256=$PM_TEAM_HASH" \
                 --dry-run=client -o yaml)"
         fi
-        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+            pm_claude_secret_yaml="$(kubectl create secret generic fork-sandbox-postmaster-claude \
+                "${pm_claude_secret_args[@]}" --dry-run=client -o yaml)"
+        elif [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
             pm_claude_secret_yaml="$(kubectl create secret generic fork-sandbox-postmaster-claude \
                 --from-file="credentials.json=$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
                 --dry-run=client -o yaml)"
         fi
 
-        pm_config_checksum="$(printf '%s%s%s%s%s%s%s%s%s' \
+        pm_config_checksum="$(printf '%s%s%s%s%s%s%s%s%s%s' \
             "$pm_config_yaml" "$pm_personas_yaml" "$pm_prompts_yaml" \
-            "$pm_handlers_yaml" "$pm_hooks_yaml" "$pm_presets_yaml" \
+            "$pm_handlers_yaml" "$pm_hooks_yaml" "$pm_presets_yaml" "$pm_headroom_yaml" \
             "$pm_git_secret_yaml" "$pm_tokens_secret_yaml" \
             "$pm_claude_secret_yaml" | k8s_sha256_stdin)"
 
@@ -4321,6 +4405,8 @@ cmd_install() {
             -e "s|__PM_MAIL_STORAGE__|$K8S_POSTMASTER_MAIL_STORAGE|g" \
             -e "s|__PM_CONFIG_CHECKSUM__|$pm_config_checksum|g" \
             -e "s|__PM_OPERATORS__|$K8S_POSTMASTER_OPERATORS|g" \
+            -e "s|__PM_CLAUDE_POOL__|$pm_claude_pool_value|g" \
+            -e "s|__PM_CLAUDE_HOOK__|$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK|g" \
             -e "s|__PM_HOOKS_SECRET__|${K8S_POSTMASTER_HOOKS_SECRET:-(none)}|g" \
             "$manifests_dir/40-postmaster.yaml")"
         if [[ -z "$K8S_POSTMASTER_STORAGE_CLASS" ]]; then
@@ -4367,10 +4453,18 @@ cmd_install() {
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
         fi
-        if [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+        if ! $pm_have_headroom; then
+            for tag in "headroom volumeMount" "headroom volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+        if [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" && -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
             for tag in "claude-credentials env" "claude-credentials volumeMount" "claude-credentials volume"; do
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
+        fi
+        if [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+            pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "claude-pool env")" || exit 1
         fi
         if ! $pm_have_presets; then
             for tag in "presets env" "presets volumeMount" "presets volume"; do
@@ -4451,6 +4545,7 @@ cmd_install() {
             $pm_have_prompts  && printf -- '---\n%s\n' "$pm_prompts_yaml"
             $pm_have_handlers && printf -- '---\n%s\n' "$pm_handlers_yaml"
             $pm_have_hooks    && printf -- '---\n%s\n' "$pm_hooks_yaml"
+            $pm_have_headroom && printf -- '---\n%s\n' "$pm_headroom_yaml"
             $pm_have_presets  && printf -- '---\n%s\n' "$pm_presets_yaml"
             printf '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.\n'
             [[ -z "$K8S_MAIL_API_TOKENS_FILE" ]] || \
@@ -4462,7 +4557,7 @@ cmd_install() {
                     printf '# (dry-run) would create Secret %s if absent ... -- not shown.\n' "$PM_TEAM_SECRET"
                 fi
             fi
-            [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]] || \
+            [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" && -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]] || \
                 printf '# (dry-run) would create Secret fork-sandbox-postmaster-claude ... -- not shown.\n'
             printf '%s\n' "$pm_file_rendered"
         fi
@@ -4504,6 +4599,7 @@ cmd_install() {
         $pm_have_prompts  && printf '%s\n' "$pm_prompts_yaml" | kubectl apply -f -
         $pm_have_handlers && printf '%s\n' "$pm_handlers_yaml" | kubectl apply -f -
         $pm_have_hooks    && printf '%s\n' "$pm_hooks_yaml" | kubectl apply -f -
+        $pm_have_headroom && printf '%s\n' "$pm_headroom_yaml" | kubectl apply -f -
         $pm_have_presets  && printf '%s\n' "$pm_presets_yaml" | kubectl apply -f -
         printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f - \
             --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts

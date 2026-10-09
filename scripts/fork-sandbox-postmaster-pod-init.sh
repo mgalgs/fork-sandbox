@@ -55,14 +55,16 @@
 #      fast-forward that is not possible (a diverged local branch, e.g.
 #      from manual `kubectl exec` surgery). A failed clone is fatal,
 #      since there is nothing to route on at all.
-#   7. execs fork-sandbox-postmaster.sh deliver --cluster --project
+#   7. Adds the optional headroom mount to PATH, then execs
+#      fork-sandbox-postmaster.sh deliver --cluster --project
 #      $HOME/src/$project, resolved next to this script (not via PATH).
 #
 # FORK_SANDBOX_SA_DIR overrides the ServiceAccount directory (default
 # /var/run/secrets/kubernetes.io/serviceaccount); FORK_SANDBOX_PM_DATA_DIR
 # overrides the data volume mount (default /var/tmp/claude-scratch);
 # FORK_SANDBOX_POSTMASTER_BIN overrides the postmaster binary this execs.
-# All three exist for tests only.
+# FORK_SANDBOX_PM_HEADROOM_DIR overrides the optional headroom mount
+# (default /etc/fork-sandbox/headroom). All four exist for tests only.
 
 set -euo pipefail
 
@@ -305,4 +307,9 @@ fi
 # --- 7. hand off to the postmaster ----------------------------------------
 
 pm_bin="${FORK_SANDBOX_POSTMASTER_BIN:-$script_dir/fork-sandbox-postmaster.sh}"
+# The optional headroom ConfigMap is mounted as executables in the pod.
+headroom_dir="${FORK_SANDBOX_PM_HEADROOM_DIR:-/etc/fork-sandbox/headroom}"
+if [[ -d "$headroom_dir" ]]; then
+    export PATH="$headroom_dir:$PATH"
+fi
 exec "$pm_bin" deliver --cluster --project "$repo_dir"

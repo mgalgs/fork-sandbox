@@ -108,6 +108,7 @@ setup_env() {
 : > "$pm_record"
 for a in "\$@"; do printf '%s\n' "\$a" >> "$pm_record"; done
 printf 'GIT_SSH_COMMAND=%s\n' "\${GIT_SSH_COMMAND:-}" > "$pm_env_record"
+printf 'PATH=%s\n' "\$PATH" >> "$pm_env_record"
 exit 0
 EOF
     chmod +x "$home/pm"
@@ -126,6 +127,7 @@ run_init() {
     FORK_SANDBOX_PM_DATA_DIR="$data_dir" \
     FORK_SANDBOX_GIT_SECRET_DIR="$secret_dir" \
     FORK_SANDBOX_POSTMASTER_BIN="$home/pm" \
+    FORK_SANDBOX_PM_HEADROOM_DIR="$home/headroom" \
     KUBERNETES_SERVICE_HOST="${TEST_K8S_HOST:-198.51.100.10}" \
     KUBERNETES_SERVICE_PORT="${TEST_K8S_PORT:-443}" \
     GIT_LOG="$git_log" \
@@ -368,6 +370,19 @@ if grep -qF "GIT_SSH_COMMAND=ssh -i $home/.ssh/deploy-key" "$pm_env_record" 2>/d
 else
     no "GIT_SSH_COMMAND is inherited by the postmaster" "$(cat "$pm_env_record" 2>/dev/null)"
 fi
+check "no headroom mount leaves PATH unchanged" "PATH=$full_tools" \
+    "$(grep '^PATH=' "$pm_env_record")"
+
+printf '\n== optional headroom mount on PATH ==\n'
+setup_env
+write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
+EOF
+mkdir -p "$home/headroom"
+run_init >/dev/null 2>&1
+check "headroom mount is prepended to PATH" "PATH=$home/headroom:$full_tools" \
+    "$(grep '^PATH=' "$pm_env_record")"
 
 printf '\n== scp-like URL is accepted ==\n'
 setup_env
