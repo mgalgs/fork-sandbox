@@ -1272,15 +1272,21 @@ case "$mode" in
         # fetch) gets a state-only stand-in. Every key summary.json carries
         # is passed through untouched; this only ever adds.
         #
-        # Once summary.json exists the run is over, by definition -- state
-        # is derived from ITS OWN exit_code (the same rule run_fleet_json's
-        # fleet-member case already applies), never from run_state(), which
-        # reads exit-code/pid files a composed or --k8s run's summary.json
-        # may stand in for without either ever existing on disk.
+        # summary.json is written before the Kubernetes collector tears
+        # down the run's cluster objects. Keep a live cluster finalizer in
+        # "working" until it exits. A local --keep-session runner instead
+        # execs an interactive shell after writing its summary, retaining
+        # the same pid indefinitely. The summary's exit_code decides success.
         reply_file_path="$run_dir/outbox/reply.md"
         if summary_json="$(run_file_read summary.json 2>/dev/null)"; then
+            finalizer_active=false
+            if [[ "$network" == "cluster" ]] && run_finalizer_alive; then
+                finalizer_active=true
+            fi
             printf '%s' "$summary_json" | jq --arg reply_file "$reply_file_path" \
-                '. + {state: (if (.exit_code | type) != "number" then "failed"
+                --argjson finalizer_active "$finalizer_active" \
+                '. + {state: (if $finalizer_active then "working"
+                              elif (.exit_code | type) != "number" then "failed"
                               elif .exit_code == 0 then "replied"
                               else "failed" end),
                       reply_file: $reply_file}'

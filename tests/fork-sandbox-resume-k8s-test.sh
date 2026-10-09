@@ -153,6 +153,8 @@ printf '{"type":"summary"}\n' > "$session_fixture_2/proj-enc/bbbb2222bbbb2222bbb
 # ---------------------------------------------------------------------------
 
 stub_bin="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-stub.XXXXXX)"
+export K8S_STUB_LOG="$stub_bin/kubectl.log"
+: > "$K8S_STUB_LOG"
 cat > "$stub_bin/git" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
@@ -210,6 +212,7 @@ case " $* " in
         printf '%s\n' '{"spec":{"containers":[{"name":"agent"}]}}' ;;
     *" get "*) printf 'stub-pod\n' ;;
     *" /work/repo.git rev-parse "*) printf '%s\n' "${K8S_STUB_BASE_SHA:-}"; exit 0 ;;
+    *" delete job "*) sleep "${K8S_STUB_DELETE_SLEEP:-0}"; exit 0 ;;
     *" delete "*) exit 0 ;;
     *" logs "*) printf 'stub pod log\n'; exit 0 ;;
     *" tar cf - -C /work/session-store "*)
@@ -248,12 +251,27 @@ wait_for_summary() {
     return 1
 }
 
+wait_for_teardown() {
+    local before="$1" rd="$2" count job
+    job="$(sed -n 's/^k8s_job_name=//p' "$rd/run.env" | head -1)"
+    for _ in $(seq 1 150); do
+        count="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
+        if (( count > before )) && grep -Fq -- \
+            "delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$job" \
+            "$K8S_STUB_LOG"; then return 0; fi
+        sleep 0.2
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 printf '\n== --resume --k8s: first submit starts a fresh conversation ==\n'
 # ---------------------------------------------------------------------------
 proj_head="$(git -C "$proj_dir" rev-parse HEAD)"
+deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
 export K8S_STUB_SESSION_DIR="$session_fixture_1" K8S_STUB_BASE_SHA="$proj_head"
-rd1="$(run_fs --resume "$state_dir" --k8s --harness claude --model claude-sonnet-5 "$proj_dir" "$note1")"
+rd1="$(K8S_STUB_DELETE_SLEEP=3 run_fs --resume "$state_dir" --k8s --harness claude \
+    --model claude-sonnet-5 "$proj_dir" "$note1")"
 rc1=$?
 check "submit 1: exits 0" "0" "$rc1"
 if [[ -n "$rd1" && -d "$rd1" ]]; then
@@ -271,6 +289,27 @@ if wait_for_summary "$rd1"; then
     ok "submit 1: the backgrounded submit+wait+collect actually finished"
 else
     no "submit 1: the backgrounded submit+wait+collect actually finished" "no summary.json after 30s"
+fi
+check "submit 1: status stays working while teardown is in progress" "working" \
+    "$("$status_sh" --json "$rd1" 2>/dev/null | jq -r '.state' 2>/dev/null)"
+if wait_for_teardown "$deletes_before" "$rd1"; then
+    ok "submit 1: teardown removed the run's Job after collect"
+else
+    no "submit 1: teardown removed the run's Job after collect"
+fi
+for _ in $(seq 1 100); do
+    [[ "$("$status_sh" --json "$rd1" 2>/dev/null | jq -r '.state' 2>/dev/null)" == replied ]] && break
+    sleep 0.1
+done
+check "submit 1: status replies only after teardown" "replied" \
+    "$("$status_sh" --json "$rd1" 2>/dev/null | jq -r '.state' 2>/dev/null)"
+job1="$(sed -n 's/^k8s_job_name=//p' "$rd1/run.env" | head -1)"
+if grep -Fq -- "delete configmap $job1-scripts" "$K8S_STUB_LOG" \
+    && grep -Fq -- "delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$job1" \
+        "$K8S_STUB_LOG"; then
+    ok "submit 1: teardown covers scripts, proxy objects, and token Secret"
+else
+    no "submit 1: teardown covers scripts, proxy objects, and token Secret"
 fi
 check "submit 1: summary.json exit_code" "0" "$(jq -r '.exit_code' "$rd1/summary.json" 2>/dev/null)"
 check "submit 1: client's session.json is untouched, byte-identical" \
@@ -326,6 +365,43 @@ check "submit 2: agent reply belongs to this run" "second agent reply" "$(cat "$
 check "submit 1: evidence remains its own" "first run event" "$(cat "$rd1/evidence/events.jsonl" 2>/dev/null)"
 check "submit 2: evidence belongs to this run" "second run event" "$(cat "$rd2/evidence/events.jsonl" 2>/dev/null)"
 
+printf '\n== --resume --k8s: a failed agent still collects and tears down ==\n'
+note_failed="$notes_dir/note-failed.md"; printf 'failed agent note\n' > "$note_failed"
+failed_base="$(git -C "$proj_dir" rev-parse "$branch2")"
+deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
+rd_failed="$(K8S_STUB_DELETE_SLEEP=3 K8S_STUB_RUN_COMPLETE_VALUE=1 \
+    K8S_STUB_BASE_SHA="$failed_base" \
+    run_fs --resume "$state_dir" --k8s --harness claude \
+    --model claude-sonnet-5 "$proj_dir" "$note_failed")"
+if wait_for_summary "$rd_failed"; then
+    ok "failed agent: collect wrote summary.json"
+else
+    no "failed agent: collect wrote summary.json"
+fi
+check "failed agent: summary.json records failure" "1" \
+    "$(jq -r '.exit_code' "$rd_failed/summary.json" 2>/dev/null)"
+check "failed agent: status stays working while teardown is in progress" "working" \
+    "$("$status_sh" --json "$rd_failed" 2>/dev/null | jq -r '.state' 2>/dev/null)"
+if wait_for_teardown "$deletes_before" "$rd_failed"; then
+    ok "failed agent: teardown removed the run's Job"
+else
+    no "failed agent: teardown removed the run's Job"
+fi
+for _ in $(seq 1 100); do
+    [[ "$("$status_sh" --json "$rd_failed" 2>/dev/null | jq -r '.state' 2>/dev/null)" == failed ]] && break
+    sleep 0.1
+done
+check "failed agent: status fails only after teardown" "failed" \
+    "$("$status_sh" --json "$rd_failed" 2>/dev/null | jq -r '.state' 2>/dev/null)"
+job_failed="$(sed -n 's/^k8s_job_name=//p' "$rd_failed/run.env" | head -1)"
+if grep -Fq -- "delete configmap $job_failed-scripts" "$K8S_STUB_LOG" \
+    && grep -Fq -- "delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$job_failed" \
+        "$K8S_STUB_LOG"; then
+    ok "failed agent: teardown covers scripts, proxy objects, and token Secret"
+else
+    no "failed agent: teardown covers scripts, proxy objects, and token Secret"
+fi
+
 # ---------------------------------------------------------------------------
 printf '\n== --resume --k8s: fork-sandbox'"'"'s own bookkeeping survived both runs ==\n'
 # ---------------------------------------------------------------------------
@@ -347,8 +423,8 @@ if [[ -f "$state_dir/.fork-sandbox/last-run-dir" ]]; then
 else
     no "the last-run-dir pointer survived both collects" "$(ls -la "$state_dir/.fork-sandbox" 2>&1)"
 fi
-check "the idempotency map still has exactly 2 rows (note1 once, note2 once)" \
-    "2" "$(wc -l < "$state_dir/.fork-sandbox/runs.tsv" 2>/dev/null | tr -d ' ')"
+check "the idempotency map has one row per submitted note" \
+    "3" "$(wc -l < "$state_dir/.fork-sandbox/runs.tsv" 2>/dev/null | tr -d ' ')"
 
 # ---------------------------------------------------------------------------
 printf '\n== --resume --k8s: status --json reports state: replied with a reply_file ==\n'
@@ -481,7 +557,7 @@ else
     no "shared evidence: refused extraction was mirrored into this run"
 fi
 
-tmpdirs+=("$rd1" "$rd2" "$rd3" "$shared_rd1" "$shared_rd2")
+tmpdirs+=("$rd1" "$rd2" "$rd_failed" "$rd3" "$shared_rd1" "$shared_rd2")
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

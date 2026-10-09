@@ -1267,6 +1267,13 @@ json="$("$status" --json "$rd_new")"
 [[ "$(printf '%s' "$json" | jq -r .harness)" == "claude" ]] \
     || { echo "json dropped an unrelated existing key: $json"; exit 1; }
 
+# A local --keep-session runner execs a shell after writing summary.json.
+# Its pid remains alive, but the run has finished and should be terminal.
+printf '%s\n' "$$" > "$rd_new/pid"
+json="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "replied" ]] \
+    || { echo "completed local run stayed working with a live shell: $json"; exit 1; }
+
 # 9b. The same, but a nonzero exit_code: state reads failed, not replied.
 printf '{"branch":"test-json-summary","exit_code":1,"harness":"claude"}' \
     > "$rd_new/summary.json"
@@ -1274,4 +1281,10 @@ json="$("$status" --json "$rd_new")"
 [[ "$(printf '%s' "$json" | jq -r .state)" == "failed" ]] \
     || { echo "json state wrong with a failed summary: $json"; exit 1; }
 
-echo "90 passed, 0 failed"
+# A cluster collector still owns teardown after it writes the summary.
+printf 'network=cluster\n' >> "$rd_new/run.env"
+json="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "working" ]] \
+    || { echo "cluster run finished before its live collector: $json"; exit 1; }
+
+echo "92 passed, 0 failed"
