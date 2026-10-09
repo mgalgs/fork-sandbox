@@ -6741,6 +6741,7 @@ CENV
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
    [[ -n "$context_secret" ]] && render_context_secret_section "$POD_CONTEXT_DIR" "$context_secret"
    [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
+   FS_BROWSER_DEFER_TO_POD=1 fs_emit_browser_section
    fs_emit_headless_turn_section
    printf 'X'; })"
     continuation_header="${continuation_header%X}"
@@ -7031,6 +7032,9 @@ $(indent_block < "$inbox_write_sh")
 $(indent_block < "$context_extract_sh")
   leg-loop.sh: |
 $(indent_block < "$leg_loop_sh")
+  browser.sh: |
+$(printf 'FORK_SANDBOX_BROWSER=%q\n' "${FORK_SANDBOX_BROWSER:-auto}" | indent_block)
+$(declare -f fs_detect_pod_browser fs_emit_browser_section fs_expand_browser_prompt | sed 's/[[:blank:]]*$//' | indent_block)
   handoff.md: |
 $(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${refresh_configmap_keys}${services_env_configmap_key}${service_ready_configmap_key}
 ---

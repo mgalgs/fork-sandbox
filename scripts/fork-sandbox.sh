@@ -4914,6 +4914,8 @@ fi
 if [[ "$k8s_runner_mode" == true ]]; then
     FS_BACKEND_TOOLCHAIN=host
     image_toolchain_version=""
+    # shellcheck disable=SC2034  # read by fs_emit_browser_section in the lib
+    FS_BROWSER_DEFER_TO_POD=1
     # Not fs_detect_browser: that function only skips host-chromium
     # detection when FS_BACKEND_TOOLCHAIN != host (image mode), which this
     # branch cannot use as its signal -- a pod run sets host above for

@@ -2769,10 +2769,18 @@ fs_detect_browser() {
 #   FS_BROWSER_PLAYWRIGHT         set by fs_detect_browser
 #   FS_BACKEND_CHROMIUM_OWN_SANDBOX  set by fs_backend_capabilities
 fs_emit_browser_section() {
+    if [[ "${FS_BROWSER_DEFER_TO_POD:-}" == 1 ]]; then
+        printf '%s\n' '%%FORK_SANDBOX_POD_BROWSER%%'
+        return 0
+    fi
     if [[ -n "$FS_BROWSER_CHROMIUM" || -n "$FS_BROWSER_PLAYWRIGHT" ]]; then
         local no_sandbox_line="Chromium's own sandbox works here; do not pass --no-sandbox."
         if [[ "$FS_BACKEND_CHROMIUM_OWN_SANDBOX" != 1 ]]; then
             no_sandbox_line="Chromium's own sandbox does not work here; pass --no-sandbox."
+        fi
+        if [[ "$FS_BACKEND_CHROMIUM_OWN_SANDBOX" == unknown ]]; then
+            no_sandbox_line="Chromium's own sandbox cannot be confirmed here;"
+            no_sandbox_line+=" pass --no-sandbox."
         fi
         if [[ -n "$FS_BROWSER_CHROMIUM" ]]; then
             cat <<EOF
@@ -2831,6 +2839,35 @@ No browser is available in this sandbox. Do not spend tool calls
 looking for one; if the task needs rendering, say so in your report.
 EOF
     fi
+}
+
+# The k8s host cannot inspect a per-run image. The pod expands the marker
+# immediately before handing each prompt to a session. Keep this detector
+# separate from fs_detect_browser: no host cache bind exists in a pod.
+fs_detect_pod_browser() {
+    FS_BROWSER_CHROMIUM=""
+    FS_BROWSER_PLAYWRIGHT=""
+    FS_BACKEND_CHROMIUM_OWN_SANDBOX=unknown
+    case "${FORK_SANDBOX_BROWSER:-auto}" in
+    0 | none) return 0 ;;
+    esac
+    local name
+    for name in chromium chromium-browser google-chrome-stable google-chrome; do
+        FS_BROWSER_CHROMIUM="$(command -v -- "$name" 2>/dev/null)" && break
+    done
+    return 0
+}
+
+fs_expand_browser_prompt() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == '%%FORK_SANDBOX_POD_BROWSER%%' ]]; then
+            fs_detect_pod_browser
+            fs_emit_browser_section
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$1"
 }
 
 # The test-run ledger: <outbox>/test-runs.jsonl, one JSON object per line,

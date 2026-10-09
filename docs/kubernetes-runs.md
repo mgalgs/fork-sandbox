@@ -534,7 +534,8 @@ takes: `mktemp -d` under the same
   run`, which threads it to `submit`.
 - `handoff.md` -- the pre-YAML rendered prompt, captured **at submit time**:
   the prompt `record` hashes and archives, matching the local run-log
-  contract. The ConfigMap's YAML clip chomping can normalize multiple
+  contract. Its Browser section is a marker until the pod expands it (see
+  below). The ConfigMap's YAML clip chomping can normalize multiple
   terminal newlines before the pod receives the prompt. It is not read again
   later, so the caller may edit or remove the original while the run is in
   flight.
@@ -546,6 +547,16 @@ takes: `mktemp -d` under the same
   project's `--k8s` suite directs fixture `record` calls to an isolated
   `HOME`, which cleanup deletes; it still tags those rows `source=test` to
   exercise the same provenance filtering as the local-path test suite.
+
+Browser-bearing pod prompts get a `## Browser` section when handed to a
+session. The pod checks its own image for a system chromium at that point,
+so a browser installed on the submitting host does not affect the result.
+`FORK_SANDBOX_BROWSER=0` or `none` on the host forces the no-browser message.
+When chromium is found, the prompt names the path resolved inside the pod and
+instructs the session to pass `--no-sandbox`: the pod runs as a non-root user,
+disables privilege escalation, and drops all capabilities, while user
+namespace support can vary by cluster. The default image has no browser;
+a custom image may include one.
 
 `submit` prints the directory's path on a line shaped exactly like the
 local launcher's own (`  run dir:  <path>`), as soon as the directory

@@ -313,6 +313,66 @@ contains "playwright-only, own sandbox broken: pass-no-sandbox line" "$out" \
 
 unset FS_BROWSER_CHROMIUM FS_BROWSER_PLAYWRIGHT FS_BACKEND_CHROMIUM_OWN_SANDBOX
 
+echo "== pod browser prompt expansion =="
+pod_bin="$scratch/pod-bin"
+mkdir -p "$pod_bin"
+ln -s /bin/cat "$pod_bin/cat"
+pod_prompt="$scratch/pod-prompt.md"
+FS_BROWSER_DEFER_TO_POD=1 fs_emit_browser_section > "$pod_prompt"
+contains "k8s prompt defers browser detection" "$(cat "$pod_prompt")" \
+    '%%FORK_SANDBOX_POD_BROWSER%%'
+pod_expected="$scratch/pod-expected.md"
+pod_expanded="$scratch/pod-expanded.md"
+FS_BROWSER_CHROMIUM=""
+FS_BROWSER_PLAYWRIGHT=""
+{
+    printf 'before-line\n'
+    fs_emit_browser_section
+    printf 'after-line\n'
+} > "$pod_expected"
+{
+    printf 'before-line\n'
+    cat "$pod_prompt"
+    printf 'after-line\n'
+} > "$pod_expanded"
+PATH="$pod_bin" fs_expand_browser_prompt "$pod_expanded" > "$pod_expanded.rendered"
+if cmp -s "$pod_expected" "$pod_expanded.rendered"; then
+    ok "pod expansion preserves the local browser section spacing"
+else
+    no "pod expansion preserves the local browser section spacing"
+fi
+cat > "$pod_bin/chromium" <<'BIN'
+#!/usr/bin/env bash
+exit 0
+BIN
+chmod +x "$pod_bin/chromium"
+out="$(PATH="$pod_bin" fs_expand_browser_prompt "$pod_prompt")"
+contains "pod image chromium path" "$out" "- chromium: $pod_bin/chromium"
+contains "pod chromium needs no-sandbox" "$out" \
+    "Chromium's own sandbox cannot be confirmed here; pass --no-sandbox."
+rm "$pod_bin/chromium"
+mkdir -p "$scratch/host-home/.cache/ms-playwright"
+out="$(HOME="$scratch/host-home" PATH="$pod_bin" \
+    fs_expand_browser_prompt "$pod_prompt")"
+contains "pod image without browser" "$out" "No browser is available in this sandbox."
+lacks "host Playwright cache does not leak into pod prompt" "$out" \
+    "playwright browser cache"
+FORK_SANDBOX_BROWSER=none
+cat > "$pod_bin/chromium" <<'BIN'
+#!/usr/bin/env bash
+exit 0
+BIN
+chmod +x "$pod_bin/chromium"
+out="$(PATH="$pod_bin" fs_expand_browser_prompt "$pod_prompt")"
+contains "host override suppresses pod chromium" "$out" \
+    "No browser is available in this sandbox."
+# shellcheck disable=SC2034  # read by fs_detect_pod_browser in the lib
+FORK_SANDBOX_BROWSER=0
+out="$(PATH="$pod_bin" fs_expand_browser_prompt "$pod_prompt")"
+contains "numeric host override suppresses pod chromium" "$out" \
+    "No browser is available in this sandbox."
+unset FORK_SANDBOX_BROWSER
+
 echo ""
 echo "$pass passed, $fail failed"
 (( fail == 0 ))

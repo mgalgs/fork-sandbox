@@ -1231,6 +1231,15 @@ if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint - < "$submit_out" 2>&1)"
     if [[ -z "$out" ]]; then ok "yamllint: submit --dry-run piped through stdin"; else no "yamllint: submit --dry-run piped through stdin" "$out"; fi
 fi
+if grep -q '%%FORK_SANDBOX_POD_BROWSER%%' \
+        <(sed -n '/^  handoff.md: |$/,/^---$/p' "$submit_out") \
+    && grep -q '^  browser.sh: |$' "$submit_out" \
+    && ! grep -q 'No browser is available in this sandbox' \
+        <(sed -n '/^  handoff.md: |$/,/^---$/p' "$submit_out"); then
+    ok "k8s handoff defers browser detection to the pod"
+else
+    no "k8s handoff defers browser detection to the pod" "$submit_out"
+fi
 if grep -q 'automountServiceAccountToken: false' "$submit_out"; then
     ok "rendered Job sets automountServiceAccountToken: false"
 else
@@ -12701,7 +12710,7 @@ claude_launch_checks=(
     'claude --dangerously-skip-permissions --print --verbose'
     '--output-format stream-json --model "$claude_model"'
     '--settings "$work_dir/inbox-settings.json" --include-hook-events'
-    '< "${1:-$mounts_dir/handoff.md}"'
+    '< <(fs_expand_browser_prompt "${1:-$mounts_dir/handoff.md}")'
     '> "${2:-$work_dir/events.jsonl}"'
     '2> "${3:-$work_dir/claude-stderr.log}"'
 )
@@ -13142,6 +13151,7 @@ refresh_ep_fns="$(sed -n '/^claude_hook_leg() {/,/^}/p;/^run_claude_continuation
     "$entrypoint_sh")"
 refresh_block_file="$(newdir)/refresh-block.sh"; tmpdirs+=("$(dirname "$refresh_block_file")")
 printf '%s\n' 'set -euo pipefail' ': "${RUN_DIR:=}"' "$refresh_ep_fns" \
+    "$(declare -f fs_expand_browser_prompt)" \
     "$claude_pod_credentials_fn" "$claude_block" \
     'printf "CLAUDE_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$refresh_block_file"
 # $1 threshold ("" = refresh off), $2 legs that write a hand-off, $3 legs that
@@ -16347,6 +16357,7 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
     # the archive's blank terminal lines before this write.
     expected_rundir_handoff="$({ fs_emit_prompt_preamble /work/clone /work/inbox \
         pi gated /work/outbox pod 67108864
+        FS_BROWSER_DEFER_TO_POD=1 fs_emit_browser_section
         fs_emit_headless_turn_section
         printf '\n---\n\n'
         cat -- "$rundir_handoff"

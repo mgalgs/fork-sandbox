@@ -144,6 +144,19 @@
 #                     seam.
 
 set -euo pipefail
+if [[ -r /mnt/fork-sandbox/browser.sh ]]; then
+    # shellcheck disable=SC1091  # generated ConfigMap key, not a source file
+    source /mnt/fork-sandbox/browser.sh
+else
+    # Direct loop tests have no ConfigMap; their prompts carry no marker.
+    fs_expand_browser_prompt() {
+        if grep -q '%%FORK_SANDBOX_POD_BROWSER%%' "$1"; then
+            echo "Error: browser.sh is missing from the pod ConfigMap." >&2
+            return 1
+        fi
+        cat "$1"
+    }
+fi
 
 : "${RUN_DIR:?RUN_DIR must be set}"
 : "${FORK_SANDBOX_LEG_HANDOFF_DIR:?FORK_SANDBOX_LEG_HANDOFF_DIR must be set}"
@@ -373,7 +386,8 @@ while true; do
     # loop's ignored signals, which survive exec: a leg would otherwise
     # ignore SIGTERM and SIGPIPE, and `timeout` could never stop it.
     ( trap - HUP INT QUIT USR1 USR2 PIPE ALRM TERM; exec "${argv[@]}" ) \
-        {reqlockfd}<&- < "$reqdir/stdin" > "$handoff/stdout" 2> "$handoff/stderr" &
+        {reqlockfd}<&- < <(fs_expand_browser_prompt "$reqdir/stdin") \
+        > "$handoff/stdout" 2> "$handoff/stderr" &
     child_pid=$!
     wait "$child_pid" && leg_rc=0 || leg_rc=$?
     kill -KILL "$hb_pid" 2>/dev/null || true

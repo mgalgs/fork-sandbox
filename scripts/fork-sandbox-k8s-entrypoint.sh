@@ -606,6 +606,8 @@ discover_model_facts() {
 }
 
 mounts_dir=/mnt/fork-sandbox
+# shellcheck disable=SC1091  # generated ConfigMap key, not a source file
+source "$mounts_dir/browser.sh"
 
 # fork-sandbox-lib.sh, shipped in only for --harness claude (see
 # render_claude_configmap_keys in fork-sandbox-k8s.sh): sourced here, before
@@ -1080,7 +1082,7 @@ run_pi_coding_leg() {
         pi_argv+=("${pi_extra_argv[@]}")
     fi
     "${pi_argv[@]}" \
-        < "$mounts_dir/handoff.md" \
+        < <(fs_expand_browser_prompt "$mounts_dir/handoff.md") \
         > "$work_dir/events.jsonl" \
         2> "$work_dir/pi-stderr.log"
 }
@@ -1610,7 +1612,7 @@ else
                 "FORK_SANDBOX_NUDGE_BASELINE=$claude_hook_dir/nudge-baseline")
         fi
         env "${leg_env[@]}" "${claude_argv[@]}" \
-            < "${1:-$mounts_dir/handoff.md}" \
+            < <(fs_expand_browser_prompt "${1:-$mounts_dir/handoff.md}") \
             > "${2:-$work_dir/events.jsonl}" \
             2> "${3:-$work_dir/claude-stderr.log}"
     }
