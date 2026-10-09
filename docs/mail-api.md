@@ -205,7 +205,7 @@ flag and refused, since there is no way to tell it from one.
 
 | verb | positionals | flags | auth |
 |---|---|---|---|
-| send | 0 | `--from --to* --cc* --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --context-secret --review-target` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--context-secret` also need cap `grant`; `--review-target` also needs cap `target` |
+| send | 0 | `--from --to* --cc* --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --context-secret --review-target --budget` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--context-secret` also need cap `grant`; `--review-target` also needs cap `target`; `--budget` needs no cap (it only lowers spend) |
 | reply | 0 | `--from --reply-to --body --to* --cc* --subject --attach* --hops --header* --upstream-head --upstream-state` | `--from` in the token's identities; `--upstream-head` and `--upstream-state` also need cap `upstream` |
 | show | 1 | | `read` |
 | tree | 1 | | `read` |
@@ -243,13 +243,14 @@ the flags are individually allowed, not that they are used together, so
 that check happens in `mail grant`/`mail send` as it always has.
 
 On `mail send` and `mail reply`, `--header` refuses any name that is
-`X-Version`, `X-Upstream-Head` or `X-Upstream-State`, or starts with
+`X-Version`, `X-Upstream-Head`, `X-Upstream-State` or `X-Thread-Budget`, or starts with
 `X-Review-Target`, compared case-insensitively (403, one line naming the
 reason). Those headers are the review-target and upstream contracts (see
 [docs/agent-mail.md](agent-mail.md)): only `mail send --review-target` and
 the postmaster may write the review-target ones, only `mail reply
 --upstream-head` may write `X-Upstream-Head`, and only `mail reply
---upstream-state` may write `X-Upstream-State`, so no caller may set them
+--upstream-state` may write `X-Upstream-State`, and only `mail send
+--budget` may write `X-Thread-Budget`, so no caller may set them
 through `--header`, including an operator token. `list`'s `--header`
 is a read-only filter and is never subject to this restriction.
 

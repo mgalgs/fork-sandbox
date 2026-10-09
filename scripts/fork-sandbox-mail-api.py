@@ -95,9 +95,9 @@ starts with '-' is a flag, so a positional that starts with '-' is refused.
 mail:
     send    0; --from --to* --cc* --subject --body --attach* --hops --header*
             --allow-namespace* --reach-probe* --context-secret
-            --review-target; --from in the token's identities (the three
-            grant flags also need cap grant, --review-target needs cap
-            target)
+            --review-target --budget; --from in the token's identities (the
+            three grant flags also need cap grant, --review-target needs cap
+            target; --budget needs no cap, it only lowers spend)
     reply   0; --from --reply-to --body --to* --cc* --subject --attach* --hops
             --header* --upstream-head --upstream-state; --from in the token's
             identities (--upstream-head and --upstream-state also need cap
@@ -113,11 +113,12 @@ postmaster:
     flag unflag: operator only
 (* = repeatable.) On mail send and mail reply (never on list, whose --header
 is a read-only filter), --header may not set
-X-Version, X-Upstream-Head, X-Upstream-State or a name that starts with
-X-Review-Target (case-insensitively): the review-target headers are that
+X-Version, X-Upstream-Head, X-Upstream-State, X-Thread-Budget or a name that
+starts with X-Review-Target (case-insensitively): the review-target headers are that
 contract's, and only mail's own --review-target flag and the postmaster may
 write them, X-Upstream-Head only comes from mail reply --upstream-head and
-X-Upstream-State only from mail reply --upstream-state -- these refusals
+X-Upstream-State only from mail reply --upstream-state, X-Thread-Budget only
+from mail send --budget -- these refusals
 apply to an operator token too. An operator passes every other check.
 --body must be '-': the
 body comes in stdin_b64. --attach names a key of "files" (a plain basename,
@@ -187,7 +188,8 @@ SPEC = {
             "--subject": VALUE, "--body": VALUE, "--attach": MULTI,
             "--hops": VALUE, "--header": MULTI,
             "--allow-namespace": MULTI, "--reach-probe": MULTI,
-            "--context-secret": VALUE, "--review-target": VALUE}),
+            "--context-secret": VALUE, "--review-target": VALUE,
+            "--budget": VALUE}),
         "reply": (0, 0, {
             "--from": VALUE, "--reply-to": VALUE, "--body": VALUE,
             "--to": MULTI, "--cc": MULTI, "--subject": VALUE,
@@ -244,6 +246,11 @@ UPSTREAM_STATE_HEADER_WHY = (
     "may set it")
 
 
+# X-Thread-Budget: only mail's own send --budget flag may produce it.
+THREAD_BUDGET_HEADER_WHY = (
+    "--header may not set X-Thread-Budget: only send --budget may set it")
+
+
 def refused_header_name(raw):
     """The reason --header may not set this header, or None if it may."""
     name = raw.split(":", 1)[0].strip().upper()
@@ -253,6 +260,8 @@ def refused_header_name(raw):
         return UPSTREAM_HEAD_HEADER_WHY
     if name == "X-UPSTREAM-STATE":
         return UPSTREAM_STATE_HEADER_WHY
+    if name == "X-THREAD-BUDGET":
+        return THREAD_BUDGET_HEADER_WHY
     return None
 
 

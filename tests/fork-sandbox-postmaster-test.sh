@@ -5426,12 +5426,14 @@ uh_sha="$(uh_commit "$uh_branch")"
 # Not called in a $( ) -- it re-roots the mail store in the CALLER's shell.
 uh_kickoff() {
     local to="$1"
+    local -a budget_args=()
+    [[ -z "${UH_BUDGET:-}" ]] || budget_args=(--budget "$UH_BUDGET")
     new_scratch_root FORK_SANDBOX_MAIL_ROOT
     export FORK_SANDBOX_MAIL_ROOT
     PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
     printf '%s\n' 'please revise' > "$work/body.tmp"
     UH_MID="$("$MAIL" send --from '@carol' --to "@$to" --subject 'upstream head topic' \
-        --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+        --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" "${budget_args[@]}" 2>/dev/null)"
     once
     once
     : > "$STUB_ARGV_LOG"
@@ -5745,6 +5747,48 @@ check "upstream-head case 8: a malformed value writes no state file" 0 \
     "$( [[ -e "$PM_STATE_DIR/upstream-head/$uh8_tid.env" ]] && echo 1 || echo 0 )"
 contains "upstream-head case 8: the ignored header is logged" \
     "$(cat "$work/once.out")" "pm upstream-head-ignored thread=$uh8_short reason=malformed"
+
+# ---- upstream-head case 9: a carry to @operator -- recorded, resets, wakes
+# nobody ----
+uh_kickoff ken; uh9_mid="$UH_MID"
+uh9_tid="$(thread_of "$uh9_mid")"
+"$postmaster" flag "$uh9_tid" "needs a human" >/dev/null 2>&1
+seq 1 5 > "$PM_STATE_DIR/spawns/$uh9_tid"
+reply_msg '@ci-demo' "$uh9_mid" 'carried' --to '@operator' --upstream-head "$uh_branch:$uh_sha" >/dev/null
+once
+check "upstream-head case 9: a carry to @operator records the head" 1 \
+    "$( [[ -e "$PM_STATE_DIR/upstream-head/$uh9_tid.env" ]] && echo 1 || echo 0 )"
+check "upstream-head case 9: it clears the needs-operator flag" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$uh9_tid" ]] && echo 1 || echo 0 )"
+check "upstream-head case 9: it resets the spawn count" 0 "$(spawn_count_of "$uh9_tid")"
+check "upstream-head case 9: it spawns no seat" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+not_contains "upstream-head case 9: no spawn event" "$(cat "$work/once.out")" "pm spawn"
+not_contains "upstream-head case 9: no flag event" "$(cat "$work/once.out")" "pm flag"
+
+# ---- a thread's own budget re-arms after an upstream-head reset ----
+UH_BUDGET=2 uh_kickoff ken; uh10_mid="$UH_MID"; unset UH_BUDGET
+uh10_tid="$(thread_of "$uh10_mid")"
+check "thread budget re-arm: the kickoff spent the thread's budget of 2" 2 "$(spawn_count_of "$uh10_tid")"
+printf '%s\n' 'one more' > "$work/body.tmp"
+"$MAIL" reply --from '@carol' --reply-to "$uh10_mid" --to '@ken' --body "$work/body.tmp" >/dev/null 2>&1
+once
+check "thread budget re-arm: at its budget the thread refuses a wake" \
+    "thread budget 2 exhausted" "$(cat "$PM_STATE_DIR/needs-operator/$uh10_tid" 2>/dev/null)"
+reply_msg '@ci-demo' "$uh10_mid" 'carry' --to '@ken' --upstream-head "$uh_branch:$uh_sha" >/dev/null
+once
+check "thread budget re-arm: the carry resets the count and ken wakes" 1 "$(spawn_count_of "$uh10_tid")"
+"$MAIL" reply --from '@carol' --reply-to "$uh10_mid" --to '@ken' --body "$work/body.tmp" >/dev/null 2>&1
+once
+check "thread budget re-arm: the thread then spends its own budget again" 2 "$(spawn_count_of "$uh10_tid")"
+"$MAIL" reply --from '@carol' --reply-to "$uh10_mid" --to '@ken' --body "$work/body.tmp" >/dev/null 2>&1
+once
+check "thread budget re-arm: and is exhausted at 2, not at the global" \
+    "thread budget 2 exhausted" "$(cat "$PM_STATE_DIR/needs-operator/$uh10_tid" 2>/dev/null)"
+uh10_json="$("$postmaster" status --thread "$uh10_tid" --json)"
+check "status: budget is the thread's own" 2 "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["budget"])' "$uh10_json")"
+check "status: budget_source is thread" thread "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["budget_source"])' "$uh10_json")"
+check "status: spawns is reset by the carry" 2 "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["spawns"])' "$uh10_json")"
+check "status: spawns_total is not" 4 "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["spawns_total"])' "$uh10_json")"
 
 # ---- case 2: a local seat on the same fleet spawns exactly as before ----
 
@@ -7623,11 +7667,15 @@ check "wake-deferred: a retry spawns the seat" 1 "$(wg_spawns hana)"
 check "wake-deferred: and clears its record" 0 \
     "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
 
-# ---- the budget reserve: the last spawns of a thread's budget ----
-# Budget 10 with 3 reserved: the band is 7 <= spawns so far < 10. carol and
-# hana may spawn inside it; alice, bob and dana may not.
-sed -i '1i budget-reserve:\n  spawns: 3\n  agents: [carol, hana]' "$FORK_SANDBOX_FLEET_FILE"
-export FORK_SANDBOX_THREAD_BUDGET=10
+# ---- the per-thread budget (X-Thread-Budget on the root) ----
+# bt_send <budget> <to> <subject>: a root carrying `send --budget`.
+bt_send() {
+    printf 'body\n' > "$work/body.tmp"
+    "$MAIL" send --from @dana --to "$2" --subject "$3" --body "$work/body.tmp" --budget "$1" 2>/dev/null
+}
+bt_root() { printf '%s' "$FORK_SANDBOX_MAIL_ROOT/threads/$1/"*-"$1".msg; }
+bt_status() { FORK_SANDBOX_THREAD_BUDGET=10 "$postmaster" status --thread "$1" --json; }
+bt_key() { python3 -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])' "$1" "$2"; }
 wg_seed() { mkdir -p -- "$WG_STATE/spawns"; seq 1 "$1" > "$WG_STATE/spawns/$tid"; }
 wg_finish_quiet() {
     local rd
@@ -7636,6 +7684,98 @@ wg_finish_quiet() {
     printf '0\n' > "$rd/exit-code"
     printf '{}\n' > "$rd/summary.json"
 }
+
+wg_new_store
+for bt_case in "5 5 thread" "10 10 thread" "50 10 global" "0 10 global" "007 10 global" "abc 10 global"; do
+    read -r bt_hdr bt_want bt_src <<< "$bt_case"
+    mid="$(bt_send 5 '@bob' "budget $bt_hdr")"
+    tid="$(thread_of "$mid")"
+    sed -i "s/^X-Thread-Budget: .*/X-Thread-Budget: $bt_hdr/" "$(bt_root "$tid")"
+    bt_json="$(bt_status "$tid")"
+    check "per-thread budget: header $bt_hdr gives budget $bt_want" "$bt_want" "$(bt_key "$bt_json" budget)"
+    check "per-thread budget: header $bt_hdr gives source $bt_src" "$bt_src" "$(bt_key "$bt_json" budget_source)"
+done
+mid="$(send_msg '@dana' '@bob' 'no budget header' 'body' 8)"
+tid="$(thread_of "$mid")"
+bt_json="$(bt_status "$tid")"
+check "per-thread budget: no header gives the global budget" "10" "$(bt_key "$bt_json" budget)"
+check "per-thread budget: no header gives source global" "global" "$(bt_key "$bt_json" budget_source)"
+
+# Absent header: exhaustion at the global budget, as always.
+wg_new_store
+mid="$(send_msg '@dana' '@bob' 'global exhaustion' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+FORK_SANDBOX_THREAD_BUDGET=10 wg_seed 9
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: no header, 9 of 10 spawns still wakes" 1 "$(wg_spawns bob)"
+wg_finish_quiet bob
+mid2="$(reply_msg '@dana' "$mid" 'again' --to '@bob')"
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: no header, exhausted at the global 10" "thread budget 10 exhausted" "$(wg_flag_file)"
+
+# A header lower than the global exhausts the thread early.
+wg_new_store
+mid="$(bt_send 2 '@bob' 'own budget 2')"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: the first message wakes" 1 "$(wg_spawns bob)"
+wg_finish_quiet bob
+reply_msg '@dana' "$mid" 'two' --to '@bob' > /dev/null
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: the second message wakes" 2 "$(wg_spawns bob)"
+wg_finish_quiet bob
+reply_msg '@dana' "$mid" 'three' --to '@bob' > /dev/null
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: the third is refused" 2 "$(wg_spawns bob)"
+check "per-thread budget: the flag names the thread's own budget" "thread budget 2 exhausted" "$(wg_flag_file)"
+contains "per-thread budget: the refusal is reason=budget" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=bob reason=budget"
+
+# A header above the global is clamped to it.
+wg_new_store
+mid="$(bt_send 50 '@bob' 'clamped')"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+FORK_SANDBOX_THREAD_BUDGET=10 wg_seed 10
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: a header above the global is clamped" "thread budget 10 exhausted" "$(wg_flag_file)"
+
+# A follow-up wake and a retry both honor the thread's own budget.
+wg_new_store
+mid="$(bt_send 2 '@carol' 'follow-up')"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+FORK_SANDBOX_THREAD_BUDGET=10 once
+reply_msg '@dana' "$mid" 'second' --to '@carol' > /dev/null
+FORK_SANDBOX_THREAD_BUDGET=10 once
+wg_seed 2
+wg_finish_quiet carol
+: > "$STUB_ARGV_LOG"
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: a follow-up wake at the thread's budget is refused" 0 "$(wg_spawns carol)"
+contains "per-thread budget: the follow-up refusal is reason=budget" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=carol reason=budget"
+check "per-thread budget: the follow-up flag names the budget" "thread budget 2 exhausted" "$(wg_flag_file)"
+
+wg_new_store
+mid="$(bt_send 2 '@dana' 'retry')"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+FORK_SANDBOX_THREAD_BUDGET=10 once
+wg_seed 1
+mkdir -p -- "$WG_STATE/retries/$tid"
+printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$mid" > "$WG_STATE/retries/$tid/carol"
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: a retry below the budget spawns" 1 "$(wg_spawns carol)"
+wg_seed 2
+printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$mid" > "$WG_STATE/retries/$tid/bob"
+FORK_SANDBOX_THREAD_BUDGET=10 once
+check "per-thread budget: a retry at the budget is refused" 0 "$(wg_spawns bob)"
+contains "per-thread budget: the retry refusal is reason=budget" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=bob reason=budget"
+
+# ---- the budget reserve: the last spawns of a thread's budget ----
+# Budget 10 with 3 reserved: the band is 7 <= spawns so far < 10. carol and
+# hana may spawn inside it; alice, bob and dana may not.
+sed -i '1i budget-reserve:\n  spawns: 3\n  agents: [carol, hana]' "$FORK_SANDBOX_FLEET_FILE"
+export FORK_SANDBOX_THREAD_BUDGET=10
 wg_record() { cat "$WG_STATE/budget-reserved/$tid" 2>/dev/null || true; }
 
 wg_new_store
@@ -7788,6 +7928,71 @@ contains "quiescent hook: sees the budget-reserved reason" "$(wg_qseen 2)" "@bob
 rm -f "$WG_HOOKS/on-quiescent"
 unset FORK_SANDBOX_POSTMASTER_HOOK_DETACH
 
+# The reserve inside a thread's own budget: band = [budget - reserve, budget).
+wg_new_store
+mid="$(bt_send 6 '@bob,@carol' 'own band')"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 3
+once
+check "thread band: inside [3, 6) the reserved seat spawns" 1 "$(wg_spawns carol)"
+check "thread band: inside [3, 6) the other seat is refused" 0 "$(wg_spawns bob)"
+contains "thread band: the refusal is budget-reserved" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=bob reason=budget-reserved"
+wg_finish_quiet carol
+once
+check "thread band: the quiescent flag names the thread's budget" \
+    "thread budget 6: @bob refused at $mid (last 3 spawns reserved for @carol, @hana) and nothing woke it" \
+    "$(wg_flag_file)"
+wg_new_store
+mid="$(bt_send 6 '@bob,@carol' 'below own band')"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+wg_seed 2
+once
+check "thread band: below it the non-reserved seat spawns" 1 "$(wg_spawns bob)"
+check "thread band: below it the reserved seat spawns" 1 "$(wg_spawns carol)"
+
+# A budget within the reserve wakes nobody and is flagged once.
+for bt_b in 3 2; do
+    wg_new_store
+    mid="$(bt_send "$bt_b" '@bob,@carol' "within reserve $bt_b")"
+    tid="$(thread_of "$mid")"; short="${tid:0:8}"
+    once
+    check "within reserve ($bt_b): a non-reserved seat does not wake" 0 "$(wg_spawns bob)"
+    check "within reserve ($bt_b): a reserved seat does not wake" 0 "$(wg_spawns carol)"
+    contains "within reserve ($bt_b): each candidate is refused" "$(cat "$work/once.out")" \
+        "pm refuse thread=$short agent=carol reason=budget"
+    check "within reserve ($bt_b): the reason names both numbers" \
+        "thread budget $bt_b is within the fleet's budget-reserve spawns (3)" "$(wg_flag_file)"
+    contains "within reserve ($bt_b): the keyword is budget-reserve" "$(cat "$work/once.out")" \
+        "pm flag thread=$short reason=budget-reserve"
+    check "within reserve ($bt_b): flagged once" 1 "$(wg_flags)"
+done
+reply_msg '@dana' "$mid" 'again' --to '@bob' > /dev/null
+once
+check "within reserve: a second message while flagged adds no flag" 1 "$(wg_flags)"
+check "within reserve: it still wakes nobody" 0 "$(wg_spawns bob)"
+reply_msg '@operator' "$mid" 'carry on' --to '@operator' > /dev/null
+once
+check "within reserve: operator mail clears the flag and the standing condition re-raises it" 2 "$(wg_flags)"
+reply_msg '@dana' "$mid" 'and again' --to '@bob' > /dev/null
+once
+check "within reserve: the re-raised flag is not raised again" 2 "$(wg_flags)"
+
+# A follow-up wake is refused the same way.
+wg_new_store
+mid="$(bt_send 6 '@carol' 'within reserve follow-up')"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+reply_msg '@dana' "$mid" 'second' --to '@carol' > /dev/null
+once
+sed -i "s/^X-Thread-Budget: .*/X-Thread-Budget: 2/" "$(bt_root "$tid")"
+wg_finish_quiet carol
+: > "$STUB_ARGV_LOG"
+once
+check "within reserve: a follow-up wake is refused" 0 "$(wg_spawns carol)"
+check "within reserve: and flagged with the reserve reason" \
+    "thread budget 2 is within the fleet's budget-reserve spawns (3)" "$(wg_flag_file)"
+
 # Startup: a reserve that is not smaller than the budget refuses to start.
 wg_new_store
 wg_rc="$(FORK_SANDBOX_THREAD_BUDGET=3 once_rc)"
@@ -7924,7 +8129,7 @@ we5_json="$(we_json "$we5_tid")"
 check "wake-exit adversarial: the status output is one line of valid JSON" 1 \
     "$(printf '%s\n' "$we5_json" | wc -l)"
 check "wake-exit adversarial: top-level keys are unchanged" \
-    "flag,grant,held,retries,review_target,runs,spawns,thread,unrouted,wake_failures" \
+    "budget,budget_source,flag,grant,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted,wake_failures" \
     "$(we_py "$we5_json" '",".join(sorted(d))')"
 check "wake-exit adversarial: the flag is still the postmaster's own" "wake for karen exited 1" \
     "$(we_py "$we5_json" 'd["flag"]["reason"][:23]')"
@@ -8004,7 +8209,7 @@ new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 we8_tid="$(thread_of "$(send_msg '@carol' '@karen' 'wake exit clean' 'first' 8)")"
 once
-check "wake-exit: a clean wake adds no wake_failures key" "flag,grant,held,retries,review_target,runs,spawns,thread,unrouted" \
+check "wake-exit: a clean wake adds no wake_failures key" "budget,budget_source,flag,grant,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted" \
     "$(we_py "$(we_json "$we8_tid")" '",".join(sorted(d))')"
 check "wake-exit: a clean wake writes no wake-exits state" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-exits" ]] && echo 1 || echo 0)"
@@ -8502,7 +8707,8 @@ bad = []
 def want(label, got, exp):
     if got != exp:
         bad.append(f"{label}: expected {exp!r}, got {got!r}")
-want("keys", sorted(d), ["flag", "grant", "held", "retries", "review_target", "runs", "spawns", "thread", "unrouted"])
+want("keys", sorted(d), ["budget", "budget_source", "flag", "grant", "held", "retries", "review_target", "runs", "spawns", "spawns_total", "thread", "unrouted"])
+want("budget", [d["budget"], d["budget_source"], d["spawns_total"]], [96, "global", 0])
 want("thread", d["thread"], t)
 want("unrouted counts this thread only, keyed on Message-ID", d["unrouted"], 1)
 want("flag", d["flag"], {"reason": "hops exhausted at " + t, "events": 2})
@@ -8531,7 +8737,7 @@ check "status --json: a flag without its journal has events null" \
 
 sfx_empty="$(sfx_pm status --thread "ffffffff-4444-4444-8444-000000000009" --json)"
 check "status --json: a thread with no state is all empty or zero" \
-    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": []}' \
+    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": [], "budget": 96, "budget_source": "global", "spawns_total": 0}' \
     "$sfx_empty"
 
 sfx_rc=0; sfx_out="$(sfx_pm status --json 2>&1)" || sfx_rc=$?

@@ -9,7 +9,7 @@
 #                              [--allow-namespace NS[:PORT]]...
 #                              [--reach-probe HOST:PORT]... [--context-ro DIR]
 #                              [--context-secret NAME]
-#                              [--review-target <branch>:<sha>]
+#                              [--review-target <branch>:<sha>] [--budget <n>]
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
@@ -41,8 +41,8 @@
 # but print it (headers, blank line, body) on stdout instead of storing it,
 # and write nothing to the store. The printed form is PORTABLE: every bare
 # address is qualified with this host's peer name, so it means the same on
-# any host. --emit does not carry attachments, grants, --review-target or
-# the upstream flags (refused). It exists so lane-mail.sh can deliver a
+# any host. --emit does not carry attachments, grants, --review-target,
+# --budget or the upstream flags (refused). It exists so lane-mail.sh can deliver a
 # message to another host before anything is written here.
 #
 # `ingest [--peer <name>]` reads one complete message from stdin (as --emit
@@ -51,7 +51,8 @@
 # refuses (one-line error, exit 1): a message over 1 MiB, a malformed or
 # duplicated core header, a missing core header (Message-ID, Thread-ID, Date,
 # From, To, Subject, X-Hops), an id that is not a store-shaped id, the
-# reserved headers X-Attachment, X-Upstream-*, X-Review-Target* and X-Version,
+# reserved headers X-Attachment, X-Upstream-*, X-Review-Target*, X-Version and
+# X-Thread-Budget,
 # an invalid address, an empty body, and a Message-ID already in the store.
 # With --peer the message is treated as received from that peer: From must
 # name that host (a bare From is qualified with it; any other host is
@@ -145,6 +146,13 @@
 #                                 3), not this store's; --hops just gives
 #                                 it (or an operator) the override to do it
 #                                 with
+#   X-Thread-Budget: <n>          `send --budget <n>` only (a positive
+#                                 integer, no leading zero, refused before
+#                                 the thread exists): this thread's own cap
+#                                 on seat spawns, on the thread's root
+#                                 only. The postmaster uses the lower of it
+#                                 and its global budget; absent means the
+#                                 global one (docs/agent-mail.md)
 #   X-<Name>: <value>             any number of caller-supplied custom
 #                                 headers, via a repeatable --header
 #                                 'X-Name: value' flag on send/reply. Name
@@ -152,11 +160,13 @@
 #                                 X- headers may be set this way; core
 #                                 headers are refused by the name pattern
 #                                 alone) and may not be X-Hops,
-#                                 X-Attachment, X-Upstream-Head or
-#                                 X-Upstream-State (any letter case), which
-#                                 this store writes itself (the last two only
-#                                 via `reply --upstream-head` and
-#                                 `reply --upstream-state`). --header
+#                                 X-Attachment, X-Upstream-Head,
+#                                 X-Upstream-State or X-Thread-Budget (any
+#                                 letter case), which this store writes
+#                                 itself (the upstream ones only via
+#                                 `reply --upstream-head` and
+#                                 `reply --upstream-state`, the budget only
+#                                 via `send --budget`). --header
 #                                 does not refuse
 #                                 X-Review-Target/X-Review-Target-Set/
 #                                 X-Version -- those are stamped by
@@ -321,7 +331,7 @@ mail_validate_no_newline() {
 # any name that isn't ^X-[A-Za-z0-9-]+$ (core, non-X headers are refused by
 # this pattern alone -- only custom X- headers may be set this way), and the
 # reserved names this store writes itself (X-Hops, X-Attachment,
-# X-Upstream-Head, X-Upstream-State), in any letter case.
+# X-Upstream-Head, X-Upstream-State, X-Thread-Budget), in any letter case.
 mail_validate_header() {
     local raw="$1" name value
     mail_validate_no_newline "$raw" "--header" || return 1
@@ -337,7 +347,7 @@ mail_validate_header() {
         return 1
     fi
     case "${name^^}" in
-        X-HOPS|X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE)
+        X-HOPS|X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-THREAD-BUDGET)
             echo "Error: --header may not set reserved header '$name'." >&2
             return 1
             ;;
@@ -814,7 +824,7 @@ mail_emit_check() {
     local verb="$1" n_attach="$2" n_ns="$3" n_probe="$4" other="$5"
     if (( n_attach > 0 )) || (( n_ns > 0 )) || (( n_probe > 0 )) || [[ -n "$other" ]]; then
         echo "Error: $verb: --emit does not carry attachments, grants, a review" >&2
-        echo "target or upstream flags." >&2
+        echo "target, a thread budget or upstream flags." >&2
         return 1
     fi
 }
@@ -847,9 +857,11 @@ cmd_send() {
     local -a attach_files=() extra_headers=()
     local -a grant_allow_ns=() grant_reach_probe=()
     local grant_context_ro="" grant_context_secret="" review_target_arg="" emit=0
+    local budget=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --emit) emit=1; shift ;;
+            --budget) budget="${2:?--budget requires a positive integer}"; shift 2 ;;
             --from) from="${2:?--from requires an address}"; shift 2 ;;
             --to) to="${to:+$to,}${2:?--to requires an address list}"; shift 2 ;;
             --cc) cc="${cc:+$cc,}${2:?--cc requires an address list}"; shift 2 ;;
@@ -882,6 +894,10 @@ cmd_send() {
     [[ -n "$subject" ]] || { echo "Error: send: --subject is required." >&2; return 1; }
     [[ -n "$body_arg" ]] || { echo "Error: send: --body is required." >&2; return 1; }
     [[ "$hops" =~ ^[0-9]+$ ]] || { echo "Error: send: --hops must be a non-negative integer." >&2; return 1; }
+    if [[ -n "$budget" && ! "$budget" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: send: --budget must be a positive integer without a leading zero." >&2
+        return 1
+    fi
     mail_validate_no_newline "$subject" "--subject" || return 1
     local -a validated_headers=()
     local eh hline
@@ -899,7 +915,7 @@ cmd_send() {
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
     if (( emit )); then
         mail_emit_check send "${#attach_files[@]}" "${#grant_allow_ns[@]}" "${#grant_reach_probe[@]}" \
-            "$grant_context_ro$grant_context_secret$review_target_arg" || return 1
+            "$grant_context_ro$grant_context_secret$review_target_arg$budget" || return 1
     fi
 
     # A grant, if given, is checked before anything is written -- a
@@ -988,6 +1004,7 @@ cmd_send() {
     [[ -n "$cc_hdr" ]] && hlines+=("Cc: $cc_hdr")
     hlines+=("Subject: $subject")
     hlines+=("X-Hops: $hops")
+    [[ -n "$budget" ]] && hlines+=("X-Thread-Budget: $budget")
     if (( saw_review_target )); then
         # The setter signal, plus the ordinary per-message target headers
         # (every message about a commit carries X-Review-Target; see
@@ -1046,6 +1063,11 @@ cmd_reply() {
             --allow-namespace|--reach-probe|--context-ro|--context-secret)
                 echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
                 echo "fork-sandbox mail grant <thread-id> ..." >&2
+                return 1
+                ;;
+            --budget)
+                echo "Error: reply: --budget applies to a new thread only (mail send); a thread's budget is" >&2
+                echo "fixed when it is opened." >&2
                 return 1
                 ;;
             --review-target)
@@ -1257,7 +1279,7 @@ mail_ingest_message() {
         name="${BASH_REMATCH[1]}"
         val="${BASH_REMATCH[3]}"
         case "${name^^}" in
-            X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-REVIEW-TARGET|X-REVIEW-TARGET-SET|X-VERSION)
+            X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-REVIEW-TARGET|X-REVIEW-TARGET-SET|X-VERSION|X-THREAD-BUDGET)
                 mail_ingest_fail "header '$name' is reserved and does not travel."
                 return 1
                 ;;

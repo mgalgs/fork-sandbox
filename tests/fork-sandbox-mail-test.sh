@@ -791,6 +791,48 @@ rc=$?
 check "reply with --review-target exits 1" "1" "$rc"
 contains "reply's refusal names send as the way to set a review target" "$out" "applies to a new thread only"
 
+printf '\n== send: --budget ==\n'
+
+bd_id="$("$mail" send --from @alice --to @bob --subject "Budgeted" --body - --budget 5 <<< "x" 2>/dev/null)"
+bd_raw="$("$mail" show "$bd_id")"
+check "send --budget stamps X-Thread-Budget once" "1" "$(grep -c '^X-Thread-Budget: 5$' <<< "$bd_raw")"
+check "X-Thread-Budget follows X-Hops" "X-Hops: 8:X-Thread-Budget: 5" \
+    "$(grep -A1 '^X-Hops:' <<< "$bd_raw" | paste -sd: -)"
+contains "--help names --budget" "$("$mail" --help 2>&1)" "--budget"
+bd_plain="$("$mail" send --from @alice --to @bob --subject "Plain" --body - <<< "x" 2>/dev/null)"
+check "a send without --budget carries no X-Thread-Budget" "0" \
+    "$("$mail" show "$bd_plain" | grep -c '^X-Thread-Budget:')"
+
+bd_threads="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+bd_bad() {
+    local label="$1" value="$2" rc=0
+    "$mail" send --from @alice --to @bob --subject "Bad budget" --body - --budget "$value" \
+        <<< "x" >/dev/null 2>&1 || rc=$?
+    check "--budget $label exits 1" "1" "$rc"
+    check "--budget $label creates no thread" "$bd_threads" \
+        "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+}
+bd_bad "0" 0
+bd_bad "007" 007
+bd_bad "-1" -1
+bd_bad "abc" abc
+bd_bad "1.5" 1.5
+bd_bad "with a newline" $'5\nX-Hops: 99'
+
+bd_out="$("$mail" reply --from @bob --reply-to "$bd_id" --body - --budget 3 <<< "x" 2>&1)"; rc=$?
+check "reply --budget exits 1" "1" "$rc"
+contains "reply's refusal names send" "$bd_out" "mail send"
+for bd_name in X-Thread-Budget x-thread-budget X-THREAD-BUDGET; do
+    bd_out="$("$mail" send --from @alice --to @bob --subject "Raw" --body - \
+        --header "$bd_name: 3" <<< "x" 2>&1)"; rc=$?
+    check "send --header $bd_name exits 1" "1" "$rc"
+    [[ "$bd_name" == x-* ]] || contains "send --header $bd_name says reserved" "$bd_out" "reserved header"
+    bd_out="$("$mail" reply --from @bob --reply-to "$bd_id" --body - \
+        --header "$bd_name: 3" <<< "x" 2>&1)"; rc=$?
+    check "reply --header $bd_name exits 1" "1" "$rc"
+    [[ "$bd_name" == x-* ]] || contains "reply --header $bd_name says reserved" "$bd_out" "reserved header"
+done
+
 printf '\n== reply: --upstream-head ==\n'
 
 uh_sha="fedcba9876543210fedcba9876543210fedcba98"
@@ -1193,6 +1235,8 @@ contains "--emit qualifies Cc" "$hx_emit" $'\nCc: @w:alpha\n'
 check "--emit stores nothing" "1" "$(find "$hx_root_a/threads" -name '*.msg' | wc -l | tr -d ' ')"
 hx_emit_attach() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --attach /etc/hostname; }
 refuses "--emit refuses an attachment" hx_emit_attach
+hx_emit_budget() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --budget 4; }
+refuses "--emit refuses --budget" hx_emit_budget
 printf 'LANE_MAIL_PEER_NAME=Bad_Name\n' > "$hx_cfg_a/lane-mail.env"
 hx_err="$(printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - 2>&1)"; rc=$?
 check "--emit with no valid peer name fails" "1" "$rc"
@@ -1255,6 +1299,7 @@ hx_try "ingest refuses a path-shaped Thread-ID" alpha 's/^Thread-ID: .*/Thread-I
 hx_try "ingest refuses a Thread-ID in a store-shaped id that is another message's thread with no In-Reply-To" alpha \
     's/^Thread-ID: .*/Thread-ID: 00000000-0000-4000-8000-000000000099/'
 hx_try "ingest refuses X-Attachment" alpha 's/^X-Hops: .*/&\nX-Attachment: attachments\/..\/..\/etc\/passwd/'
+hx_try "ingest refuses X-Thread-Budget" alpha 's/^X-Hops: .*/&\nX-Thread-Budget: 5/'
 hx_try "ingest refuses X-Review-Target" alpha 's/^X-Hops: .*/&\nX-Review-Target: main aaaaaaaa/'
 hx_try "ingest refuses a non-numeric X-Hops" alpha 's/^X-Hops: .*/X-Hops: lots/'
 hx_try "ingest refuses a malformed header line" alpha 's/^X-Hops: .*/&\nno colon here/'

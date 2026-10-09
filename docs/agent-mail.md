@@ -163,6 +163,7 @@ Subject: <text>
 In-Reply-To: <parent uuid>      replies only
 References: <uuid> <uuid>...    replies only, root-to-parent order
 X-Hops: <int>                   default 8 on a new thread
+X-Thread-Budget: <int>          root only, `send --budget` only
 X-<Name>: <value>               any number of caller-supplied custom
                                  headers, one per repeatable --header
                                  'X-Name: value' flag on send/reply
@@ -209,6 +210,17 @@ authority is written down.
 - **`X-Hops`**: store-written. Default 8 on a new thread; copied
   **verbatim** from the parent on reply — decrementing is the
   postmaster's job, not the store's (see above). Always present.
+- **`X-Thread-Budget`**: root only; store-written by `mail send --budget
+  <n>` (a positive integer, no leading zero; anything else is refused
+  before the thread exists). It is this thread's own cap on seat spawns:
+  the postmaster's budget for the thread is the lower of it and
+  `$FORK_SANDBOX_THREAD_BUDGET` (routing rule 3). ABSENT — or malformed,
+  which the store never writes but a hand-edited root could carry — means
+  the global budget, exactly as before the header existed. `--header`
+  refuses it in any letter case, `reply --budget` is refused, `ingest` and
+  `--emit` refuse it, and the mail API refuses it as a raw header for
+  every token, an operator's included (`send --budget` is the only way to
+  set it, and needs no cap: it can only lower spend).
 - **`X-Attachment`**: store-owned; `--header` refuses to set it directly.
 - **`X-AI-Persona`**: postmaster-stamped on every harvested reply. ABSENT
   means the message was not a harvested reply — an operator message or
@@ -1112,7 +1124,13 @@ once when it goes quiet, as any thread does.
 
 ### Status
 
-`postmaster status --thread <tid> --json` includes a `review_target`
+`postmaster status --thread <tid> --json` includes `budget` (the thread's
+effective budget, an integer), `budget_source` (`"thread"` while the root's
+`X-Thread-Budget` is in force, `"global"` when it is absent, malformed or
+larger than the global and so clamped) and `spawns_total` (every spawn the
+thread ever made, from the per-thread `seq/` record, which no reset
+touches — unlike `spawns`, which operator mail and upstream-head messages
+reset). It also includes a `review_target`
 field: an object with `branch`, `sha`, `version`, `set_by`, `set_at`, or
 `null` when the thread has no review target.
 
@@ -1508,15 +1526,21 @@ thread routes it.
    routed, wakes no one, and rules 2–5 are skipped.
 2. **Hops gate.** `X-Hops == 0` means no wakes from M. Flag T
    needs-operator, reason `hops exhausted at <message-id>`.
-3. **Thread budget.** Spawns so far ≥ budget (default 96,
-   `$FORK_SANDBOX_THREAD_BUDGET`) means no wake. Flag T, reason
+3. **Thread budget.** Spawns so far ≥ the thread's budget means no
+   wake. The thread's budget is the lower of the global
+   (`$FORK_SANDBOX_THREAD_BUDGET`, default 96) and the `X-Thread-Budget`
+   on the thread's root message (`mail send --budget`); a root without
+   that header, or with a malformed one, uses the global. The budget is
+   read from the root, so the upstream-moved reset (spawns back to 0)
+   re-arms the thread at its own budget. Flag T, reason
    `thread budget <n> exhausted` (keyword `budget-exhausted`). This is
    checked once per message, not once per candidate: a message addressing
    four agents with one slot left still spawns all four. v1 does not
    ration within a single message — except inside a reserve band:
    a fleet `budget-reserve:` block (`spawns: N`, `agents: [...]`) makes
    the last N spawns of the budget the reserved seats' alone. While the
-   count is in the band (`budget − N ≤ spawns so far < budget`) the check
+   count is in the band (`budget − N ≤ spawns so far < budget`, on the
+   thread's own budget) the check
    is per candidate: a message addressing a reserved seat and two others
    spawns only the reserved seat. Each refused candidate gets a `refuse
    ... reason=budget-reserved` event and a line in
@@ -1530,6 +1554,15 @@ thread routes it.
    that wakes it leaves nothing to flag. At or past the budget the
    exhausted check above applies unchanged, reserved seats included.
    Follow-up wakes, retries included, honor the band the same way.
+   A thread whose own budget is no larger than the reserve's `N` has no
+   room outside the reserve and never wakes anyone: every To candidate
+   gets `refuse ... reason=budget`, and the thread is flagged once
+   (keyword `budget-reserve`, reason `thread budget <n> is within the
+   fleet's budget-reserve spawns (<N>)`; not re-flagged while that reason
+   stands; operator mail clears it and the standing condition raises it
+   again on that same message). `deliver`'s startup
+   check on the reserve is against the global budget only: the kickoff
+   cannot know the fleet.
 4. **One wake per (agent, message).** An agent named twice — directly and
    via a list, in `To` and/or `Cc` — wakes once. The run's ledger, and
    the handoff itself, record whether `To` or `Cc` actually produced the
@@ -1872,7 +1905,7 @@ own thread scans never see it:
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
 | `needs-operator-journal/<thread-id>` | append-only history: one line per `pm_flag` call (timestamp, `flag`, keyword, reason) and one per `pm_unflag` call that actually cleared a flag (timestamp, `unflag`, empty keyword, empty reason) — a redundant unflag on an already-clear thread appends nothing — and one `clear` line (keyword `wake-exit`, reason `<the original reason> cleared by run <run id>`) per wake-exit flag a seat's successful wake cleared. The flag-line count is what `status` shows next to the current reason, or `(no journal)` if this file doesn't exist yet for a thread flagged before the journal did. Operator-readable, but not display-only: a successful retry's clear reads it, so the `flag`/`unflag`/`clear` kind, the keyword and a wake-exit reason's `wake for <agent> exited ` prefix and `(run <id>)` shape are load-bearing |
 | `wake-exits/<thread-id>/<agent>/<run-id>.json` | one failed wake's evidence: agent, run id, exit code, capped log tail (see "Status"), written once and never rewritten. A sibling `<run-id>.cleared` (`BY`, `AT`) marks it cleared. Served as `wake_failures` by `status --thread --json`; nothing routes on it |
-| `spawns/<thread-id>` | one line per spawn, reset by rule 1 (and by an `X-Upstream-Head` message) — line count is the **budget** count |
+| `spawns/<thread-id>` | one line per spawn, reset by rule 1 (and by an `X-Upstream-Head` message) — line count is the **budget** count, against the thread's effective budget |
 | `upstream-state/<thread-id>.env` | the thread's upstream state: `STATE` (`closed` or `open`), `MSGID` (the message that set it), `AT`. No file means open — see "Upstream closed" |
 | `upstream-head/<thread-id>.env` | the thread's last upstream-moved announcement: `BRANCH`, `SHA`, `MSGID`, `SET_AT` — see "Upstream moved" |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
@@ -2090,7 +2123,7 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_MAIL_ROOT` | `/var/tmp/claude-scratch/agent-mail` | store, router, renderer |
 | `FORK_SANDBOX_FLEET_FILE` | `~/.config/fork-sandbox/fleet.yaml` | registry |
 | `FORK_SANDBOX_PERSONAS_DIR` | `~/.config/fork-sandbox/personas` | registry |
-| `FORK_SANDBOX_THREAD_BUDGET` | `32` | router (rule 3) |
+| `FORK_SANDBOX_THREAD_BUDGET` | `96` | router (rule 3) |
 | `FORK_SANDBOX_POSTMASTER_DEBOUNCE` | `30` (seconds, `0` disables) | router (pre-rule-0 quiescence gate) |
 | `FORK_SANDBOX_POSTMASTER_INTERVAL` | `15` (seconds) | router loop |
 | `FORK_SANDBOX_POSTMASTER_FETCH_WINDOW` | `300` (seconds, `0` flags at once) | router (how long a wake whose sha is not on `origin` yet is deferred before the thread is flagged — see "Upstream moved") |

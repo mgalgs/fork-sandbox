@@ -835,6 +835,30 @@ check "the flag alongside a raw header is refused for an operator" "403" \
     "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$rt_tid" --body - --upstream-state closed --header "X-Upstream-State: open")"
 check "the refused calls wrote no message" "$us_msgs_before" "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
 
+printf '== 11d. send --budget: no cap, never on reply, header refused ==\n'
+
+check "no caps: send --budget 4: 200" "200" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- send --from @bot --to @x --subject b --body - --budget 4)"
+check "no caps: that send ran: rc 0" "0" "$(rjson rc)"
+bd_tid="$(rjson stdout | tr -d '\n')"
+contains "the root carries X-Thread-Budget" "$("$mail" show "$bd_tid")" "X-Thread-Budget: 4"
+check "a bad --budget value is mail's own refusal: rc 1" "200" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- send --from @bot --to @x --subject b --body - --budget 0)"
+check "... and it ran as a failure" "1" "$(rjson rc)"
+check "reply --budget: 403" "403" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- reply --from @bot --reply-to "$bd_tid" --body - --budget 3)"
+contains "... the flag is not allowed" "$(rjson error)" "not allowed"
+for bd_name in X-Thread-Budget x-thread-budget; do
+    for bd_tok in ci-kickoff laptop; do
+        bd_from=@ci-kickoff; [[ "$bd_tok" == laptop ]] && bd_from=@operator
+        check "raw $bd_name header refused on send ($bd_tok)" "403" \
+            "$(xr "$tok/$bd_tok" --tool mail --stdin hi -- send --from "$bd_from" --to @x --subject h --body - --header "$bd_name: 3")"
+        contains "... names X-Thread-Budget" "$(rjson error)" "X-Thread-Budget"
+        check "raw $bd_name header refused on reply ($bd_tok)" "403" \
+            "$(xr "$tok/$bd_tok" --tool mail --stdin hi -- reply --from "$bd_from" --reply-to "$bd_tid" --body - --header "$bd_name: 3")"
+    done
+done
+
 printf '== 12. list --json --header for a read token ==\n'
 
 demo_tid="$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject demo --body - --header "X-Demo-PR: 42" >/dev/null; rjson stdout | tr -d '\n')"

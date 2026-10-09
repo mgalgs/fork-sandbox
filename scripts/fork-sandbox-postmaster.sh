@@ -387,8 +387,11 @@
 #      agent, and a malformed list refuses startup (exit 2).
 #   2. X-Hops gate: M's X-Hops == 0 means no wakes from M -- flag T
 #      needs-operator, reason "hops exhausted at <message-id>".
-#   3. Thread budget: spawns-so-far(T) >= budget (default 96,
-#      $FORK_SANDBOX_THREAD_BUDGET overrides) means no wake -- flag T,
+#   3. Thread budget: spawns-so-far(T) >= budget means no wake. The
+#      budget is the lower of the global (default 96,
+#      $FORK_SANDBOX_THREAD_BUDGET overrides) and the X-Thread-Budget on
+#      T's root message (`mail send --budget`; a missing or malformed
+#      value reads as absent) -- flag T,
 #      reason "thread budget <n> exhausted". Checked once per message,
 #      not once per candidate: a message addressing several agents with
 #      one budget slot left still spawns all of them (v1 does not ration
@@ -403,8 +406,13 @@
 #      count (keyword budget-reserved, reason "thread budget <n>: @a
 #      refused at <mid> (last <N> spawns reserved for @x, @y) and nothing
 #      woke it"). At or past the budget the exhausted gate is unchanged.
-#      A reserve of N >= budget refuses startup (exit 2). pm_followup_wake
-#      applies the same band.
+#      A reserve of N >= the global budget refuses startup (exit 2). A
+#      thread whose own budget is <= N wakes nobody: every To candidate
+#      gets `refuse ... reason=budget` and T is flagged once (keyword
+#      budget-reserve, reason "thread budget <n> is within the fleet's
+#      budget-reserve spawns (<N>)"; not re-flagged while that reason
+#      stands). pm_followup_wake applies the same gates and band, on the
+#      thread's own budget.
 #   4. One wake per (agent, message), regardless of which header named it:
 #      an agent named in To and/or Cc (directly or via a list, including
 #      both headers at once, or the same header twice via two lists)
@@ -1207,6 +1215,34 @@ pm_header() {
     return 0
 }
 
+# Header $2 of thread $1's root message (the one whose Message-ID is the
+# thread id; empty when there is none or it lacks the header). The root is
+# immutable, so this is the record of a kickoff-only fact about the thread.
+pm_root_header() {
+    local tid="$1" name="$2" f
+    for f in "$MAIL_ROOT/threads/$tid"/*-"$tid".msg; do
+        [[ -e "$f" ]] || continue
+        pm_header "$f" "$name"
+        return 0
+    done
+    return 0
+}
+
+# `<budget> <source>` for thread $1: the lower of the root's X-Thread-Budget
+# and the global $FORK_SANDBOX_THREAD_BUDGET (default 96), source "thread"
+# while the header is in force and "global" when it is absent, malformed
+# (re-validated here: the store never writes a bad one, but a hand-edited
+# root must not satisfy a threshold) or larger than the global.
+pm_thread_budget() {
+    local tid="$1" global="${FORK_SANDBOX_THREAD_BUDGET:-96}" hdr
+    hdr="$(pm_root_header "$tid" X-Thread-Budget)"
+    if [[ "$hdr" =~ ^[1-9][0-9]*$ ]] && (( hdr <= global )); then
+        printf '%s thread\n' "$hdr"
+    else
+        printf '%s global\n' "$global"
+    fi
+}
+
 pm_find_by_id() {
     local id="$1" f
     for f in "$MAIL_ROOT"/threads/*/*.msg; do
@@ -1882,6 +1918,7 @@ pm_flag_keyword() {
         "thread budget"*"exhausted") printf 'budget-exhausted' ;;
         "wake deferred: @"*" and nothing woke it") printf 'wake-deferred' ;;
         "thread budget "*": @"*" refused at "*" and nothing woke it") printf 'budget-reserved' ;;
+        "thread budget "*" is within the fleet's budget-reserve spawns ("*")") printf 'budget-reserve' ;;
         "malformed reply file"*) printf 'malformed-reply' ;;
         "pending message"*"vanished"*) printf 'pending-vanished' ;;
         "run dir for"*"vanished"*) printf 'run-vanished' ;;
@@ -1931,6 +1968,15 @@ pm_flag() {
     # events instead of 1.
     pm_flag_journal_append "$tid" flag "$keyword" "$reason"
     pm_event "flag thread=${tid:0:8} reason=$keyword${extra:+ $extra}"
+}
+
+# pm_flag unless the thread's flag already holds exactly this reason: a
+# standing condition (a budget no wake can ever fit in) is raised once, and
+# re-raised after the operator clears it.
+pm_flag_unless_current() {
+    local tid="$1" reason="$2"
+    [[ "$(cat -- "$NEEDS_OPERATOR/$tid" 2>/dev/null)" == "$reason" ]] && return 0
+    pm_flag "$tid" "$reason"
 }
 
 pm_unflag() {
@@ -3370,7 +3416,19 @@ pm_reserve_load() {
 # True when $1 spawns so far puts the thread in the reserve band: below the
 # budget but within the last PM_RESERVE_SPAWNS of it. Needs pm_reserve_load.
 pm_in_reserve_band() {
-    [[ -n "$PM_RESERVE_SPAWNS" ]] && (( $1 >= ${FORK_SANDBOX_THREAD_BUDGET:-96} - PM_RESERVE_SPAWNS ))
+    [[ -n "$PM_RESERVE_SPAWNS" ]] && (( $1 >= $2 - PM_RESERVE_SPAWNS ))
+}
+
+# True when thread budget $1 leaves no room outside the reserve (budget <=
+# the fleet's reserve spawns): such a thread wakes nobody. Needs
+# pm_reserve_load.
+pm_budget_within_reserve() {
+    [[ -n "$PM_RESERVE_SPAWNS" ]] && (( $1 <= PM_RESERVE_SPAWNS ))
+}
+
+# The gate reason for a thread whose budget $1 is within the reserve.
+pm_within_reserve_reason() {
+    printf "thread budget %s is within the fleet's budget-reserve spawns (%s)" "$1" "$PM_RESERVE_SPAWNS"
 }
 
 pm_reserved_seat() {
@@ -4175,20 +4233,24 @@ pm_process_message() {
         to_reason="unresolvable To: $unresolved_joined at $mid"
     fi
 
-    local gate_reason="" in_reserve_band=0
+    local gate_reason="" in_reserve_band=0 gate_once=0
     if [[ "$x_hops" == "0" ]]; then
         gate_reason="hops exhausted at $mid"
     else
-        local budget="${FORK_SANDBOX_THREAD_BUDGET:-96}" count
+        local budget count
+        read -r budget _ < <(pm_thread_budget "$tid")
         count="$(pm_spawn_count "$tid")"
-        if (( count >= budget )); then
+        pm_reserve_load
+        if pm_budget_within_reserve "$budget"; then
+            gate_reason="$(pm_within_reserve_reason "$budget")"
+            gate_once=1
+        elif (( count >= budget )); then
             gate_reason="thread budget $budget exhausted"
         else
             # Once per message, like the budget check itself: a message
             # that finds the thread in the band judges every candidate
             # against it, however many spawns it adds along the way.
-            pm_reserve_load
-            ! pm_in_reserve_band "$count" || in_reserve_band=1
+            ! pm_in_reserve_band "$count" "$budget" || in_reserve_band=1
         fi
     fi
 
@@ -4327,7 +4389,11 @@ pm_process_message() {
         for cand in "${to_candidates[@]}"; do
             pm_event "refuse thread=${tid:0:8} agent=$cand reason=$refuse_reason"
         done
-        pm_flag "$tid" "$gate_reason"
+        if (( gate_once )); then
+            pm_flag_unless_current "$tid" "$gate_reason"
+        else
+            pm_flag "$tid" "$gate_reason"
+        fi
         return 0
     fi
 
@@ -4670,15 +4736,21 @@ pm_followup_wake() {
         pm_flag "$tid" "hops exhausted at $mid"
         return 1
     fi
-    local budget="${FORK_SANDBOX_THREAD_BUDGET:-96}" count
+    local budget count
+    read -r budget _ < <(pm_thread_budget "$tid")
     count="$(pm_spawn_count "$tid")"
+    pm_reserve_load
+    if pm_budget_within_reserve "$budget"; then
+        pm_event "refuse thread=${tid:0:8} agent=$agent reason=budget"
+        pm_flag_unless_current "$tid" "$(pm_within_reserve_reason "$budget")"
+        return 1
+    fi
     if (( count >= budget )); then
         pm_event "refuse thread=${tid:0:8} agent=$agent reason=budget"
         pm_flag "$tid" "thread budget $budget exhausted"
         return 1
     fi
-    pm_reserve_load
-    if pm_in_reserve_band "$count" && ! pm_reserved_seat "$agent"; then
+    if pm_in_reserve_band "$count" "$budget" && ! pm_reserved_seat "$agent"; then
         pm_refuse_reserved "$tid" "$agent" "$mid"
         return 1
     fi
@@ -5505,7 +5577,7 @@ pm_deferral_pass() {
 pm_reserved_reason() {
     local tid="$1" reason
     pm_reserve_load
-    reason="thread budget ${FORK_SANDBOX_THREAD_BUDGET:-96}: $(pm_seat_record_text "$BUDGET_RESERVED/$tid" "refused at")"
+    reason="thread budget $(pm_thread_budget "$tid" | cut -d' ' -f1): $(pm_seat_record_text "$BUDGET_RESERVED/$tid" "refused at")"
     if [[ -n "$PM_RESERVE_SPAWNS" ]]; then
         local names="" a
         for a in $PM_RESERVE_AGENTS; do names+="${names:+, }@$a"; done
@@ -5769,6 +5841,13 @@ cmd_status_json() {
         fi
         printf '%s\0' spawns "${n//[[:space:]]/}"
 
+        local total=0 budget budget_source
+        read -r budget budget_source < <(pm_thread_budget "$tid")
+        if [[ -f "$SEQ/$tid" ]]; then
+            total="$(wc -l < "$SEQ/$tid")"
+        fi
+        printf '%s\0' budget "$budget" "$budget_source" spawns_total "${total//[[:space:]]/}"
+
         local rid agent run_state run_dir resumed
         for f in "$RUNS"/*.env; do
             [[ -e "$f" ]] || continue
@@ -5820,9 +5899,10 @@ if tok and tok[-1] == "":
     tok.pop()
 out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
        "review_target": None,
-       "spawns": 0, "runs": [], "retries": [], "held": []}
+       "spawns": 0, "runs": [], "retries": [], "held": [],
+       "budget": None, "budget_source": None, "spawns_total": 0}
 arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "upstream_state": 3,
-         "review_target": 5, "spawns": 1,
+         "review_target": 5, "spawns": 1, "budget": 2, "spawns_total": 1,
          "run": 5, "retry": 4, "held": 3, "wake_exit": 3}
 wake_exits = []
 i = 0
@@ -5848,6 +5928,11 @@ while i < len(tok):
                                  "set_by": a[3], "set_at": a[4]}
     elif tag == "spawns":
         out["spawns"] = int(a[0] or 0)
+    elif tag == "budget":
+        out["budget"] = int(a[0])
+        out["budget_source"] = a[1]
+    elif tag == "spawns_total":
+        out["spawns_total"] = int(a[0] or 0)
     elif tag == "run":
         out["runs"].append({"run_id": a[0], "agent": a[1], "state": a[2],
                             "run_dir": a[3], "resumed": a[4] or None})
