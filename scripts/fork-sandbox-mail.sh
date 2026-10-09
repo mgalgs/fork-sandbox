@@ -10,6 +10,7 @@
 #                              [--reach-probe HOST:PORT]... [--context-ro DIR]
 #                              [--context-secret NAME]
 #                              [--review-target <branch>:<sha>] [--budget <n>]
+#                              [--no-grant]
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
@@ -42,7 +43,7 @@
 # and write nothing to the store. The printed form is PORTABLE: every bare
 # address is qualified with this host's peer name, so it means the same on
 # any host. --emit does not carry attachments, grants, --review-target,
-# --budget or the upstream flags (refused). It exists so lane-mail.sh can deliver a
+# --budget, --no-grant or the upstream flags (refused). It exists so lane-mail.sh can deliver a
 # message to another host before anything is written here.
 #
 # `ingest [--peer <name>]` reads one complete message from stdin (as --emit
@@ -51,9 +52,8 @@
 # refuses (one-line error, exit 1): a message over 1 MiB, a malformed or
 # duplicated core header, a missing core header (Message-ID, Thread-ID, Date,
 # From, To, Subject, X-Hops), an id that is not a store-shaped id, the
-# reserved headers X-Attachment, X-Upstream-*, X-Review-Target*, X-Version and
-# X-Thread-Budget,
-# an invalid address, an empty body, and a Message-ID already in the store.
+# reserved headers X-Attachment, X-Upstream-*, X-Review-Target*, X-Version,
+# X-Thread-Budget and X-Grant, an invalid address, an empty body, and a Message-ID already in the store.
 # With --peer the message is treated as received from that peer: From must
 # name that host (a bare From is qualified with it; any other host is
 # refused) and bare To/Cc addresses, which are in the sender's frame, are
@@ -153,6 +153,14 @@
 #                                 only. The postmaster uses the lower of it
 #                                 and its global budget; absent means the
 #                                 global one (docs/agent-mail.md)
+#   X-Grant: none                 `send --no-grant` only (refused together
+#                                 with any grant flag), on the thread's
+#                                 root only: this thread has no
+#                                 environment, so a `grant: required` k8s
+#                                 seat spawns with no grant flags instead
+#                                 of holding, and `grant <tid> <values>`
+#                                 refuses the thread. Absent never means
+#                                 "no environment" (docs/agent-mail.md)
 #   X-<Name>: <value>             any number of caller-supplied custom
 #                                 headers, via a repeatable --header
 #                                 'X-Name: value' flag on send/reply. Name
@@ -161,12 +169,13 @@
 #                                 headers are refused by the name pattern
 #                                 alone) and may not be X-Hops,
 #                                 X-Attachment, X-Upstream-Head,
-#                                 X-Upstream-State or X-Thread-Budget (any
-#                                 letter case), which this store writes
-#                                 itself (the upstream ones only via
-#                                 `reply --upstream-head` and
+#                                 X-Upstream-State, X-Thread-Budget or
+#                                 X-Grant (any letter case), which this
+#                                 store writes itself (the upstream ones
+#                                 only via `reply --upstream-head` and
 #                                 `reply --upstream-state`, the budget only
-#                                 via `send --budget`). --header
+#                                 via `send --budget`, X-Grant only via
+#                                 `send --no-grant`). --header
 #                                 does not refuse
 #                                 X-Review-Target/X-Review-Target-Set/
 #                                 X-Version -- those are stamped by
@@ -331,7 +340,7 @@ mail_validate_no_newline() {
 # any name that isn't ^X-[A-Za-z0-9-]+$ (core, non-X headers are refused by
 # this pattern alone -- only custom X- headers may be set this way), and the
 # reserved names this store writes itself (X-Hops, X-Attachment,
-# X-Upstream-Head, X-Upstream-State, X-Thread-Budget), in any letter case.
+# X-Upstream-Head, X-Upstream-State, X-Thread-Budget, X-Grant), in any letter case.
 mail_validate_header() {
     local raw="$1" name value
     mail_validate_no_newline "$raw" "--header" || return 1
@@ -347,7 +356,7 @@ mail_validate_header() {
         return 1
     fi
     case "${name^^}" in
-        X-HOPS|X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-THREAD-BUDGET)
+        X-HOPS|X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-THREAD-BUDGET|X-GRANT)
             echo "Error: --header may not set reserved header '$name'." >&2
             return 1
             ;;
@@ -824,7 +833,7 @@ mail_emit_check() {
     local verb="$1" n_attach="$2" n_ns="$3" n_probe="$4" other="$5"
     if (( n_attach > 0 )) || (( n_ns > 0 )) || (( n_probe > 0 )) || [[ -n "$other" ]]; then
         echo "Error: $verb: --emit does not carry attachments, grants, a review" >&2
-        echo "target, a thread budget or upstream flags." >&2
+        echo "target, a thread budget, --no-grant or upstream flags." >&2
         return 1
     fi
 }
@@ -857,10 +866,11 @@ cmd_send() {
     local -a attach_files=() extra_headers=()
     local -a grant_allow_ns=() grant_reach_probe=()
     local grant_context_ro="" grant_context_secret="" review_target_arg="" emit=0
-    local budget=""
+    local budget="" no_grant=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --emit) emit=1; shift ;;
+            --no-grant) no_grant=1; shift ;;
             --budget) budget="${2:?--budget requires a positive integer}"; shift 2 ;;
             --from) from="${2:?--from requires an address}"; shift 2 ;;
             --to) to="${to:+$to,}${2:?--to requires an address list}"; shift 2 ;;
@@ -898,6 +908,12 @@ cmd_send() {
         echo "Error: send: --budget must be a positive integer without a leading zero." >&2
         return 1
     fi
+    if (( no_grant )) && { (( ${#grant_allow_ns[@]} > 0 )) || (( ${#grant_reach_probe[@]} > 0 )) \
+            || [[ -n "$grant_context_ro$grant_context_secret" ]]; }; then
+        echo "Error: send: --no-grant opens a thread with no environment and cannot be combined with" >&2
+        echo "--allow-namespace, --reach-probe, --context-ro or --context-secret." >&2
+        return 1
+    fi
     mail_validate_no_newline "$subject" "--subject" || return 1
     local -a validated_headers=()
     local eh hline
@@ -914,8 +930,10 @@ cmd_send() {
     cc_norm=""
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
     if (( emit )); then
+        local no_grant_mark=""
+        (( no_grant )) && no_grant_mark="no-grant"
         mail_emit_check send "${#attach_files[@]}" "${#grant_allow_ns[@]}" "${#grant_reach_probe[@]}" \
-            "$grant_context_ro$grant_context_secret$review_target_arg$budget" || return 1
+            "$grant_context_ro$grant_context_secret$review_target_arg$budget$no_grant_mark" || return 1
     fi
 
     # A grant, if given, is checked before anything is written -- a
@@ -1005,6 +1023,7 @@ cmd_send() {
     hlines+=("Subject: $subject")
     hlines+=("X-Hops: $hops")
     [[ -n "$budget" ]] && hlines+=("X-Thread-Budget: $budget")
+    (( no_grant )) && hlines+=("X-Grant: none")
     if (( saw_review_target )); then
         # The setter signal, plus the ordinary per-message target headers
         # (every message about a commit carries X-Review-Target; see
@@ -1063,6 +1082,11 @@ cmd_reply() {
             --allow-namespace|--reach-probe|--context-ro|--context-secret)
                 echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
                 echo "fork-sandbox mail grant <thread-id> ..." >&2
+                return 1
+                ;;
+            --no-grant)
+                echo "Error: reply: --no-grant applies to a new thread only (mail send); a thread's environment" >&2
+                echo "is chosen when it is opened." >&2
                 return 1
                 ;;
             --budget)
@@ -1279,7 +1303,7 @@ mail_ingest_message() {
         name="${BASH_REMATCH[1]}"
         val="${BASH_REMATCH[3]}"
         case "${name^^}" in
-            X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-REVIEW-TARGET|X-REVIEW-TARGET-SET|X-VERSION|X-THREAD-BUDGET)
+            X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-REVIEW-TARGET|X-REVIEW-TARGET-SET|X-VERSION|X-THREAD-BUDGET|X-GRANT)
                 mail_ingest_fail "header '$name' is reserved and does not travel."
                 return 1
                 ;;
@@ -1617,6 +1641,12 @@ cmd_grant() {
     mail_thread_root_exists "$tid" || { echo "Error: grant: no such thread '$tid'." >&2; return 1; }
 
     local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env"
+
+    if (( ! show && ! clear )) \
+            && [[ "$(mail_header "$(mail_find_by_id "$tid")" X-Grant)" == "none" ]]; then
+        echo "Error: grant: thread $tid was opened with --no-grant and takes no grant." >&2
+        return 2
+    fi
 
     if (( show )); then
         if (( json )); then

@@ -164,6 +164,7 @@ In-Reply-To: <parent uuid>      replies only
 References: <uuid> <uuid>...    replies only, root-to-parent order
 X-Hops: <int>                   default 8 on a new thread
 X-Thread-Budget: <int>          root only, `send --budget` only
+X-Grant: none                   root only, `send --no-grant` only
 X-<Name>: <value>               any number of caller-supplied custom
                                  headers, one per repeatable --header
                                  'X-Name: value' flag on send/reply
@@ -221,6 +222,18 @@ authority is written down.
   `--emit` refuse it, and the mail API refuses it as a raw header for
   every token, an operator's included (`send --budget` is the only way to
   set it, and needs no cap: it can only lower spend).
+- **`X-Grant`**: root only; store-written by `mail send --no-grant` (the
+  literal `none`; refused together with `--allow-namespace`,
+  `--reach-probe`, `--context-ro` and `--context-secret`). It says the
+  thread was opened with **no environment**: a `backend: k8s`,
+  `grant: required` seat on it spawns at once with no grant flags instead
+  of holding, and `mail grant <tid> <values>` refuses it. ABSENT means "a
+  grant may be required" — today's hold — and must never be read as "no
+  environment"; any value other than `none` reads as absent. `--header`
+  refuses it in any letter case, `reply --no-grant` is refused, `ingest`
+  and `--emit` refuse it, and the mail API refuses it as a raw header for
+  every token, an operator's included. `send --no-grant` over the API needs
+  cap `grant`: choosing a thread's environment is grant authority.
 - **`X-Attachment`**: store-owned; `--header` refuses to set it directly.
 - **`X-AI-Persona`**: postmaster-stamped on every harvested reply. ABSENT
   means the message was not a harvested reply — an operator message or
@@ -797,6 +810,15 @@ value leaves nothing behind. `mail reply` refuses all four — a grant
 applies only at thread creation, never on an existing thread (use the
 `grant` verb for that instead).
 
+`mail send --no-grant` is the opposite choice at creation time: it stamps
+`X-Grant: none` on the root (see the header contract) and means the thread
+has no environment at all. It is refused together with any of the four
+grant flags. `grant <thread-id> <values>` then refuses that thread (exit 2,
+saying it was opened with `--no-grant`); `--show` and `--clear` keep
+working. If a grant file nonetheless exists for such a thread (placed by
+hand), the postmaster ignores it for every k8s seat — nothing is
+forwarded — and emits `grant-ignored thread=<8>` on each k8s wake.
+
 ### The grant file as a read contract
 
 Path: `$MAIL_ROOT/.postmaster/grants/<thread-id>.env`. Written atomically
@@ -851,7 +873,11 @@ wake" below) — there is no inbox hook to write a banner into mid-Job.
 A `grant: required` seat with no grant file yet for a thread **holds**
 instead of failing: the message itself still routes normally (Cc triage
 already ran), only that one seat waits, flagged once with reason
-`no grant for k8s seat <agent>: <message-id>` (keyword `no-grant`). Run
+`no grant for k8s seat <agent>: <message-id>` (keyword `no-grant`), unless
+the thread's root carries `X-Grant: none` (`mail send --no-grant`): that
+thread has no environment to wait for, so the seat spawns at once with no
+`--allow-namespace`, `--reach-probe`, `--context-ro` or `--context-secret`
+flags. A thread without that header always holds. Run
 `fork-sandbox-mail.sh grant <thread-id> ...` (above) to release it — the
 next `deliver` pass picks the grant up and dispatches the held trigger. See
 "The held state file is a read contract" below for the on-disk record, and
@@ -1124,7 +1150,10 @@ once when it goes quiet, as any thread does.
 
 ### Status
 
-`postmaster status --thread <tid> --json` includes `budget` (the thread's
+`postmaster status --thread <tid> --json` includes `grant_mode`: `"none"`
+when the root says `X-Grant: none` (even if a grant file exists),
+`"file"` when only a grant file exists, `"missing"` otherwise; the boolean
+`grant` keeps meaning "a grant file exists". It also includes `budget` (the thread's
 effective budget, an integer), `budget_source` (`"thread"` while the root's
 `X-Thread-Budget` is in force, `"global"` when it is absent, malformed or
 larger than the global and so clamped) and `spawns_total` (every spawn the
@@ -1277,6 +1306,8 @@ woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
 line), `upstream-head` (thread, sha=<12 hex> — an upstream-moved announcement was
 recorded), `upstream-head-ignored` (thread, reason=fleet-sender|malformed),
 `upstream-head-local-seat` (thread, agent — see "Upstream moved" above),
+`grant-ignored` (thread — a k8s seat woke on a `--no-grant` thread that
+has a grant file; the file was not forwarded),
 `upstream-state` (thread, state=closed|open, msg=<8 hex> — the thread's
 upstream state changed), `upstream-state-ignored` (thread,
 reason=fleet-sender|malformed — see "Upstream closed" above),

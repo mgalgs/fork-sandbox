@@ -6174,6 +6174,71 @@ check "k8s case9: the released wake's handoff carries the retry section" 1 \
     "$(grep -c -- '^## This is a retry$' "$PM_STATE_DIR/handoffs/$k9_run_id.md")"
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
+# ---- no-grant threads: X-Grant: none on the root ----
+ng_flags_in_argv() {
+    grep -c -e '^--allow-namespace$' -e '^--reach-probe$' -e '^--context-ro$' -e '^--context-secret$' "$STUB_ARGV_LOG" || true
+}
+ng_key() { python3 -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])' "$1" "$2"; }
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+printf '%s\n' 'no env body' > "$work/body.tmp"
+ng1_mid="$("$MAIL" send --from '@carol' --to '@karl' --subject 'no env topic' \
+    --body "$work/body.tmp" --hops 8 --no-grant 2>/dev/null)"
+ng1_tid="$(thread_of "$ng1_mid")"; ng1_short="${ng1_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "no-grant thread: a grant: required seat spawns at once with --k8s" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "no-grant thread: and carries no grant flag" 0 "$(ng_flags_in_argv)"
+not_contains "no-grant thread: no no-grant refusal" "$(cat "$work/once.out")" "reason=no-grant"
+check "no-grant thread: no held record" 0 "$( [[ -e "$PM_STATE_DIR/held/$ng1_tid/karl" ]] && echo 1 || echo 0 )"
+check "no-grant thread: no flag" 0 "$( [[ -e "$PM_STATE_DIR/needs-operator/$ng1_tid" ]] && echo 1 || echo 0 )"
+ng1_json="$("$postmaster" status --thread "$ng1_tid" --json)"
+check "no-grant thread: status grant_mode is none" none "$(ng_key "$ng1_json" grant_mode)"
+check "no-grant thread: status grant stays false" False "$(ng_key "$ng1_json" grant)"
+
+# A grant file placed by hand is ignored for every k8s seat.
+mkdir -p -- "$PM_STATE_DIR/grants"
+printf 'ALLOW_NAMESPACE=ns-a\nREACH_PROBE=svc.ns-a:80\nCONTEXT_SECRET=ctx\n' > "$PM_STATE_DIR/grants/$ng1_tid.env"
+ng1_json="$("$postmaster" status --thread "$ng1_tid" --json)"
+check "no-grant thread: grant_mode is none even with a file" none "$(ng_key "$ng1_json" grant_mode)"
+check "no-grant thread: grant stays true with a file" True "$(ng_key "$ng1_json" grant)"
+for ng_seat in karl karen; do
+    : > "$STUB_ARGV_LOG"
+    reply_msg '@carol' "$ng1_mid" "again $ng_seat" --to "@$ng_seat" >/dev/null
+    once
+    check "no-grant thread: $ng_seat spawns with a stray grant file" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+    check "no-grant thread: $ng_seat forwards none of it" 0 "$(ng_flags_in_argv)"
+    contains "no-grant thread: $ng_seat emits grant-ignored" "$(cat "$work/once.out")" \
+        "pm grant-ignored thread=$ng1_short"
+done
+
+# No header: a grant: required seat holds, a grant file is forwarded.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+ng2_mid="$(send_msg '@carol' '@karl' 'no header topic' 'first' 8)"
+ng2_tid="$(thread_of "$ng2_mid")"; ng2_short="${ng2_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "no header: a grant: required seat holds" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+contains "no header: with the no-grant refusal" "$(cat "$work/once.out")" \
+    "pm refuse thread=$ng2_short agent=karl reason=no-grant"
+contains "no header: and the no-grant flag" "$(cat "$PM_STATE_DIR/needs-operator/$ng2_tid" 2>/dev/null)" "no grant for k8s seat karl"
+ng2_json="$("$postmaster" status --thread "$ng2_tid" --json)"
+check "no header: status grant_mode is missing" missing "$(ng_key "$ng2_json" grant_mode)"
+"$MAIL" grant "$ng2_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+ng2_json="$("$postmaster" status --thread "$ng2_tid" --json)"
+check "no header: status grant_mode is file once granted" file "$(ng_key "$ng2_json" grant_mode)"
+check "no header: status grant is true" True "$(ng_key "$ng2_json" grant)"
+: > "$STUB_ARGV_LOG"
+once
+check "no header: the grant file is forwarded to the released seat" 1 \
+    "$(grep -c -- '^--allow-namespace$' "$STUB_ARGV_LOG")"
+not_contains "no header: no grant-ignored event" "$(cat "$work/once.out")" "grant-ignored"
+
 # ---- case 10: a malformed K8S_TIMEOUT refuses deliver at startup ----
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT

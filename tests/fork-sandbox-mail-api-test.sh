@@ -859,6 +859,37 @@ for bd_name in X-Thread-Budget x-thread-budget; do
     done
 done
 
+printf '== 11e. send --no-grant: needs cap grant, never on reply, header refused ==\n'
+
+check "no caps: send --no-grant: 403" "403" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- send --from @bot --to @x --subject n --body - --no-grant)"
+contains "... names the 'grant' cap" "$(rjson error)" "'grant' cap"
+check "grant cap: send --no-grant: 200" "200" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject n --body - --no-grant)"
+check "grant cap: that send ran: rc 0" "0" "$(rjson rc)"
+ng_tid="$(rjson stdout | tr -d '\n')"
+contains "the root carries X-Grant: none" "$("$mail" show "$ng_tid")" "X-Grant: none"
+check "operator: send --no-grant: 200" "200" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject n --body - --no-grant)"
+check "reply --no-grant: 403" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$ng_tid" --body - --no-grant)"
+for ng_name in X-Grant x-grant; do
+    for ng_tok in ci-kickoff laptop; do
+        ng_from=@ci-kickoff; [[ "$ng_tok" == laptop ]] && ng_from=@operator
+        check "raw $ng_name header refused on send ($ng_tok)" "403" \
+            "$(xr "$tok/$ng_tok" --tool mail --stdin hi -- send --from "$ng_from" --to @x --subject h --body - --header "$ng_name: none")"
+        contains "... names X-Grant" "$(rjson error)" "X-Grant"
+        check "raw $ng_name header refused on reply ($ng_tok)" "403" \
+            "$(xr "$tok/$ng_tok" --tool mail --stdin hi -- reply --from "$ng_from" --reply-to "$ng_tid" --body - --header "$ng_name: none")"
+    done
+done
+ng_threads="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "--no-grant with grant flags passes the API" "200" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject n --body - --no-grant --allow-namespace ns --reach-probe h:80)"
+check "... and is mail's own refusal: rc 1" "1" "$(rjson rc)"
+check "... which created no thread" "$ng_threads" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+
 printf '== 12. list --json --header for a read token ==\n'
 
 demo_tid="$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject demo --body - --header "X-Demo-PR: 42" >/dev/null; rjson stdout | tr -d '\n')"

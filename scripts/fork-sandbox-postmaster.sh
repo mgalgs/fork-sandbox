@@ -137,6 +137,12 @@
 #                thread's upstream state (see UPSTREAM STATE below): every
 #                spawn path refuses, spends no budget and flags nothing.
 #                At route-pass time it names To: candidates only.
+#   grant-ignored thread -- a k8s seat woke on a thread whose root carries
+#                X-Grant: none (`mail send --no-grant`) although a grant
+#                file exists for it; the file was not forwarded (no
+#                --allow-namespace/--reach-probe/--context-ro/
+#                --context-secret). `mail grant` refuses such a thread, so
+#                this only fires for a file placed by hand.
 #   held-release thread, agent, trigger=<short-id> -- a held `backend: k8s`
 #                seat (reason=no-grant above) was released by pm_held_pass:
 #                its grant file showed up, or its seat stopped resolving
@@ -679,7 +685,12 @@
 # for a per-thread grant file before it is allowed to spawn at all: see
 # the `refuse ... reason=no-grant` and `held-release` events above, and
 # docs/agent-mail.md's "Cluster seats" and "The held state file is a read
-# contract" sections for the grant file, the hold, and its release.
+# contract" sections for the grant file, the hold, and its release. A
+# thread whose root carries X-Grant: none (`mail send --no-grant`) has no
+# environment: such a seat spawns at once with no grant flags, and a grant
+# file for the thread, if one exists, is ignored (event grant-ignored). A
+# thread without the header keeps the hold -- absence never reads as "no
+# environment".
 #
 # REPLY HARVEST
 #
@@ -1226,6 +1237,13 @@ pm_root_header() {
         return 0
     done
     return 0
+}
+
+# True when thread $1's root says `X-Grant: none` (`mail send --no-grant`):
+# the thread was opened with no environment. Only that exact value counts;
+# an absent or any other header is "a grant may be required", never "none".
+pm_thread_no_grant() {
+    [[ "$(pm_root_header "$1" X-Grant)" == none ]]
 }
 
 # `<budget> <source>` for thread $1: the lower of the root's X-Thread-Budget
@@ -3662,10 +3680,12 @@ pm_spawn_wake() {
     # failing the wake outright: the grant is expected to show up later
     # (an operator runs `mail grant`), and the message itself has already
     # routed (Cc triage already ran), so only this one seat waits, not the
-    # whole message. See pm_held_pass for the release side.
+    # whole message. See pm_held_pass for the release side. A thread opened
+    # with --no-grant (X-Grant: none on its root) has no environment to wait
+    # for: the seat spawns at once with no grant flags.
     if [[ "$backend" == k8s && "$grant" == required ]]; then
         local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env"
-        if [[ ! -e "$grant_file" ]]; then
+        if [[ ! -e "$grant_file" ]] && ! pm_thread_no_grant "$tid"; then
             local held_file="$STATE/held/$tid/$agent" old_trigger="" since retry_flag=0
             old_trigger="$(fs_pm_env_get "$held_file" TRIGGER)"
             if [[ -e "$held_file" ]]; then
@@ -3829,7 +3849,11 @@ pm_spawn_wake() {
         # -- an optional grant still shapes network/context access when
         # present.
         local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env" g_line
-        if [[ -e "$grant_file" ]]; then
+        if [[ -e "$grant_file" ]] && pm_thread_no_grant "$tid"; then
+            # A no-grant thread's grant file is never forwarded (defence in
+            # depth: `mail grant` refuses to write one).
+            pm_event "grant-ignored thread=${tid:0:8}"
+        elif [[ -e "$grant_file" ]]; then
             while IFS= read -r g_line; do
                 spawn_args+=(--allow-namespace "$g_line")
             done < <(sed -n 's/^ALLOW_NAMESPACE=//p' "$grant_file")
@@ -5816,9 +5840,13 @@ cmd_status_json() {
             printf '%s\0' flag "$(cat -- "$NEEDS_OPERATOR/$tid")" "$events"
         fi
 
+        local grant_mode='missing'
         if [[ -e "$STATE/grants/$tid.env" ]]; then
             printf '%s\0' grant
+            grant_mode='file'
         fi
+        pm_thread_no_grant "$tid" && grant_mode='none'
+        printf '%s\0' grant_mode "$grant_mode"
 
         # Only a thread that has ever seen X-Upstream-State carries the key
         # (a thread that never did prints exactly what it always did).
@@ -5900,9 +5928,10 @@ if tok and tok[-1] == "":
 out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
        "review_target": None,
        "spawns": 0, "runs": [], "retries": [], "held": [],
-       "budget": None, "budget_source": None, "spawns_total": 0}
+       "budget": None, "budget_source": None, "spawns_total": 0,
+       "grant_mode": "missing"}
 arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "upstream_state": 3,
-         "review_target": 5, "spawns": 1, "budget": 2, "spawns_total": 1,
+         "review_target": 5, "spawns": 1, "budget": 2, "spawns_total": 1, "grant_mode": 1,
          "run": 5, "retry": 4, "held": 3, "wake_exit": 3}
 wake_exits = []
 i = 0
@@ -5931,6 +5960,8 @@ while i < len(tok):
     elif tag == "budget":
         out["budget"] = int(a[0])
         out["budget_source"] = a[1]
+    elif tag == "grant_mode":
+        out["grant_mode"] = a[0]
     elif tag == "spawns_total":
         out["spawns_total"] = int(a[0] or 0)
     elif tag == "run":

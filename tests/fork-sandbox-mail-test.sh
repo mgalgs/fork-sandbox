@@ -833,6 +833,51 @@ for bd_name in X-Thread-Budget x-thread-budget X-THREAD-BUDGET; do
     [[ "$bd_name" == x-* ]] || contains "reply --header $bd_name says reserved" "$bd_out" "reserved header"
 done
 
+printf '\n== send: --no-grant ==\n'
+
+ng_id="$("$mail" send --from @alice --to @bob --subject "No env" --body - --no-grant <<< "x" 2>/dev/null)"
+ng_raw="$("$mail" show "$ng_id")"
+check "send --no-grant stamps X-Grant: none once" "1" "$(grep -c '^X-Grant: none$' <<< "$ng_raw")"
+contains "--help names --no-grant" "$("$mail" --help 2>&1)" "--no-grant"
+check "a plain send carries no X-Grant" "0" "$("$mail" show "$bd_plain" | grep -c '^X-Grant:')"
+
+ng_threads="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+ng_grants="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+for ng_flag in "--allow-namespace ns-x" "--reach-probe svc.ns-x:80" "--context-ro /tmp" "--context-secret ctx"; do
+    # shellcheck disable=SC2086  # the flag and its value are two words
+    ng_out="$("$mail" send --from @alice --to @bob --subject "Conflict" --body - --no-grant $ng_flag <<< "x" 2>&1)"; rc=$?
+    check "--no-grant with ${ng_flag%% *} exits 1" "1" "$rc"
+    contains "--no-grant with ${ng_flag%% *} names the conflict" "$ng_out" "--no-grant"
+done
+check "the conflicts create no thread" "$ng_threads" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "the conflicts write no grant file" "$ng_grants" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+
+ng_out="$("$mail" reply --from @bob --reply-to "$ng_id" --body - --no-grant <<< "x" 2>&1)"; rc=$?
+check "reply --no-grant exits 1" "1" "$rc"
+contains "reply's refusal names send" "$ng_out" "mail send"
+for ng_name in X-Grant x-grant X-GRANT; do
+    ng_out="$("$mail" send --from @alice --to @bob --subject "Raw" --body - \
+        --header "$ng_name: none" <<< "x" 2>&1)"; rc=$?
+    check "send --header $ng_name exits 1" "1" "$rc"
+    ng_out="$("$mail" reply --from @bob --reply-to "$ng_id" --body - \
+        --header "$ng_name: none" <<< "x" 2>&1)"; rc=$?
+    check "reply --header $ng_name exits 1" "1" "$rc"
+    [[ "$ng_name" == x-* ]] || contains "reply --header $ng_name says reserved" "$ng_out" "reserved header"
+done
+
+ng_out="$("$mail" grant "$ng_id" --allow-namespace ns-x --reach-probe svc.ns-x:80 2>&1)"; rc=$?
+check "grant on a no-grant thread exits 2" "2" "$rc"
+contains "the refusal says the thread was opened with --no-grant" "$ng_out" "opened with --no-grant"
+check "the refused grant writes no file" "0" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name "$ng_id.env" | wc -l)"
+"$mail" grant "$ng_id" --show >/dev/null 2>&1; check "grant --show still works on it" "0" "$?"
+"$mail" grant "$ng_id" --show --json >/dev/null 2>&1; check "grant --show --json still works on it" "0" "$?"
+"$mail" grant "$ng_id" --clear >/dev/null 2>&1; check "grant --clear still works on it" "0" "$?"
+"$mail" grant "$bd_plain" --allow-namespace ns-x --reach-probe svc.ns-x:80 >/dev/null 2>&1
+check "grant on a thread without the header still works" "0" "$?"
+
 printf '\n== reply: --upstream-head ==\n'
 
 uh_sha="fedcba9876543210fedcba9876543210fedcba98"
@@ -1237,6 +1282,8 @@ hx_emit_attach() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s 
 refuses "--emit refuses an attachment" hx_emit_attach
 hx_emit_budget() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --budget 4; }
 refuses "--emit refuses --budget" hx_emit_budget
+hx_emit_no_grant() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --no-grant; }
+refuses "--emit refuses --no-grant" hx_emit_no_grant
 printf 'LANE_MAIL_PEER_NAME=Bad_Name\n' > "$hx_cfg_a/lane-mail.env"
 hx_err="$(printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - 2>&1)"; rc=$?
 check "--emit with no valid peer name fails" "1" "$rc"
@@ -1300,6 +1347,7 @@ hx_try "ingest refuses a Thread-ID in a store-shaped id that is another message'
     's/^Thread-ID: .*/Thread-ID: 00000000-0000-4000-8000-000000000099/'
 hx_try "ingest refuses X-Attachment" alpha 's/^X-Hops: .*/&\nX-Attachment: attachments\/..\/..\/etc\/passwd/'
 hx_try "ingest refuses X-Thread-Budget" alpha 's/^X-Hops: .*/&\nX-Thread-Budget: 5/'
+hx_try "ingest refuses X-Grant" alpha 's/^X-Hops: .*/&\nX-Grant: none/'
 hx_try "ingest refuses X-Review-Target" alpha 's/^X-Hops: .*/&\nX-Review-Target: main aaaaaaaa/'
 hx_try "ingest refuses a non-numeric X-Hops" alpha 's/^X-Hops: .*/X-Hops: lots/'
 hx_try "ingest refuses a malformed header line" alpha 's/^X-Hops: .*/&\nno colon here/'
