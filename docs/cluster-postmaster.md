@@ -65,7 +65,7 @@ Do these in order.
    | `K8S_POSTMASTER_STORAGE` | no | the data volume's requested size; default `20Gi`; must match `^[0-9]+(Mi\|Gi\|Ti)$` |
    | `K8S_POSTMASTER_MAIL_STORAGE` | no | the mail volume's requested size; default `2Gi`; same pattern as `K8S_POSTMASTER_STORAGE` |
    | `K8S_POSTMASTER_ACCESS_MODE` | no | access mode of both PVCs: `ReadWriteOncePod` (default) or `ReadWriteOnce`, for a StorageClass or CSI driver that does not support RWOP yet; anything else is refused |
-   | `K8S_POSTMASTER_SEAT_SERVICES` | no | `true` (default) or `false` for k8s seat services; a seat's `services` value in `fleet.yaml` wins over this default. |
+   | `K8S_POSTMASTER_SEAT_SERVICES` | no | `true` (default) or `false` for k8s seat services; a seat's `services` value in `fleet.yaml` wins over this default. Other values are refused by `install --postmaster`. |
    | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
    | `K8S_POSTMASTER_HOOKS_SECRET` | no | the name of a Secret you create in the namespace, to hand your hooks credentials. Install never creates or reads it, only references it. Must be a DNS-1123 subdomain name. See "Hooks". |
    | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |

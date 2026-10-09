@@ -820,6 +820,7 @@
 #                         is refused.
 #   K8S_POSTMASTER_SEAT_SERVICES=
 #                         true (default) or false; fleet.yaml services overrides.
+#                         Any other value is refused by install --postmaster.
 #   K8S_POSTMASTER_OPERATORS=
 #                         comma-separated @names (no spaces) that carry
 #                         rule-1 authority in the cluster postmaster: only
@@ -1152,6 +1153,7 @@ K8S_POSTMASTER_MAIL_STORAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_MAIL_STO
 K8S_POSTMASTER_MAIL_STORAGE="${K8S_POSTMASTER_MAIL_STORAGE:-2Gi}"
 K8S_POSTMASTER_ACCESS_MODE="$(read_env_value "$k8s_env" K8S_POSTMASTER_ACCESS_MODE || true)"
 K8S_POSTMASTER_ACCESS_MODE="${K8S_POSTMASTER_ACCESS_MODE:-ReadWriteOncePod}"
+K8S_POSTMASTER_SEAT_SERVICES="$(read_env_value "$k8s_env" K8S_POSTMASTER_SEAT_SERVICES || true)"
 K8S_POSTMASTER_OPERATORS="$(read_env_value "$k8s_env" K8S_POSTMASTER_OPERATORS || true)"
 K8S_POSTMASTER_OPERATORS="${K8S_POSTMASTER_OPERATORS:-@operator}"
 K8S_POSTMASTER_HOOKS_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_HOOKS_SECRET || true)"
@@ -3574,6 +3576,11 @@ cmd_install() {
         if [[ "$K8S_POSTMASTER_ACCESS_MODE" != ReadWriteOncePod && "$K8S_POSTMASTER_ACCESS_MODE" != ReadWriteOnce ]]; then
             echo "Error: K8S_POSTMASTER_ACCESS_MODE='$K8S_POSTMASTER_ACCESS_MODE' must be" >&2
             echo "ReadWriteOncePod or ReadWriteOnce." >&2
+            exit 1
+        fi
+        if [[ -n "$K8S_POSTMASTER_SEAT_SERVICES" && "$K8S_POSTMASTER_SEAT_SERVICES" != true && "$K8S_POSTMASTER_SEAT_SERVICES" != false ]]; then
+            echo "Error: K8S_POSTMASTER_SEAT_SERVICES='$K8S_POSTMASTER_SEAT_SERVICES' must be" >&2
+            echo "true or false." >&2
             exit 1
         fi
         if [[ -n "$K8S_POSTMASTER_HOOKS_SECRET" ]]; then

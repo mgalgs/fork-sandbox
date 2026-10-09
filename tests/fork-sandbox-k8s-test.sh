@@ -17992,6 +17992,37 @@ else
     ok "invalid access mode never invokes kubectl"
 fi
 
+# 3b. The postmaster's services default must be a YAML-style boolean
+# before its config is shipped to the pod, or every k8s seat wake fails.
+for pm_services_value in true false; do
+    pm_cfg_services="$(newdir)"; tmpdirs+=("$pm_cfg_services")
+    cp -r "$pm_cfg1"/. "$pm_cfg_services"/
+    chmod 600 "$pm_cfg_services/deploy-key" "$pm_cfg_services/pi.env"
+    printf 'K8S_POSTMASTER_SEAT_SERVICES=%s\n' "$pm_services_value" >> "$pm_cfg_services/k8s.env"
+    if PATH="$pm_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_services" \
+        "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/dev/null; then
+        ok "seat services default $pm_services_value installs"
+    else
+        no "seat services default $pm_services_value installs"
+    fi
+done
+for pm_services_value in no False 0; do
+    pm_cfg_services="$(newdir)"; tmpdirs+=("$pm_cfg_services")
+    cp -r "$pm_cfg1"/. "$pm_cfg_services"/
+    chmod 600 "$pm_cfg_services/deploy-key" "$pm_cfg_services/pi.env"
+    printf 'K8S_POSTMASTER_SEAT_SERVICES=%s\n' "$pm_services_value" >> "$pm_cfg_services/k8s.env"
+    pm_log_services="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_services")")
+    refuses "seat services default $pm_services_value refuses" \
+        "K8S_POSTMASTER_SEAT_SERVICES='$pm_services_value' must be" \
+        env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_services" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_services" \
+        "$k8s_sh" install --postmaster --dry-run
+    if [[ -s "$pm_log_services" ]]; then
+        no "invalid seat services default $pm_services_value never invokes kubectl" "$(cat "$pm_log_services")"
+    else
+        ok "invalid seat services default $pm_services_value never invokes kubectl"
+    fi
+done
+
 # 4. Each optional block renders (env, volumeMount, volume, its own
 # ConfigMap) iff its config dir exists, checked one integration at a
 # time, plus a mixed combination (the shape a template-indentation bug

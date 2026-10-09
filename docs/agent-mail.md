@@ -677,12 +677,12 @@ other seat would be refused from a thread's first message.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # seventeen lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # eighteen lines: harness, model, thinking,
                                       # network, persona-path, description,
                                       # wake-on-cc, refresh-at, triage,
                                       # preset, handler, command, backend,
                                       # endpoint, grant, review-target,
-                                      # wake-when
+                                      # wake-when, services
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -701,7 +701,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly seventeen lines;
+than stopping at the first. `resolve` always prints exactly eighteen lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
