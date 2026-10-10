@@ -2953,6 +2953,8 @@ pm_review_history_add() {
 pm_review_history_pin() {
     local project="$1" tid="$2" name="$3" sha="$4"
     local pin="refs/fork-sandbox/review/$tid/$name"
+    # `git -C ""` is the current directory, which is not the project.
+    [[ -n "$project" ]] || return 0
     git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null || return 0
     git -C "$project" rev-parse --verify --quiet "$pin" >/dev/null 2>&1 \
         || git -C "$project" update-ref "$pin" "$sha" "" 2>/dev/null || true
