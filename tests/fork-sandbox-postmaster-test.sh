@@ -5865,6 +5865,37 @@ check "prior heads: the missing shas are not pinned" 0 \
 check "prior heads: and the thread is not flagged" 0 \
     "$( [[ -e "$PM_STATE_DIR/needs-operator/$ph2_tid" ]] && echo 1 || echo 0 )"
 
+# ---- an announced head only on origin is fetched and pinned at announcement,
+# so a force-push before any seat wakes cannot lose it ----
+new_root PH_ORIGIN_BARE
+git init -q --bare "$PH_ORIGIN_BARE"
+new_root PH_ORIGIN_SRC
+git -C "$PH_ORIGIN_SRC" init -q
+git -C "$PH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test commit -q --allow-empty -m 'first head'
+ph3_branch="feature/force-pushed"
+ph3_sha="$(git -C "$PH_ORIGIN_SRC" rev-parse HEAD)"
+git -C "$PH_ORIGIN_SRC" push -q "$PH_ORIGIN_BARE" "HEAD:refs/heads/$ph3_branch"
+git -C "$PROJECT_DIR" remote add origin "$PH_ORIGIN_BARE"
+uh_kickoff karen; ph3_mid="$UH_MID"
+ph3_tid="$(thread_of "$ph3_mid")"
+check "prior heads origin-only: the sha is not local before the announcement" 1 \
+    "$(git -C "$PROJECT_DIR" cat-file -e "$ph3_sha^{commit}" >/dev/null 2>&1 && echo 0 || echo 1)"
+ph3_reply="$(reply_msg '@ci-demo' "$ph3_mid" 'carry' --to '@operator' --upstream-head "$ph3_branch:$ph3_sha")"
+once
+check "prior heads origin-only: a carry that wakes nobody still pinned the head" "$ph3_sha" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$ph3_tid/head-$(head_id "$ph3_reply")" 2>/dev/null)"
+git -C "$PH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test commit -q --amend --allow-empty -m 'rewritten'
+git -C "$PH_ORIGIN_SRC" push -q -f "$PH_ORIGIN_BARE" "HEAD:refs/heads/$ph3_branch"
+git -C "$PH_ORIGIN_BARE" reflog expire --expire=now --all
+git -C "$PH_ORIGIN_BARE" gc --prune=now -q 2>/dev/null
+reply_msg '@carol' "$ph3_reply" 'next wake' --to '@karen' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "prior heads origin-only: the force-pushed-away head is still handed over" \
+    "head-$(head_id "$ph3_reply")=$ph3_sha" "$(extra_refs)"
+not_contains "prior heads origin-only: and nothing is reported missing" "$(cat "$work/once.out")" "review-history-missing"
+git -C "$PROJECT_DIR" remote remove origin
+
 # ---- case 2: a local seat on the same fleet spawns exactly as before ----
 
 # Fresh root: case1's k8s reply (no explicit To:, so reply-all to its

@@ -3099,7 +3099,7 @@ pm_write_upstream_head() {
 # nothing upstream of the store is trusted to have shaped it -- because the
 # branch ends up in a fetch refspec.
 pm_record_upstream_head() {
-    local tid="$1" mid="$2" from_name="$3" value="$4"
+    local tid="$1" mid="$2" from_name="$3" value="$4" project="${5:-}"
     local branch sha
     if "$FLEET" resolve "$from_name" >/dev/null 2>&1; then
         pm_event "upstream-head-ignored thread=${tid:0:8} reason=fleet-sender"
@@ -3119,6 +3119,24 @@ pm_record_upstream_head() {
     fi
     pm_fetch_wait_supersede "$tid"
     pm_event "upstream-head thread=${tid:0:8} sha=${sha:0:12}"
+    [[ -z "$project" ]] || pm_pin_announced_head "$project" "$tid" "$mid" "$branch" "$sha"
+    return 0
+}
+
+# Best effort, at announcement time while the branch tip is likely still
+# <sha>: fetches <branch> from origin when the project repo lacks <sha>, then
+# pins it under the head-<id> review-history ref (see pm_review_history_refs),
+# so a later force-push or gc cannot lose it before any seat wakes. Never
+# fails the announcement; a sha that cannot be had stays unpinned and is
+# reported by review-history-missing at wake time.
+pm_pin_announced_head() {
+    local project="$1" tid="$2" mid="$3" branch="$4" sha="$5" name pin
+    pm_target_sha_present "$project" "$branch" "$sha" || return 0
+    name="head-$(printf '%s' "${mid//-/}" | cut -c1-12)"
+    [[ "$name" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || return 0
+    pin="refs/fork-sandbox/review/$tid/$name"
+    git -C "$project" rev-parse --verify --quiet "$pin" >/dev/null 2>&1 \
+        || git -C "$project" update-ref "$pin" "$sha" "" 2>/dev/null || true
     return 0
 }
 
@@ -4224,7 +4242,7 @@ pm_process_message() {
     # only mail reply --upstream-head can produce the header, and the mail
     # API gates that flag on a cap, so reaching here is the authorization.
     local uh_recorded=0 us_applied=0
-    if [[ -n "$uh_value" ]] && pm_record_upstream_head "$tid" "$mid" "$from_name" "$uh_value"; then
+    if [[ -n "$uh_value" ]] && pm_record_upstream_head "$tid" "$mid" "$from_name" "$uh_value" "$project"; then
         pm_unflag "$tid"
         mkdir -p -- "$SPAWNS"
         : > "$SPAWNS/$tid"

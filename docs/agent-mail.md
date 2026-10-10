@@ -1112,10 +1112,13 @@ all, and local (non-k8s) seats are unchanged.
 Each sha is **pinned** in the project repo under
 `refs/fork-sandbox/review/<thread-id>/<name>` the first time the postmaster
 sees it there (created once, never moved), so a force-push upstream and a
-gc cannot lose it. A sha the project repo does not hold and that cannot be
-pinned (possible only for a thread older than this feature) is skipped with
-a `review-history-missing thread=<8> ref=<name>` event; the wake goes ahead
-without that ref and nothing is flagged. No fetch is attempted to find it.
+gc cannot lose it. When an upstream-head announcement is recorded the
+postmaster fetches the announced branch from `origin` if the project repo
+lacks the sha, and pins the `head-<id>` ref at once, so a force-push before
+any seat wakes (or a carry that wakes nobody) loses nothing. A sha the
+project repo still does not hold is skipped at wake time with a
+`review-history-missing thread=<8> ref=<name>` event; the wake goes ahead
+without that ref and nothing is flagged. No fetch is attempted at wake time.
 
 ### Upstream closed: `mail reply --upstream-state closed|open`
 
