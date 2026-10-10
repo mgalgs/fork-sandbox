@@ -47,7 +47,7 @@ writing a detailed handoff so nothing gets dropped.
 3. **If the user provided a topic**, emphasize that area in the
    "Remaining Work" section as the first priority.
 
-4. **Launch the new session** as a split in the current window,
+4. **Launch the new session** as a split beside the current pane,
    **carrying the current session's model over** — a refresh must not
    silently change models (a Fable session forks to Fable, not to the
    CLI default). Read the model from the stash `statusline-stash.sh`
@@ -55,9 +55,10 @@ writing a detailed handoff so nothing gets dropped.
    docs/permissions.md), the same source `context-usage.sh` prints:
    ```bash
    model="$(jq -r .model "/tmp/claude-$(id -u)/context-nudge/ctx-$CLAUDE_CODE_SESSION_ID.json")"
-   fork-task.sh --split --relation continuation --model "$model" . <handoff-file>
+   fork-task.sh --hsplit --relation continuation --model "$model" . <handoff-file>
    ```
-   Always use `--split` and `.` (current project) — this is a same-project
+   Always use `--hsplit` (side by side, not `--split`, which stacks the new
+   pane below) and `.` (current project) — this is a same-project
    session refresh, not a cross-project fork. Always pass
    `--relation continuation` too: the new session carries on this same job
    under a new session id, so the agent registry must record it as a
@@ -73,7 +74,7 @@ writing a detailed handoff so nothing gets dropped.
    If the user asked for a specific model (fable, opus, sonnet, or a full
    model ID), use that instead of the stashed one:
    ```bash
-   fork-task.sh --split --relation continuation --model sonnet . <handoff-file>
+   fork-task.sh --hsplit --relation continuation --model sonnet . <handoff-file>
    ```
    Only if the stash file is missing (the status line never ran) and the
    user named no model, omit `--model` and say so in the launch report.
@@ -102,4 +103,4 @@ writing a detailed handoff so nothing gets dropped.
    successor.
 
 5. **Confirm** to the user that the handoff is ready and the new session
-   is running in the split below.
+   is running in the split beside this one.
