@@ -2904,6 +2904,9 @@ pm_review_history_refs() {
                 pm_review_history_add "$project" "$tid" "$name" "$sha" seen "$3"
             fi
         fi
+    done
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] || continue
         value="$(pm_header "$f" X-Upstream-Head)"
         [[ -n "$value" ]] || continue
         from="$(pm_header "$f" From)"
@@ -2925,6 +2928,7 @@ pm_review_history_add() {
     local project="$1" tid="$2" name="$3" sha="$4"
     local -n seen_ref="$5"
     local -n list_ref="$6"
+    [[ "$name" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || return 0
     [[ -z "${seen_ref["$name"]:-}" ]] || return 0
     seen_ref["$name"]=1
     if ! git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null; then

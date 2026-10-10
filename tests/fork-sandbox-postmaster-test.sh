@@ -6677,6 +6677,16 @@ check "prior heads: review-v1 is pinned in the project repo" "$rt5_seed_sha" \
 check "prior heads: without an announcement no seat gets an upstream ref" 0 \
     "$(extra_refs | grep -c '^upstream=' || true)"
 
+# A later announcement appears after the VERSION 1 target in the archive;
+# review-version refs precede head refs regardless of archive interleaving.
+: > "$STUB_ARGV_LOG"
+rt5_announcement="$(reply_msg '@ci-demo' "$rt5_mid" 'new upstream head' \
+    --to '@kai' --upstream-head "$rt5_branch:$rt5_branch_sha")"
+once
+check "prior heads: review versions precede announced heads" \
+    "review-v1=$rt5_seed_sha head-$(head_id "$rt5_announcement")=$rt5_branch_sha" \
+    "$(extra_refs | paste -sd' ')"
+
 # ---- review-target case B1b: a Version: reply whose branch tip is NOT a
 # descendant of the old target is accepted and recorded -- the human
 # rebased or squashed, and the persona resets its wake branch to `upstream`
