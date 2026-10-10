@@ -146,6 +146,14 @@ Do these in order.
   template carries a `checksum/pm-config` annotation computed over the
   rendered ConfigMaps and Secrets; a changed checksum is a changed pod
   template, which rolls the pod.
+- **Config applied some other way** (a GitOps tool applying the rendered
+  manifests, or a hand edit of a ConfigMap) is not live when the apply
+  returns. If the pod does not roll, it sees the change only once the
+  kubelet syncs the mounted ConfigMap, which takes up to about a minute by
+  default. Mail sent in that window runs with the old values, a stale
+  `K8S_IMAGE` included. If it does roll, the old pod may take mail until
+  the new one is ready. Either way, wait for `kubectl rollout status`, or
+  for the pod to show the new value, before sending.
 - **Rotating the git deploy key** is the same: replace the file named by
   `K8S_POSTMASTER_GIT_KEY_FILE` (or `K8S_POSTMASTER_KNOWN_HOSTS_FILE`) and
   run `install --postmaster` again. The Secret is part of the checksum, so
