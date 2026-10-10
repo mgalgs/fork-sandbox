@@ -4864,6 +4864,10 @@ pm_harvest_one_file() {
     # without reaching here, so nothing announced never moves what everyone
     # else reviews.
     if [[ -n "$rt_write_sha" ]]; then
+        # Pin the announced version now, not at some later wake: if the
+        # reply wakes no k8s seat the branch could be replaced and gc'd
+        # before any wake pinned it.
+        pm_review_history_pin "$project" "$tid" "review-v$rt_write_version" "$rt_write_sha"
         if ! pm_write_review_target "$tid" "$rt_write_branch" "$rt_write_sha" "$rt_write_version" "@$agent"; then
             pm_flag "$tid" "review target not recorded after posting"
         fi

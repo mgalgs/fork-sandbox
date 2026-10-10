@@ -6691,6 +6691,8 @@ rt5_state="$(cat "$PM_STATE_DIR/review-target/$rt5_tid.env" 2>/dev/null)"
 contains "review-target case B1: state file VERSION advanced to 2" "$rt5_state" "VERSION=2"
 contains "review-target case B1: state file BRANCH updated to the wake's branch" "$rt5_state" "BRANCH=$rt5_branch"
 contains "review-target case B1: state file SHA updated to the wake's resolved sha" "$rt5_state" "SHA=$rt5_branch_sha"
+check "review-target case B1: the harvested version is pinned before any later wake" "$rt5_branch_sha" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$rt5_tid/review-v2" 2>/dev/null)"
 
 # ---- prior heads: B1's thread is at VERSION 2, so every k8s seat gets the
 # VERSION 1 target as review-v1 and no review-v2 ----
