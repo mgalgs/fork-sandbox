@@ -8285,7 +8285,7 @@ we5_json="$(we_json "$we5_tid")"
 check "wake-exit adversarial: the status output is one line of valid JSON" 1 \
     "$(printf '%s\n' "$we5_json" | wc -l)"
 check "wake-exit adversarial: top-level keys are unchanged" \
-    "budget,budget_source,flag,grant,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted,wake_failures" \
+    "budget,budget_source,flag,grant,grant_mode,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted,wake_failures" \
     "$(we_py "$we5_json" '",".join(sorted(d))')"
 check "wake-exit adversarial: the flag is still the postmaster's own" "wake for karen exited 1" \
     "$(we_py "$we5_json" 'd["flag"]["reason"][:23]')"
@@ -8365,7 +8365,7 @@ new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 we8_tid="$(thread_of "$(send_msg '@carol' '@karen' 'wake exit clean' 'first' 8)")"
 once
-check "wake-exit: a clean wake adds no wake_failures key" "budget,budget_source,flag,grant,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted" \
+check "wake-exit: a clean wake adds no wake_failures key" "budget,budget_source,flag,grant,grant_mode,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted" \
     "$(we_py "$(we_json "$we8_tid")" '",".join(sorted(d))')"
 check "wake-exit: a clean wake writes no wake-exits state" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-exits" ]] && echo 1 || echo 0)"
@@ -8863,8 +8863,9 @@ bad = []
 def want(label, got, exp):
     if got != exp:
         bad.append(f"{label}: expected {exp!r}, got {got!r}")
-want("keys", sorted(d), ["budget", "budget_source", "flag", "grant", "held", "retries", "review_target", "runs", "spawns", "spawns_total", "thread", "unrouted"])
+want("keys", sorted(d), ["budget", "budget_source", "flag", "grant", "grant_mode", "held", "retries", "review_target", "runs", "spawns", "spawns_total", "thread", "unrouted"])
 want("budget", [d["budget"], d["budget_source"], d["spawns_total"]], [96, "global", 0])
+want("grant_mode", d["grant_mode"], "file")
 want("thread", d["thread"], t)
 want("unrouted counts this thread only, keyed on Message-ID", d["unrouted"], 1)
 want("flag", d["flag"], {"reason": "hops exhausted at " + t, "events": 2})
@@ -8893,7 +8894,7 @@ check "status --json: a flag without its journal has events null" \
 
 sfx_empty="$(sfx_pm status --thread "ffffffff-4444-4444-8444-000000000009" --json)"
 check "status --json: a thread with no state is all empty or zero" \
-    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": [], "budget": 96, "budget_source": "global", "spawns_total": 0}' \
+    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": [], "budget": 96, "budget_source": "global", "spawns_total": 0, "grant_mode": "missing"}' \
     "$sfx_empty"
 
 sfx_rc=0; sfx_out="$(sfx_pm status --json 2>&1)" || sfx_rc=$?
