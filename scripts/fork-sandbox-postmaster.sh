@@ -1277,7 +1277,10 @@ pm_thread_no_grant() {
 pm_thread_budget() {
     local tid="$1" global="${FORK_SANDBOX_THREAD_BUDGET:-96}" hdr
     hdr="$(pm_root_header "$tid" X-Thread-Budget)"
-    if [[ "$hdr" =~ ^[1-9][0-9]*$ ]] && (( hdr <= global )); then
+    # Compared as digit strings (no leading zero, so length orders them):
+    # a value past the shell's integer range must clamp, not wrap.
+    if [[ "$hdr" =~ ^[1-9][0-9]*$ ]] \
+        && { (( ${#hdr} < ${#global} )) || { (( ${#hdr} == ${#global} )) && [[ ! "$hdr" > "$global" ]]; }; }; then
         printf '%s thread\n' "$hdr"
     else
         printf '%s global\n' "$global"
@@ -2898,10 +2901,16 @@ pm_review_history_refs() {
             set_value="$(pm_header "$f" X-Review-Target-Set)"
             version="$(pm_header "$f" X-Version)"
             sha="${set_value#* }"
-            if [[ -n "$set_value" && "$version" =~ ^[1-9][0-9]*$ ]] && (( version < current )) \
+            if [[ -n "$set_value" && "$version" =~ ^[1-9][0-9]*$ ]] \
                 && [[ "$sha" =~ ^[0-9a-f]{40}$ && "$set_value" == "${set_value%% *} $sha" ]]; then
                 name="review-v$version"
-                pm_review_history_add "$project" "$tid" "$name" "$sha" seen "$3"
+                if (( version < current )); then
+                    pm_review_history_add "$project" "$tid" "$name" "$sha" seen "$3"
+                else
+                    # The current target is pinned too (so a later
+                    # version finds it) but not handed out.
+                    pm_review_history_pin "$project" "$tid" "$name" "$sha"
+                fi
             fi
         fi
     done
@@ -2935,10 +2944,18 @@ pm_review_history_add() {
         pm_event "review-history-missing thread=${tid:0:8} ref=$name"
         return 0
     fi
+    pm_review_history_pin "$project" "$tid" "$name" "$sha"
+    list_ref+=("$name=$sha")
+}
+
+# Pins <sha> under refs/fork-sandbox/review/<tid>/<name> when the project
+# repo holds it and no pin exists yet; never moves an existing pin.
+pm_review_history_pin() {
+    local project="$1" tid="$2" name="$3" sha="$4"
     local pin="refs/fork-sandbox/review/$tid/$name"
+    git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null || return 0
     git -C "$project" rev-parse --verify --quiet "$pin" >/dev/null 2>&1 \
         || git -C "$project" update-ref "$pin" "$sha" "" 2>/dev/null || true
-    list_ref+=("$name=$sha")
 }
 
 # Atomic tmp+mv write of one pending fetch-miss record (see FETCH MISS in the

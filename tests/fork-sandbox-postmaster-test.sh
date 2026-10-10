@@ -6705,6 +6705,8 @@ for ph_seat in kai ken; do
 done
 check "prior heads: review-v1 is pinned in the project repo" "$rt5_seed_sha" \
     "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$rt5_tid/review-v1" 2>/dev/null)"
+check "prior heads: the current target is pinned too, but not handed out" "$rt5_branch_sha" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$rt5_tid/review-v2" 2>/dev/null)"
 check "prior heads: without an announcement no seat gets an upstream ref" 0 \
     "$(extra_refs | grep -c '^upstream=' || true)"
 
@@ -7883,7 +7885,7 @@ wg_finish_quiet() {
 }
 
 wg_new_store
-for bt_case in "5 5 thread" "10 10 thread" "50 10 global" "0 10 global" "007 10 global" "abc 10 global"; do
+for bt_case in "5 5 thread" "10 10 thread" "11 10 global" "9223372036854775808 10 global" "99999999999999999999999 10 global" "50 10 global" "0 10 global" "007 10 global" "abc 10 global"; do
     read -r bt_hdr bt_want bt_src <<< "$bt_case"
     mid="$(bt_send 5 '@bob' "budget $bt_hdr")"
     tid="$(thread_of "$mid")"
