@@ -830,7 +830,7 @@ the thing the handoff says, not from how small the request sounded:
 
 | Shape | Composition | Wall-clock target |
 |---|---|---|
-| Mechanical and fully specified — a rename, a fixture fix, a pattern applied across files; the handoff leaves the implementer nothing to decide | one code leg, or a code leg and one light review | about one leg |
+| Mechanical and fully specified — a rename, a fixture fix, a pattern applied across files; the handoff leaves the implementer nothing to decide | one code leg on this session's own harness and model, no review loop (fork-sandbox skill, "Small tasks") | about one leg |
 | Ordinary implementation with a clear plan | the standard composition | the standard composition's usual time |
 | Large or subtle, or it modifies code other things already run through (a shared helper, an engine, a hot path) | the deepest composition available: a plan stage when the design spans files, the review loop, and a maintain step on the strongest model | whatever it takes |
 | High-volume or exploratory — a sweep, an investigation | the cheapest capable harness, sealed where one exists | short legs, many of them |

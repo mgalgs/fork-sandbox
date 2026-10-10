@@ -78,6 +78,18 @@ reach it — see "What it gives up".)
    Pass `--sandbox-args "--unpin-egress"` only when the task must reach the
    tailnet, a VPN, or a libvirt/docker bridge. It removes a restriction.
 
+   ### Small tasks: one leg, on your own model
+
+   A small, self-contained task — one function and its tests, a fixture
+   fix, anything you will read in full when it returns — runs as a single
+   code leg on the harness and model this session runs on
+   (`--harness claude --model <your model id>`; a codex orchestrator
+   passes `--harness codex/<its model>`), with no review or maintainer
+   loop and no preset. Your own read of the diff is the review. Do not
+   route it to a cheaper model to save quota: every extra leg is a fresh
+   agent that rereads the repo and reruns the tests, and that overhead
+   turns a fifteen-minute change into an hour.
+
    ### `--review-loop N` — let the run review its own work
 
    With the flag, the run does not end when the coding session does. A
