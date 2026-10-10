@@ -622,11 +622,17 @@ dead or timed-out run gets a row instead of vanishing.
   `.run-complete` sentinel) and a `git rev-list --count` between the
   pushed base and the fetched tip, the same measure the zero-harvest check
   itself uses.
-- **cost and tokens: omitted entirely, never written as zero.** They live
-  in the pod, and extracting them is its own piece of work this round does
-  not do. An absent key says "not measured"; a zero would claim the run
-  was measured and free -- a permanent false economy on every cluster row
-  otherwise.
+- **cost and tokens:** for a legacy Claude seat, `collect` reads the
+  captured `events.jsonl` with the same formatter a local run uses.
+  `cost_usd` is the coding session's reported dollar cost, including
+  priced attempts before a transient-error retry, and
+  `total_cost_usd` adds separate continuation, review and fix session costs
+  only when every such session reports a price. A review or fix leg run by
+  pi, or any other unpriced sibling stream, leaves `total_cost_usd` null
+  even when `cost_usd` is known. `usage` and `usage_source: "claude"` carry
+  the coding session's token counts. A missing dollar figure stays null; when the result has
+  tokens but no price, the tokens still reach the summary. Other legacy
+  harnesses have no cost or token accounting in this path.
 - **`uncommitted_files`/`uncommitted_files_list`: omitted entirely, for a
   different reason than cost -- not unmeasured, structurally moot.** On
   the fixed-skeleton (legacy) shape above, the pod IS the sandbox, so the
@@ -2483,8 +2489,9 @@ the first, left a hand-off without moving the branch or writing to its
 outbox) and `continuations`
 (leg, exit, handoff, handoff_stale). A run with refresh disabled reports
 `none` and `[]`; an enabled run whose `refresh.json` did not come back
-leaves both keys absent and warns. There is no per-continuation cost: k8s
-runs measure none.
+leaves both keys absent and warns. For legacy Claude seats, collect adds
+the cost reported by each captured continuation transcript to
+`total_cost_usd`.
 Continuations lengthen the pod's runtime inside the same Job deadline, and
 a deadline kill skips the snapshot, so the host keeps the last pushed store.
 

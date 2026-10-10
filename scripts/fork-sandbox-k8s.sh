@@ -9236,7 +9236,7 @@ cmd_collect() {
         evidence_ok=false
         refresh_cleanup_ok=false
     fi
-    local events_tar events_err events_rc=0
+    local events_tar events_err events_rc=0 events_capture_ok=true
     events_tar="$(mktemp)"
     events_err="$(mktemp)"
     kubectl exec --request-timeout=60s -c agent "$pod_name" -- \
@@ -9250,10 +9250,12 @@ cmd_collect() {
     if (( $("$FS_STAT" -c '%s' -- "$events_tar") > FS_RUN_EVIDENCE_MAX_BYTES )); then
         echo "fork-sandbox-k8s: warning: pod $pod_name's transcript is over the $FS_RUN_EVIDENCE_MAX_BYTES byte cap; refusing to pull it back." >&2
         evidence_ok=false
+        events_capture_ok=false
     elif (( events_rc != 0 )); then
         echo "fork-sandbox-k8s: warning: could not read the transcript from pod $pod_name; no transcript pulled back." >&2
         fs_report_captured_stderr "kubectl exec into pod $pod_name (transcript read)" "$events_err"
         evidence_ok=false
+        events_capture_ok=false
     fi
     rm -f -- "$events_err"
     # The shared extraction guard, same as the outbox: untarring a stream
@@ -9266,6 +9268,7 @@ cmd_collect() {
         && ! "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$events_tar" "$evidence_dir" "$FS_RUN_EVIDENCE_MAX_BYTES"; then
         echo "fork-sandbox-k8s: warning: could not extract the transcript tarball; no transcript pulled back to $evidence_dir" >&2
         evidence_ok=false
+        events_capture_ok=false
     fi
     rm -f -- "$events_tar"
 
@@ -9853,11 +9856,10 @@ cmd_collect() {
     # base_sha is the pushed revision already read above (the same value
     # the zero-harvest check measures against), and commits is a rev-list
     # count over that same base and the post-fetch tip -- mirroring how
-    # fork-sandbox.sh's own local run counts its commits. cost and token
-    # counts are omitted entirely, never written as zero: they live in the
-    # pod, and extracting them is separate work this round does not do --
-    # an absent key says "not measured"; a zero would falsely claim the
-    # run was measured and free. commits gets the same treatment: it is
+    # fork-sandbox.sh's own local run counts its commits. Legacy Claude
+    # cost and token counts come from captured pod events below; a missing
+    # price is null, while other harnesses and failed captures omit these
+    # keys. commits gets the same treatment: it is
     # only computable when both base_sha and after_sha are known, which is
     # exactly when the zero-harvest check above is decidable -- an
     # unreadable base (kubectl exec failure) leaves it empty, and empty
@@ -9875,6 +9877,73 @@ cmd_collect() {
         run_log_image_source="$(read_env_value "$run_dir/run.env" image_source || true)"
         run_log_claude_source="$(read_env_value "$run_dir/run.env" claude_credentials_source || true)"
         run_log_claude_via="$(read_env_value "$run_dir/run.env" claude_credentials_via || true)"
+        # Legacy single-seat pods write events.jsonl, not summary.json.
+        # Read the captured stream with the same formatter as a local
+        # Claude run. Each continuation/review/fix stream is a separate
+        # session, so its price joins total_cost_usd, while cost_usd and
+        # usage describe the coding session alone. Archived attempts of
+        # the coding session join both cost fields. A missing price leaves
+        # the total unknown; token usage can still be reported.
+        local run_log_accounting='{}' run_log_cost="" run_log_total="" run_log_usage=""
+        local run_log_event run_log_leg_cost run_log_cost_unknown=false
+        if [[ "$runner_mode" != 1 && "$run_log_harness" == claude \
+            && "$events_capture_ok" == true && -s "$evidence_dir/events.jsonl" ]]; then
+            run_log_cost="$("$script_dir/fork-sandbox-format.sh" --cost "$evidence_dir/events.jsonl" 2>/dev/null || true)"
+            run_log_usage="$("$script_dir/fork-sandbox-format.sh" --usage "$evidence_dir/events.jsonl" 2>/dev/null || true)"
+            [[ "$run_log_cost" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]] || run_log_cost=""
+            if [[ -n "$run_log_cost" ]]; then
+                run_log_cost="$(jq -n --argjson v "$run_log_cost" '$v | select((isnan or isinfinite or . > 1e15) | not)' 2>/dev/null || true)"
+            fi
+            if [[ -n "$run_log_cost" ]]; then
+                run_log_total="$run_log_cost"
+            else
+                run_log_cost_unknown=true
+            fi
+            for run_log_event in "$evidence_dir"/events-attempt-[0-9]*.jsonl; do
+                [[ -f "$run_log_event" && ! -L "$run_log_event" ]] || continue
+                run_log_leg_cost="$("$script_dir/fork-sandbox-format.sh" --cost "$run_log_event" 2>/dev/null || true)"
+                if [[ "$run_log_leg_cost" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                    run_log_leg_cost="$(jq -n --argjson v "$run_log_leg_cost" '$v | select((isnan or isinfinite or . > 1e15) | not)' 2>/dev/null || true)"
+                else
+                    run_log_leg_cost=""
+                fi
+                if [[ -n "$run_log_leg_cost" && "$run_log_cost_unknown" == false ]]; then
+                    run_log_cost="$(jq -n --argjson a "$run_log_cost" --argjson b "$run_log_leg_cost" '($a + $b) * 1000000 | round / 1000000')"
+                    run_log_total="$run_log_cost"
+                else
+                    run_log_cost_unknown=true
+                fi
+            done
+            [[ "$run_log_cost_unknown" == false ]] || { run_log_cost=""; run_log_total=""; }
+            for run_log_event in "$evidence_dir"/events-*.jsonl; do
+                [[ -f "$run_log_event" && ! -L "$run_log_event" ]] || continue
+                [[ "$run_log_event" == "$evidence_dir"/events-attempt-* ]] && continue
+                run_log_leg_cost="$("$script_dir/fork-sandbox-format.sh" --cost "$run_log_event" 2>/dev/null || true)"
+                if [[ "$run_log_leg_cost" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                    run_log_leg_cost="$(jq -n --argjson v "$run_log_leg_cost" '$v | select((isnan or isinfinite or . > 1e15) | not)' 2>/dev/null || true)"
+                else
+                    run_log_leg_cost=""
+                fi
+                if [[ -n "$run_log_leg_cost" ]]; then
+                    if [[ "$run_log_cost_unknown" == false ]]; then
+                        run_log_total="$(jq -n --argjson a "$run_log_total" --argjson b "$run_log_leg_cost" '($a + $b) * 1000000 | round / 1000000')"
+                    fi
+                else
+                    run_log_cost_unknown=true
+                fi
+            done
+            [[ "$run_log_cost_unknown" == false ]] || run_log_total=""
+            [[ -n "$run_log_usage" ]] && jq -e 'type == "object"' <<< "$run_log_usage" >/dev/null 2>&1 || run_log_usage=""
+            if [[ -n "$run_log_usage" ]]; then
+                run_log_usage="$(jq -c 'walk(if type == "number" and ((isnan or isinfinite) or . > 1e15 or . < -1e15) then null else . end)' <<< "$run_log_usage")"
+            fi
+            run_log_accounting="$(jq -n \
+                --argjson cost "${run_log_cost:-null}" \
+                --argjson total "${run_log_total:-null}" \
+                --argjson usage "${run_log_usage:-null}" \
+                '{cost_usd: $cost, total_cost_usd: $total, usage: $usage,
+                  usage_source: (if $usage == null then null else "claude" end)}')"
+        fi
         if [[ -n "$base_sha" && -n "$after_sha" ]]; then
             run_log_commits="$(cd "$origin_repo" && git rev-list --count "$base_sha..$after_sha" 2>/dev/null || true)"
         fi
@@ -9895,7 +9964,7 @@ cmd_collect() {
         # takes the pod's own refresh.json, pulled as evidence above; and
         # enabled with no usable record leaves both keys ABSENT (a warning,
         # not "none": the run was set to refresh and we cannot say whether
-        # it did). The pod records no per-continuation cost or usage.
+        # it did). Continuation costs are read from captured events above.
         #
         # Runner mode (RUNNER=1) skips this whole block: the runner tracks
         # refresh itself, in-process, and already reports it through
@@ -10066,6 +10135,7 @@ cmd_collect() {
             --arg session_state "$pull_session_state" \
             --arg session_id "$run_log_session_id" \
             --argjson refresh_block "$run_log_refresh_block" \
+            --argjson legacy_accounting "$run_log_accounting" \
             --argjson tidy_has_maintain_step "$run_log_tidy_has_maintain" \
             --argjson tidy "$run_log_tidy_json" \
             '{
@@ -10093,6 +10163,7 @@ cmd_collect() {
                 session_id: (if $session_id == "" then null else $session_id end),
             } end)
             + (if $tidy_has_maintain_step then {tidy: $tidy} else {} end)
+            + $legacy_accounting
             + $refresh_block
             + $duration_block' > "$run_dir/summary.json.part" 2>/dev/null; then
             mv -f -- "$run_dir/summary.json.part" "$run_dir/summary.json"

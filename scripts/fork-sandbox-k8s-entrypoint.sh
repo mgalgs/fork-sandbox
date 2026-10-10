@@ -1661,11 +1661,8 @@ else
     # unconditionally for HARNESS=claude (this whole block runs only in
     # that branch), so no existence guard is needed here -- a missing
     # lib.sh already failed the source above loudly, before reaching this
-    # point. Simpler than the local runner's own driver: one leg, no
-    # per-attempt archiving (this pod's events.jsonl is simply overwritten
-    # by the next attempt) and no cost accounting (the host reads this
-    # run's cost from the pod's own outbox/evidence afterwards, not from
-    # anything this loop tracks).
+    # point. Archive each failed attempt before a retry overwrites
+    # events.jsonl, so collect can account for its cost as well.
     IFS=' ' read -r -a claude_retry_delays <<< "${FS_LEG_RETRY_DELAYS:-30 120}"
     claude_retry_attempt=0
     for claude_retry_delay in "${claude_retry_delays[@]}"; do
@@ -1681,6 +1678,7 @@ else
             "($claude_retry_err); retry $claude_retry_attempt/${#claude_retry_delays[@]}" \
             "in ${claude_retry_delay}s" >&2
         sleep "$claude_retry_delay"
+        mv -- "$work_dir/events.jsonl" "$work_dir/events-attempt-$claude_retry_attempt.jsonl"
         claude_argv=("${claude_argv_fresh[@]}")
         pi_rc=0
         run_claude_attempt || pi_rc=$?

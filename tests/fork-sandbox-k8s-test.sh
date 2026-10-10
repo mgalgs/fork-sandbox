@@ -12997,6 +12997,14 @@ claude_block_run() {
         '    fi' \
         '    echo '"'"'{"type":"result","is_error":false,"result":"ok"}'"'"'' \
         '    exit 0 ;;' \
+        '  transient-priced-then-ok)' \
+        '    if [[ ! -e "$CLAUDE_STUB_MARKER" ]]; then' \
+        '      touch "$CLAUDE_STUB_MARKER"' \
+        '      echo '\''{"type":"result","is_error":true,"result":"API Error: 503 overloaded","total_cost_usd":0.04}'\''' \
+        '      exit 1' \
+        '    fi' \
+        '    echo '\''{"type":"result","is_error":false,"total_cost_usd":0.125}'\''' \
+        '    exit 0 ;;' \
         '  persistent401)' \
         '    echo '"'"'{"type":"result","is_error":true,"result":"API Error: 401 OAuth access token has been revoked"}'"'"'' \
         '    exit 1 ;;' \
@@ -13114,6 +13122,15 @@ if [[ "$CLAUDE_BLOCK_CALLS" == 2 ]] && [[ "$CLAUDE_BLOCK_PI_RC" == 0 ]] \
     ok "a 401-revoked claude failure is retried once, fresh, and logs the retry and its success"
 else
     no "a 401-revoked claude failure is retried once, fresh, and logs the retry and its success" \
+        "calls=$CLAUDE_BLOCK_CALLS pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+claude_block_run transient-priced-then-ok ""
+if [[ "$CLAUDE_BLOCK_PI_RC" == 0 && "$CLAUDE_BLOCK_CALLS" == 2 ]] \
+    && [[ "$("$repo_dir/scripts/fork-sandbox-format.sh" --cost "$(dirname "$CLAUDE_BLOCK_CLONE")/events-attempt-1.jsonl")" == 0.04 ]] \
+    && [[ "$("$repo_dir/scripts/fork-sandbox-format.sh" --cost "$(dirname "$CLAUDE_BLOCK_CLONE")/events.jsonl")" == 0.125 ]]; then
+    ok "a priced failed Claude attempt is archived before the retry overwrites events.jsonl"
+else
+    no "a priced failed Claude attempt is archived before the retry overwrites events.jsonl" \
         "calls=$CLAUDE_BLOCK_CALLS pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
 fi
 # The stub writes 3 (the cap) into the guard's counter on every attempt; the
@@ -19877,6 +19894,96 @@ if [[ "$(grep -c '^network=' "$rd_launcher_env/run.env" 2>/dev/null)" == 1 ]] \
 else
     no "submit --run-dir's network=cluster is the one and only network= line" \
         "$(cat "$rd_launcher_env/run.env" 2>/dev/null)"
+fi
+
+printf '\n== fork-sandbox-k8s.sh collect: legacy Claude accounting from pod events ==\n'
+legacy_cost_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.fs-k8s-test-cost.XXXXXX)"
+tmpdirs+=("$legacy_cost_rd")
+printf 'version=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$proj_dir" > "$legacy_cost_rd/run.env"
+legacy_cost_work="$(newdir)"; tmpdirs+=("$legacy_cost_work")
+printf '%s\n' '{"type":"result","total_cost_usd":0.125,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":5}}' > "$legacy_cost_work/events.jsonl"
+printf '%s\n' '{"type":"result","total_cost_usd":0.025,"usage":{"input_tokens":30,"output_tokens":3}}' > "$legacy_cost_work/events-review-1.jsonl"
+printf '%s\n' '{"type":"result","is_error":true,"total_cost_usd":0.04}' > "$legacy_cost_work/events-attempt-1.jsonl"
+legacy_cost_log="$(newdir)/kubectl.log"; legacy_cost_out="$(newdir)/collect-out.txt"
+tmpdirs+=("$(dirname "$legacy_cost_log")" "$(dirname "$legacy_cost_out")")
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_WORK_DIR="$legacy_cost_work" \
+    collectstub_collect "$legacy_cost_log" "$legacy_cost_out" \
+    --branch fs-k8s-test-legacy-cost --run-dir "$legacy_cost_rd" "$proj_dir"
+if jq -e '.cost_usd == 0.165 and .total_cost_usd == 0.19
+    and .usage_source == "claude" and .usage.input_tokens == 100
+    and .usage.total_tokens == 135' "$legacy_cost_rd/summary.json" >/dev/null 2>&1; then
+    ok "legacy Claude cost includes a priced retry attempt in the host summary"
+else
+    no "legacy Claude cost includes a priced retry attempt in the host summary" \
+        "$(cat "$legacy_cost_rd/summary.json" 2>/dev/null)"
+fi
+
+legacy_usage_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.fs-k8s-test-usage.XXXXXX)"
+tmpdirs+=("$legacy_usage_rd")
+printf 'version=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$proj_dir" > "$legacy_usage_rd/run.env"
+legacy_usage_work="$(newdir)"; tmpdirs+=("$legacy_usage_work")
+printf '%s\n' '{"type":"result","usage":{"input_tokens":7,"output_tokens":2}}' > "$legacy_usage_work/events.jsonl"
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_WORK_DIR="$legacy_usage_work" \
+    collectstub_collect "$legacy_cost_log" "$legacy_cost_out" \
+    --branch fs-k8s-test-legacy-usage --run-dir "$legacy_usage_rd" "$proj_dir"
+if jq -e '.cost_usd == null and .total_cost_usd == null
+    and .usage_source == "claude" and .usage.input_tokens == 7' \
+    "$legacy_usage_rd/summary.json" >/dev/null 2>&1; then
+    ok "legacy Claude tokens survive when the result has no dollar cost"
+else
+    no "legacy Claude tokens survive when the result has no dollar cost" \
+        "$(cat "$legacy_usage_rd/summary.json" 2>/dev/null)"
+fi
+
+# An unpriced continuation/review stream makes the total unknown while
+# preserving the priced coding session. Malformed prices must not abort
+# collect or reuse the price of the preceding attempt/review stream.
+for legacy_unpriced_case in malformed no-result pi-review; do
+    legacy_unpriced_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.fs-k8s-test-unpriced.XXXXXX)"
+    tmpdirs+=("$legacy_unpriced_rd")
+    printf 'version=1\nharness=claude\nmodel=sonnet\nPROJECT=%s\n' "$proj_dir" > "$legacy_unpriced_rd/run.env"
+    legacy_unpriced_work="$(newdir)"; tmpdirs+=("$legacy_unpriced_work")
+    printf '%s\n' '{"type":"result","total_cost_usd":0.125,"usage":{"input_tokens":7,"output_tokens":2}}' \
+        > "$legacy_unpriced_work/events.jsonl"
+    case "$legacy_unpriced_case" in
+        malformed)
+            printf '%s\n' '{"type":"result","total_cost_usd":0.025}' \
+                > "$legacy_unpriced_work/events-review-1.jsonl"
+            printf '%s\n' '{"type":"result","total_cost_usd":"x"}' \
+                > "$legacy_unpriced_work/events-continuation-1.jsonl" ;;
+        no-result)
+            printf '%s\n' '{"type":"system","message":"interrupted"}' \
+                > "$legacy_unpriced_work/events-continuation-1.jsonl" ;;
+        pi-review)
+            printf '%s\n' '{"type":"message","role":"assistant","content":"reviewed"}' \
+                > "$legacy_unpriced_work/events-review-1.jsonl" ;;
+    esac
+    if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_WORK_DIR="$legacy_unpriced_work" \
+        collectstub_collect "$legacy_cost_log" "$legacy_cost_out" \
+        --branch "fs-k8s-test-legacy-$legacy_unpriced_case" --run-dir "$legacy_unpriced_rd" "$proj_dir" \
+        && jq -e '.exit_code == 0 and .cost_usd == 0.125 and .total_cost_usd == null
+            and .usage_source == "claude" and .usage.input_tokens == 7' \
+            "$legacy_unpriced_rd/summary.json" >/dev/null 2>&1; then
+        ok "legacy Claude $legacy_unpriced_case sibling leaves total unknown without failing collect"
+    else
+        no "legacy Claude $legacy_unpriced_case sibling leaves total unknown without failing collect" \
+            "summary=$(cat "$legacy_unpriced_rd/summary.json" 2>/dev/null) out=$(cat "$legacy_cost_out")"
+    fi
+done
+
+legacy_pi_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.fs-k8s-test-pi.XXXXXX)"
+tmpdirs+=("$legacy_pi_rd")
+printf 'version=1\nharness=pi\nmodel=test\nPROJECT=%s\n' "$proj_dir" > "$legacy_pi_rd/run.env"
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_WORK_DIR="$legacy_cost_work" \
+    collectstub_collect "$legacy_cost_log" "$legacy_cost_out" \
+    --branch fs-k8s-test-legacy-pi --run-dir "$legacy_pi_rd" "$proj_dir"
+if jq -e '.exit_code == 0 and (has("cost_usd") | not)
+    and (has("total_cost_usd") | not) and (has("usage") | not)
+    and (has("usage_source") | not)' "$legacy_pi_rd/summary.json" >/dev/null 2>&1; then
+    ok "legacy pi summary omits Claude accounting keys"
+else
+    no "legacy pi summary omits Claude accounting keys" \
+        "$(cat "$legacy_pi_rd/summary.json" 2>/dev/null)"
 fi
 
 printf '\n== fork-sandbox-k8s.sh collect: RUNNER=1 run-directory pull-back and summary merge ==\n'
