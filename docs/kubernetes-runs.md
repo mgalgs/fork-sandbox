@@ -2934,10 +2934,12 @@ defaults) is not configurable.
 
 ### The agent's container resources
 
-A pod's work-running container names no resources of its own, so it takes
-the `LimitRange` default: limit 1 cpu / 2Gi, request 250m / 512Mi. A seat
-running a large test suite can outgrow 2Gi and be OOMKilled. Four optional
-`k8s.env` keys set explicit resources on the container that runs the agent's
+A pod's work-running container requests `1Gi` ephemeral storage by default.
+Under node disk pressure the kubelet evicts first the pods using more
+ephemeral storage than they request, so a request of zero would put every
+run first in line. CPU and memory use the `LimitRange` defaults: limit
+1 cpu / 2Gi, request 250m / 512Mi. A seat running a large test suite can
+outgrow 2Gi and be OOMKilled. Six optional `k8s.env` keys set explicit resources on the container that runs the agent's
 work, and on it only — the egress-gate init container, the per-run
 claude-proxy pods and the postmaster are untouched, and the `LimitRange` and
 quota defaults do not change. Which container that is depends on the pod's
@@ -2961,24 +2963,31 @@ container is called `leg`.
 | `K8S_AGENT_REQUESTS_MEMORY` | unset (see below: the limit, else `LimitRange` `512Mi`) | integer, optional suffix: `512Mi`, `6G` |
 | `K8S_AGENT_LIMITS_CPU`      | unset (`LimitRange`: `1`)    | cpu quantity                        |
 | `K8S_AGENT_LIMITS_MEMORY`   | unset (`LimitRange`: `2Gi`)  | integer, optional suffix            |
+| `K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE` | `1Gi` when neither storage key is set; `0` disables | integer, optional suffix (or `0`) |
+| `K8S_AGENT_LIMITS_EPHEMERAL_STORAGE` | unset (no limit) | integer, optional suffix |
 | `K8S_AGENT_PRIORITY_CLASS` | unset | existing PriorityClass name (DNS-1123 subdomain) |
 
 `K8S_AGENT_PRIORITY_CLASS` sets `priorityClassName` on every agent Job pod and on separate per-run Claude or Codex proxy Pods. Unset omits the field. Create the PriorityClass in the cluster first; `install` only checks for it and warns if missing.
 
-Each resource key is independent: an unset key renders no field, so with none set
-both pod shapes are rendered exactly as before, and setting only
-`K8S_AGENT_LIMITS_MEMORY` renders only that limit. What the admitted pod
-gets for the field that was left out is not the same everywhere, though. The
-rendered YAML names no request, but Kubernetes defaults an unset request to
-the container's limit when the limit is set, before the `LimitRange` is
-consulted. So `K8S_AGENT_LIMITS_MEMORY=6Gi` on its own yields a `6Gi` memory
-request, not the `LimitRange` default `512Mi`, and likewise
-`K8S_AGENT_LIMITS_CPU` alone yields a cpu request equal to that limit. The
-`LimitRange` default request applies only when the limit is unset too. Set a
-request alongside every limit, as the worked example below does, unless you
-want the seat to reserve its whole limit. Because the keys live in
-`k8s.env`, they apply to every pod `submit` creates — including the seats the
-in-cluster postmaster launches, whose pod carries the same `k8s.env` (re-run
+CPU and memory keys are independent: an unset key renders no field. Kubernetes
+defaults an unset request to its limit when a limit is set, before consulting
+the `LimitRange`. Thus `K8S_AGENT_LIMITS_MEMORY=6Gi` alone reserves `6Gi`,
+not `512Mi`; the same holds for CPU. The `LimitRange` request applies when
+both keys for that resource are unset. Set an explicit request with a limit
+unless reserving the whole limit is intended.
+
+Ephemeral storage differs. When both storage keys are unset, the work
+container renders a `1Gi` request and no limit. There is no default limit
+because breaching one evicts the pod, and a clone plus its build output can
+legitimately be large. Set `K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=0` to
+render no request. A storage limit set alone also omits the default `1Gi`
+request, and Kubernetes then makes the admitted request equal to that
+limit, so the default can never exceed an explicit limit. An explicit
+positive request can be paired with a limit but cannot exceed it. The
+namespace quota and LimitRange have no ephemeral-storage constraints.
+
+Because the keys live in `k8s.env`, they apply to every pod `submit`
+creates — including the seats the in-cluster postmaster launches, whose pod carries the same `k8s.env` (re-run
 `install --postmaster` after changing it; see
 [cluster-postmaster.md](cluster-postmaster.md)).
 
@@ -2990,7 +2999,8 @@ K8S_AGENT_REQUESTS_MEMORY=1Gi
 ```
 
 Every value is checked before anything is applied, and a failure names the
-key: a malformed or zero quantity; a request above its limit; a limit above
+key: a malformed or zero quantity (except the storage request `0` disable
+value); a request above its limit; a limit above
 the `LimitRange` max (4 cpu / 8Gi), which would otherwise surface as a pod
 admission rejection at submit time; and a request above the `LimitRange`
 default limit while its own limit is unset (the pod would get a limit below

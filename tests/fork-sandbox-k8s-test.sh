@@ -1265,16 +1265,13 @@ agent_res_cfg() {
     [[ ! -f "$config_dir/claude.env" ]] || install -m 600 "$config_dir/claude.env" "$d/claude.env"
     printf '%s' "$d"
 }
-check "no K8S_AGENT_* keys set: the agent container has no resources stanza, exactly as before" \
-    '        - name: agent
-          image: registry.example/you/fork-sandbox:latest
-          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]' \
-    "$(agent_container_of < "$submit_out")"
-if grep -q '^ *resources:' "$submit_out"; then
-    no "no K8S_AGENT_* keys set: no container in the Job has a resources stanza" "$(grep -n 'resources:' "$submit_out")"
-else
-    ok "no K8S_AGENT_* keys set: no container in the Job has a resources stanza"
-fi
+check "default storage request on the single-leg work container" \
+    '          resources:
+            requests:
+              ephemeral-storage: "1Gi"' \
+    "$(agent_container_of < "$submit_out" | sed -n '4,6p')"
+check "default storage request belongs to only one container" \
+    "1" "$(grep -c '^ *ephemeral-storage:' "$submit_out")"
 
 if grep -q 'priorityClassName:' "$submit_out"; then
     no "unset priority class omits pod field" "$(grep 'priorityClassName:' "$submit_out")"
@@ -1302,6 +1299,7 @@ check "all four K8S_AGENT_* keys set render the full stanza on the agent contain
             requests:
               cpu: "500m"
               memory: "1Gi"
+              ephemeral-storage: "1Gi"
             limits:
               cpu: "2"
               memory: "6Gi"' \
@@ -1320,19 +1318,50 @@ for agent_one in \
     'K8S_AGENT_LIMITS_CPU=2|limits|cpu|2' \
     'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi'; do
     IFS='|' read -r agent_one_kv agent_one_sect agent_one_field agent_one_val <<< "$agent_one"
+    agent_one_expected="          resources:
+            requests:"
+    if [[ "$agent_one_sect" == requests ]]; then
+        agent_one_expected+="
+              $agent_one_field: \"$agent_one_val\""
+    fi
+    agent_one_expected+="
+              ephemeral-storage: \"1Gi\""
+    if [[ "$agent_one_sect" == limits ]]; then
+        agent_one_expected+="
+            limits:
+              $agent_one_field: \"$agent_one_val\""
+    fi
     check "${agent_one_kv%%=*} alone adds exactly that one field" \
-        "          resources:
-            $agent_one_sect:
-              $agent_one_field: \"$agent_one_val\"" \
+        "$agent_one_expected" \
         "$(agent_container_of <<< "$(agent_res_render "$(agent_res_cfg "$agent_one_kv")")" | sed -n '4,$p')"
 done
 agent_res_empty_out="$(agent_res_render "$(agent_res_cfg K8S_AGENT_LIMITS_MEMORY= K8S_AGENT_REQUESTS_CPU=)")"
 check "keys set to the empty string count as unset" \
     "$(agent_container_of < "$submit_out")" "$(agent_container_of <<< "$agent_res_empty_out")"
 
+agent_storage_override="$(agent_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=2Gi K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=3Gi)")"
+check "explicit storage request and limit render on the work container" \
+    '          resources:
+            requests:
+              ephemeral-storage: "2Gi"
+            limits:
+              ephemeral-storage: "3Gi"' \
+    "$(agent_container_of <<< "$agent_storage_override" | sed -n '4,$p')"
+agent_storage_disabled="$(agent_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=0)")"
+check "storage request 0 omits resources when no other keys are set" \
+    '        - name: agent
+          image: registry.example/you/fork-sandbox:latest
+          command: ["bash", "/mnt/fork-sandbox/entrypoint.sh"]' \
+    "$(agent_container_of <<< "$agent_storage_disabled")"
+agent_storage_limit_only="$(agent_res_render "$(agent_res_cfg K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=512Mi)")"
+check "storage limit alone omits the default request" \
+    '          resources:
+            limits:
+              ephemeral-storage: "512Mi"' \
+    "$(agent_container_of <<< "$agent_storage_limit_only" | sed -n '4,$p')"
 # Everything outside the agent container's own stanza is unchanged.
 check "the rest of the Job renders identically with the keys set" \
-    "$(grep -v -e '^ *resources:$' -e '^ *requests:$' -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$agent_res_all_out")" \
+    "$(grep -v -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$agent_res_all_out")" \
     "$(agent_res_render "$config_dir")"
 
 # The built-in LimitRange constants the early check uses must be the manifest's.
@@ -1350,6 +1379,10 @@ agent_bad_cases=(
     'negative cpu|K8S_AGENT_LIMITS_CPU=-1|K8S_AGENT_LIMITS_CPU|a Kubernetes cpu quantity'
     'zero cpu|K8S_AGENT_LIMITS_CPU=0|K8S_AGENT_LIMITS_CPU|a Kubernetes cpu quantity'
     'yaml-injecting cpu|K8S_AGENT_REQUESTS_CPU=1: 2|K8S_AGENT_REQUESTS_CPU|a Kubernetes cpu quantity'
+    'bad storage request|K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=lots|K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE|a Kubernetes memory quantity'
+    'bad storage limit|K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=1GB|K8S_AGENT_LIMITS_EPHEMERAL_STORAGE|a Kubernetes memory quantity'
+    'zero storage limit|K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=0|K8S_AGENT_LIMITS_EPHEMERAL_STORAGE|a Kubernetes memory quantity'
+    'storage request above limit|K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=2Gi K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=1Gi|K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE|is above K8S_AGENT_LIMITS_EPHEMERAL_STORAGE'
     'bad memory|K8S_AGENT_LIMITS_MEMORY=lots|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
     'GB is not a quantity|K8S_AGENT_LIMITS_MEMORY=6GB|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
     'cpu unit on memory|K8S_AGENT_REQUESTS_MEMORY=500m|K8S_AGENT_REQUESTS_MEMORY|a Kubernetes memory quantity'
@@ -1391,6 +1424,8 @@ done
 # Boundary values the checks must accept: request equal to limit, limit
 # equal to the LimitRange max, a request within the default limit.
 for agent_ok_kvs in \
+    'K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=1Gi K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=1024Mi' \
+    'K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=512Mi' \
     'K8S_AGENT_REQUESTS_MEMORY=2Gi K8S_AGENT_LIMITS_MEMORY=2048Mi' \
     'K8S_AGENT_LIMITS_MEMORY=8Gi K8S_AGENT_LIMITS_CPU=4' \
     'K8S_AGENT_LIMITS_CPU=4000m' \
@@ -19304,6 +19339,7 @@ check "a seat rendered from the pod's k8s.env gets the stanza" \
     '          resources:
             requests:
               memory: "1Gi"
+              ephemeral-storage: "1Gi"
             limits:
               memory: "6Gi"' \
     "$(agent_container_of <<< "$(agent_res_render "$pm_ar_pod_cfg")" | sed -n '4,$p')"
@@ -21905,16 +21941,31 @@ comp_res_render() {
 }
 comp_res_fixture="$(rd_make_fixture claude)"; tmpdirs+=("$comp_res_fixture")
 comp_res_base_out="$(comp_res_render "$config_dir")"
-if grep -q '^ *resources:' <<< "$comp_res_base_out"; then
-    no "composed pod, no K8S_AGENT_* keys: no container has a resources stanza" "$(grep -n 'resources:' <<< "$comp_res_base_out")"
-else
-    ok "composed pod, no K8S_AGENT_* keys: no container has a resources stanza"
-fi
-check "composed pod, no keys: the leg container's command is followed directly by env" \
-    '          command: ["bash", "/mnt/fork-sandbox/leg-loop.sh"]
-          env:' \
-    "$(container_named leg <<< "$comp_res_base_out" | sed -n '3,4p')"
+check "composed pod default storage request belongs to leg" \
+    '          resources:
+            requests:
+              ephemeral-storage: "1Gi"' \
+    "$(container_named leg <<< "$comp_res_base_out" | sed -n '4,6p')"
+check "composed pod walker has no resources" \
+    "0" "$(container_named agent <<< "$comp_res_base_out" | grep -c 'resources:')"
 
+comp_storage_disabled="$(comp_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=0)")"
+check "composed pod storage request 0 removes leg resources" \
+    "0" "$(container_named leg <<< "$comp_storage_disabled" | grep -c 'resources:')"
+comp_storage_limit_only="$(comp_res_render "$(agent_res_cfg K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=512Mi)")"
+check "composed pod storage limit alone has no request" \
+    '          resources:
+            limits:
+              ephemeral-storage: "512Mi"' \
+    "$(container_named leg <<< "$comp_storage_limit_only" | sed -n '4,6p')"
+comp_storage_override="$(comp_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=2Gi K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=3Gi)")"
+check "composed pod storage request and limit render on leg" \
+    '          resources:
+            requests:
+              ephemeral-storage: "2Gi"
+            limits:
+              ephemeral-storage: "3Gi"' \
+    "$(container_named leg <<< "$comp_storage_override" | sed -n '4,8p')"
 comp_res_all_out="$(comp_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_CPU=500m \
     K8S_AGENT_REQUESTS_MEMORY=1Gi K8S_AGENT_LIMITS_CPU=2 K8S_AGENT_LIMITS_MEMORY=6Gi)")"
 check "composed pod, all four keys: the leg container carries the full stanza" \
@@ -21923,18 +21974,19 @@ check "composed pod, all four keys: the leg container carries the full stanza" \
             requests:
               cpu: "500m"
               memory: "1Gi"
+              ephemeral-storage: "1Gi"
             limits:
               cpu: "2"
               memory: "6Gi"
           env:' \
-    "$(container_named leg <<< "$comp_res_all_out" | sed -n '3,11p')"
+    "$(container_named leg <<< "$comp_res_all_out" | sed -n '3,12p')"
 check "composed pod, all four keys: the agent (walker) container has no resources" \
     "0" "$(container_named agent <<< "$comp_res_all_out" | grep -c 'resources:')"
 check "composed pod, all four keys: exactly one resources stanza in the Job" \
     "1" "$(grep -c '^ *resources:' <<< "$comp_res_all_out")"
 check "composed pod: the rest of the Job renders identically with the keys set" \
     "$comp_res_base_out" \
-    "$(grep -v -e '^ *resources:$' -e '^ *requests:$' -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$comp_res_all_out")"
+    "$(grep -v -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$comp_res_all_out")"
 # The render is still valid YAML, and the stanza parses onto the leg container.
 if python3 -c 'import yaml' 2>/dev/null; then
     comp_res_parsed="$(python3 -c '
@@ -21943,7 +21995,7 @@ docs = [d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind") == "Job"
 cs = {c["name"]: c for c in docs[0]["spec"]["template"]["spec"]["containers"]}
 print(cs["leg"].get("resources"))
 print(cs["agent"].get("resources"))' <<< "$comp_res_all_out")"
-    check "composed pod, all four keys: the stanza parses onto leg, and agent has none"         "{'requests': {'cpu': '500m', 'memory': '1Gi'}, 'limits': {'cpu': '2', 'memory': '6Gi'}}
+    check "composed pod, all four keys: the stanza parses onto leg, and agent has none"         "{'requests': {'cpu': '500m', 'memory': '1Gi', 'ephemeral-storage': '1Gi'}, 'limits': {'cpu': '2', 'memory': '6Gi'}}
 None" "$comp_res_parsed"
 fi
 # Each key alone adds exactly its one field to the leg container.
@@ -21954,11 +22006,22 @@ for agent_one in \
     'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi'; do
     IFS='|' read -r agent_one_kv agent_one_sect agent_one_field agent_one_val <<< "$agent_one"
     comp_one_out="$(comp_res_render "$(agent_res_cfg "$agent_one_kv")")"
+    agent_one_expected="          resources:
+            requests:"
+    if [[ "$agent_one_sect" == requests ]]; then
+        agent_one_expected+="
+              $agent_one_field: \"$agent_one_val\""
+    fi
+    agent_one_expected+="
+              ephemeral-storage: \"1Gi\""
+    if [[ "$agent_one_sect" == limits ]]; then
+        agent_one_expected+="
+            limits:
+              $agent_one_field: \"$agent_one_val\""
+    fi
     check "composed pod: ${agent_one_kv%%=*} alone adds exactly that one field to the leg container" \
-        "          resources:
-            $agent_one_sect:
-              $agent_one_field: \"$agent_one_val\"" \
-        "$(container_named leg <<< "$comp_one_out" | sed -n '4,6p')"
+        "$agent_one_expected" \
+        "$(container_named leg <<< "$comp_one_out" | sed -n '4,$p' | sed '/^          env:/,$d')"
     check "composed pod: ${agent_one_kv%%=*} alone leaves the walker container as it was" \
         "$(container_named agent <<< "$comp_res_base_out")" "$(container_named agent <<< "$comp_one_out")"
 done

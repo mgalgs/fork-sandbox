@@ -708,7 +708,8 @@
 #                         for concurrent claude runs. A malformed value is
 #                         refused by install before anything is applied.
 #   K8S_AGENT_REQUESTS_CPU=, K8S_AGENT_REQUESTS_MEMORY=,
-#   K8S_AGENT_LIMITS_CPU=, K8S_AGENT_LIMITS_MEMORY=
+#   K8S_AGENT_LIMITS_CPU=, K8S_AGENT_LIMITS_MEMORY=,
+#   K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=, K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=
 #                         explicit resource requests and limits for the
 #                         container that runs the agent's work in every run
 #                         pod -- and so for every seat the in-cluster
@@ -719,8 +720,13 @@
 #                         `agent` container (the pipeline walker) gets no
 #                         resources and keeps the LimitRange default. Not
 #                         renamed K8S_LEG_*: one set of keys, one meaning.
-#                         Optional, each independent; unset (the default)
-#                         renders no field for it. With no key set the
+#                         CPU and memory keys are optional; unset
+#                         renders no field. Ephemeral storage requests
+#                         default to 1Gi when both storage keys are unset;
+#                         request 0 disables this default. A storage limit
+#                         alone leaves the request unset, so Kubernetes
+#                         defaults the request to that limit. Storage has
+#                         no default limit. With no CPU/memory key set the
 #                         namespace LimitRange default applies (limit 1
 #                         cpu / 2Gi, request 250m / 512Mi). An unset
 #                         request beside a set limit is NOT the LimitRange
@@ -731,13 +737,14 @@
 #                         container, the claude-proxy pods and the
 #                         postmaster are untouched. The cpu keys take a
 #                         Kubernetes cpu quantity (2, 0.5, 500m), the memory
-#                         keys an integer with an optional suffix (512Mi,
-#                         6Gi, 6G); zero is refused. Refused, naming the
-#                         key, before anything is applied: a malformed
-#                         value, a request above its limit, a limit above
-#                         the LimitRange max (4 cpu / 8Gi), a request above
-#                         the LimitRange default limit while its limit is
-#                         unset. The namespace quota must leave room for
+#                         and storage keys take an integer with an optional
+#                         suffix (512Mi, 6Gi, 6G); zero is refused except
+#                         for the storage request disable value. Refused,
+#                         naming the key, before anything is applied: a
+#                         malformed value, a request above its limit, a
+#                         limit above the LimitRange max (4 cpu / 8Gi), a
+#                         request above the LimitRange default limit while
+#                         its limit is unset. The namespace quota must leave room for
 #                         concurrent seats at that size: see
 #                         K8S_QUOTA_LIMITS_MEMORY above.
 #   K8S_AGENT_PRIORITY_CLASS=
@@ -1113,12 +1120,23 @@ K8S_QUOTA_LIMITS_CPU="${K8S_QUOTA_LIMITS_CPU:-20}"
 K8S_QUOTA_LIMITS_MEMORY="$(read_env_value "$k8s_env" K8S_QUOTA_LIMITS_MEMORY || true)"
 K8S_QUOTA_LIMITS_MEMORY="${K8S_QUOTA_LIMITS_MEMORY:-40Gi}"
 # Optional explicit resources for the container that runs the legs (see the
-# header table). Unset means no field is rendered and the LimitRange default
-# applies. Validated below by k8s_validate_agent_resources.
+# header table). CPU/memory unset fields use the LimitRange defaults. Storage
+# requests default to 1Gi only when neither storage key is set; 0 disables
+# the rendered request. Validated below by k8s_validate_agent_resources.
 K8S_AGENT_REQUESTS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_CPU || true)"
 K8S_AGENT_REQUESTS_MEMORY="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_MEMORY || true)"
 K8S_AGENT_LIMITS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_LIMITS_CPU || true)"
 K8S_AGENT_LIMITS_MEMORY="$(read_env_value "$k8s_env" K8S_AGENT_LIMITS_MEMORY || true)"
+K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE="$(
+    read_env_value "$k8s_env" K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE || true
+)"
+K8S_AGENT_LIMITS_EPHEMERAL_STORAGE="$(
+    read_env_value "$k8s_env" K8S_AGENT_LIMITS_EPHEMERAL_STORAGE || true
+)"
+if [[ -z "$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE" &&
+      -z "$K8S_AGENT_LIMITS_EPHEMERAL_STORAGE" ]]; then
+    K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=1Gi
+fi
 K8S_AGENT_PRIORITY_CLASS="$(read_env_value "$k8s_env" K8S_AGENT_PRIORITY_CLASS || true)"
 # The namespace LimitRange's numbers (manifests/k8s/00-namespace.yaml), for
 # the early checks on those keys; the test suite pins them to the manifest.
@@ -1202,22 +1220,25 @@ k8s_quantity_value() {
     }'
 }
 
-# Validates K8S_AGENT_{REQUESTS,LIMITS}_{CPU,MEMORY}, all shape and
+# Validates K8S_AGENT_{REQUESTS,LIMITS}_{CPU,MEMORY,EPHEMERAL_STORAGE}, shape and
 # ordering checks, before anything is rendered or applied. Each value lands
 # in a YAML manifest with no quoting of its own, so the anchored shape check
 # is also what keeps a value from injecting YAML.
 k8s_validate_agent_resources() {
     local kind key val what max_val def_val
-    for kind in cpu memory; do
+    for kind in cpu memory ephemeral_storage; do
         for key in "K8S_AGENT_REQUESTS_${kind^^}" "K8S_AGENT_LIMITS_${kind^^}"; do
             val="${!key}"
             [[ -z "$val" ]] && continue
+            if [[ "$key" == K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE && "$val" == 0 ]]; then
+                continue
+            fi
             if [[ "$kind" == cpu ]]; then
                 what="a Kubernetes cpu quantity (2, 0.5 or 500m) greater than zero"
             else
                 what="a Kubernetes memory quantity greater than zero: an integer with an optional binary or decimal suffix (512Mi, 6Gi, 6G)"
             fi
-            if [[ -z "$(k8s_quantity_value "$kind" "$val")" ]]; then
+            if [[ -z "$(k8s_quantity_value "${kind/ephemeral_storage/memory}" "$val")" ]]; then
                 echo "Error: $key in $k8s_env must be $what," >&2
                 echo "got '$val'." >&2
                 exit 1
@@ -1227,12 +1248,15 @@ k8s_validate_agent_resources() {
         local req="${!req_key}" lim="${!lim_key}" req_n lim_n
         if [[ "$kind" == cpu ]]; then
             max_val="$K8S_LIMITRANGE_MAX_CPU"; def_val="$K8S_LIMITRANGE_DEFAULT_CPU"
-        else
+        elif [[ "$kind" == memory ]]; then
             max_val="$K8S_LIMITRANGE_MAX_MEMORY"; def_val="$K8S_LIMITRANGE_DEFAULT_MEMORY"
+        else
+            max_val=""; def_val=""
+            [[ "$req" == 0 ]] && req=""
         fi
-        req_n="$(k8s_quantity_value "$kind" "$req")"
-        lim_n="$(k8s_quantity_value "$kind" "$lim")"
-        if [[ -n "$lim_n" ]] && (( lim_n > $(k8s_quantity_value "$kind" "$max_val") )); then
+        req_n="$(k8s_quantity_value "${kind/ephemeral_storage/memory}" "$req")"
+        lim_n="$(k8s_quantity_value "${kind/ephemeral_storage/memory}" "$lim")"
+        if [[ -n "$max_val" && -n "$lim_n" ]] && (( lim_n > $(k8s_quantity_value "$kind" "$max_val") )); then
             echo "Error: $lim_key in $k8s_env is $lim, above the namespace LimitRange max" >&2
             echo "of $max_val (manifests/k8s/00-namespace.yaml); the pod would be rejected at" >&2
             echo "admission. Raise the LimitRange max there, or lower the key." >&2
@@ -1243,7 +1267,7 @@ k8s_validate_agent_resources() {
             echo "a request cannot exceed its limit." >&2
             exit 1
         fi
-        if [[ -n "$req_n" && -z "$lim_n" ]] \
+        if [[ -n "$def_val" && -n "$req_n" && -z "$lim_n" ]] \
             && (( req_n > $(k8s_quantity_value "$kind" "$def_val") )); then
             echo "Error: $req_key in $k8s_env ($req) is above the LimitRange default limit" >&2
             echo "($def_val) that applies while $lim_key is unset; set $lim_key too." >&2
@@ -1253,15 +1277,22 @@ k8s_validate_agent_resources() {
 }
 
 # The `resources:` lines for the container that runs the legs (leading
-# newline included, so it appends to the line before it), or nothing when no
-# K8S_AGENT_* key is set. Called on the single container of a legacy pod and
-# on the `leg` container of a composed one -- never on the composed `agent`
-# (walker) container.
+# newline included, so it appends to the line before it), or nothing when
+# the storage request is disabled and no other resource key is set. Called
+# on the single container of a legacy pod and on the `leg` container of a
+# composed one -- never on the composed `agent` (walker) container.
 k8s_agent_resources_yaml() {
     local req="" lim=""
     [[ -n "$K8S_AGENT_REQUESTS_CPU" ]] && req+=$'\n'"              cpu: \"$K8S_AGENT_REQUESTS_CPU\""
     [[ -n "$K8S_AGENT_REQUESTS_MEMORY" ]] && req+=$'\n'"              memory: \"$K8S_AGENT_REQUESTS_MEMORY\""
     [[ -n "$K8S_AGENT_LIMITS_CPU" ]] && lim+=$'\n'"              cpu: \"$K8S_AGENT_LIMITS_CPU\""
+    if [[ -n "$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE" &&
+          "$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE" != 0 ]]; then
+        req+=$'\n'"              ephemeral-storage: \"$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE\""
+    fi
+    if [[ -n "$K8S_AGENT_LIMITS_EPHEMERAL_STORAGE" ]]; then
+        lim+=$'\n'"              ephemeral-storage: \"$K8S_AGENT_LIMITS_EPHEMERAL_STORAGE\""
+    fi
     [[ -n "$K8S_AGENT_LIMITS_MEMORY" ]] && lim+=$'\n'"              memory: \"$K8S_AGENT_LIMITS_MEMORY\""
     [[ -z "$req$lim" ]] && return 0
     printf '\n          resources:'
@@ -1356,7 +1387,9 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
         "$K8S_LEG_VOLUME_SIZE_LIMIT" \
         "$K8S_AGENT_REQUESTS_CPU" "$K8S_AGENT_REQUESTS_MEMORY" \
-        "$K8S_AGENT_LIMITS_CPU" "$K8S_AGENT_LIMITS_MEMORY" "$K8S_AGENT_PRIORITY_CLASS" \
+        "$K8S_AGENT_LIMITS_CPU" "$K8S_AGENT_LIMITS_MEMORY" \
+        "$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE" "$K8S_AGENT_LIMITS_EPHEMERAL_STORAGE" \
+        "$K8S_AGENT_PRIORITY_CLASS" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
         "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
