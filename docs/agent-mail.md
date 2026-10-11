@@ -544,6 +544,201 @@ adding the key is the decision to trust that peer. The fleet store and its
 postmaster are untouched: they never route `@lane:host`, and a thread
 addressing one is treated like any name the postmaster cannot resolve.
 
+### Alerts into lane mail
+
+A monitoring alert can land in a lane's inbox, `@ops` say, and wake the
+session watching it, or start one. The path:
+
+```
+Alertmanager / Grafana --webhook--> lane-mail-alert (on a LAN host)
+    --lane-mail.sh send--> @ops inbox --> lane-mail-watch.sh wakes the session
+                                      `-> or a spawn timer starts one
+```
+
+`lane-mail-alert` is a small HTTP receiver. It turns each webhook
+notification, which is one alert *group*, into at most one lane-mail message
+from `@alerts`. Its header has the full contract. In short:
+
+- **One thread per incident.** A group's first notification opens a thread.
+  Later notifications for that group (an alert joined, an alert left, the
+  group resolved) reply in it, so `[RESOLVED]` lands under its `[FIRING:n]`.
+  A group that fires again within an hour of resolving (`--reopen`) continues
+  the same thread, so a flapping alert stays one thread.
+- **No repeats.** A notification identical to the group's last one is
+  dropped. Alertmanager re-sends a firing group every `repeat_interval`, and
+  those re-sends wake no one.
+- **Findable.** Every message carries `X-Alert-Group: <hash>` and
+  `X-Alert-Status: firing|resolved`, so
+  `lane-mail.sh list --header 'X-Alert-Group: <hash>'` lists a group's threads.
+
+**1. Run the bridge.** Run it on the host whose `@ops` lane should hear the
+alerts, as the user that owns the lane-mail store. It needs a token that the
+sender will present:
+
+```
+mkdir -p ~/.config/fork-sandbox
+openssl rand -hex 24 > ~/.config/fork-sandbox/lane-mail-alert.token
+chmod 600 ~/.config/fork-sandbox/lane-mail-alert.token
+```
+
+A systemd user unit keeps it running. Run `loginctl enable-linger` once, so the
+unit runs without a login session:
+
+```ini
+# ~/.config/systemd/user/lane-mail-alert.service
+[Unit]
+Description=Alert webhooks into lane mail
+
+[Service]
+ExecStart=%h/.claude/scripts/lane-mail-alert serve --listen 0.0.0.0:9095 \
+    --token-file %h/.config/fork-sandbox/lane-mail-alert.token --to @ops
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now lane-mail-alert
+curl -s http://localhost:9095/healthz        # ok
+```
+
+It speaks plain HTTP with a bearer token. That is fine on a LAN where every
+machine is yours. If it is not, bind it to an address only the sender can
+reach, or put it behind a TLS proxy.
+
+`--to` takes any lane addresses, including `@ops:beta` on a peer host, which
+are delivered as `lane-mail.sh send` delivers them. But a cross-host send is
+all-or-nothing, so one unreachable peer would block the alert for every
+host. To have several hosts hear the alerts, run one bridge per host, each
+with `--to @ops`, and list every bridge in the sender (below). Each host then
+keeps its own threads, and one host being down never blocks another.
+
+**2a. Point Alertmanager at it.** Add a webhook receiver. With
+kube-prometheus-stack, in the chart's values (the token goes in a Secret named
+`lane-mail-alert` with key `token`, in the Alertmanager's namespace):
+
+```yaml
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    secrets: [lane-mail-alert]        # mounted at /etc/alertmanager/secrets/lane-mail-alert/
+  config:
+    route:
+      receiver: "null"
+      group_by: [alertname, namespace, node]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      routes:
+        - receiver: lane-mail
+          matchers: ['severity =~ "warning|critical"']
+    receivers:
+      - name: "null"
+      - name: lane-mail
+        webhook_configs:
+          - url: http://alpha.example.test:9095/v1/alert
+            send_resolved: true
+            http_config:
+              authorization:
+                credentials_file: /etc/alertmanager/secrets/lane-mail-alert/token
+          # one entry per bridge, for several hosts:
+          # - url: http://beta.example.test:9095/v1/alert ...
+```
+
+The default route goes to `"null"`. Only warnings and criticals reach the
+lane, and `Watchdog` (always firing, by design) does not. `group_by` decides
+what counts as one incident, and so what shares a thread. Each distinct
+grouping is its own thread.
+
+**2b. Or point Grafana at it.** Under Alerting, Contact points, add a
+**Webhook** contact point: URL `http://alpha.example.test:9095/v1/alert`,
+method POST, and, under optional settings, Authorization header scheme `Bearer`
+with the token as credentials. Grafana's webhook body has the same shape as
+Alertmanager's, plus dashboard, panel and silence links, which the bridge
+puts in the message.
+
+A test notification from either one should land in `lane-mail.sh inbox ops`.
+A bad token is refused with 401, and a body that is not a webhook with 400.
+If the send fails, the bridge answers 500 and the sender retries.
+
+**3. Wake a running session.** A session that has taken the lane is woken
+like any other lane:
+
+```
+lane-mail.sh register ops
+lane-mail-watch.sh ops --wait     # run_in_background
+```
+
+The message has the alert summary, labels, start and end times, and links back
+to the source. The session investigates, replies in the thread with what it
+found (the reply goes to `@alerts`, which no one reads, so the thread itself is
+the record), and marks the message seen before it relaunches `--wait`.
+
+**4. Or start a session when none is watching.** The watcher only wakes a
+session that is already running. When no session is running, there are three
+options, from simplest up:
+
+- **A standing session.** Keep one `@ops` session open in tmux, registered
+  and watching. You need no spawn logic and the cost is one idle session.
+  This is the right default.
+- **A spawn timer.** A systemd user timer checks the inbox every minute and
+  starts a session only when alert mail has sat unread past a grace period.
+  The example below is a recipe, not a shipped script.
+- **The bridge launching a session itself.** Not offered. It would run once
+  per notification, inside the HTTP request. A timer looks at the inbox
+  instead, after dedup and after any session has marked mail seen, so it
+  acts on what is actually unhandled.
+
+The timer is bounded three ways. The grace period gives a running, watching
+session time to take the mail first. A cooldown spaces spawns apart. And the
+service runs the session in the foreground, so systemd skips the timer while a
+session is still running, which means at most one spawned session at a time:
+
+```bash
+#!/bin/bash
+# ~/.local/bin/ops-spawn -- start an @ops session for alert mail left unread
+set -euo pipefail
+lane=ops grace=120 cooldown=1800
+state="$HOME/.local/state/ops-spawn"
+mkdir -p "$state"
+now="$(date +%s)"
+if [[ -z "$(lane-mail.sh inbox "$lane")" ]]; then
+    rm -f "$state/pending-since"
+    exit 0
+fi
+[[ -f "$state/pending-since" ]] || echo "$now" > "$state/pending-since"
+(( now - $(<"$state/pending-since") >= grace )) || exit 0
+last="$(cat "$state/last-spawn" 2>/dev/null || echo 0)"
+(( now - last >= cooldown )) || exit 0
+echo "$now" > "$state/last-spawn"
+cd "$HOME/src/ops"      # a project whose settings allow read-only cluster access
+exec claude -p "You are the @ops lane. Run 'lane-mail.sh register $lane', read \
+'lane-mail.sh inbox $lane', investigate each alert thread, reply in it with \
+what you found and did, and mark each message seen."
+```
+
+```ini
+# ~/.config/systemd/user/ops-spawn.service
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ops-spawn
+
+# ~/.config/systemd/user/ops-spawn.timer
+[Timer]
+OnCalendar=minutely
+[Install]
+WantedBy=timers.target
+```
+
+The spawned session runs unattended, with only the permissions that its
+project's settings grant. So give that project the read-only rules it needs to
+investigate, and nothing that changes the cluster. Once it registers on the
+lane, the unread-mail Stop hook keeps it from finishing while the inbox is
+non-empty. A flapping alert costs at most one spawn per cooldown. Its
+notifications stay in one thread, and its repeats never reach the inbox.
+
 ## The fleet registry
 
 `fork-sandbox fleet` answers "who are the agents, and what seat does each

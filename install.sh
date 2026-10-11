@@ -310,6 +310,7 @@ PORCELAIN=(
     fork-sandbox-stop.sh
     fork-sandbox.sh
     fork-task.sh
+    lane-mail-alert           # operator-run webhook receiver; a service unit starts it from the install path
     lane-mail-hook.sh         # Stop/UserPromptSubmit hook command: settings.json invokes it by bare name
     lane-mail-peer            # operator command; edits authorized_keys, so never allowlisted; the peer runs its half at this exact link path
     lane-mail-serve           # authorized_keys forced command on the receiving host: invoked by bare name

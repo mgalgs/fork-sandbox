@@ -155,6 +155,11 @@ yourself, in a terminal; it is on `PATH` only so you can, and so the peer can
 run its half of the setup. Do not add a `Bash(lane-mail-peer:*)` rule, or one
 for its path under `~/.claude/scripts`.
 
+**`lane-mail-alert` — a service; never allowlist it.** Its `serve` mode
+opens a listening port, and `--to` can name any peer lane. A service unit
+runs it (docs/agent-mail.md, "Alerts into lane mail"); a session never needs
+to, so do not add a rule for it.
+
 **`lane-mail-watch.sh` — read-only.** It only ever calls `lane-mail.sh inbox
 <lane>` in a loop and prints what comes back. It mutates nothing. Its
 `--wait` mode is the same read-only loop with a different exit condition —
