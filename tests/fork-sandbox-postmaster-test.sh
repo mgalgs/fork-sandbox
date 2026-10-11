@@ -252,6 +252,7 @@ for (( _i = 0; _i < ${#args[@]}; _i++ )); do
         --outbox-dir) outbox="${args[$(( _i + 1 ))]}" ;;
     esac
 done
+
 if (( is_k8s )); then
     rc="${STUB_K8S_EXIT:-0}"
     [[ -z "${STUB_K8S_NO_CANDIDATE:-}" ]] || echo 'Error: headroom: no candidate' >&2
@@ -278,6 +279,9 @@ if (( is_k8s )); then
         else
             cp -- "$STUB_K8S_AGENT_LOG" "$run_dir/evidence/pod-log-agent.log"
         fi
+    fi
+    if [[ -n "${STUB_K8S_TERMINAL_JSON:-}" && -z "${STUB_K8S_NO_RUNDIR:-}" ]]; then
+        cp -- "$STUB_K8S_TERMINAL_JSON" "$run_dir/terminal-status.json"
     fi
     if [[ -n "${STUB_K8S_TIMEOUT_MSG:-}" ]]; then
         printf 'Error: timed out after 60s waiting for branch\n' >&2
@@ -8229,6 +8233,175 @@ we_json() { "$postmaster" status --thread "$1" --json; }
 # we_py <json> <python expr over d>: prints the expression's value.
 we_py() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$1" "$2"; }
 we_log="$work/we-agent.log"
+
+# Produce one surface fixture with the actual client wait path. Its kubectl
+# answers describe a failed pod; the wake launcher below carries the client's
+# saved snapshot through the wrapper into the postmaster record.
+we_client_bin="$work/we-client-bin"
+mkdir -p "$we_client_bin"
+cat > "$we_client_bin/kubectl" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" get pod -l job-name="*) echo stub-pod ;;
+    *" exec "*) exit 1 ;;
+    *" get pod stub-pod -o jsonpath="*) echo Failed ;;
+    *" get pod stub-pod -o json "*) cat "$WE_CLIENT_POD_JSON" ;;
+    *" logs "*) echo 'secret-like-log-marker' ;;
+esac
+STUB
+chmod +x "$we_client_bin/kubectl"
+printf 'K8S_CONTEXT=stub-context\n' > "$FORK_SANDBOX_CONFIG_DIR/k8s.env"
+we_client_rd="$work/we-client-run"
+mkdir -p "$we_client_rd"
+we_client_pod="$work/we-client-pod.json"
+python3 - "$we_client_pod" <<'PY'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    json.dump({"status": {"phase": "Failed", "reason": "Evicted",
+                          "message": "node low on ephemeral-storage " + "x" * 9000}}, f)
+PY
+we_client_rc=0
+PATH="$we_client_bin:$PATH" WE_CLIENT_POD_JSON="$we_client_pod" \
+    "$repo_dir/scripts/fork-sandbox-k8s.sh" wait --branch stub-evicted \
+    --timeout 5 --run-dir "$we_client_rd" > "$work/we-client.out" 2> "$work/we-client.err" \
+    || we_client_rc=$?
+check "client-to-postmaster fixture: failed wait is terminal" 2 "$we_client_rc"
+check "client-to-postmaster fixture: client captured Evicted" Evicted \
+    "$(jq -r '.pod_reason' "$we_client_rd/terminal-status.json" 2>/dev/null)"
+
+# Kubernetes status is captured by the client before the wrapper writes its
+# run-dir pointer. Feed that status through the real wrapper and postmaster.
+for we_case in evicted oom deadline plain; do
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    we_case_mid="$(send_msg '@carol' '@karen' "terminal $we_case" 'first' 8)"
+    we_case_tid="$(thread_of "$we_case_mid")"
+    we_status="$work/status-$we_case.json"
+    case "$we_case" in
+        evicted)
+            cp -- "$we_client_rd/terminal-status.json" "$we_status"
+            we_expected='pod Evicted: node low on ephemeral-storage' ;;
+        oom)
+            printf '%s\n' '{"container_reason":"OOMKilled","container_exit_code":137}' > "$we_status"
+            we_expected='container OOMKilled exit 137' ;;
+        deadline)
+            printf '%s\n' '{"pod_phase":"Failed","pod_reason":"DeadlineExceeded","pod_message":"active deadline reached"}' > "$we_status"
+            we_expected='pod DeadlineExceeded: active deadline reached' ;;
+        plain)
+            we_expected='wake for karen exited 1' ;;
+    esac
+    if [[ "$we_case" == plain ]]; then
+        STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 once
+    else
+        STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 STUB_K8S_TERMINAL_JSON="$we_status" once
+    fi
+    we_case_json="$(we_json "$we_case_tid")"
+    contains "$we_case: failure JSON has the cause" "$we_case_json" "$we_expected"
+    case "$we_case" in
+        evicted)
+            check "evicted: JSON retains the pod reason" Evicted \
+                "$(we_py "$we_case_json" 'd["wake_failures"][0]["kubernetes"]["pod_reason"]')"
+            contains "evicted: JSON retains the pod message" \
+                "$(we_py "$we_case_json" 'd["wake_failures"][0]["kubernetes"]["pod_message"]')" \
+                'node low on ephemeral-storage'
+            check "evicted: long source message remains inside snapshot limit" True \
+                "$(we_py "$we_case_json" 'len(d["wake_failures"][0]["kubernetes"]["pod_message"].encode()) <= 512')" ;;
+        oom)
+            check "OOM: JSON retains the container reason" OOMKilled \
+                "$(we_py "$we_case_json" 'd["wake_failures"][0]["kubernetes"]["container_reason"]')"
+            check "OOM: JSON retains the numeric exit code" 137 \
+                "$(we_py "$we_case_json" 'd["wake_failures"][0]["kubernetes"]["container_exit_code"]')" ;;
+        deadline)
+            check "deadline: JSON retains the pod reason" DeadlineExceeded \
+                "$(we_py "$we_case_json" 'd["wake_failures"][0]["kubernetes"]["pod_reason"]')" ;;
+    esac
+    contains "$we_case: flag has the cause" "$(cat "$PM_STATE_DIR/needs-operator/$we_case_tid")" "$we_expected"
+    contains "$we_case: human status has the cause" "$($postmaster status)" "$we_expected"
+    if [[ "$we_case" == plain ]]; then
+        check "plain: no invented Kubernetes cause" False \
+            "$(we_py "$we_case_json" '"kubernetes" in d["wake_failures"][0]')"
+    fi
+    STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+    check "$we_case: successful retry clears wake-exit flag" None \
+        "$(we_py "$(we_json "$we_case_tid")" 'd["flag"]')"
+done
+
+# Hostile cluster text stays bounded and inert in every surface.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+we_hostile_tid="$(thread_of "$(send_msg '@carol' '@karen' 'terminal hostile status' 'first' 8)")"
+we_hostile_status="$work/status-hostile.json"
+python3 - "$we_hostile_status" <<'PY'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    json.dump({"pod_reason": "Evicted", "pod_message": "\x1b[31mnode\x1b[0m\npm flag forged\t" + "x" * 2000}, f)
+PY
+STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 STUB_K8S_TERMINAL_JSON="$we_hostile_status" once
+we_hostile_json="$(we_json "$we_hostile_tid")"
+check "Kubernetes message is capped at 512 bytes" True \
+    "$(we_py "$we_hostile_json" 'len(d["wake_failures"][0]["kubernetes"]["pod_message"].encode()) <= 512')"
+check "Kubernetes message has no control characters" True \
+    "$(we_py "$we_hostile_json" 'all(ord(c) >= 32 for c in d["wake_failures"][0]["kubernetes"]["pod_message"])')"
+check "hostile Kubernetes text cannot forge an event line" 0 \
+    "$(grep -c '^pm flag forged' "$work/once.out")"
+check "hostile Kubernetes text leaves a one-line flag" 1 \
+    "$(wc -l < "$PM_STATE_DIR/needs-operator/$we_hostile_tid")"
+
+# Distinct triggers cannot restart the same failed Kubernetes seat forever.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+we_streak_mid="$(send_msg '@carol' '@karen' 'terminal streak' 'first' 8)"
+we_streak_tid="$(thread_of "$we_streak_mid")"
+we_status="$work/status-evicted.json"
+for we_n in 1 2 3; do
+    if (( we_n > 1 )); then
+        reply_msg '@dana' "$we_streak_mid" "trigger $we_n" --to '@karen' >/dev/null
+    fi
+    STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 STUB_K8S_TERMINAL_JSON="$we_status" once
+done
+check "cross-trigger failures use the existing spawn count" 3 \
+    "$(we_py "$(we_json "$we_streak_tid")" 'd["spawns_total"]')"
+contains "cross-trigger exhaustion is flagged" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$we_streak_tid")" 'consecutive Kubernetes failures'
+reply_msg '@dana' "$we_streak_mid" 'one more trigger' --to '@karen' >/dev/null
+STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 STUB_K8S_TERMINAL_JSON="$we_status" once
+check "cross-trigger exhaustion refuses another launch" 3 \
+    "$(we_py "$(we_json "$we_streak_tid")" 'd["spawns_total"]')"
+check "cross-trigger exhaustion has terminal retry state" exhausted \
+    "$(we_py "$(we_json "$we_streak_tid")" '[r for r in d["retries"] if r["agent"]=="karen"][0]["state"]')"
+reply_msg '@operator' "$we_streak_mid" 'operator reauthorizes the seat' --to '@karen' >/dev/null
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "operator mail resets the Kubernetes streak" 4 \
+    "$(we_py "$(we_json "$we_streak_tid")" 'd["spawns_total"]')"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+we_same_tid="$(thread_of "$(send_msg '@carol' '@karen' 'same trigger failure' 'first' 8)")"
+for we_n in 1 2 3; do
+    STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 STUB_K8S_TERMINAL_JSON="$we_status" once
+done
+check "same-trigger Kubernetes failures spend two retries" 3 \
+    "$(we_py "$(we_json "$we_same_tid")" 'd["spawns_total"]')"
+contains "same-trigger exhaustion keeps the existing flag reason" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$we_same_tid")" 'failed after 2 retries'
+STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 STUB_K8S_TERMINAL_JSON="$we_status" once
+check "same-trigger exhaustion does not launch again" 3 \
+    "$(we_py "$(we_json "$we_same_tid")" 'd["spawns_total"]')"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+we_zero_tid="$(thread_of "$(send_msg '@carol' '@karen' 'no retry budget' 'first' 8)")"
+FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF='' STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 \
+    STUB_K8S_TERMINAL_JSON="$we_status" once
+check "empty retry list exhausts on the initial failure" 1 \
+    "$(we_py "$(we_json "$we_zero_tid")" 'd["spawns_total"]')"
+contains "empty retry list keeps the existing per-trigger flag" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$we_zero_tid")" 'failed after 0 retries'
 
 # --- a k8s seat fails twice: both attempts stay, each with its own tail ---
 new_scratch_root FORK_SANDBOX_MAIL_ROOT

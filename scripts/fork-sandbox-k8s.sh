@@ -5190,6 +5190,55 @@ k8s_runner_dead_json() {
     ' >/dev/null 2>&1
 }
 
+# Save only terminal pod fields while the API still has them. The composed
+# runner can be removed immediately after detection, so the wake wrapper
+# cannot reliably query it later. Failure to capture is never fatal.
+k8s_save_terminal_status() {
+    local run_dir="$1" pod_json="$2" tmp
+    [[ -n "$run_dir" && -d "$run_dir" && -n "$pod_json" ]] || return 0
+    tmp="$(mktemp "$run_dir/.terminal-status.XXXXXX" 2>/dev/null)" || return 0
+    # 128 Unicode code points occupy at most 512 UTF-8 bytes; bounding all
+    # text fields also keeps the snapshot within the postmaster's 8192 bytes.
+    if jq -c '
+        def bounded: if type == "string" then .[:128] else . end;
+        .status as $s |
+        (($s.containerStatuses // [] | map(select(.name == "agent")) | .[0] // {}) |
+         (.state.terminated // .lastState.terminated // {})) as $t |
+        {pod_phase: ($s.phase | bounded), pod_reason: ($s.reason | bounded),
+         pod_message: ($s.message | bounded), container_reason: ($t.reason | bounded),
+         container_message: ($t.message | bounded), container_exit_code: $t.exitCode,
+         container_signal: $t.signal} |
+        with_entries(select(.value != null))
+    ' <<< "$pod_json" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        mv -f -- "$tmp" "$run_dir/terminal-status.json" 2>/dev/null || rm -f -- "$tmp"
+    else
+        rm -f -- "$tmp"
+    fi
+    return 0
+}
+
+# An extra terminal read must never hold up harvesting a known-dead wake.
+k8s_capture_terminal_pod() {
+    local run_dir="$1" pod_name="$2" pod_json
+    pod_json="$("$FS_TIMEOUT" 5s kubectl --context="$K8S_CONTEXT" -n "$K8S_NAMESPACE" \
+        get pod "$pod_name" -o json \
+        --request-timeout=5s 2>/dev/null)" || return 0
+    k8s_save_terminal_status "$run_dir" "$pod_json"
+}
+
+k8s_save_unavailable_status() {
+    local run_dir="$1" kind="${2:-Unavailable}" tmp
+    [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
+    tmp="$(mktemp "$run_dir/.terminal-status.XXXXXX" 2>/dev/null)" || return 0
+    if printf '{"pod_reason":"%s","pod_message":"pod status unavailable"}\n' "$kind" \
+        > "$tmp" 2>/dev/null && mv -f -- "$tmp" "$run_dir/terminal-status.json" 2>/dev/null; then
+        :
+    else
+        rm -f -- "$tmp"
+    fi
+    return 0
+}
+
 k8s_report_unready_pod() {
     local pod="$1" ready_checks="${2:-}" runner_dead="${3:-false}" pod_json
     local request_timeout=60
@@ -7879,6 +7928,7 @@ EOF
             runner_status="$(kubectl get pod "$pod_name" -o json \
                 --request-timeout=5s 2>/dev/null || true)"
             if [[ -n "$runner_status" ]] && k8s_runner_dead_json <<< "$runner_status"; then
+                k8s_save_terminal_status "$run_dir" "$runner_status"
                 k8s_report_unready_pod "$pod_name" "$services_ready_checks" true
                 k8s_capture_failed_agent_log "$pod_name" "$run_dir" false
                 printf '2\n' > "$run_dir/exit-code"
@@ -8594,13 +8644,13 @@ k8s_teardown_codex_proxy() {
 # fetched), while exit 1 is the probe's own deadline (the run may still be
 # going) or a usage error.
 #
-# Captures the agent container's log when cmd_wait finds a Failed pod or a
+# Captures the agent container's log quietly when cmd_wait finds a Failed pod or a
 # Failed job condition -- a pod that died before any leg never reaches
 # cmd_collect's own evidence capture (k8s_run_tail below exits on a
 # non-zero wait before collect ever runs), so this is the only chance to
-# carry the tail into the run's own log and status. Prints the last 40
-# lines to stderr, bounded (--request-timeout=60s, like every other
-# evidence read in this file) and best effort: a read failure is reported
+# carry the tail into the run's own log and status. The read is
+# bounded (--request-timeout=60s, like every other evidence read in this
+# file) and best effort: a read failure is reported
 # but never changes the caller's exit code. Given a non-empty $2 (the run
 # directory), also saves the full log to $2/evidence/pod-log-agent.log --
 # the exact path pm_wake_exit_record (fork-sandbox-postmaster.sh) already
@@ -8702,6 +8752,7 @@ cmd_wait() {
             fi
             echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
             echo "have already been fetched and removed, or the run never started." >&2
+            k8s_save_unavailable_status "$run_dir"
             exit 2
         fi
     else
@@ -8709,6 +8760,7 @@ cmd_wait() {
         if [[ -z "$pod_name" ]]; then
             echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
             echo "have already been fetched and removed, or the run never started." >&2
+            k8s_save_unavailable_status "$run_dir" Unknown
             exit 2
         fi
     fi
@@ -8789,6 +8841,7 @@ cmd_wait() {
             runner_status="$(kubectl get pod "${runner_kubectl_opts[@]}" \
                 "$pod_name" -o json 2>/dev/null || true)"
             if [[ -n "$runner_status" ]] && k8s_runner_dead_json <<< "$runner_status"; then
+                [[ "$probe" == true ]] || k8s_save_terminal_status "$run_dir" "$runner_status"
                 if [[ "$probe" != true ]]; then
                     k8s_report_unready_pod "$pod_name" "" true
                     k8s_capture_failed_agent_log "$pod_name" "$run_dir" false
@@ -8818,13 +8871,16 @@ cmd_wait() {
         # reach what is left in the pod's /work volume.
         phase="$(kubectl get pod "${probe_kubectl_opts[@]}" "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
         if [[ "$phase" == Failed ]]; then
+            if [[ "$probe" != true && -n "$run_dir" ]]; then
+                k8s_capture_terminal_pod "$run_dir" "$pod_name"
+            fi
             echo "Error: pod $pod_name is Failed -- it died before writing" >&2
             echo "/work/.run-complete. Inspect it with:" >&2
             echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe pod $pod_name" >&2
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            [[ "$probe" == true ]] || { wait_terminal_teardown=true; k8s_capture_failed_agent_log "$pod_name" "$run_dir"; }
+            [[ "$probe" == true ]] || { wait_terminal_teardown=true; k8s_capture_failed_agent_log "$pod_name" "$run_dir" false; }
             exit 2
         fi
         if [[ "$phase" == Succeeded ]]; then
@@ -8846,13 +8902,16 @@ cmd_wait() {
         job_failed="$(kubectl get job "${probe_kubectl_opts[@]}" "$safe_name" \
             -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
         if [[ "$job_failed" == True ]]; then
+            if [[ "$probe" != true && -n "$run_dir" ]]; then
+                k8s_capture_terminal_pod "$run_dir" "$pod_name"
+            fi
             echo "Error: job $safe_name reports a Failed condition -- it" >&2
             echo "died before /work/.run-complete appeared. Inspect it with:" >&2
             echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe job $safe_name" >&2
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            [[ "$probe" == true ]] || { wait_terminal_teardown=true; k8s_capture_failed_agent_log "$pod_name" "$run_dir"; }
+            [[ "$probe" == true ]] || { wait_terminal_teardown=true; k8s_capture_failed_agent_log "$pod_name" "$run_dir" false; }
             exit 2
         fi
 

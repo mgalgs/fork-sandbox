@@ -1221,6 +1221,16 @@ earlier attempt's entry:
  "cleared": null}
 ```
 
+A failed Kubernetes wake may also have `"kubernetes"` with `pod_phase`,
+`pod_reason`, `pod_message`, `container_reason`, `container_message`,
+`container_exit_code`, and `container_signal` when the cluster reported
+them. The numeric `exit_code` above remains the launcher result; a runner
+may have container exit 137 while the launcher exits 2. Kubernetes text is
+stripped of controls and capped at 512 bytes per field. The needs-operator
+flag and human `status` include a concise pod/container reason after the
+`(run <id>)` token. If the pod status is unavailable, the ordinary numeric
+exit remains visible without an invented cause.
+
 `log.tail` is the end of the failed agent's own log, capped at the last 40
 lines and 8 KiB (`truncated` says whether anything was cut). For a k8s seat
 the source is the agent container's pod log that the fetch saved under the
@@ -1865,6 +1875,12 @@ leading, trailing, or doubled comma — fails `deliver` at startup with the
 full value quoted, the same posture as its other `pm_require_*` startup
 gates; the whole string is checked against the grammar before it is ever
 split, so a trailing comma cannot silently vanish into a shorter list.
+For Kubernetes seats, consecutive failures with captured terminal status
+also spend this same attempt budget across different triggers. The
+postmaster reads the ordered `seq/` runs and their `wake-exits/` records;
+it stops after the initial attempt plus the configured retries and marks
+the seat exhausted with a distinct infrastructure-failure flag. A clean
+wake or operator/external mail resets this actionable streak.
 
 A wake resumed for a retry is told so in its handoff (a "This is a retry"
 section, right after the triggering message is named): if it already sent
@@ -1974,7 +1990,7 @@ own thread scans never see it:
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
 | `needs-operator-journal/<thread-id>` | append-only history: one line per `pm_flag` call (timestamp, `flag`, keyword, reason) and one per `pm_unflag` call that actually cleared a flag (timestamp, `unflag`, empty keyword, empty reason) — a redundant unflag on an already-clear thread appends nothing — and one `clear` line (keyword `wake-exit`, reason `<the original reason> cleared by run <run id>`) per wake-exit flag a seat's successful wake cleared. The flag-line count is what `status` shows next to the current reason, or `(no journal)` if this file doesn't exist yet for a thread flagged before the journal did. Operator-readable, but not display-only: a successful retry's clear reads it, so the `flag`/`unflag`/`clear` kind, the keyword and a wake-exit reason's `wake for <agent> exited ` prefix and `(run <id>)` shape are load-bearing |
-| `wake-exits/<thread-id>/<agent>/<run-id>.json` | one failed wake's evidence: agent, run id, exit code, capped log tail (see "Status"), written once and never rewritten. A sibling `<run-id>.cleared` (`BY`, `AT`) marks it cleared. Served as `wake_failures` by `status --thread --json`; nothing routes on it |
+| `wake-exits/<thread-id>/<agent>/<run-id>.json` | one failed wake's evidence: agent, run id, exit code, capped log tail and optional sanitized Kubernetes terminal status (see "Status"), written once and never rewritten. A sibling `<run-id>.cleared` (`BY`, `AT`) marks it cleared. Served as `wake_failures` by `status --thread --json`; the ordered records bound repeated Kubernetes failures across triggers |
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 (and by an `X-Upstream-Head` message) — line count is the **budget** count, against the thread's effective budget |
 | `upstream-state/<thread-id>.env` | the thread's upstream state: `STATE` (`closed` or `open`), `MSGID` (the message that set it), `AT`. No file means open — see "Upstream closed" |
 | `upstream-head/<thread-id>.env` | the thread's last upstream-moved announcement: `BRANCH`, `SHA`, `MSGID`, `SET_AT` — see "Upstream moved" |

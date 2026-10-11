@@ -345,8 +345,8 @@
 #     carry image and image_source, and fork-sandbox.sh --k8s --image
 #     renders byte-for-byte what a direct run --dry-run --image does (and
 #     is refused by name without --k8s).
-#   - `wait` on a Failed pod or a Failed job condition (non-probe) prints
-#     the agent container's log tail to stderr and, given --run-dir, saves
+#   - `wait` on a Failed pod or a Failed job condition (non-probe) captures
+#     the agent container's log quietly and, given --run-dir, saves
 #     it to <run-dir>/evidence/pod-log-agent.log, without changing the
 #     exit code; --probe makes no `kubectl logs` call at all.
 #   - image-supplied clone provisioning (run_image_provisioning, extracted
@@ -8079,7 +8079,15 @@ case " $* " in
         [[ "${K8S_STUB_JOB_EXISTS:-}" == 1 ]] && printf 'job.batch/stub-job\n'
         exit 0 ;;
     *" get pod "*)
-        printf '%s' "${K8S_STUB_POD_PHASE:-Running}"
+        if [[ " $* " == *" -o json "* ]]; then
+            if [[ -n "${K8S_STUB_POD_JSON:-}" ]]; then
+                printf '%s' "$K8S_STUB_POD_JSON"
+            else
+                printf '{"status":{"phase":"%s"}}' "${K8S_STUB_POD_PHASE:-Running}"
+            fi
+        else
+            printf '%s' "${K8S_STUB_POD_PHASE:-Running}"
+        fi
         exit 0 ;;
     *" get job "*)
         printf '%s' "${K8S_STUB_JOB_FAILED:-False}"
@@ -8162,9 +8170,61 @@ else
     no "a Failed pod fails the wait with the terminal code 2" "rc=$rc: $(cat "$wait_err2")"
 fi
 contains_log2=$(grep -c 'stub pod log: entrypoint narration' "$wait_err2")
-check "a Failed pod's agent log tail is printed to stderr" "1" "$contains_log2"
+check "a Failed pod's agent log stays out of stderr" "0" "$contains_log2"
 check "a Failed pod's agent log is saved to <run-dir>/evidence/pod-log-agent.log" \
     "stub pod log: entrypoint narration" "$(cat "$wait2_rd/evidence/pod-log-agent.log" 2>/dev/null)"
+
+wait_evicted_rd="$(newdir)"; tmpdirs+=("$wait_evicted_rd")
+wait_evicted_json='{"status":{"phase":"Failed","reason":"Evicted","message":"node low on ephemeral-storage"}}'
+K8S_STUB_POD_PHASE=Failed K8S_STUB_POD_JSON="$wait_evicted_json" \
+    waitstub_wait "$wait_log2" "$wait_out2" "$wait_err2" \
+    --branch fs-k8s-test-evicted --timeout 5 --run-dir "$wait_evicted_rd" || true
+check "an Evicted pod status is saved before teardown" Evicted \
+    "$(jq -r '.pod_reason' "$wait_evicted_rd/terminal-status.json" 2>/dev/null)"
+check "the Evicted message is saved" 'node low on ephemeral-storage' \
+    "$(jq -r '.pod_message' "$wait_evicted_rd/terminal-status.json" 2>/dev/null)"
+if grep -q -- 'get pod stub-pod -o json --request-timeout=5s' "$wait_log2"; then
+    ok "terminal pod status read has a five-second request timeout"
+else
+    no "terminal pod status read has a five-second request timeout" "$(cat "$wait_log2")"
+fi
+if grep -q -- '--context=.* -n .* get pod stub-pod -o json --request-timeout=5s' "$wait_log2"; then
+    ok "terminal pod status read uses the configured context and namespace"
+else
+    no "terminal pod status read uses the configured context and namespace" "$(cat "$wait_log2")"
+fi
+
+# A kubelet message longer than the postmaster's snapshot limit must not
+# erase the short reason that classifies this as an infrastructure failure.
+wait_long_rd="$(newdir)"; tmpdirs+=("$wait_long_rd")
+wait_long_json="$(python3 - <<'PY'
+import json
+print(json.dumps({"status": {"phase": "Failed", "reason": "Evicted",
+                            "message": "x" * 9000}}))
+PY
+)"
+K8S_STUB_POD_PHASE=Failed K8S_STUB_POD_JSON="$wait_long_json" \
+    waitstub_wait "$wait_log2" "$wait_out2" "$wait_err2" \
+    --branch fs-k8s-test-long-eviction --timeout 5 --run-dir "$wait_long_rd" || true
+check "long eviction retains its short reason" Evicted \
+    "$(jq -r '.pod_reason' "$wait_long_rd/terminal-status.json" 2>/dev/null)"
+if (( $(wc -c < "$wait_long_rd/terminal-status.json") <= 8192 )) \
+    && (( $(jq -r '.pod_message | length' "$wait_long_rd/terminal-status.json") <= 128 )); then
+    ok "long eviction snapshot stays inside the postmaster limit"
+else
+    no "long eviction snapshot stays inside the postmaster limit"
+fi
+
+wait_oom_rd="$(newdir)"; tmpdirs+=("$wait_oom_rd")
+printf 'RUNNER=1\n' > "$wait_oom_rd/run.env"
+wait_oom_json='{"status":{"phase":"Running","containerStatuses":[{"name":"agent","state":{"terminated":{"reason":"OOMKilled","exitCode":137}}}]}}'
+K8S_STUB_POD_JSON="$wait_oom_json" \
+    waitstub_wait "$wait_log2" "$wait_out2" "$wait_err2" \
+    --branch fs-k8s-test-oom --timeout 5 --run-dir "$wait_oom_rd" || true
+check "a dead runner's OOMKilled reason is saved" OOMKilled \
+    "$(jq -r '.container_reason' "$wait_oom_rd/terminal-status.json" 2>/dev/null)"
+check "a dead runner's container exit code is numeric" 137 \
+    "$(jq -r '.container_exit_code' "$wait_oom_rd/terminal-status.json" 2>/dev/null)"
 
 # 2b. A Failed pod whose log read itself fails still gives the terminal
 # code 2 -- the capture is best effort and never changes the outcome.
@@ -8226,15 +8286,22 @@ fi
 # same as the Failed-pod case above.
 wait_log3b="$(newdir)/kubectl.log"; wait_out3b="$(newdir)/out3b.txt"; wait_err3b="$(newdir)/err3b.txt"
 tmpdirs+=("$(dirname "$wait_log3b")")
+wait3b_rd="$(newdir)"; tmpdirs+=("$wait3b_rd")
 rc=0
 K8S_STUB_JOB_FAILED=True \
     waitstub_wait "$wait_log3b" "$wait_out3b" "$wait_err3b" \
-    --branch fs-k8s-test-wait-jobfailed-nop --timeout 5 || rc=$?
-if (( rc == 2 )) && grep -q 'stub pod log: entrypoint narration' "$wait_err3b"; then
-    ok "a Failed job condition without --probe also captures the agent log"
+    --branch fs-k8s-test-wait-jobfailed-nop --timeout 5 --run-dir "$wait3b_rd" || rc=$?
+if (( rc == 2 )) && [[ "$(cat "$wait3b_rd/evidence/pod-log-agent.log" 2>/dev/null)" == 'stub pod log: entrypoint narration' ]] \
+    && ! grep -q 'stub pod log: entrypoint narration' "$wait_err3b"; then
+    ok "a Failed job condition saves the agent log without printing it"
 else
-    no "a Failed job condition without --probe also captures the agent log" \
+    no "a Failed job condition saves the agent log without printing it" \
         "rc=$rc: $(cat "$wait_err3b")"
+fi
+if grep -q -- 'get pod stub-pod -o json --request-timeout=5s' "$wait_log3b"; then
+    ok "terminal Failed Job pod read has a five-second request timeout"
+else
+    no "terminal Failed Job pod read has a five-second request timeout" "$(cat "$wait_log3b")"
 fi
 
 # 4. No sentinel by the deadline: the wait itself fails with code 1 --
@@ -8337,14 +8404,17 @@ fi
 # (exit 2), unchanged from before finding 1.
 wait_log9="$(newdir)/kubectl.log"; wait_out9="$(newdir)/out9.txt"; wait_err9="$(newdir)/err9.txt"
 tmpdirs+=("$(dirname "$wait_log9")")
+wait9_rd="$(newdir)"; tmpdirs+=("$wait9_rd")
 rc=0
 waitstub_wait_nopod "$wait_log9" "$wait_out9" "$wait_err9" \
-    --branch fs-k8s-test-wait-probe-nopod-nojob --timeout 5 --probe || rc=$?
+    --branch fs-k8s-test-wait-probe-nopod-nojob --timeout 5 --probe --run-dir "$wait9_rd" || rc=$?
 if (( rc == 2 )) && grep -q 'no pod found for branch' "$wait_err9"; then
     ok "--probe: no pod and no Job is terminal (exit 2)"
 else
     no "--probe: no pod and no Job is terminal (exit 2)" "rc=$rc: $(cat "$wait_err9")"
 fi
+check "an API-confirmed absent pod has a fixed status description" Unavailable \
+    "$(jq -r '.pod_reason' "$wait9_rd/terminal-status.json" 2>/dev/null)"
 
 # 10. --probe: the Job lookup itself cannot reach the cluster -- exit 4,
 # same as the pod lookup failing.

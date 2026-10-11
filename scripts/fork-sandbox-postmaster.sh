@@ -48,12 +48,15 @@
 # (the full trigger id). Agent names are as stored, without the '@'. A thread
 # where a wake exited non-zero also carries `wake_failures` (the key is absent
 # otherwise, so a thread of clean wakes prints exactly what it always did):
-# one {run_id, agent, exit_code, at, log, cleared} entry per failed attempt,
+# one {run_id, agent, exit_code, at, log, cleared[, kubernetes]} entry per failed attempt,
 # oldest first, where log is {state, source[, lines, truncated, tail]} -- the
 # capped tail of the failed agent's own log (see pm_wake_exit_record for the
 # caps and the sanitizing) or, in state, why there is none -- and cleared is
 # null or {by, at} once a successful wake of the same seat (or the operator)
-# cleared the failure's flag reason. The two flags must be given together:
+# cleared the failure's flag reason. `kubernetes`, when present, is the
+# sanitized pod phase/reason/message and agent container termination state;
+# its numeric exit code is separate from the launcher exit_code above.
+# The two flags must be given together:
 # the text view is whole-store and the JSON view is per-thread, so either
 # alone exits 2. A thread that has seen X-Upstream-State also carries
 # `upstream_state`: {state: "open"} or, closed, {state: "closed", message_id,
@@ -909,14 +912,16 @@
 #                                   shape -- keep them when pruning,
 #                                   rotating or rewording
 #   wake-exits/<thread-id>/<agent>/<run-id>.json  one failed wake's
-#                                   evidence: agent, run id, exit code and a
-#                                   capped tail of the failed agent's log
+#                                   evidence: agent, run id, exit code, an
+#                                   optional Kubernetes terminal status and
+#                                   a capped tail of the failed agent's log
 #                                   (pm_wake_exit_record), written once; a
 #                                   sibling <run-id>.cleared (BY, AT) marks
 #                                   it cleared -- the record outlives the
 #                                   flag. `status --thread --json` serves
-#                                   these as wake_failures; nothing routes
-#                                   on them
+#                                   these as wake_failures; their ordered
+#                                   open Kubernetes records bound repeated
+#                                   infrastructure failures across triggers
 #   spawns/<thread-id>             one line appended per spawn, reset to
 #                                   empty by rule 1 -- line count is the
 #                                   thread's BUDGET count (rule 3). A
@@ -2146,11 +2151,49 @@ state, text, nlines, truncated = read_tail()
 log = {"state": state, "source": source}
 if state == "captured":
     log.update({"lines": nlines, "truncated": truncated, "tail": text})
-print(json.dumps({
+
+def clean(value):
+    if not isinstance(value, str):
+        return None
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    value = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", value)
+    value = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value)
+    value = " ".join(value.split())
+    return value.encode("utf-8")[:512].decode("utf-8", "ignore") or None
+
+def terminal_status():
+    if source != "pod-log-agent.log" or not base or not os.path.isabs(base):
+        return None
+    path = os.path.join(base, "terminal-status.json")
+    try:
+        if os.path.islink(base) or os.path.islink(path) or os.stat(path).st_size > 8192:
+            return None
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return None
+    except (OSError, ValueError, UnicodeError):
+        return None
+    out = {}
+    for key in ("pod_phase", "pod_reason", "pod_message", "container_reason", "container_message"):
+        value = clean(raw.get(key))
+        if value:
+            out[key] = value
+    for key in ("container_exit_code", "container_signal"):
+        value = raw.get(key)
+        if type(value) is int and 0 <= value <= 255:
+            out[key] = value
+    return out or None
+
+record = {
     "run_id": rid, "agent": agent,
     "exit_code": int(code) if re.fullmatch(r"[0-9]{1,9}", code) else None,
     "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "log": log}))
+    "log": log}
+status = terminal_status()
+if status:
+    record["kubernetes"] = status
+print(json.dumps(record))
 ' "$agent" "$rid" "$code" "$base" "$rel" "$source" \
         "$PM_WAKE_EXIT_TAIL_LINES" "$PM_WAKE_EXIT_TAIL_BYTES" 2>/dev/null)" || return 1
     [[ -n "$json" ]] || return 1
@@ -2160,6 +2203,31 @@ print(json.dumps({
     fi
     rm -f -- "$tmp"
     return 1
+}
+
+# Read only the already-sanitized record written above. This text is used in
+# one-line flag reasons; the run token stays before the suffix for clear.
+pm_wake_exit_suffix() {
+    local path="$WAKE_EXITS/$1/$2/$3.json"
+    [[ -f "$path" ]] || return 0
+    python3 - "$path" <<'PY'
+import json, sys
+try:
+    k = json.load(open(sys.argv[1], encoding="utf-8")).get("kubernetes", {})
+    if not isinstance(k, dict):
+        raise ValueError()
+    pod = k.get("pod_reason") or (k.get("pod_phase") if k.get("pod_phase") == "Failed" else None)
+    container = k.get("container_reason")
+    code = k.get("container_exit_code")
+    parts = []
+    if pod:
+        parts.append("pod " + pod + (": " + k["pod_message"] if k.get("pod_message") else ""))
+    if container or type(code) is int:
+        parts.append("container " + (container or "terminated") + (" exit " + str(code) if type(code) is int else ""))
+    print("; ".join(parts), end="")
+except (OSError, ValueError, TypeError, KeyError):
+    pass
+PY
 }
 
 # Marks the wake-exit record of $3 (a run id) for agent $2 as cleared by $4
@@ -3720,6 +3788,9 @@ pm_spawn_wake() {
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
     fi
+    if [[ "$backend" == k8s ]] && pm_k8s_streak_exhausted "$tid" "$agent" "$mid"; then
+        return 0
+    fi
     # The one choke point for the wake gate: every spawn path passes here.
     # A retry and a held seat's release were already admitted, so neither
     # is asked again (PM_WAKE_ADMITTED is set by pm_held_pass).
@@ -5064,6 +5135,48 @@ pm_retry_schedule() {
         pending "$cap" "$rid" ""
 }
 
+# The per-trigger retry cap can be bypassed by pending or new triggers.
+# Use monotonic seq history and existing wake-exit evidence; a successful
+# wake or rule-1-cleared record ends the consecutive failure streak.
+pm_k8s_failure_streak() {
+    local tid="$1" agent="$2" rid env_file record count=0
+    [[ -f "$SEQ/$tid" ]] || { printf '0'; return; }
+    while IFS= read -r rid; do
+        env_file="$RUNS/$rid.env"
+        [[ -f "$env_file" ]] || break
+        [[ "$(fs_pm_env_get "$env_file" AGENT)" == "$agent" ]] || continue
+        record="$WAKE_EXITS/$tid/$agent/$rid.json"
+        [[ "$(fs_pm_env_get "$env_file" BACKEND)" == k8s && -f "$record" \
+            && ! -e "$WAKE_EXITS/$tid/$agent/$rid.cleared" ]] || break
+        jq -e '.kubernetes | type == "object" and length > 0' "$record" >/dev/null 2>&1 || break
+        count=$(( count + 1 ))
+    done < <(tac -- "$SEQ/$tid")
+    printf '%s' "$count"
+}
+
+pm_k8s_streak_exhausted() {
+    local tid="$1" agent="$2" trigger="$3" cap="${#PM_RETRY_BACKOFF[@]}" count rid
+    count="$(pm_k8s_failure_streak "$tid" "$agent")"
+    (( count > cap )) || return 1
+    local retry_file="$RETRIES/$tid/$agent" on_trigger attempt fails last
+    on_trigger="$(fs_pm_env_get "$retry_file" TRIGGER)"
+    attempt="$(fs_pm_env_get "$retry_file" ATTEMPT)"
+    [[ "$on_trigger" == "$trigger" && "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+    fails="$(pm_retry_fails_get "$tid" "$agent")"
+    last=""
+    while IFS= read -r rid; do
+        if [[ "$(fs_pm_env_get "$RUNS/$rid.env" AGENT)" == "$agent" ]]; then
+            last="$rid"
+            break
+        fi
+    done < <(tac -- "$SEQ/$tid")
+    if [[ "$(fs_pm_env_get "$retry_file" STATE)" != exhausted || "$on_trigger" != "$trigger" ]]; then
+        pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "" exhausted "$cap" "$last" ""
+    fi
+    pm_flag_unless_current "$tid" "wake for $agent stopped after $count consecutive Kubernetes failures (run $last)"
+    return 0
+}
+
 # Starts fork-sandbox-k8s-wake.sh on $1 (a wake dir): a normal wake when
 # $2 is 0, `--adopt` when 1. Returns 0 when it started, 1 when the detached
 # launch itself failed (tmux could not start a session -- the k8s
@@ -5285,7 +5398,9 @@ pm_harvest_run() {
             local log_key=""
             pm_wake_exit_record "$tid" "$agent" "$rid" "$exit_code" "$run_dir" "$backend" \
                 && log_key="log=$rid"
-            local failure_reason="wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
+            local failure_reason="wake for $agent exited $exit_code (run $rid); outbox may be incomplete" suffix=""
+            [[ "$backend" == k8s ]] && suffix="$(pm_wake_exit_suffix "$tid" "$agent" "$rid")"
+            [[ -z "$suffix" ]] || failure_reason="wake for $agent exited $exit_code (run $rid) ($suffix); outbox may be incomplete"
             if [[ -f "$run_dir/launch.log" ]] && grep -q 'headroom: no candidate' "$run_dir/launch.log"; then
                 failure_reason="wake for $agent failed: headroom: no candidate (run $rid)"
             fi
@@ -5437,11 +5552,17 @@ pm_harvest_run() {
             :
         elif (( ! was_failure )) && pm_mail_delivered_live "$run_dir" "$newest"; then
             pm_ledger_delivered_live "$tid" "$agent" "$newest" "$rid"
+        elif (( was_failure )) && [[ "$backend" == k8s ]] \
+            && pm_k8s_streak_exhausted "$tid" "$agent" "$newest"; then
+            :
         else
             pm_followup_wake "$project" "$agent" "$tid" "$newest"
         fi
     elif (( was_failure )) && ! pm_upstream_closed "$tid"; then
         pm_retry_schedule "$tid" "$agent" "$trigger" "$rid"
+        if [[ "$backend" == k8s && "$(fs_pm_env_get "$RETRIES/$tid/$agent" STATE)" != exhausted ]]; then
+            pm_k8s_streak_exhausted "$tid" "$agent" "$trigger" || true
+        fi
     fi
 
     pm_hook_on_harvest "$tid" "$rid" "$branch" "$agent" "${posted_ids[@]}"
@@ -6131,6 +6252,22 @@ while i < len(tok):
                 rec["log"].update({"lines": int(lg["lines"]),
                                    "truncated": bool(lg["truncated"]),
                                    "tail": str(lg["tail"])[-8192:]})
+            k = r.get("kubernetes")
+            if isinstance(k, dict):
+                ks = {}
+                for key in ("pod_phase", "pod_reason", "pod_message", "container_reason", "container_message"):
+                    value = k.get(key)
+                    if isinstance(value, str):
+                        value = "".join(c if ord(c) >= 32 and ord(c) != 127 else " " for c in value).strip()
+                        value = value.encode("utf-8")[:512].decode("utf-8", "ignore")
+                        if value:
+                            ks[key] = value
+                for key in ("container_exit_code", "container_signal"):
+                    value = k.get(key)
+                    if type(value) is int and 0 <= value <= 255:
+                        ks[key] = value
+                if ks:
+                    rec["kubernetes"] = ks
             wake_exits.append(rec)
         except (ValueError, KeyError, TypeError):
             pass

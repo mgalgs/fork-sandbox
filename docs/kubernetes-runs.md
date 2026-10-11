@@ -423,8 +423,8 @@ pull usually is.
 once `wait` sees the run finish — but a pod that dies before any leg (a
 Failed pod, or a Failed job condition) never reaches it: `wait` itself
 exits 2 first, and `collect` never runs. For exactly that case, `wait`
-captures the agent container's own log directly: the last 40 lines go to
-stderr, and, when it was given `--run-dir` (as `run` always passes, and a
+captures the agent container's own log directly. When given `--run-dir`
+(as `run` always passes, and a
 cluster postmaster's own wake does too), the full log is saved to
 `<run-dir>/evidence/pod-log-agent.log` — the same path a cluster
 postmaster's `pm_wake_exit_record` already reads for a k8s wake's own
