@@ -2,15 +2,6 @@
 
 *Sandboxed agents and orchestration framework*
 
-A single run is one agent: a handoff goes in, a branch comes back. Agent
-mail is the layer above that — a fleet of agents with standing
-instructions and mailboxes, working asynchronously and talking to each
-other by email. See [A fleet that emails itself](#a-fleet-that-emails-itself).
-[lkml-review](https://github.com/mgalgs/lkml-review) is an example app built
-on that toolkit: a patch series reviewed the way the Linux kernel mailing
-list does it, by a panel of reviewer personas replying in threads while the
-author posts v2, v3 and so on.
-
 **Skills:**
 
 - `/fork-sandbox` - Runs an agent in a sandbox and gets a result back as a
@@ -19,6 +10,15 @@ author posts v2, v3 and so on.
 - `/sandbox-coder-mode` - For interactive orchestrator sessions where all
   implementation tasks are delegated to `/fork-sandbox` agents. See
   [Driving sandbox-coder-mode](#driving-sandbox-coder-mode).
+
+Each `/fork-sandbox` run is one agent: a handoff goes in, a branch comes back. Agent
+mail is the layer above that — a fleet of agents with standing
+instructions and mailboxes, working asynchronously and talking to each
+other by email. See [A fleet that emails itself](#a-fleet-that-emails-itself).
+[lkml-review](https://github.com/mgalgs/lkml-review) is an example app built
+on that toolkit: a patch series reviewed the way the Linux kernel mailing
+list does it, by a panel of reviewer personas replying in threads while the
+author posts v2, v3 and so on.
 
 **Scripts (porcelain) for programmatic sandbox use:**
 
