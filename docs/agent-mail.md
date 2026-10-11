@@ -739,6 +739,112 @@ lane, the unread-mail Stop hook keeps it from finishing while the inbox is
 non-empty. A flapping alert costs at most one spawn per cooldown. Its
 notifications stay in one thread, and its repeats never reach the inbox.
 
+### Alerts handled in the cluster
+
+When a cluster runs a postmaster (docs/cluster-postmaster.md), alerts can be
+handled there instead of on the LAN hosts. The bridge mails a fleet seat in
+the cluster's store. The postmaster wakes one `--k8s` run for it and posts
+the run's reply in the alert's thread. Sessions on dev hosts follow a lane
+there through the mail API. Nothing on the hosts has to be awake, and only one
+handler ever runs, because the postmaster is the only router:
+
+```
+Alertmanager --webhook--> lane-mail-alert (in the cluster, --via remote)
+    --> @ops or @shop seat in the cluster's store --> postmaster wakes a --k8s run
+    --> its reply, Cc @shop-outbox --> lane-mail-subscribe on any dev host
+Alertmanager --Watchdog--> lane-mail-alert --heartbeat (on a LAN host)
+    --> AlertingQuiet into that host's @ops lane when the cluster goes quiet
+```
+
+**1. Seats.** In the cluster's fleet, `@ops` is an LLM seat whose persona
+investigates an alert read-only and replies with what it found. A
+project-specific seat (`@shop`) knows one project. A seat's persona says to
+Cc that project's outbox, `@shop-outbox`, on every reply. The reply file's
+own `Cc:` line does that (see `REPLY HARVEST` in `fork-sandbox postmaster
+--help`).
+
+The postmaster flags a thread when a recipient resolves to no seat (routing
+rule 0). Two names in this design receive mail without being seats: the
+bridge's `@alerts`, which a seat's reply-all goes back to, and every outbox.
+Make each one a handler seat whose command does nothing. A handler that writes
+no reply file sends no reply, so these names resolve without waking anyone:
+
+```yaml
+# fleet.yaml
+agents:
+  ops: {}
+  shop: {}
+  alerts:      {handler: exec, command: mailbox}
+  shop-outbox: {handler: exec, command: mailbox}
+```
+
+```sh
+# $FORK_SANDBOX_HANDLERS_DIR/mailbox: an address that only receives
+#!/bin/sh
+exit 0
+```
+
+Give the seats read-only cluster access with per-thread grants (see
+"Per-thread k8s grants"). Set `K8S_AGENT_PRIORITY_CLASS`, so that a node under
+pressure evicts the incident's handler last.
+
+**2. The bridge in the cluster.** Run `lane-mail-alert serve` beside the mail
+API with `--via remote`. Its token is a client token whose identity is the
+bridge's sender, `fork-sandbox mail-api mint --role client --label
+alert-bridge --as @alerts`. Point the client at the API with
+`FORK_SANDBOX_MAIL_API_URL` and `FORK_SANDBOX_MAIL_API_TOKEN_FILE` (see
+docs/mail-api.md). `--route` sends a project's alerts to its seat:
+
+```
+lane-mail-alert serve --listen 0.0.0.0:9095 --token-file /secrets/webhook-token \
+    --via remote --state-dir /state --to @ops --route namespace=shop:@shop
+```
+
+Running on the store's own host instead, `--via fleet` writes to
+`$FORK_SANDBOX_MAIL_ROOT` directly. Keep `--state-dir` on a volume. If the
+state is lost, the group's next notification opens a new thread instead of
+replying in the old one.
+
+**3. Following from a dev host.** A session that cares about a project
+follows its outbox:
+
+```
+lane-mail-subscribe wait shop-outbox      # run_in_background; exits when mail lands
+lane-mail-subscribe show <id>
+lane-mail-subscribe seen shop-outbox <id>
+```
+
+It reads through the mail API, configured as for `fork-sandbox mail
+--remote`. The store's `seen` list is shared by every reader of a mailbox, so
+a subscriber never marks the cluster's copy. It keeps its own cursor on its
+own host, and every subscriber sees every message once. A first read starts
+from now, unless `--backlog`.
+
+**4. When the cluster itself goes quiet.** An alert cannot report that the
+alerting pipeline is down. kube-prometheus-stack's `Watchdog` alert fires all
+the time for this purpose. Route it to a bridge on an always-on LAN host,
+outside the cluster, started with `--heartbeat`. That bridge never mails
+`Watchdog` itself. When no heartbeat has arrived for the given time, it mails
+that host's `@ops` lane `[FIRING:1] AlertingQuiet`, and the `[RESOLVED]` once
+the heartbeat is back:
+
+```
+lane-mail-alert serve --listen 0.0.0.0:9095 --token-file ... --to @ops --heartbeat 900
+```
+
+```yaml
+# Alertmanager: Watchdog to the LAN bridge, re-sent well inside --heartbeat
+routes:
+  - receiver: heartbeat
+    matchers: ['alertname = "Watchdog"']
+    group_wait: 0s
+    group_interval: 1m
+    repeat_interval: 5m
+```
+
+Most outages announce themselves first: disk pressure, evictions, a node going
+NotReady. The heartbeat covers the rest.
+
 ## The fleet registry
 
 `fork-sandbox fleet` answers "who are the agents, and what seat does each
