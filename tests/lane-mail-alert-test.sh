@@ -63,6 +63,17 @@ mk_host() {
 }
 mk_host alpha
 mk_host beta
+# The mail API client, played by a stub that runs the store against the
+# "cluster" root: --via remote must hand it `mail <verb> args...`.
+mkdir -p "$scratch/cluster"
+cat > "$scratch/alpha/bin/fork-sandbox-mail-remote.py" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == mail ]] || { echo "stub: expected the mail tool, got '$1'" >&2; exit 2; }
+shift
+FORK_SANDBOX_MAIL_ROOT="$CLUSTER_ROOT" exec "$STORE" "$@"
+STUB
+chmod +x "$scratch/alpha/bin/fork-sandbox-mail-remote.py"
+export CLUSTER_ROOT="$scratch/cluster" STORE="$scripts/fork-sandbox-mail.sh"
 printf 'beta beta-dest\n' > "$scratch/alpha/cfg/lane-mail-peers"
 export BETA="$scratch/beta"
 
@@ -215,6 +226,40 @@ out="$(payload resolved 'xhost' "$(am_alert resolved fp1)" | ingest --to @ops,@o
 check "its resolution threads under it on the remote host too" "$xid" \
     "$(hdr "$(on beta "$scratch/beta/bin/lane-mail.sh" show "$(field "$out" id)")" In-Reply-To)"
 
+echo "== --via and --route =="
+alert ingest --via nowhere </dev/null >/dev/null 2>&1; rc=$?
+check "an unknown --via is refused with exit 2" "2" "$rc"
+alert ingest --via fleet --to @ops:beta </dev/null >/dev/null 2>&1; rc=$?
+check "--via fleet refuses a host-qualified address" "2" "$rc"
+alert ingest --route 'namespace=shop' </dev/null >/dev/null 2>&1; rc=$?
+check "a --route without a lane is refused with exit 2" "2" "$rc"
+alert ingest --heartbeat 5 </dev/null >/dev/null 2>&1; rc=$?
+check "--heartbeat outside serve is refused with exit 2" "2" "$rc"
+mkdir -p "$scratch/fleet"
+out="$(payload firing 'fleet-group' "$(am_alert firing fp1)" \
+    | FORK_SANDBOX_MAIL_ROOT="$scratch/fleet" ingest --via fleet)"
+check "--via fleet sends" "sent" "$(field "$out" result)"
+fid="$(field "$out" id)"
+check "into the store at FORK_SANDBOX_MAIL_ROOT" "$fid" \
+    "$(FORK_SANDBOX_MAIL_ROOT="$scratch/fleet" "$scripts/fork-sandbox-mail.sh" inbox ops | cut -f1)"
+check "and not into lane mail" "0" "$(lm inbox ops --all | grep -c "$fid")"
+out="$(payload resolved 'fleet-group' "$(am_alert resolved fp1)" \
+    | FORK_SANDBOX_MAIL_ROOT="$scratch/fleet" ingest --via fleet)"
+check "--via fleet threads the resolution" "$fid" "$(field "$out" thread)"
+out="$(payload firing 'remote-group' "$(am_alert firing fp1)" | ingest --via remote)"
+check "--via remote sends through the API client" "sent" "$(field "$out" result)"
+rid="$(field "$out" id)"
+check "into the remote store" "$rid" \
+    "$(FORK_SANDBOX_MAIL_ROOT="$CLUSTER_ROOT" "$scripts/fork-sandbox-mail.sh" inbox ops | cut -f1)"
+out="$(payload resolved 'remote-group' "$(am_alert resolved fp1)" | ingest --via remote)"
+check "--via remote replies in the thread" "replied" "$(field "$out" result)"
+shop='{"groupKey":"shop-g","status":"firing","groupLabels":{"alertname":"PodCrashLooping"},"commonLabels":{"alertname":"PodCrashLooping","namespace":"shop"},"alerts":[{"status":"firing","fingerprint":"s1","labels":{"alertname":"PodCrashLooping","namespace":"shop"},"annotations":{}}]}'
+out="$(printf '%s' "$shop" | ingest --route 'namespace=other:@other' --route 'namespace=shop:@shop,@ops')"
+m="$(lm show "$(field "$out" id)")"
+check "the first matching --route picks the recipients" "@shop, @ops" "$(hdr "$m" To)"
+out="$(payload firing 'unrouted' "$(am_alert firing fp1)" | ingest --route 'namespace=shop:@shop')"
+check "a group no route matches goes to --to" "@ops" "$(hdr "$(lm show "$(field "$out" id)")" To)"
+
 echo "== serve =="
 # serve_bg <args>: start serve in the background, set $server_pid and $port.
 # env, not the on() function, so $! is the server itself and kill reaches it.
@@ -256,6 +301,32 @@ kill "$server_pid"; wait "$server_pid" 2>/dev/null
 serve_bg --state-dir "$scratch/state-http" --to @ops:nowhere
 check "a failed send is 500, so the sender retries" "500" \
     "$(code -X POST -H "Authorization: Bearer $token" --data "$dead" "http://127.0.0.1:$port/v1/alert")"
+kill "$server_pid"; wait "$server_pid" 2>/dev/null
+server_pid=""
+
+echo "== heartbeat =="
+serve_bg --state-dir "$scratch/state-hb" --to @hb --heartbeat 2
+url="http://127.0.0.1:$port"
+beat='{"groupKey":"wd","status":"firing","groupLabels":{"alertname":"Watchdog"},"alerts":[{"status":"firing","fingerprint":"w","labels":{"alertname":"Watchdog","severity":"none"},"annotations":{}}]}'
+check "a heartbeat is 200" "200" "$(code -X POST -H "Authorization: Bearer $token" --data "$beat" "$url/v1/alert")"
+check "answered as a heartbeat" "heartbeat" "$(field "$(cat "$scratch/resp")" result)"
+check "a heartbeat is never mailed" "" "$(lm inbox hb)"
+for _ in $(seq 1 60); do [[ -n "$(lm inbox hb)" ]] && break; sleep 0.1; done
+quiet="$(lm inbox hb)"
+check "silence past --heartbeat mails AlertingQuiet" "[FIRING:1] AlertingQuiet" "$(cut -f5 <<<"$quiet")"
+contains "naming the heartbeat" "$(lm show "$(cut -f1 <<<"$quiet")")" "No Watchdog heartbeat for"
+sleep 1
+check "the quiet alert is mailed once" "1" "$(lm inbox hb | grep -c .)"
+code -X POST -H "Authorization: Bearer $token" --data "$beat" "$url/v1/alert" >/dev/null
+back="$(lm inbox hb | tail -1)"
+check "the heartbeat's return mails the resolution" "[RESOLVED] AlertingQuiet" "$(cut -f5 <<<"$back")"
+check "threaded under the quiet alert" "$(cut -f1 <<<"$quiet")" "$(hdr "$(lm show "$(cut -f1 <<<"$back")")" In-Reply-To)"
+wd_alert='{"status":"firing","fingerprint":"w","labels":{"alertname":"Watchdog"},"annotations":{}}'
+mixed="$(payload firing 'with-beat' "$(am_alert firing fp1)" "$wd_alert")"
+check "a payload mixing a heartbeat with alerts is 200" "200" \
+    "$(code -X POST -H "Authorization: Bearer $token" --data "$mixed" "$url/v1/alert")"
+m="$(lm show "$(field "$(cat "$scratch/resp")" id)")"
+check "its real alerts are mailed, the heartbeat left out" "[FIRING:1] KubeNodePressure node-a1" "$(hdr "$m" Subject)"
 kill "$server_pid"; wait "$server_pid" 2>/dev/null
 server_pid=""
 

@@ -15,6 +15,24 @@ Options (both modes):
                    ~/.local/state/fork-sandbox/lane-mail-alert)
   --reopen SECS    a group that fires again within SECS of resolving
                    continues its old thread (default 3600; 0 never)
+  --via STORE      where the mail goes: lane (default) sends with
+                   lane-mail.sh; fleet sends with fork-sandbox-mail.sh to
+                   the store at $FORK_SANDBOX_MAIL_ROOT, for running beside a
+                   postmaster; remote sends through the mail API
+                   (fork-sandbox-mail-remote.py, configured as for
+                   `fork-sandbox mail --remote`). Only lane takes
+                   `@lane:host` addresses.
+  --route LABEL=VALUE:LIST
+                   repeatable: a group whose common labels have LABEL=VALUE
+                   goes to LIST instead of --to. The first matching route
+                   wins (e.g. --route namespace=shop:@shop).
+
+serve only:
+  --heartbeat SECS treat the always-firing --heartbeat-alert (default
+                   Watchdog) as a dead-man's switch: it is never mailed, and
+                   when none has arrived for SECS (counting from startup) the
+                   bridge mails --to an `[FIRING:1] AlertingQuiet` alert, and
+                   its `[RESOLVED]` once the heartbeat returns
 
 The bridge from a monitoring system to a lane-mail inbox (docs/agent-mail.md,
 "Alerts into lane mail"). An Alertmanager webhook receiver and a Grafana
@@ -56,6 +74,11 @@ Grafana both retry.
 
 ingest handles ONE payload from stdin the same way and prints the same JSON
 on stdout: exit 0 when handled, 2 for a bad payload, 1 when sending failed.
+
+The heartbeat covers what an alert cannot report: the alerting pipeline
+itself going down. Run it on a bridge OUTSIDE the cluster whose alerts it
+watches, and route only the heartbeat alert to it. A heartbeat-only
+notification answers 200 {"result": "heartbeat"}.
 """
 
 import argparse
@@ -67,12 +90,17 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 SCRIPT_DIR = Path(os.path.realpath(__file__)).parent
-LANE_MAIL = SCRIPT_DIR / "lane-mail.sh"
+VIA = {
+    "lane": [str(SCRIPT_DIR / "lane-mail.sh")],
+    "fleet": [str(SCRIPT_DIR / "fork-sandbox-mail.sh")],
+    "remote": [str(SCRIPT_DIR / "fork-sandbox-mail-remote.py"), "mail"],
+}
 MAX_BODY = 1 << 20
 MAX_LISTED = 20
 ADDR_RE = re.compile(r"^@[a-z0-9][a-z0-9-]*(:[a-z0-9][a-z0-9.-]*)?$")
@@ -203,9 +231,9 @@ def body_for(payload, group, status, alerts):
     return "\n".join(out) + "\n"
 
 
-def lane_mail(args, body):
+def run_mail(cmd, args, body):
     try:
-        proc = subprocess.run([str(LANE_MAIL), *args], input=body,
+        proc = subprocess.run([*cmd, *args], input=body,
                               capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise SendFailed(oneline(e))
@@ -213,16 +241,103 @@ def lane_mail(args, body):
         raise SendFailed(oneline(proc.stderr or f"exit {proc.returncode}"))
     lines = proc.stdout.strip().splitlines()
     if not lines:
-        raise SendFailed("lane-mail.sh printed no message id")
+        raise SendFailed("the mail command printed no message id")
     return lines[-1].strip()
 
 
+def parse_route(spec):
+    """'LABEL=VALUE:@a[,@b]' -> (label, value, '@a,@b'), or None."""
+    match, sep, addrs = spec.partition(":@")
+    label, eq, value = match.partition("=")
+    if not sep or not eq or not label or not value:
+        return None
+    return label, value, "@" + addrs
+
+
 class Bridge:
-    def __init__(self, to, sender, state_dir, reopen):
+    def __init__(self, to, sender, state_dir, reopen, via="lane",
+                 routes=(), heartbeat=0, heartbeat_alert="Watchdog"):
         self.to = to
         self.sender = sender
         self.state_dir = Path(state_dir)
         self.reopen = reopen
+        self.cmd = VIA[via]
+        self.routes = list(routes)
+        self.heartbeat = heartbeat
+        self.heartbeat_alert = heartbeat_alert
+        self.hb_lock = threading.Lock()
+        self.hb_last = time.time()
+        self.hb_quiet = False
+
+    def recipients(self, payload):
+        labels = {}
+        for key in ("groupLabels", "commonLabels"):
+            if isinstance(payload.get(key), dict):
+                labels.update(payload[key])
+        for label, value, addrs in self.routes:
+            if str(labels.get(label, "")) == value:
+                return addrs
+        return self.to
+
+    def _heartbeat_payload(self, status, seconds):
+        if status == "firing":
+            summary = (f"No {self.heartbeat_alert} heartbeat for {seconds}s. "
+                       "The alerting pipeline (Prometheus, Alertmanager, or "
+                       "the network to this host) may be down, so other "
+                       "alerts may not be arriving.")
+        else:
+            summary = (f"The {self.heartbeat_alert} heartbeat is back after "
+                       f"{seconds}s of silence.")
+        return {"groupKey": f"lane-mail-alert/heartbeat/{self.heartbeat_alert}",
+                "status": status, "receiver": "lane-mail-alert heartbeat",
+                "groupLabels": {"alertname": "AlertingQuiet"},
+                "alerts": [{"status": status, "fingerprint": "heartbeat",
+                            "labels": {"alertname": "AlertingQuiet",
+                                       "heartbeat": self.heartbeat_alert},
+                            "annotations": {"summary": summary}}]}
+
+    def check_heartbeat(self):
+        """Mails AlertingQuiet when the heartbeat has been silent too long."""
+        with self.hb_lock:
+            silent = int(time.time() - self.hb_last)
+            if self.hb_quiet or silent < self.heartbeat:
+                return None
+        result = self.handle(self._heartbeat_payload("firing", silent))
+        with self.hb_lock:
+            self.hb_quiet = True
+        return result
+
+    def _take_heartbeat(self, payload):
+        """Strips heartbeat alerts from a payload; returns what is left."""
+        alerts = payload.get("alerts")
+        if not self.heartbeat or not isinstance(alerts, list):
+            return payload, None
+        beats = [a for a in alerts if isinstance(a, dict) and
+                 (a.get("labels") or {}).get("alertname") ==
+                 self.heartbeat_alert]
+        if not beats:
+            return payload, None
+        with self.hb_lock:
+            gap = int(time.time() - self.hb_last)
+            back = self.hb_quiet
+            self.hb_last = time.time()
+            self.hb_quiet = False
+        resolved = None
+        if back:
+            resolved = self.handle(self._heartbeat_payload("resolved", gap))
+        rest = [a for a in alerts if a not in beats]
+        return (dict(payload, alerts=rest) if rest else None), resolved
+
+    def handle_webhook(self, payload):
+        if isinstance(payload, dict):
+            payload, resolved = self._take_heartbeat(payload)
+            if payload is None:
+                out = {"result": "heartbeat", "group": None, "id": None,
+                       "thread": None}
+                if resolved:
+                    out["resolved"] = resolved
+                return out
+        return self.handle(payload)
 
     def _state_path(self, group):
         return self.state_dir / f"{group}.json"
@@ -258,7 +373,7 @@ class Bridge:
 
         subject = subject_for(payload, status, alerts)
         body = body_for(payload, group, status, alerts)
-        common = ["--from", self.sender, "--to", self.to,
+        common = ["--from", self.sender, "--to", self.recipients(payload),
                   "--subject", subject,
                   "--header", f"X-Alert-Group: {group}",
                   "--header", f"X-Alert-Status: {status}",
@@ -270,8 +385,9 @@ class Bridge:
         result = None
         if continues:
             try:
-                mid = lane_mail(["reply", "--reply-to", st["last"], *common],
-                                body)
+                mid = run_mail(self.cmd,
+                               ["reply", "--reply-to", st["last"], *common],
+                               body)
                 result = {"result": "replied", "id": mid,
                           "thread": st.get("thread", mid)}
             except SendFailed as e:
@@ -281,7 +397,7 @@ class Bridge:
                 print(f"lane-mail-alert: group {group}: reply failed "
                       f"({e}); opening a new thread", file=sys.stderr)
         if result is None:
-            mid = lane_mail(["send", *common], body)
+            mid = run_mail(self.cmd, ["send", *common], body)
             result = {"result": "sent", "id": mid, "thread": mid}
         self._save(group, {"thread": result["thread"], "last": result["id"],
                            "status": status, "firing": firing,
@@ -336,7 +452,7 @@ def make_handler(bridge, token):
                 return
             raw = self.rfile.read(length)
             try:
-                result = bridge.handle(json.loads(raw))
+                result = bridge.handle_webhook(json.loads(raw))
             except (ValueError, BadPayload) as e:
                 self._reply(400, {"error": oneline(e)})
                 return
@@ -344,8 +460,9 @@ def make_handler(bridge, token):
                 print(f"lane-mail-alert: send failed: {e}", file=sys.stderr)
                 self._reply(500, {"error": f"lane-mail: {e}"})
                 return
-            print(f"lane-mail-alert: group {result['group']}: "
-                  f"{result['result']} {result['id']}", file=sys.stderr)
+            if result["result"] != "heartbeat":
+                print(f"lane-mail-alert: group {result['group']}: "
+                      f"{result['result']} {result['id']}", file=sys.stderr)
             self._reply(200, result)
 
     return Handler
@@ -377,6 +494,10 @@ def main():
     p.add_argument("--reopen", type=int, default=3600)
     p.add_argument("--listen")
     p.add_argument("--token-file")
+    p.add_argument("--via", default="lane")
+    p.add_argument("--route", action="append", default=[])
+    p.add_argument("--heartbeat", type=int, default=0)
+    p.add_argument("--heartbeat-alert", default="Watchdog")
     try:
         a = p.parse_args()
     except SystemExit:
@@ -385,20 +506,39 @@ def main():
         print(__doc__.strip())
         sys.exit(0)
 
-    to = [t.strip() for t in a.to.split(",")]
-    if not all(ADDR_RE.match(t) for t in to):
-        die(f"bad --to '{a.to}' (lane addresses, "
-                 "comma-separated: @lane or @lane:host)")
+    if a.via not in VIA:
+        die(f"bad --via '{a.via}' (lane, fleet, remote)")
+    addr_re = ADDR_RE if a.via == "lane" else LOCAL_ADDR_RE
+
+    def addr_list(value, what):
+        addrs = [t.strip() for t in value.split(",")]
+        if not all(addr_re.match(t) for t in addrs):
+            die(f"bad {what} '{value}' (comma-separated addresses: @name"
+                + (", or @lane:host" if a.via == "lane" else "") + ")")
+        return ",".join(addrs)
+
+    to = addr_list(a.to, "--to")
+    routes = []
+    for spec in a.route:
+        route = parse_route(spec)
+        if route is None:
+            die(f"bad --route '{spec}' (LABEL=VALUE:@name[,@name])")
+        routes.append((route[0], route[1], addr_list(route[2], "--route")))
+    if a.heartbeat < 0:
+        die("--heartbeat must be >= 0")
+    if a.heartbeat and a.mode != "serve":
+        die("--heartbeat needs serve: it watches for a heartbeat over time")
     if not LOCAL_ADDR_RE.match(a.sender):
         die(f"bad --from '{a.sender}' (a lane on this "
                  "host: @lane)")
     if a.reopen < 0:
         die("--reopen must be >= 0")
-    bridge = Bridge(",".join(to), a.sender, a.state_dir, a.reopen)
+    bridge = Bridge(to, a.sender, a.state_dir, a.reopen, a.via, routes,
+                    a.heartbeat, a.heartbeat_alert)
 
     if a.mode == "ingest":
         try:
-            result = bridge.handle(json.loads(sys.stdin.read()))
+            result = bridge.handle_webhook(json.loads(sys.stdin.read()))
         except (ValueError, BadPayload) as e:
             print(f"lane-mail-alert: bad payload: {oneline(e)}",
                   file=sys.stderr)
@@ -422,10 +562,28 @@ def main():
     print(f"lane-mail-alert: listening on {host}:{server.server_address[1]}, "
           f"mailing {bridge.to} "
           f"as {bridge.sender}", file=sys.stderr)
+    if a.heartbeat:
+        threading.Thread(target=heartbeat_loop, args=(bridge,),
+                         daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+def heartbeat_loop(bridge):
+    tick = min(max(bridge.heartbeat / 4, 0.25), 30)
+    while True:
+        time.sleep(tick)
+        try:
+            result = bridge.check_heartbeat()
+        except SendFailed as e:
+            print(f"lane-mail-alert: heartbeat alert failed, will retry: {e}",
+                  file=sys.stderr)
+            continue
+        if result:
+            print(f"lane-mail-alert: heartbeat quiet: {result['result']} "
+                  f"{result['id']}", file=sys.stderr)
 
 
 if __name__ == "__main__":
