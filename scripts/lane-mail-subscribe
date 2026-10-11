@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# lane-mail-subscribe -- :approved: Follow a lane in a remote mail store, as one of many readers
+#
+# Usage: lane-mail-subscribe wait <lane> [--interval SECS] [--backlog]
+#        lane-mail-subscribe unread <lane> [--backlog]
+#        lane-mail-subscribe seen <lane> <message-id>...
+#        lane-mail-subscribe show <message-id>
+#        lane-mail-subscribe tree <thread-id>
+#
+# A lane in the mail store behind the mail API (a cluster postmaster's
+# store, say) can serve as a broadcast topic: agents there post or Cc it,
+# and any number of sessions on other hosts follow it (docs/agent-mail.md,
+# "Alerts handled in the cluster"). This reads it through the mail API with
+# fork-sandbox-mail-remote.py, configured as for `fork-sandbox mail
+# --remote`, and needs a token with the read cap.
+#
+# The store keeps one `seen` list per mailbox, shared by every reader, so a
+# subscriber never marks the remote copy. It keeps its own cursor instead,
+# one file per lane under ${XDG_STATE_HOME:-~/.local/state}/fork-sandbox/
+# lane-mail-subscribe/, so each subscriber sees every message once, whatever
+# the others do. A subscriber's first read starts from now: messages already
+# in the lane are marked seen without being shown, unless --backlog.
+#
+#   wait    block until the lane has a message this subscriber has not
+#           seen, print one line per such message, exit 0. Run it as a
+#           background command, like `lane-mail-watch.sh --wait`. Mark what
+#           you handled `seen` before relaunching it, or it fires again at
+#           once. Five failed reads in a row print the error and exit 1.
+#   unread  print the unseen messages now (mid, thread, from, subject).
+#   seen    mark messages seen, in this subscriber's cursor only.
+#   show, tree  read a message or thread through the mail API.
+#
+# Writes only the cursor files; never the remote store.
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+remote="$script_dir/fork-sandbox-mail-remote.py"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/fork-sandbox/lane-mail-subscribe"
+
+usage() {
+    sed -n '2,/^[^#]/{ /^#/s/^# \{0,1\}//p }' "$0"
+}
+
+die() {
+    echo "lane-mail-subscribe: $*" >&2
+    exit "${2:-2}"
+}
+
+check_lane() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "bad lane name '$1' (no leading @)"
+}
+
+# Sets $lines to the lane's messages as `mid<TAB>thread<TAB>from<TAB>subject`;
+# on failure sets $lines to the error and returns 1.
+fetch() {
+    local out err
+    err="$(mktemp)"
+    if out="$("$remote" mail inbox "$1" --all 2>"$err")"; then
+        rm -f -- "$err"
+        lines="$(awk -F'\t' 'NF >= 5 { print $1 "\t" $2 "\t" $4 "\t" $5 }' <<<"$out")"
+        return 0
+    fi
+    lines="$(tr '\n' ' ' < "$err")"
+    rm -f -- "$err"
+    return 1
+}
+
+# Prints the lines of $lines whose id is not in the lane's cursor. A first
+# read, with no cursor yet, records every current id unless $backlog.
+unseen() {
+    local lane="$1" cursor="$state_dir/$1.seen"
+    if [[ ! -f "$cursor" ]]; then
+        mkdir -p -- "$state_dir"
+        if (( backlog )); then
+            : > "$cursor"
+        else
+            cut -f1 <<<"$lines" | grep . > "$cursor" || true
+            echo "lane-mail-subscribe: subscribed to @$lane from now ($(grep -c . "$cursor") earlier messages skipped)" >&2
+        fi
+    fi
+    [[ -n "$lines" ]] || return 0
+    awk -F'\t' -v cursor="$cursor" '
+        BEGIN { while ((getline id < cursor) > 0) seen[id] = 1 }
+        !($1 in seen)' <<<"$lines"
+}
+
+verb="${1:-}"
+[[ $# -gt 0 ]] && shift
+interval=15
+backlog=0
+case "$verb" in
+    -h|--help|"") usage; exit 0 ;;
+    show|tree)
+        [[ $# -eq 1 ]] || die "$verb takes one id"
+        exec "$remote" mail "$verb" "$1"
+        ;;
+    seen)
+        [[ $# -ge 2 ]] || die "seen takes a lane and at least one message id"
+        lane="$1"; shift
+        check_lane "$lane"
+        for id in "$@"; do
+            [[ "$id" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]] || die "bad message id '$id'"
+        done
+        mkdir -p -- "$state_dir"
+        printf '%s\n' "$@" >> "$state_dir/$lane.seen"
+        exit 0
+        ;;
+    wait|unread)
+        lane="${1:-}"
+        [[ -n "$lane" ]] || die "$verb takes a lane"
+        shift
+        check_lane "$lane"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --interval)
+                    [[ "${2:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--interval takes seconds"
+                    interval="$2"; shift 2 ;;
+                --backlog) backlog=1; shift ;;
+                *) die "unknown option '$1'" ;;
+            esac
+        done
+        ;;
+    *) die "unknown verb '$verb' (wait, unread, seen, show, tree)" ;;
+esac
+
+if [[ "$verb" == unread ]]; then
+    fetch "$lane" || die "cannot read @$lane: $lines" 1
+    unseen "$lane"
+    exit 0
+fi
+
+fails=0
+while :; do
+    if fetch "$lane"; then
+        fails=0
+        new="$(unseen "$lane")"
+        if [[ -n "$new" ]]; then
+            while IFS=$'\t' read -r mid _tid from subject; do
+                printf '[lane-mail] @%s new: %s -- %s (id %s)\n' "$lane" "$from" "$subject" "$mid"
+            done <<<"$new"
+            exit 0
+        fi
+    else
+        fails=$(( fails + 1 ))
+        if (( fails >= 5 )); then
+            printf '[lane-mail] @%s: remote read failed: %s\n' "$lane" "$lines"
+            exit 1
+        fi
+    fi
+    sleep "$interval"
+done
