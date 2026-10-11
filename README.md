@@ -2,6 +2,15 @@
 
 *Sandboxed agents and orchestration framework*
 
+A single run is one agent: a handoff goes in, a branch comes back. Agent
+mail is the layer above that — a fleet of agents with standing
+instructions and mailboxes, working asynchronously and talking to each
+other by email. See [A fleet that emails itself](#a-fleet-that-emails-itself).
+[lkml-review](https://github.com/mgalgs/lkml-review) is an example app built
+on that toolkit: a patch series reviewed the way the Linux kernel mailing
+list does it, by a panel of reviewer personas replying in threads while the
+author posts v2, v3 and so on.
+
 **Skills:**
 
 - `/fork-sandbox` - Runs an agent in a sandbox and gets a result back as a
@@ -39,8 +48,6 @@ installed and callable under its own name — `fork-sandbox status` and
 - `fork-sandbox postmaster deliver|status|flag|unflag` — the host-side
   router: wakes addressed agents, harvests replies, enforces stop rules
   (those three together are [agent mail](#a-fleet-that-emails-itself))
-- the lkml-mode review toolchain now lives in its own repo:
-  https://github.com/mgalgs/lkml-review
 
 Usage examples for all of these: [Scripts](#scripts).
 
@@ -579,11 +586,6 @@ fork-sandbox's own bookkeeping for a state dir lives under
 `<state-dir>/session.json`, which belongs to the client.
 
 ## A fleet that emails itself
-
-Everything above runs one agent: a handoff goes in, a branch comes back.
-Agent mail is the layer above that — a fleet of agents with standing
-instructions and mailboxes, working asynchronously and talking to each
-other by email.
 
 You mail an agent. It wakes up in a sandbox, reads the thread, does
 something, and replies. Its reply is mail too, so it can wake somebody
