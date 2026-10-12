@@ -12745,7 +12745,11 @@ check "an empty EXTRA_REFS creates nothing and exits 0" "0 0" \
 er_ep_out="$(er_run_block "upstream=$er_missing_sha")"
 er_ep_rc=$?
 check "a sha that differs from what the pod holds fails the run" "1" "$er_ep_rc"
-contains "... and names the ref and the expected sha" "$er_ep_out" "extra ref 'upstream' is not at $er_missing_sha"
+if [[ "$er_ep_out" == *"extra ref 'upstream' is not at $er_missing_sha"* ]]; then
+    ok "... and names the ref and the expected sha"
+else
+    no "... and names the ref and the expected sha" "$er_ep_out"
+fi
 git -C "$er_ep_root/clone" branch -q -D upstream
 er_ep_out="$(er_run_block "Up=$er_ep_up_sha")"
 check "a malformed EXTRA_REFS name fails the run" "1" "$?"
