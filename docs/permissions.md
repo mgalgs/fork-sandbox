@@ -87,7 +87,7 @@ dangerous primitives, and each is constrained:
 
 ## lane-mail and lane-mail-watch
 
-Three more scripts are safe to blanket-approve, though the argument for
+Two more scripts are safe to blanket-approve, though the argument for
 `lane-mail.sh` is not quite the one above: it fixes *where it writes*, not
 what it reads. See below.
 
@@ -100,10 +100,7 @@ what it reads. See below.
       "Bash(/home/<you>/.claude/scripts/lane-mail.sh:*)",
       "Bash(lane-mail-watch.sh:*)",
       "Bash(~/.claude/scripts/lane-mail-watch.sh:*)",
-      "Bash(/home/<you>/.claude/scripts/lane-mail-watch.sh:*)",
-      "Bash(lane-mail-subscribe:*)",
-      "Bash(~/.claude/scripts/lane-mail-subscribe:*)",
-      "Bash(/home/<you>/.claude/scripts/lane-mail-subscribe:*)"
+      "Bash(/home/<you>/.claude/scripts/lane-mail-watch.sh:*)"
     ]
   }
 }
@@ -157,18 +154,6 @@ login, which is not something a session should be able to spend. Run it
 yourself, in a terminal; it is on `PATH` only so you can, and so the peer can
 run its half of the setup. Do not add a `Bash(lane-mail-peer:*)` rule, or one
 for its path under `~/.claude/scripts`.
-
-**`lane-mail-alert` — a service; never allowlist it.** Its `serve` mode
-opens a listening port, and `--to` can name any peer lane. A service unit
-runs it (docs/agent-mail.md, "Alerts into lane mail"); a session never needs
-to, so do not add a rule for it.
-
-**`lane-mail-subscribe` — reads the remote store, writes only its cursor.**
-It calls the mail API's read verbs (`inbox`, `show`, `tree`) through
-`fork-sandbox-mail-remote.py`, never one that changes the remote store, and
-writes only its own cursor files under `~/.local/state`. The token it uses
-decides what it can read; give subscribers a token with the read cap and no
-other.
 
 **`lane-mail-watch.sh` — read-only.** It only ever calls `lane-mail.sh inbox
 <lane>` in a loop and prints what comes back. It mutates nothing. Its
