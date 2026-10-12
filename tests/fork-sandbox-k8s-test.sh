@@ -4571,6 +4571,104 @@ else
     no "a trailing slash after /v1 is tolerated"
 fi
 
+printf '\n== K8S_PROXY_READ_TIMEOUT -- read/send timeout on chat locations ==\n'
+# rt_fixture <dir> <endpoints-line> <keys> <embeddings> <timeout>: embed_fixture
+# plus a K8S_PROXY_READ_TIMEOUT line, left out when <timeout> is empty.
+rt_fixture() {
+    embed_fixture "$1" "$2" "$3" "$4"
+    [[ -n "$5" ]] && printf 'K8S_PROXY_READ_TIMEOUT=%s\n' "$5" >> "$1/k8s.env"
+    return 0
+}
+rt_bad() { # <timeout>
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    rt_fixture "$d" "$embed_eps" '' '' "$1"
+    refuses "K8S_PROXY_READ_TIMEOUT='$1' is refused, naming the key" \
+        "K8S_PROXY_READ_TIMEOUT" env FORK_SANDBOX_CONFIG_DIR="$d" "$k8s_sh" install --dry-run
+}
+for rt_val in 60 0s 060s 1.5m '60 s' 60sec 1h30m 60S -5s; do
+    rt_bad "$rt_val"
+done
+
+rt_on_dir="$(newdir)"; tmpdirs+=("$rt_on_dir")
+rt_fixture "$rt_on_dir" "$embed_eps" secondary=MY_API_KEY secondary 60m
+rt_on_out="$(embed_render "$rt_on_dir")"; rt_rc=$?
+check "an endpoints install with K8S_PROXY_READ_TIMEOUT=60m --dry-run exits 0" 0 "$rt_rc"
+for rt_name in primary secondary; do
+    rt_chat="$(embed_block "$rt_on_out" "\\/e\\/$rt_name\\/v1\\/chat\\/completions")"
+    if grep -qxF '                proxy_read_timeout 60m;' <<< "$rt_chat" \
+        && grep -qxF '                proxy_send_timeout 60m;' <<< "$rt_chat"; then
+        ok "$rt_name's chat location carries proxy_read_timeout and proxy_send_timeout"
+    else
+        no "$rt_name's chat location carries proxy_read_timeout and proxy_send_timeout" "$rt_chat"
+    fi
+done
+if [[ "$(grep -c 'proxy_read_timeout' <<< "$rt_on_out")" == 2 \
+    && "$(grep -c 'proxy_send_timeout' <<< "$rt_on_out")" == 2 ]]; then
+    ok "no models or embeddings location gets the timeouts"
+else
+    no "no models or embeddings location gets the timeouts" "$(grep -n 'proxy_.*_timeout' <<< "$rt_on_out")"
+fi
+
+# Unset: no trace, and taking the two lines back out of each chat location
+# of the set render gives the unset render exactly, checksum line aside.
+rt_off_dir="$(newdir)"; tmpdirs+=("$rt_off_dir")
+rt_fixture "$rt_off_dir" "$embed_eps" secondary=MY_API_KEY secondary ''
+rt_off_out="$(embed_render "$rt_off_dir")"
+rt_empty_dir="$(newdir)"; tmpdirs+=("$rt_empty_dir")
+cp -a "$rt_off_dir/." "$rt_empty_dir/"
+printf 'K8S_PROXY_READ_TIMEOUT=\n' >> "$rt_empty_dir/k8s.env"
+if [[ -n "$rt_off_out" && "$rt_off_out" == "$(embed_render "$rt_empty_dir")" ]] \
+    && ! grep -q 'proxy_.*_timeout' <<< "$rt_off_out"; then
+    ok "an unset K8S_PROXY_READ_TIMEOUT renders like an empty one, with no timeout lines"
+else
+    no "an unset K8S_PROXY_READ_TIMEOUT renders like an empty one, with no timeout lines"
+fi
+rt_strip() { grep -vE 'proxy_(read|send)_timeout 60m;|checksum/nginx-conf' <<< "$1"; }
+if [[ "$(rt_strip "$rt_on_out")" == "$(rt_strip "$rt_off_out")" ]]; then
+    ok "the timeout lines are the only difference the key makes to the render"
+else
+    no "the timeout lines are the only difference the key makes to the render" \
+        "$(diff <(rt_strip "$rt_off_out") <(rt_strip "$rt_on_out") | head -20)"
+fi
+if [[ "$(embed_checksum "$rt_on_out")" != "$(embed_checksum "$rt_off_out")" ]]; then
+    ok "setting K8S_PROXY_READ_TIMEOUT changes checksum/nginx-conf"
+else
+    no "setting K8S_PROXY_READ_TIMEOUT changes checksum/nginx-conf"
+fi
+
+# The legacy chat location takes it too; unset, the legacy golden-file
+# check above still holds.
+rt_legacy_dir="$(newdir)"; tmpdirs+=("$rt_legacy_dir")
+rt_fixture "$rt_legacy_dir" 'K8S_PROXY_UPSTREAM=https://openrouter.ai' '' '' 90s
+rt_legacy_chat="$(embed_block "$(embed_render "$rt_legacy_dir")" '\/api\/v1\/chat\/completions')"
+if grep -qxF '                proxy_read_timeout 90s;' <<< "$rt_legacy_chat" \
+    && grep -qxF '                proxy_send_timeout 90s;' <<< "$rt_legacy_chat"; then
+    ok "the legacy chat location carries the timeouts when the key is set"
+else
+    no "the legacy chat location carries the timeouts when the key is set" "$rt_legacy_chat"
+fi
+
+rt_file="$(newdir)/render.yaml"; tmpdirs+=("$(dirname "$rt_file")")
+printf '%s\n' "$rt_on_out" > "$rt_file"
+rt_nginx_conf="$(extract_nginx_conf "$rt_file")"
+if [[ -z "${nginx_mode:-}" ]]; then
+    printf '  SKIP  neither nginx nor a working docker on PATH\n'
+elif [[ -z "$rt_nginx_conf" ]]; then
+    no "extracted nginx.conf from the read-timeout install --dry-run output"
+else
+    rt_nginx_dir="$(newdir)"; tmpdirs+=("$rt_nginx_dir")
+    printf '%s\n' "${rt_nginx_conf//kube-dns.kube-system.svc.cluster.local/127.0.0.1}" \
+        > "$rt_nginx_dir/nginx.conf"
+    # shellcheck disable=SC2016  # nginx config, not shell
+    printf 'set $upstream_key_secondary "dummy";\n' > "$rt_nginx_dir/upstream-key.conf"
+    out="$(run_nginx_t "$rt_nginx_dir")"; rc=$?
+    if (( rc == 0 )); then
+        ok "nginx -t accepts the rendered read-timeout proxy config"
+    else
+        no "nginx -t accepts the rendered read-timeout proxy config" "$out"
+    fi
+fi
+
 rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
     /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
     /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err \

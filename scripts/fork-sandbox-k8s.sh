@@ -595,6 +595,16 @@
 #                         Rate-limited in its own zone, apart from the
 #                         agent's chat traffic. Endpoints only, and off by
 #                         default: unset renders exactly as before.
+#   K8S_PROXY_READ_TIMEOUT=
+#                         <digits><unit>, unit one of ms s m h d, e.g. 60m --
+#                         sets proxy_read_timeout and proxy_send_timeout on
+#                         every chat-completions location of the proxy
+#                         (each named endpoint's, or the legacy one). nginx
+#                         otherwise answers 504 after 60s with no byte from
+#                         the upstream, which cuts off a gateway that
+#                         queues requests or a long prefill. It bounds the
+#                         gap between two reads, not the whole response.
+#                         Unset renders exactly as before.
 #   K8S_DEFAULT_ENDPOINT= the K8S_PROXY_ENDPOINTS entry a run is wired to
 #                         when neither submit nor run names one with
 #                         --endpoint. Optional, and only meaningful on an
@@ -1035,6 +1045,7 @@ K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
 K8S_PROXY_ENDPOINT_KEYS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_KEYS || true)"
 # Opts endpoints in to the embeddings routes; see parse_proxy_endpoint_embeddings.
 K8S_PROXY_ENDPOINT_EMBEDDINGS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_EMBEDDINGS || true)"
+K8S_PROXY_READ_TIMEOUT="$(read_env_value "$k8s_env" K8S_PROXY_READ_TIMEOUT || true)"
 K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 # Default model for a run with no --model, on a K8S_PROXY_ENDPOINTS
 # install; see the model-requirement block in cmd_submit, which resolves
@@ -1338,6 +1349,15 @@ fi
 if [[ "${1-}" != check-grant && -n "$K8S_ALLOW_UNLISTED_MODEL" && "$K8S_ALLOW_UNLISTED_MODEL" != 1 ]]; then
     echo "Error: K8S_ALLOW_UNLISTED_MODEL in $k8s_env must be 1 (or unset)," >&2
     echo "got '$K8S_ALLOW_UNLISTED_MODEL'." >&2
+    exit 1
+fi
+# Rendered unquoted into two nginx directives, so the shape check is the
+# whole guard against a value that breaks the proxy's config.
+if [[ "${1-}" != check-grant && -n "$K8S_PROXY_READ_TIMEOUT" \
+    && ! "$K8S_PROXY_READ_TIMEOUT" =~ ^[1-9][0-9]*(ms|s|m|h|d)$ ]]; then
+    echo "Error: K8S_PROXY_READ_TIMEOUT in $k8s_env must be a positive whole" >&2
+    echo "number with an nginx time unit (ms, s, m, h or d), e.g. 60m; got" >&2
+    echo "'$K8S_PROXY_READ_TIMEOUT'." >&2
     exit 1
 fi
 if [[ "${1-}" != check-grant && -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_value "$K8S_RUN_OWNER"; then
@@ -3311,6 +3331,14 @@ pm_collect_configmap_files() {
 render_proxy_locations_body() {
     local upstream_host="$1"
 
+    # Chat-completions locations only. Empty when the key is unset, which
+    # keeps the render byte-identical to an install that predates the key.
+    local timeouts=""
+    if [[ -n "$K8S_PROXY_READ_TIMEOUT" ]]; then
+        printf -v timeouts '\n                proxy_read_timeout %s;\n                proxy_send_timeout %s;' \
+            "$K8S_PROXY_READ_TIMEOUT" "$K8S_PROXY_READ_TIMEOUT"
+    fi
+
     if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
         cat <<EOF
             location = /api/v1/chat/completions {
@@ -3336,7 +3364,7 @@ render_proxy_locations_body() {
                 proxy_set_header Host "$upstream_host";
 
                 proxy_set_header Authorization "Bearer \$upstream_key";
-                proxy_hide_header Authorization;
+                proxy_hide_header Authorization;${timeouts}
             }
 EOF
         return 0
@@ -3372,7 +3400,7 @@ EOF
                 proxy_ssl_verify_depth 3;
                 proxy_ssl_server_name on;
                 proxy_ssl_name "$host";
-                proxy_set_header Host "$host";${auth_header}
+                proxy_set_header Host "$host";${auth_header}${timeouts}
             }
 
             location = /e/$name/v1/models {

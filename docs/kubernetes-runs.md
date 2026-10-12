@@ -1755,6 +1755,23 @@ before, so existing installs do not roll the proxy; the agent egress
 policy, the proxy's `NetworkPolicy`, and the per-run claude proxy are
 unchanged either way.
 
+nginx gives up on an upstream after 60 seconds without a byte from it and
+answers 504. That is too short for an endpoint that queues requests (a
+gateway in front of a GPU that serves one or two streams at a time, say)
+or for a long prompt whose prefill takes minutes before the first token.
+`K8S_PROXY_READ_TIMEOUT=<n><unit>` (unit one of `ms s m h d`, e.g. `60m`)
+sets `proxy_read_timeout` and `proxy_send_timeout` to that value on every
+chat-completions location: each registered endpoint's
+`/e/<name>/v1/chat/completions`, or the legacy `/api/v1/chat/completions`.
+It is one value for all of them, not a per-endpoint one: the timeout bounds
+only the silence between two reads, so a long one costs a fast endpoint
+nothing but a slower failure when it hangs. The models and embeddings
+locations keep nginx's default. Anything that is not a positive whole
+number with one of those units is a parse-time error. With the key unset
+the rendered proxy config is byte-identical to before. The proxy still
+buffers responses; an upstream that streams should send
+`X-Accel-Buffering: no`, which nginx honours.
+
 `http://` is accepted here (and on `K8S_PROXY_UPSTREAM`) when the host is a
 literal private IPv4 address (RFC1918, loopback, or link-local), or when it
 is a Kubernetes Service DNS name — a host ending in
