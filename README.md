@@ -502,15 +502,15 @@ What to expect while it is on:
   in-session. The session reports each sandboxed round in a few lines —
   branch, what landed, whether the suites pass on the host, any caveat —
   and quotes the cost every round.
-- The session picks each round's pipeline. Leg composition follows the
-  task's shape and an estimate of how long the round will take: a
-  mechanical, fully specified change gets one or two legs, while a large,
-  subtle or widely-depended-on one gets the deepest composition. Harness
-  and model follow whatever quota information the environment exposes.
-  The standard composition for ordinary work (a light model implements, a
-  stronger one reviews, up to two review loops) is overridable per machine
-  in `~/.config/fork-sandbox/coder-mode.env`. Every routing decision is
-  announced in one line, with its time estimate and reason.
+- The session sizes each round and builds its pipeline up from a floor of
+  one code leg plus its own read of the diff. It adds a review leg when
+  existing behaviour changes or the code is security-sensitive, and a plan
+  stage, second seat or maintainer only for large, cross-subsystem or
+  shared-default-path work. Harness and model follow whatever quota
+  information the environment exposes. `~/.config/fork-sandbox/coder-mode.env`
+  sets which seats it may use and, optionally, a ceiling. Every routing
+  decision is announced with its size estimate, time estimate, reason and
+  the cheaper option it passed over.
 - To pin one composition for a whole session, name it on the invocation:
   `/sandbox-coder-mode --preset <name>` (a file in
   `~/.config/fork-sandbox/presets/`) or `--pipeline <spec>` runs every

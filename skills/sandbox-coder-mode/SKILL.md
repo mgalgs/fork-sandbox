@@ -1,7 +1,7 @@
 ---
 name: sandbox-coder-mode
 description: Enter a standing mode where this session stops writing code and delegates every coding and editing task to an unattended fork-sandbox run, acting as orchestrator, reviewer and integrator. Use when the user wants an expensive model to plan and review while cheap or self-hosted models do the typing, or wants unattended editing to happen somewhere that is not their own checkout. Stays on until the user ends it.
-argument-hint: [off|--preset <name>|--pipeline <spec>] — no argument turns the mode on, and the orchestrator then picks each round's pipeline from the task and the quota left — see "Routing a round". Pass "off" (or say so in plain words) to end it. "--preset <name>" or "--pipeline <spec>" pins every round of this session to that composition instead — see "Pinning one composition for the session". "--auto-preset-router" and "--long" are accepted and change nothing.
+argument-hint: [off|--preset <name>|--pipeline <spec>] — no argument turns the mode on, and the orchestrator then sizes each round and builds its pipeline up from one code leg, by size, risk and the quota left — see "Routing a round". Pass "off" (or say so in plain words) to end it. "--preset <name>" or "--pipeline <spec>" pins every round of this session to that composition instead — see "Pinning one composition for the session". "--auto-preset-router" and "--long" are accepted and change nothing.
 user-invocable: true
 ---
 
@@ -30,8 +30,8 @@ spends its tokens on reading, planning, reviewing and integrating — not on
 generating the bulk of the code. The typing in the sandbox runs whatever is
 cheap: a smaller claude model, `pi` against OpenRouter, or a sealed `pi`
 against a self-hosted endpoint, which costs nothing at all. The in-sandbox review
-leg (tier 3, see **Entering the mode**) is the deliberate exception: it runs
-the expensive model too, by default, because catching a defect before it
+leg (tier 3, see **Running long**) is the deliberate exception: when a round
+gets one, it runs the expensive model too, because catching a defect before it
 ever leaves the sandbox is worth that model's price — the economics argument
 is about where the *bulk* of the tokens go, not a ban on the expensive model
 appearing in a sandbox at all.
@@ -75,40 +75,38 @@ This posture is the default; it does not need to be asked for.
 ## Entering the mode
 
 Before the first launch, read `~/.config/fork-sandbox/coder-mode.env` if it
-exists — `cat` it, or use the Read tool, either is fine — and note the
-effective launch defaults; see **Choosing a harness and a model** for what
-it can override and what a missing file means. The announcement below
-names those defaults in one clause, worded from what was actually read, not
-from the example text here, so a machine whose config overrides them
-announces what it will actually do.
+exists — `cat` it, or use the Read tool, either is fine. See **Choosing a
+harness and a model** for its keys. It settles two things:
 
-When the file sets `CODER_MODE_PRESET`, the composition lives in
-`~/.config/fork-sandbox/presets/<name>.yaml` instead of in per-flag keys:
-read that file too, and word the announcement from what it says — see
-**The machine's composition can be a preset** for the key's rules.
+- **The seats** routing may use — which harness and model a code, review
+  or maintainer leg runs on. A comment listing them counts; unset keys
+  mean the shipped seats.
+- **A ceiling, if any.** `CODER_MODE_PRESET` or a `*_LOOP` key bounds what
+  routing may add (**The machine's composition is a ceiling**). A file
+  with no composition keys, or no file, means **route adaptively** with
+  no ceiling — the default, and the announcement says so.
 
 When the mode is invoked with `--preset <name>` or `--pipeline <spec>`,
 that composition is pinned for every round and this session does no
 routing of its own — read it and word the announcement from it, saying
-what is pinned and that it overrides the machine default. See **Pinning
-one composition for the session**.
+what is pinned. See **Pinning one composition for the session**.
 
 Otherwise this session routes each round itself (see **Routing a round**).
-Also list `~/.config/fork-sandbox/presets/` if it exists and read every
-preset there — the header comment is its author's statement of intent,
-the `agents`/`pipeline` body is what it actually runs — since a preset
-that fits a task's shape is a ready-made answer. And note whether the
-environment exposes quota or usage information at all; routing reads it
-per round.
+Note what quota information the environment exposes — a quota command,
+recorded quota plans, a provider's reported limits — since routing reads
+it on every round, not as a tiebreak.
 
-Tell the user, in one or two lines, stating plainly that this session will
-stay high level:
+Tell the user, in one or two lines, worded from what was actually read and
+stating plainly that this session will stay high level:
 
-> Sandbox coder mode is on. I'll read, plan, review and integrate; the actual
-> editing goes to sandboxed runs on their own branches. I'll pick each
-> round's pipeline from the task and the quota left, say which and why when
-> I launch, and report each round with its time and cost. Say "exit
-> sandbox coder mode" when you want me writing code here again.
+> Sandbox coder mode is on, routing adaptively (coder-mode.env sets no
+> composition; seats: claude sonnet/opus, codex sol). I'll read, plan,
+> review and integrate; the editing goes to sandboxed runs on their own
+> branches. Each round starts at one code leg plus my own read of the
+> diff, and I add legs only for its size, risk or the quota; I'll print
+> the size estimate and the cheaper option I passed over when I launch,
+> and report each round with its time and cost. Say "exit sandbox coder
+> mode" when you want me writing code here again.
 
 Then carry on with whatever they asked for. Do not re-announce the mode on
 every turn.
@@ -131,14 +129,16 @@ describes the mode; this section describes what running long demands.
   and a spot-check of what executes on the host — integrates, and owns all
   host-side git (see **What stays in this session**). It writes no project
   code.
-- **Tier 2 — implementer.** The cheap model, in the sandbox. It types, at the
-  default `--harness claude --model sonnet` — or a `pi` / sealed-`pi` harness
-  when a per-round reason calls for one — per **Choosing a harness and a
-  model**.
-- **Tier 3 — in-sandbox reviewer.** Part of the standard composition, via
-  `--review-model opus --review-loop 2`. A fresh session reviews tier 2's
-  work before it ever leaves the sandbox. Routing leaves it out only for a
-  mechanical, fully specified round, and says so (**Routing a round**).
+- **Tier 2 — implementer.** In the sandbox, it types. On a floor round it
+  runs on this session's own harness and model; once a round adds legs,
+  it moves to the cheapest capable code seat — `--harness claude --model
+  sonnet` as shipped, or a `pi` / sealed-`pi` harness — per **Choosing a
+  harness and a model**.
+- **Tier 3 — in-sandbox reviewer.** Added by routing, not by default:
+  `--review-model opus --review-loop 1` when the round changes the default
+  path of existing code or touches security, data that can be lost or
+  host privilege (**Routing a round**). A fresh session reviews tier 2's
+  work before it ever leaves the sandbox.
 
 **Tier 1's review is never skipped because tier 3 ran.** This is the
 load-bearing rule of the whole arrangement:
@@ -227,11 +227,9 @@ reporting:
   own summary — per **Reviewing and integrating**.
 - Quote the cost every round. It varies by an order of magnitude between
   rounds of similar size, and it is the number that decides the next
-  round's harness. The
-  default `--review-loop 2` with `--review-model opus` means up to two
-  opus review legs and two sonnet fix legs on top of the coding session
-  itself, so a round at the defaults can cost materially more than a
-  single-pass run.
+  round's harness. Each review loop adds a review leg and a fix leg on
+  top of the coding session, so `--review-loop 2` with `--review-model
+  opus` can cost materially more than the floor's single pass.
 - A mid-turn ask is not an interrupt. When the user fires off a new idea
   while a round is in flight, acknowledge it in one sentence, keep the
   current work moving, and start it at the next natural break — unless it
@@ -354,6 +352,13 @@ what only this session knows, close to the user's own request:
 - acceptance as properties the result must have. Reviewers verify only
   what the handoff states, so every invariant that matters is written here.
 
+**Check the scope before the handoff is final.** Strike anything the user
+did not ask for — future-proofing ("so the next one is one row"), a
+registry, a guard for a case that cannot occur today — and offer it to the
+user in one line instead: "could also add X". Compiling is where scope
+inflates, and an inflated spec then justifies a deeper pipeline than the
+request ever needed.
+
 Leave the mechanics out: file and line pointers, the choice of mechanism,
 the test list. The implementer reads the code and finds them, in a short
 context that ends with the leg, and the review loops catch a wrong one.
@@ -369,26 +374,23 @@ leg runs (see docs/presets.md).
 
 ## Launching and watching
 
-The flags below are the shipped defaults from **Choosing a harness and a
-model** — substitute the effective values noted at **Entering the mode** if
-`coder-mode.env` overrides any of them (including adding `--review-harness`
-or the `--maintainer-*` trio, which the shipped defaults don't set), and see
-**Reasons to deviate for one round** before changing `--harness` for a
-single launch.
+The composition comes from **Routing a round**. The floor — one code leg
+on this session's own harness and model — is:
 
 ```bash
-fork-sandbox run --harness claude --model sonnet --review-model opus --review-loop 2 \
+fork-sandbox run --harness claude --model <your model id> \
     --branch "<branch>" \
-    --task-meta '{"kind":"implement","difficulty":3,"size":"m","prompt_template_id":"<slug>"}' \
+    --task-meta '{"kind":"implement","difficulty":2,"size":"s","prompt_template_id":"<slug>"}' \
     "<project-path>" "<handoff-file>"
 ```
 
-On a machine whose `coder-mode.env` names a preset, the composition flags
-collapse into it — the task-shaped flags stay on the command line, since a
-preset deliberately cannot carry them (see `docs/presets.md`):
+A round that routing builds up names its legs as an inline pipeline (or a
+preset whose shape matches); the task-shaped flags stay on the command
+line, since a pipeline deliberately cannot carry them (see
+`docs/presets.md`):
 
 ```bash
-fork-sandbox run --preset <name> \
+fork-sandbox run --pipeline csonnet1-ropus1 \
     --branch "<branch>" \
     --task-meta '{"kind":"implement","difficulty":3,"size":"m","prompt_template_id":"<slug>"}' \
     "<project-path>" "<handoff-file>"
@@ -487,11 +489,11 @@ What there is still no flag for is resuming with NEW instructions — a
 different handoff, a corrected approach, or one round applying what a review
 found. `fork-sandbox.sh` starts a fresh session every time, and the sandbox
 is destroyed with its clone, so THAT kind of second round is a new run that
-starts from the first one's branch. Same shipped-default flags as
-**Launching and watching** above, substituted the same way:
+starts from the first one's branch, routed afresh like any round (the fix
+round is often smaller than the first):
 
 ```bash
-fork-sandbox run --harness claude --model sonnet --review-model opus --review-loop 2 \
+fork-sandbox run <composition flags> \
     --branch "<branch>-2" --checkout "<branch>" \
     "<project-path>" "<handoff-file-2>"
 ```
@@ -556,8 +558,8 @@ model that misread the task will misread it again.
 3. **Integrate in the real repo**: merge, rebase or cherry-pick onto the
    working branch. These prompt for permission, and that friction is the
    point — this is the one place host state changes. When the branch
-   modifies code other things already run through, see **One more pass
-   before you merge** first.
+   changes behaviour on the default path of code other things run
+   through, see **One more pass before you merge** first.
 
 4. **Run the tests on the host.** The sandbox's pass is evidence, not proof:
    it had no network, and possibly no dependencies the suite wanted.
@@ -565,12 +567,13 @@ model that misread the task will misread it again.
 5. **Push only if the user asks.** No sandbox can.
 
 6. **Record the verdict** — what the review found, which the log cannot know
-   by itself. The run id is the run directory's basename; capture it before
-   the cleanup below deletes the directory:
+   by itself, and which leg found it, so routing can be calibrated (see
+   **Routing a round**). The run id is the run directory's basename;
+   capture it before the cleanup below deletes the directory:
 
    ```bash
    fork-sandbox log verdict <run-id> --outcome integrated-with-fixes \
-       --defects 2 --notes "selection off-by-one; missing test for empty set"
+       --defects 2 --notes "legs: review 1, maintain 0, tier-1 1; selection off-by-one; missing test for empty set"
    ```
 
 7. **Clean up** once the branch is reviewed: `rm -rf <run-dir>`.
@@ -587,9 +590,10 @@ changed. The loop never opens those, because they are not in the diff, and
 neither does a green suite: the suite exercises what someone already
 thought to write down.
 
-So, as a habit before merging: when a branch **modifies** code that other
-things already run through — an engine file, a shared helper, a state
-container, a hot path — spend one more review on the branch as it will be
+So, as a habit before merging: when a branch **changes behaviour on the
+default path** of code other things already run through — an engine file,
+a shared helper, a state container, a hot path — spend one more review on
+the branch as it will be
 merged, with the strongest model available. Launching the run with
 `--maintainer-loop 1 --maintainer-model opus` does exactly this pass at
 the end of the run — a fresh session reviewing the merged shape the way a
@@ -603,20 +607,23 @@ fork-sandbox run --review-only --checkout "<branch>" \
     --harness claude --model opus "<project-path>" "<review-handoff>"
 ```
 
-Adding a new self-contained file does not earn a pass; modifying a file
-other code depends on does. `git diff --diff-filter=M HEAD.."<branch>"` is
-the whole test — when it comes back empty, or names only the branch's own
-new tests, the loop's word is enough.
+Adding a new self-contained file does not earn a pass, and neither does an
+addition behind a flag, an arm name or a config key that nothing sets
+today: every existing caller still runs the old code. `git diff
+--diff-filter=M HEAD.."<branch>"` is the first filter — when it comes back
+empty, or names only the branch's own new tests, the loop's word is
+enough. When it names shared files, ask whether any existing caller now
+behaves differently; only a yes earns the pass.
 
-This neither replaces `--review-loop` nor lowers it. The loop still runs on
-every round, in the sandbox, at the user's composition; this is one pass on
-top, at the end, over the merged shape instead of over each round's diff.
+This neither replaces `--review-loop` nor lowers it. A round routing gave a
+review loop still runs it, in the sandbox; this is one pass on top, at the
+end, over the merged shape instead of over each round's diff.
 
 **On the manual pass, say that in the review handoff** — the
 `--maintainer-loop` prompt already carries the framing — or the pass
 drifts back into reviewing the branch and buys a third opinion on a diff
 that already has two. Tell it:
-this diff has already been reviewed, twice, line by line, so re-reading it
+this diff has already been reviewed line by line, so re-reading it
 for the same class of defect will find the same things; what has *not* been
 looked at is the blast radius — who calls this, what assumed the old
 behaviour, and what now runs on every frame or every request. That
@@ -680,29 +687,29 @@ fork-sandbox log list --days 14
 
 ## Choosing a harness and a model
 
-The default launch is:
+There is no default composition: **Routing a round** decides which legs a
+round gets. This section decides which seat each leg sits in. The shipped
+seats are a `--harness claude --model sonnet` code leg (on a round with
+more than the floor's one leg), an `--review-model opus` reviewer and an
+opus maintainer.
 
-```
---harness claude --model sonnet --review-model opus --review-loop 2
-```
-
-That is what to launch with when no per-round reason says otherwise. It is
-overridable per machine, never per repo: if
+They are overridable per machine, never per repo: if
 `~/.config/fork-sandbox/coder-mode.env` exists, its keys replace the
-matching flag's default and every other flag keeps its default. A missing
-file, or a key absent from it, means the default above.
+matching seat. A missing file, or a key absent from it, means the shipped
+seat. The two `*_LOOP` keys are not seats: set, they are the ceiling on
+what routing may add; unset, routing decides.
 
-| key | flag | default |
+| key | flag | unset means |
 |---|---|---|
 | `CODER_MODE_HARNESS` | `--harness` | `claude` |
 | `CODER_MODE_MODEL` | `--model` | `sonnet` |
 | `CODER_MODE_NETWORK` | `--network` | `pinned` |
-| `CODER_MODE_REVIEW_HARNESS` | `--review-harness` | unset (same as `--harness`) |
+| `CODER_MODE_REVIEW_HARNESS` | `--review-harness` | same as `--harness` |
 | `CODER_MODE_REVIEW_MODEL` | `--review-model` | `opus` |
-| `CODER_MODE_REVIEW_LOOP` | `--review-loop` | `2` |
-| `CODER_MODE_MAINTAINER_HARNESS` | `--maintainer-harness` | unset (same as `--harness`) |
-| `CODER_MODE_MAINTAINER_MODEL` | `--maintainer-model` | unset — **required** to run the tier |
-| `CODER_MODE_MAINTAINER_LOOP` | `--maintainer-loop` | unset (no maintainer tier) |
+| `CODER_MODE_REVIEW_LOOP` | `--review-loop` | routing decides; set, the most it adds |
+| `CODER_MODE_MAINTAINER_HARNESS` | `--maintainer-harness` | same as `--harness` |
+| `CODER_MODE_MAINTAINER_MODEL` | `--maintainer-model` | `opus` when routing adds the tier; the script requires one |
+| `CODER_MODE_MAINTAINER_LOOP` | `--maintainer-loop` | routing decides; set, the most it adds |
 
 1. **A harness's keys move together.** `sonnet` and `opus` are claude model
    names. A file that sets `CODER_MODE_HARNESS` to anything else must also
@@ -749,18 +756,18 @@ file, or a key absent from it, means the default above.
    `README.md`'s `--harness pi --network sealed --review-harness claude
    --review-model opus --review-loop 2` for the recipe this exists to unblock. Leave the
    review harness unset, or sealed, to keep the whole run sealed.
-4. **`CODER_MODE_REVIEW_LOOP=0` means no in-sandbox reviewer**: omit
-   `--review-loop`, `--review-model` and `--review-harness` from the
-   launch, all three — the script refuses `--review-harness` without
-   `--review-loop`, and refuses `--review-loop` set to `0` on the command
-   line.
-5. **The maintainer keys follow the same rules, with one inversion.**
-   Unset (or `0`) `CODER_MODE_MAINTAINER_LOOP` means no maintainer tier:
-   omit all three `--maintainer-*` flags, as in item 4. When the loop is
-   set, `CODER_MODE_MAINTAINER_MODEL` is **required** — unlike the review
-   model, the maintainer model has no default, because its verdict is the
-   run's last word on the branch (`fork-sandbox.sh` refuses the loop
-   without a model). The harness key resolves the model name exactly as
+4. **A round with no in-sandbox reviewer omits all three review flags** —
+   `--review-loop`, `--review-model` and `--review-harness` — whether
+   routing left it out or `CODER_MODE_REVIEW_LOOP=0` forbids one. The
+   script refuses `--review-harness` without `--review-loop`, and refuses
+   `--review-loop` set to `0` on the command line.
+5. **The maintainer keys follow the same rules, with one inversion.** A
+   round without the tier omits all three `--maintainer-*` flags, as in
+   item 4, and `CODER_MODE_MAINTAINER_LOOP=0` forbids it. A round with it
+   always names the model — `fork-sandbox.sh` refuses the loop without
+   one, because the maintainer's verdict is the run's last word on the
+   branch, so the script will not guess it. The harness key resolves the
+   model name exactly as
    item 1 describes for review, and a sealed implement leg with a
    networked maintainer harness warns by name exactly as item 3 describes
    — a maintainer leg sends the clone's contents to that harness's
@@ -774,114 +781,142 @@ does not write it either — its target allowlist is deliberately hardcoded
 (see [configure.md](../../docs/configure.md)); this file is written by
 hand, by whoever set up the machine.
 
-### The machine's composition can be a preset
+### The machine's composition is a ceiling
 
-`CODER_MODE_PRESET=<name>` replaces the whole table above: the composition
-then lives in `~/.config/fork-sandbox/presets/<name>.yaml` (the format and
-override rules are `docs/presets.md`), and every launch passes `--preset
-<name>` in place of the per-flag spelling. The per-flag keys must not also
-be set — a file carrying both is a config error to surface to the user,
-never to resolve silently, because two sources for one composition is
-exactly what this key exists to remove. `coder-mode.env` then holds only
-the pointer, plus any mode keys that are not composition.
+`CODER_MODE_PRESET=<name>` names a composition in
+`~/.config/fork-sandbox/presets/<name>.yaml` (the format is
+`docs/presets.md`). Whoever set it chose it deliberately, so it bounds
+routing two ways: its seats are the ones routing draws from, and its legs
+are the most routing adds. It is never what an ordinary round inherits —
+routing still starts at the floor, and a round that needs everything the
+preset has passes `--preset <name>` and says so. The `*_LOOP` keys set
+the same kind of ceiling, one tier at a time.
 
-Everything else in this section applies unchanged. The preset is the
-standard composition that **Routing a round** starts from. A per-round
-deviation is either another composition entirely (`--pipeline`, or
-another preset) or flags stacked on top of `--preset`: a flag beats its
-preset counterpart key by key, and a harness override drops that seat's
-preset model, arguments and repeat ("Flags override, key by key" in
-`docs/presets.md`). Either way it is announced with its reason.
+The per-seat keys must not also be set alongside `CODER_MODE_PRESET` — a file carrying both is a config
+error to surface to the user, never to resolve silently, because two
+sources for one composition is exactly what this key exists to remove.
 
-### Reasons to deviate for one round
+To go past the ceiling for one round, the user names the composition
+(**Who decides**, below); this session does not.
 
-Pick per task, and say why in one line when you launch:
+### Picking a leg's seat
+
+Pick per leg, and say why in one line when you launch:
 
 | Task | Harness | Cost (this leg) |
 |---|---|---|
 | Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi --network sealed` | nothing — unless the round's `--review-harness` is networked, which prices the review leg separately (see item 3 above) |
-| Ordinary implementation with a clear plan | `--harness claude --model sonnet` (the default) | subscription |
+| Ordinary implementation with a clear plan | `--harness claude --model sonnet` (the shipped code seat) | subscription |
 | Work where the model quality decides the outcome | `--harness claude --model opus` | subscription |
 | A second opinion from outside the family | `--harness pi --model <openrouter-id>` or `--harness codex` | real money / ChatGPT sign-in |
 
 The review flags travel with `--harness`, not with this table: a round
-that deviates from the machine's harness restates `--review-model` (and
+that moves off the machine's harness restates `--review-model` (and
 `--review-harness`, if the reviewer should run elsewhere) in names that
-harness understands. Which legs a round gets at all is the next section's
-question, not this table's.
+harness understands. An inline `--pipeline` names every seat's model
+itself. Which legs a round gets at all is the next section's question.
 
 ### Routing a round
 
 Unless the user has pinned a composition (see **Pinning one composition
-for the session**), this session picks each round's pipeline itself: the
-legs (which stages, how many passes) from the task, and the harness and
-model for each leg from the quota left. The machine's composition from
-`coder-mode.env` is the **standard composition** — what an ordinary
-implement round gets — not a floor every round must clear.
+for the session**), this session builds every round's pipeline itself.
+There is no standard composition to start from and argue down. There is
+the **floor** — one code leg, with this session's own read of the whole
+diff as the review — and what the round's size, risk and quota add to it.
+A machine composition in `coder-mode.env`, if any, is the ceiling.
 
 Who decides, highest first:
 
 1. An explicit pipeline or preset the user names for this round.
 2. A composition pinned for the session.
-3. This session's routing, below.
+3. This session's routing, below, under the machine's ceiling.
 
-**Legs follow the task's shape.** Judge the shape from the compiled spec,
-the thing the handoff says, not from how small the request sounded:
+**Size the round first, in numbers.** Routing cannot be skipped by
+skipping this step. From the compiled spec — after the scope check in
+**Writing the handoff**, not from how big the request sounded — write:
 
-| Shape | Composition | Wall-clock target |
-|---|---|---|
-| Mechanical and fully specified — a rename, a fixture fix, a pattern applied across files; the handoff leaves the implementer nothing to decide | one code leg on this session's own harness and model, no review loop (fork-sandbox skill, "Small tasks") | about one leg |
-| Ordinary implementation with a clear plan | the standard composition | the standard composition's usual time |
-| Large or subtle, or it modifies code other things already run through (a shared helper, an engine, a hot path) | the deepest composition available: a plan stage when the design spans files, the review loop, and a maintain step on the strongest model | whatever it takes |
-| High-volume or exploratory — a sweep, an investigation | the cheapest capable harness, sealed where one exists | short legs, many of them |
+```
+production lines ~N, files M, default path changes: yes/no, suite ~T min, legs that rerun it: K
+```
+
+Production lines exclude tests. "Default path changes" asks whether any
+existing caller, run with today's flags and config, behaves differently
+afterwards; new code behind a flag, an arm name or a config key that
+nothing sets today is "no". K follows from the composition chosen below.
+The line goes into the announcement.
+
+**Route up from the floor.** Each addition needs a reason the size line or
+the code's risk names:
+
+| Add | When |
+|---|---|
+| nothing: the floor | no row below applies |
+| one review leg (`--review-loop 1`) | the default path of existing code changes; or the change touches a security property, authentication, data that can be lost, or anything that runs on the host with privileges, however small it is |
+| a plan stage, a second code seat, or a maintain step on the strongest model | more than ~300 production lines; a design spanning subsystems; or changed behaviour on the default path of code other things run through (a shared helper, an engine, a hot path) |
+| cheapest capable harness, sealed where one exists, short legs | high-volume or exploratory work: a sweep, an investigation |
+
+An addition behind a flag, arm name or config key does not trigger the
+third row, however central the file it lands in. The floor's code leg runs
+on this session's own harness and model (fork-sandbox skill, "Small
+tasks"): every extra leg is a fresh agent rereading the repo and rerunning
+the suite, which costs more than the cheaper model saves. Once a round
+adds legs, the code leg moves to the cheapest capable code seat, since
+the legs after it check its work.
 
 **Estimate the completion time before launching**, and let it decide
 between compositions that would all do the job. A round takes roughly the
-sum over its legs of the leg's work plus the project's test suite, for
-every leg that runs the suite. A long suite multiplies across legs: a
-mechanical change on a project with a fifteen-minute suite should be one
-or two legs, not six. Review legs that look at a commit an earlier leg
-already tested reuse that recorded result rather than paying for the
-suite again, but every fix leg's new commit is tested afresh. Compare
+sum over its legs of the leg's work plus the suite, for each of the K legs
+that run it. A long suite multiplies across legs: a mechanical change on a
+project with a fifteen-minute suite should be one or two legs, not six.
+Review legs that look at a commit an earlier leg already tested reuse that
+recorded result, but every fix leg's new commit is tested afresh. Compare
 the estimate with the round's actual elapsed time when it lands, and
-correct the next estimate.
+correct the next one.
 
-**Harness and model follow the quota.** When the environment exposes
-quota or usage information — a status command, a usage file, a provider's
-reported limits, or quota plans the user has recorded — read it before
-each launch. Seat legs on a provider with headroom. Never start a long
-composition on a window that is projected to run out before it resets:
-a leg that dies mid-run costs more than a slower model would have. Follow
-any spending preference the user has stated. When no quota information
-exists, use the standard composition's harnesses and models, and use
-`fork-sandbox status --json` costs from recent rounds as the guide.
+**Quota is an input on every round.** Read whatever the environment
+exposes — a quota command, quota plans the user has recorded, a
+provider's reported limits — before each launch, and follow any spending
+preference the user has stated. It picks the provider: seat legs where
+there is headroom. A short or nearly spent window means fewer or cheaper
+legs, and never a long composition on a window projected to run out
+before it resets — a leg that dies mid-run costs more than a slower model
+would have. With no quota information, use `fork-sandbox status --json`
+costs from recent rounds as the guide.
+
+**Calibrate from the log.** The verdict notes which leg found each defect
+(**Reviewing and integrating** step 6). Before adding a leg out of habit,
+read recent verdicts at that size — `fork-sandbox log list` shows their
+notes, `fork-sandbox log stats --by task.size` the cost and landed rate
+per size. A leg that keeps finding nothing on rounds like this one is
+evidence for leaving it off.
 
 `--pipeline <spec>` (see `docs/presets.md`, "Inline pipelines") expresses
-any composition the routing arrives at without a preset file; a preset
-file whose shape fits is an equally good answer.
+any composition routing arrives at; a preset whose shape matches is an
+equally good spelling, never a starting point.
 
 What routing never changes:
 
 - **Tier 1 review is never skipped.** A round with no in-sandbox review
   means this session reads the whole diff itself, not just the diffstat.
-- **Light composition is for mechanical shape only.** A change that touches
-  a security property, authentication, data that can be lost, or anything
-  that runs on the host with privileges gets a review leg, however small
-  it is.
-- **Doubt resolves upward.** When the shape is unclear, or the handoff
-  leaves the implementer a real choice, use the standard composition, or
-  deeper.
+- **The floor is for rounds whose risk is in the reading.** Security,
+  authentication, data that can be lost and host privilege always get a
+  review leg, however small the change.
+- **Doubt moves one step up, not to the ceiling.** When the size line is
+  unclear, or the handoff leaves the implementer a real choice, add the
+  next row's leg — or settle the choice before launching.
 - **Every leg names its model**, as **Pin `--model` on every claude run**
   below requires; a spec or preset does that for each seat.
 
-**Announce every routing decision.** One line at launch: the composition,
-the time estimate, and the reason, including what the quota reading said
-when there was one. Silence would leave the user unable to tell a
-decision from a habit:
+**Announce every routing decision.** At launch: the size line, the
+composition, the time estimate, the quota reading, and the cheaper
+alternative passed over with the reason it was rejected. Silence on the
+alternative is how habit passes for a decision:
 
-> Launching `sbx-fixture-hermetic` on `--pipeline csonnet`: a fixture fix
-> the handoff spells out file by file, the suite is ~15 min, so one leg
-> (~25 min) and I read the diff; the subscription has headroom.
+> Launching `sbx-retry-backoff` on `--pipeline csonnet1-ropus1`.
+> Production lines ~120, files 4, default path changes: yes, suite ~8
+> min, legs that rerun it: 2. One review leg because every caller's retry
+> timing changes; ~40 min. Passed over: the floor alone — a default-path
+> change gets a second reader. Claude window 35% used, resets in 2 days.
 
 ### Pinning one composition for the session
 
@@ -901,12 +936,13 @@ deviation from it is still flags stacked on top, with the reason
 announced.
 
 `--auto-preset-router` and `CODER_MODE_AUTO_PRESET_ROUTER=1` are still
-accepted and change nothing, since routing is now the default.
+accepted and change nothing: routing is always on unless a composition is
+pinned.
 
 **Pin `--model` on every claude run.** Without it the run takes the host's
-default, which is the expensive model this session is likely running on —
-and the mode's whole reason for existing is gone. The defaults above are
-that pin; only spell the flags out again when deviating from them.
+default, which may not be the model routing chose — and a cheap seat
+silently becomes the expensive one. Name it on every launch, the floor's
+own-model leg included.
 
 A sealed run has no network at all, so nothing can be installed or
 fetched in there. Say in the handoff what is already provided, or the run
