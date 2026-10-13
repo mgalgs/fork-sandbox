@@ -5701,6 +5701,7 @@ if [[ -n "$pialg_fn" ]]; then
     printf '%s\n' 'set -euo pipefail' \
         ': "${PI_ARGS:=}"' \
         "$pialg_fn" \
+        "$(declare -f fs_expand_browser_prompt)" \
         'run_pi_coding_leg' > "$pialg_fn_file"
     ok "run_pi_coding_leg is a standalone function in the entrypoint"
 else
