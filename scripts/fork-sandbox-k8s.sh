@@ -584,6 +584,19 @@
 #                         a Secret, mounted into the proxy only, and never
 #                         reaches the agent pod -- same handling as
 #                         K8S_PROXY_UPSTREAM's own key, one layer down.
+#   K8S_PROXY_KEYS_SECRET=
+#                         name of a Secret YOU create in K8S_NAMESPACE
+#                         holding the proxy's keys, one data key per
+#                         variable name (OPENROUTER_API_KEY with
+#                         K8S_PROXY_UPSTREAM, else each K8S_PROXY_ENDPOINT_KEYS
+#                         <VAR_NAME>). When set, install reads no key from
+#                         pi.env and writes no fork-sandbox-upstream-key; an
+#                         initContainer in the proxy pod checks each value
+#                         (no '"', '$', backslash or line break) and renders
+#                         nginx's key lines into memory. A bad or missing
+#                         key fails that pod, not install. Changing the
+#                         Secret does not roll the proxy. Same name rules as
+#                         the postmaster's *_SECRET keys.
 #   K8S_PROXY_ENDPOINT_EMBEDDINGS=
 #                         <name>[,<name>...] -- opts K8S_PROXY_ENDPOINTS
 #                         entries in to two more exact-match proxy routes,
@@ -1074,6 +1087,7 @@ K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
 # Keys a K8S_PROXY_ENDPOINTS entry -- holds the VAR_NAME only, never the
 # value; see parse_proxy_endpoint_keys and cmd_install's Secret handling.
 K8S_PROXY_ENDPOINT_KEYS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_KEYS || true)"
+K8S_PROXY_KEYS_SECRET="$(read_env_value "$k8s_env" K8S_PROXY_KEYS_SECRET || true)"
 # Opts endpoints in to the embeddings routes; see parse_proxy_endpoint_embeddings.
 K8S_PROXY_ENDPOINT_EMBEDDINGS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_EMBEDDINGS || true)"
 K8S_PROXY_READ_TIMEOUT="$(read_env_value "$k8s_env" K8S_PROXY_READ_TIMEOUT || true)"
@@ -1433,7 +1447,7 @@ fi
 if [[ "${1-}" != check-grant ]]; then
     fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
         "$K8S_PROJECT_IMAGES" \
-        "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ENDPOINT_KEYS" \
+        "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ENDPOINT_KEYS" "$K8S_PROXY_KEYS_SECRET" \
         "$K8S_PROXY_ENDPOINT_EMBEDDINGS" \
         "$K8S_PROXY_ALLOW" \
         "$K8S_PROXY_ALLOW_NS" "$K8S_CLUSTER_DOMAIN" \
@@ -3292,6 +3306,97 @@ strip_proxy_key_volume() {
     printf '%s' "$stripped"
 }
 
+# The proxy's initContainer script for K8S_PROXY_KEYS_SECRET. Args are
+# <nginx var>=<data key> pairs; it reads /keys/<data key> and writes the
+# `set $var "value";` lines to /rendered/upstream-key.conf. It refuses what
+# reject_nginx_unsafe_chars refuses -- the value lands inside an nginx
+# string -- and never prints a value. Runs under the proxy image's
+# busybox sh, so POSIX only.
+read -r -d '' PROXY_RENDER_KEYS_SCRIPT <<'EOF' || true
+set -eu
+keys="${RENDER_KEYS_DIR:-/keys}"
+out="${RENDER_OUT_DIR:-/rendered}/upstream-key.conf"
+nl="$(printf '\nx')"; nl="${nl%x}"
+cr="$(printf '\r')"
+: > "$out.tmp"
+for pair in "$@"; do
+    var="${pair%%=*}" key="${pair#*=}"
+    if [ ! -f "$keys/$key" ]; then
+        echo "render-keys: key $key is missing from K8S_PROXY_KEYS_SECRET" >&2
+        exit 1
+    fi
+    v="$(cat "$keys/$key")"
+    case "$v" in
+        '')
+            echo "render-keys: key $key is empty" >&2
+            exit 1 ;;
+        *'"'*|*'$'*|*'\'*|*"$nl"*|*"$cr"*)
+            echo "render-keys: key $key holds a '\"', '\$', backslash or" >&2
+            echo "line break, which would break its nginx line" >&2
+            exit 1 ;;
+    esac
+    printf 'set $%s "%s";\n' "$var" "$v" >> "$out.tmp"
+done
+mv "$out.tmp" "$out"
+EOF
+
+# ref_proxy_key_volume TEXT SECRET PAIR...: the proxy Deployment with its
+# upstream-key Secret volume swapped for an in-memory emptyDir that an
+# initContainer fills from SECRET (see PROXY_RENDER_KEYS_SCRIPT). The nginx
+# container's mount is untouched: it reads the same upstream-key.conf.
+ref_proxy_key_volume() {
+    local text="$1" secret="$2"; shift 2
+    local volume_block new_volumes init image pair stripped
+    volume_block=$'        - name: upstream-key\n          secret:\n            secretName: fork-sandbox-upstream-key\n'
+    image="$(sed -n 's/^          image: //p' <<< "$text" | head -n 1)"
+    if [[ -z "$image" ]]; then
+        echo "Error: could not find the nginx image in the rendered proxy" >&2
+        echo "Deployment -- manifests/k8s/30-proxy.yaml and ref_proxy_key_volume" >&2
+        echo "in this script have drifted apart." >&2
+        return 1
+    fi
+    new_volumes=$'        - name: upstream-key\n          emptyDir:\n            medium: Memory\n'
+    new_volumes+=$'        - name: upstream-key-src\n          secret:\n'
+    new_volumes+="            secretName: $secret"$'\n            items:\n'
+    for pair in "$@"; do
+        new_volumes+="              - key: ${pair#*=}"$'\n'"                path: ${pair#*=}"$'\n'
+    done
+    init=$'      initContainers:\n        - name: render-keys\n'
+    init+="          image: $image"$'\n'
+    init+=$'          command: ["/bin/sh", "-c"]\n          args:\n            - |\n'
+    local nl_indent=$'\n              '
+    init+="              ${PROXY_RENDER_KEYS_SCRIPT//$'\n'/"$nl_indent"}"$'\n'
+    init+=$'            - render-keys\n'
+    for pair in "$@"; do
+        init+="            - $pair"$'\n'
+    done
+    init+=$'          securityContext:\n            allowPrivilegeEscalation: false\n'
+    init+=$'            readOnlyRootFilesystem: true\n            capabilities:\n              drop: ["ALL"]\n'
+    init+=$'          volumeMounts:\n            - name: upstream-key-src\n              mountPath: /keys\n'
+    init+=$'              readOnly: true\n            - name: upstream-key\n              mountPath: /rendered\n'
+
+    # Replacements quoted: bash 5.2's patsub_replacement would otherwise
+    # expand each '&' (the script's >&2) to the matched text.
+    local anchor=$'      containers:\n'
+    init+="$anchor"
+    stripped="${text/"$volume_block"/"$new_volumes"}"
+    if [[ "$stripped" == "$text" ]]; then
+        echo "Error: could not find the upstream-key volume in the rendered" >&2
+        echo "proxy Deployment -- manifests/k8s/30-proxy.yaml and" >&2
+        echo "ref_proxy_key_volume in this script have drifted apart." >&2
+        return 1
+    fi
+    text="$stripped"
+    stripped="${text/"$anchor"/"$init"}"
+    if [[ "$stripped" == "$text" ]]; then
+        echo "Error: could not find the proxy Deployment's containers list --" >&2
+        echo "manifests/k8s/30-proxy.yaml and ref_proxy_key_volume in this" >&2
+        echo "script have drifted apart." >&2
+        return 1
+    fi
+    printf '%s' "$stripped"
+}
+
 # Removes one of the postmaster Deployment's marker-fenced optional blocks
 # (manifests/k8s/40-postmaster.yaml's "# >>> $tag" / "# <<< $tag" comment
 # pairs -- personas/prompts/handlers/hooks/presets, each fencing an env entry, a
@@ -3678,7 +3783,8 @@ cmd_install() {
             "K8S_POSTMASTER_HOOKS_SECRET=$K8S_POSTMASTER_HOOKS_SECRET" \
             "K8S_POSTMASTER_GIT_SECRET=$K8S_POSTMASTER_GIT_SECRET" \
             "K8S_POSTMASTER_CLAUDE_SECRET=$K8S_POSTMASTER_CLAUDE_SECRET" \
-            "K8S_MAIL_API_TOKENS_SECRET=$K8S_MAIL_API_TOKENS_SECRET"; do
+            "K8S_MAIL_API_TOKENS_SECRET=$K8S_MAIL_API_TOKENS_SECRET" \
+            "K8S_PROXY_KEYS_SECRET=$K8S_PROXY_KEYS_SECRET"; do
             pm_ref_key="${pm_ref_pair%%=*}"
             pm_ref_name="${pm_ref_pair#*=}"
             [[ -n "$pm_ref_name" ]] || continue
@@ -4392,7 +4498,28 @@ cmd_install() {
     # K8S_PROXY_ENDPOINT_KEYS variable.
     local api_key=""
     local -a keyed_endpoint_values=() keyed_endpoint_nginx_vars=()
-    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+    # K8S_PROXY_KEYS_SECRET: the keys live in a Secret the site made, one
+    # data key per variable name, and an initContainer renders the nginx
+    # lines in the pod. Nothing is read from pi.env; only the
+    # <nginx var>=<data key> pairs the initContainer needs are built here.
+    local -a proxy_ref_pairs=()
+    if [[ -n "$K8S_PROXY_KEYS_SECRET" ]]; then
+        pm_validate_secret_ref K8S_PROXY_KEYS_SECRET "$K8S_PROXY_KEYS_SECRET" || exit 1
+        if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+            proxy_ref_pairs=(upstream_key=OPENROUTER_API_KEY)
+        else
+            local ref_j
+            for (( ref_j = 0; ref_j < ${#KEYED_ENDPOINT_NAMES[@]}; ref_j++ )); do
+                proxy_ref_pairs+=("upstream_key_${KEYED_ENDPOINT_NAMES[$ref_j]//-/_}=${KEYED_ENDPOINT_VARS[$ref_j]}")
+            done
+        fi
+        if [[ ${#proxy_ref_pairs[@]} -eq 0 ]]; then
+            echo "Error: K8S_PROXY_KEYS_SECRET is set, but no endpoint is keyed" >&2
+            echo "(no K8S_PROXY_UPSTREAM, no K8S_PROXY_ENDPOINT_KEYS entry), so" >&2
+            echo "there is nothing to read from it. Unset it." >&2
+            exit 1
+        fi
+    elif [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
         require_secret_file "$pi_env" || exit 1
         api_key="$(read_env_value "$pi_env" OPENROUTER_API_KEY || true)"
         if [[ -z "$api_key" ]]; then
@@ -4509,6 +4636,9 @@ cmd_install() {
             if [[ -z "$K8S_PROXY_UPSTREAM" && ${#KEYED_ENDPOINT_NAMES[@]} -eq 0 ]]; then
                 file_rendered="$(strip_proxy_key_include "$file_rendered")" || exit 1
                 file_rendered="$(strip_proxy_key_volume "$file_rendered")" || exit 1
+            elif [[ -n "$K8S_PROXY_KEYS_SECRET" ]]; then
+                file_rendered="$(ref_proxy_key_volume "$file_rendered" \
+                    "$K8S_PROXY_KEYS_SECRET" "${proxy_ref_pairs[@]}")" || exit 1
             fi
 
             # A hash of the rendered nginx.conf, filled into the proxy
@@ -4731,10 +4861,12 @@ cmd_install() {
     if [[ "$dry_run" == true ]]; then
         printf '%s\n' "$rendered"
         local dry_key_name
-        for dry_key_name in "${KEYED_ENDPOINT_NAMES[@]}"; do
-            printf '# (dry-run) would create/update Secret fork-sandbox-upstream-key entry for K8S_PROXY_ENDPOINTS endpoint '\''%s'\'' here -- not shown.\n' \
-                "$dry_key_name"
-        done
+        if [[ -z "$K8S_PROXY_KEYS_SECRET" ]]; then
+            for dry_key_name in "${KEYED_ENDPOINT_NAMES[@]}"; do
+                printf '# (dry-run) would create/update Secret fork-sandbox-upstream-key entry for K8S_PROXY_ENDPOINTS endpoint '\''%s'\'' here -- not shown.\n' \
+                    "$dry_key_name"
+            done
+        fi
         if $postmaster; then
             # kubectl's own -o yaml render carries no leading `---`, unlike
             # every manifests/k8s/*.yaml file (each already opens with
@@ -4777,8 +4909,11 @@ cmd_install() {
     # K8S_PROXY_ENDPOINTS install only when at least one endpoint is named
     # in K8S_PROXY_ENDPOINT_KEYS -- a keyless endpoints install (see
     # proxy_key_include_block/strip_proxy_key_include above for the other
-    # half of that) reads no credential from pi.env at all.
-    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+    # half of that) reads no credential from pi.env at all, and neither does
+    # a K8S_PROXY_KEYS_SECRET install, whose Secret the site owns.
+    if [[ -n "$K8S_PROXY_KEYS_SECRET" ]]; then
+        :
+    elif [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
         # shellcheck disable=SC2016  # the literal text $upstream_key is nginx config, not shell
         printf 'set $upstream_key "%s";' "$api_key" \
             | k8s_render_upstream_key_secret_manifest fork-sandbox-upstream-key "$K8S_NAMESPACE" \

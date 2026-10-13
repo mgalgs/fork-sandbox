@@ -324,6 +324,11 @@ them in `k8s.env`:
 | `K8S_MAIL_API_TOKENS_SECRET` | `K8S_MAIL_API_TOKENS_FILE` | `tokens` |
 | `K8S_POSTMASTER_HOOKS_SECRET` | (no file form) | whatever your hooks read |
 
+The model proxy's keys can be referenced the same way, with
+`K8S_PROXY_KEYS_SECRET`; see the proxy section of
+[kubernetes-runs.md](kubernetes-runs.md). It follows the naming rules
+below and counts as a reference for the distinct-Secret rule.
+
 Setting a reference and the file key it replaces is refused. Install never
 creates, reads or prints a referenced Secret; it only names it in the
 Deployment. That has consequences:

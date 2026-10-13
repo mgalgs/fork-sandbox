@@ -1736,6 +1736,23 @@ Secret entry *would be created*, naming only the endpoint. One key per
 endpoint, shared by every run using it — there is no per-run or
 per-operator credential here.
 
+A site that installs from CI, or keeps credentials off laptops, can hold
+the proxy's keys in a Secret of its own instead: create it in the
+namespace with one data key per variable name (`OPENROUTER_API_KEY` with
+`K8S_PROXY_UPSTREAM`, otherwise each `VAR_NAME` from
+`K8S_PROXY_ENDPOINT_KEYS`) and set `K8S_PROXY_KEYS_SECRET=<name>`.
+`install` then reads nothing from `pi.env` and writes no
+`fork-sandbox-upstream-key`. An initContainer in the proxy pod reads the
+Secret, refuses an empty value or one holding `"`, `$`, a backslash or a
+line break (trailing newlines are dropped), and writes the same
+`set $... "...";` lines into an in-memory volume nginx includes. The value
+is never printed. Because `install` no longer sees the values, a bad or
+missing key shows up as a proxy pod stuck in `Init`, not as an install
+error, and changing the Secret does not roll the proxy: run
+`kubectl rollout restart deployment/fork-sandbox-proxy`. The name follows
+the rules in "Secrets by reference" in
+[cluster-postmaster.md](cluster-postmaster.md).
+
 Embeddings are off by default. `K8S_PROXY_ENDPOINT_EMBEDDINGS=<name>[,...]`
 opts registered endpoints in to two more exact-match locations each,
 `/e/<name>/v1/embeddings` (forwarded to the registered base URL's

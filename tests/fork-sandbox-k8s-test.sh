@@ -4270,6 +4270,97 @@ refuses "a keyed endpoint whose pi.env variable is empty is refused, naming both
     env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$empty_var_config_dir" \
     "$k8s_sh" install
 
+# K8S_PROXY_KEYS_SECRET: the keys come from a Secret the site made, rendered
+# into nginx's include by an initContainer. The pi.env here is EMPTY, so an
+# install that still read it would refuse as above.
+pk_cfg="$(newdir)"; tmpdirs+=("$pk_cfg")
+cp "$keyed_config_dir/k8s.env" "$pk_cfg/k8s.env"
+printf 'K8S_PROXY_KEYS_SECRET=site-proxy-keys\n' >> "$pk_cfg/k8s.env"
+install -m 600 /dev/null "$pk_cfg/pi.env"
+pk_out="$(FORK_SANDBOX_CONFIG_DIR="$pk_cfg" "$k8s_sh" install --dry-run 2>"$pk_cfg/err")"
+check "keys secret: install --dry-run exits 0 with nothing in pi.env" "0" "$?"
+pk_dep() { yq -r "select(.kind == \"Deployment\" and .metadata.name == \"fork-sandbox-proxy\") | $1" <<< "$pk_out"; }
+check "keys secret: one initContainer, render-keys" "render-keys" "$(pk_dep '.spec.template.spec.initContainers[].name')"
+check "keys secret: it runs the proxy's own image" "$(pk_dep '.spec.template.spec.containers[0].image')" \
+    "$(pk_dep '.spec.template.spec.initContainers[0].image')"
+check "keys secret: its pairs map the endpoint's nginx variable to the data key" "upstream_key_secondary=MY_API_KEY" \
+    "$(pk_dep '.spec.template.spec.initContainers[0].args[2:][]')"
+check "keys secret: the key volume is an in-memory emptyDir" "Memory" \
+    "$(pk_dep '.spec.template.spec.volumes[] | select(.name == "upstream-key") | .emptyDir.medium')"
+check "keys secret: the source volume is the site's Secret, the one key projected" "site-proxy-keys MY_API_KEY" \
+    "$(pk_dep '.spec.template.spec.volumes[] | select(.name == "upstream-key-src") | "\(.secret.secretName) \(.secret.items[0].key)"')"
+check "keys secret: nginx still mounts upstream-key.conf from the key volume" "upstream-key upstream-key.conf" \
+    "$(pk_dep '.spec.template.spec.containers[0].volumeMounts[] | select(.mountPath == "/etc/nginx/upstream-key.conf") | "\(.name) \(.subPath)"')"
+check "keys secret: the source Secret is mounted in the initContainer only" "0" \
+    "$(pk_dep '.spec.template.spec.containers[].volumeMounts[].name' | grep -c 'upstream-key-src')"
+check "keys secret: no upstream-key Secret entry is announced" "0" \
+    "$(grep -c 'would create/update Secret fork-sandbox-upstream-key' <<< "$pk_out")"
+check "keys secret: nginx.conf still includes the key file" "1" \
+    "$(grep -c 'include /etc/nginx/upstream-key.conf;' <<< "$pk_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    check "yamllint: keys secret" "" "$(printf '%s\n' "$pk_out" | yamllint - 2>&1)"
+fi
+
+# A real install against a logging stub applies no upstream-key Secret.
+env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pk_cfg" "$k8s_sh" install >/dev/null 2>&1
+check "keys secret: a real install exits 0" "0" "$?"
+check "keys secret: ... and applies no Secret of its own" "0" \
+    "$(grep -c -- '--field-manager=fork-sandbox-k8s-install' "$missing_var_kubectl_log")"
+: > "$missing_var_kubectl_log"
+
+# The rendered script itself, run as the pod would run it, against keys on
+# disk. RENDER_KEYS_DIR/RENDER_OUT_DIR stand in for the pod's mounts.
+pk_script="$(pk_dep '.spec.template.spec.initContainers[0].args[0]')"
+pk_keys="$(newdir)"; pk_rend="$(newdir)"; tmpdirs+=("$pk_keys" "$pk_rend")
+printf 'sk-from-secret\n' > "$pk_keys/MY_API_KEY"
+printf 'sk-other' > "$pk_keys/OTHER"
+pk_render() { RENDER_KEYS_DIR="$pk_keys" RENDER_OUT_DIR="$pk_rend" sh -c "$pk_script" render-keys "$@" 2>"$pk_rend/err"; }
+pk_render upstream_key_secondary=MY_API_KEY upstream_key_x=OTHER
+check "keys script: renders one nginx line per pair, trailing newline dropped" \
+    "set \$upstream_key_secondary \"sk-from-secret\";|set \$upstream_key_x \"sk-other\";|" \
+    "$(tr '\n' '|' < "$pk_rend/upstream-key.conf")"
+for pk_bad in 'a"b' 'a$b' 'a\b' $'a\nb' $'a\rb' ''; do
+    printf '%s' "$pk_bad" > "$pk_keys/BAD"
+    rm -f "$pk_rend/upstream-key.conf"
+    if pk_render upstream_key_secondary=MY_API_KEY upstream_key_bad=BAD; then
+        no "keys script: refuses $(printf '%q' "$pk_bad")" "it rendered"
+    else
+        check "keys script: refuses $(printf '%q' "$pk_bad"), writing nothing, printing no value" "0 0" \
+            "$([[ -e "$pk_rend/upstream-key.conf" ]] && echo 1 || echo 0) $(grep -c 'sk-from-secret' "$pk_rend/err")"
+    fi
+done
+pk_render upstream_key_secondary=MISSING && pk_rc=0 || pk_rc=$?
+check "keys script: a key absent from the Secret refuses, naming it" "1 1" \
+    "$pk_rc $(grep -c 'key MISSING is missing' "$pk_rend/err")"
+
+# The legacy single-upstream path reads OPENROUTER_API_KEY from the Secret.
+pk_up="$(newdir)"; tmpdirs+=("$pk_up")
+grep -v '^K8S_PROXY_ENDPOINT' "$pk_cfg/k8s.env" > "$pk_up/k8s.env"
+printf 'K8S_PROXY_UPSTREAM=https://openrouter.ai\n' >> "$pk_up/k8s.env"
+install -m 600 /dev/null "$pk_up/pi.env"
+pk_out="$(FORK_SANDBOX_CONFIG_DIR="$pk_up" "$k8s_sh" install --dry-run 2>/dev/null)"
+check "keys secret, upstream: the pair is upstream_key=OPENROUTER_API_KEY" "upstream_key=OPENROUTER_API_KEY" \
+    "$(pk_dep '.spec.template.spec.initContainers[0].args[2:][]')"
+
+# Refusals, before any kubectl call.
+pk_nokey="$(newdir)"; tmpdirs+=("$pk_nokey")
+grep -v '^K8S_PROXY_ENDPOINT_KEYS=' "$pk_cfg/k8s.env" > "$pk_nokey/k8s.env"
+install -m 600 /dev/null "$pk_nokey/pi.env"
+refuses "keys secret with no keyed endpoint is refused" "nothing to read from it" \
+    env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pk_nokey" "$k8s_sh" install
+for pk_name in Site_Keys fork-sandbox-upstream-key; do
+    pk_badname="$(newdir)"; tmpdirs+=("$pk_badname")
+    sed "s/^K8S_PROXY_KEYS_SECRET=.*/K8S_PROXY_KEYS_SECRET=$pk_name/" "$pk_cfg/k8s.env" > "$pk_badname/k8s.env"
+    install -m 600 /dev/null "$pk_badname/pi.env"
+    refuses "keys secret named '$pk_name' is refused" "K8S_PROXY_KEYS_SECRET='$pk_name'" \
+        env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pk_badname" "$k8s_sh" install
+done
+if [[ -s "$missing_var_kubectl_log" ]]; then
+    no "keys secret refusals never invoke kubectl" "$(cat "$missing_var_kubectl_log")"
+else
+    ok "keys secret refusals never invoke kubectl"
+fi
+
 # A keyed credential containing '"', '$' or '\' would break the nginx `set
 # $var "...";` line it renders into -- refused by name at install time
 # instead of shipping a crashlooping proxy with nothing in the install
