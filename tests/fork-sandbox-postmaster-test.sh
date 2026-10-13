@@ -5758,6 +5758,82 @@ check "fetch-miss case 13: after the sync kai is checked out at the target" \
     "$fw13_sha" "$(argv_after --checkout "$STUB_ARGV_LOG")"
 fw_gone="$(git -C "$PROJECT_DIR" cat-file -e "$fw13_sha^{commit}" 2>/dev/null && echo 1 || echo 0)"
 check "fetch-miss case 13: the sha was fetched into the project repo" 1 "$fw_gone"
+
+# ---- orphaned target: a force-push before the first review. The target sha
+# is never fetchable; the branch is force-pushed to a commit with unrelated
+# history. ----
+# ot_unrelated <label>: a root commit in the origin's source repo, not pushed.
+ot_unrelated() {
+    local tree
+    tree="$(git -C "$UH_ORIGIN_SRC" mktree < /dev/null)"
+    git -C "$UH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test \
+        commit-tree -m "unrelated $1" "$tree"
+}
+ot_kickoff() {
+    printf '%s\n' 'review this' > "$work/body.tmp"
+    OT_MID="$("$MAIL" send --from '@carol' --to '@kai' --subject "orphaned target $1" \
+        --body "$work/body.tmp" --hops 8 --review-target "$1:$2" 2>/dev/null)"
+    OT_TID="$(thread_of "$OT_MID")"
+    : > "$STUB_ARGV_LOG"
+    once
+}
+
+# case 14: nothing reviewed yet -- the version is re-frozen at the new head.
+ot14_branch="feature/rebased"
+ot14_old="$(fw_commit "$ot14_branch")"
+ot_kickoff "$ot14_branch" "$ot14_old"; ot14_tid="$OT_TID"; ot14_short="${ot14_tid:0:8}"
+contains "orphaned target case 14 setup: kai's wake waits on the target" \
+    "$(cat "$work/once.out")" "pm defer thread=$ot14_short agent=kai reason=fetch-miss attempt=1"
+ot14_new="$(ot_unrelated 14)"
+fw_sync "$ot14_branch" "$ot14_new"
+: > "$STUB_ARGV_LOG"
+reply_msg '@ci-demo' "$OT_MID" 'force-pushed' --to '@kai' --upstream-head "$ot14_branch:$ot14_new" >/dev/null
+once
+check "orphaned target case 14: the thread is not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$ot14_tid" ]] && echo 1 || echo 0 )"
+contains "orphaned target case 14: the re-freeze is logged" "$(cat "$work/once.out")" \
+    "pm review-target-refrozen thread=$ot14_short version=1 from=${ot14_old:0:12} to=${ot14_new:0:12}"
+check "orphaned target case 14: kai spawned at the new head" "$ot14_new" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+ot14_rt="$(cat "$PM_STATE_DIR/review-target/$ot14_tid.env")"
+contains "orphaned target case 14: the target file holds the new head" "$ot14_rt" "SHA=$ot14_new"
+contains "orphaned target case 14: at the same version" "$ot14_rt" "VERSION=1"
+contains "orphaned target case 14: set by the postmaster" "$ot14_rt" "SET_BY=@postmaster"
+check "orphaned target case 14: the version's history pin is the new head" "$ot14_new" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$ot14_tid/review-v1" 2>/dev/null)"
+check "orphaned target case 14: no fetch-wait record is left" 0 \
+    "$(find "$PM_STATE_DIR/fetch-wait/$ot14_tid" -type f 2>/dev/null | wc -l)"
+
+# case 15: a seat already replied on the version -- flag at once, keep the target.
+ot15_branch="feature/rebased-after-review"
+ot15_old="$(fw_commit "$ot15_branch")"
+ot_kickoff "$ot15_branch" "$ot15_old"; ot15_tid="$OT_TID"; ot15_short="${ot15_tid:0:8}"
+ot15_reply="$(reply_msg '@kai' "$OT_MID" 'my review' --to '@carol')"
+ot15_file="$(grep -l "^Message-ID: $ot15_reply$" "$FORK_SANDBOX_MAIL_ROOT/threads/$ot15_tid"/*.msg)"
+sed -i "s/^X-Hops: .*/&\nX-AI-Persona: kai\nX-Version: 1/" "$ot15_file"
+ot15_new="$(ot_unrelated 15)"
+fw_sync "$ot15_branch" "$ot15_new"
+: > "$STUB_ARGV_LOG"
+reply_msg '@ci-demo' "$OT_MID" 'force-pushed' --to '@kai' --upstream-head "$ot15_branch:$ot15_new" >/dev/null
+once
+contains "orphaned target case 15: flagged at once, naming the orphan and the newest head" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$ot15_tid" 2>/dev/null)" \
+    "review target $ot15_branch $ot15_old orphaned by a force-push (newest head $ot15_branch $ot15_new)"
+contains "orphaned target case 15: with the review-target keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$ot15_short reason=review-target"
+check "orphaned target case 15: kai was not woken" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+contains "orphaned target case 15: the target is not moved" \
+    "$(cat "$PM_STATE_DIR/review-target/$ot15_tid.env")" "SHA=$ot15_old"
+check "orphaned target case 15: no fetch-wait record is left" 0 \
+    "$(find "$PM_STATE_DIR/fetch-wait/$ot15_tid" -type f 2>/dev/null | wc -l)"
+
+# case 16: a target that is merely lagging, with no newer head, still waits.
+ot16_branch="feature/just-lagging"
+ot16_sha="$(fw_commit "$ot16_branch")"
+ot_kickoff "$ot16_branch" "$ot16_sha"; ot16_tid="$OT_TID"
+not_contains "orphaned target case 16: no re-freeze without an upstream head" \
+    "$(cat "$work/once.out")" "review-target-refrozen"
+check "orphaned target case 16: the wait is pending, the thread unflagged" 1 \
+    "$( [[ -f "$(fw_file "$ot16_tid" kai)" && ! -e "$PM_STATE_DIR/needs-operator/$ot16_tid" ]] && echo 1 || echo 0 )"
 unset FORK_SANDBOX_POSTMASTER_FETCH_WINDOW
 
 refuses "fetch-miss: a non-numeric FETCH_WINDOW refuses deliver" \
@@ -5865,7 +5941,9 @@ contains "prior heads: the missing review version is reported" "$(cat "$work/onc
 contains "prior heads: the missing head is reported" "$(cat "$work/once.out")" \
     "pm review-history-missing thread=$ph2_short ref=head-$(head_id "$ph2_reply")"
 check "prior heads: the missing shas are not pinned" 0 \
-    "$(git -C "$PROJECT_DIR" for-each-ref "refs/fork-sandbox/review/$ph2_tid" | wc -l)"
+    "$(git -C "$PROJECT_DIR" for-each-ref "refs/fork-sandbox/review/$ph2_tid" | grep -cv '/review-v2$' || true)"
+check "prior heads: the current version is pinned from the state file" "$rt1_sha" \
+    "$(git -C "$PROJECT_DIR" rev-parse "refs/fork-sandbox/review/$ph2_tid/review-v2" 2>/dev/null)"
 check "prior heads: and the thread is not flagged" 0 \
     "$( [[ -e "$PM_STATE_DIR/needs-operator/$ph2_tid" ]] && echo 1 || echo 0 )"
 

@@ -291,9 +291,30 @@
 # once, the old behavior) have passed since the first miss, the thread is
 # flagged exactly as a miss always was (keyword upstream-head or
 # review-target) and the seat is not woken. A newer upstream-head
-# announcement supersedes a pending wait: its window starts fresh. A project
-# with no `origin` has nothing to wait for and flags at once. A thread that
-# is waiting is not quiescent; closing the upstream drops the wait.
+# announcement supersedes a pending wait of either kind: its window starts
+# fresh. A project with no `origin` has nothing to wait for and flags at
+# once. A thread that is waiting is not quiescent; closing the upstream drops
+# the wait.
+#
+# ORPHANED TARGET
+#
+# A force-push can orphan the review target before anyone reviews it: the
+# sha is in neither the project repo nor origin's branch, and only a new
+# version would move it. So before the review-target fetch gate, when the
+# target is missing (after one fetch) and the thread's upstream-head file
+# names a different sha announced no earlier than the target was set
+# (pm_review_target_orphan):
+#   - if no seat reply carries the current X-Version (a message stamped
+#     X-AI-Persona, not the one that set the version), the postmaster
+#     re-freezes the review-target file at the upstream head -- same
+#     VERSION, SET_BY=@postmaster, event `review-target-refrozen` -- and the
+#     wake goes on to the gate with the new sha and a fresh window. The
+#     version's review-v<N> pin is then taken from the state file, and an
+#     existing pin outranks the version's message in PRIOR HEADS;
+#   - otherwise a review would be discarded: the thread is flagged at once
+#     (keyword review-target, reason "review target <branch> <sha> orphaned
+#     by a force-push (newest head <branch> <sha>)") without spending the
+#     window.
 #
 # UPSTREAM STATE
 #
@@ -2961,8 +2982,13 @@ pm_review_history_refs() {
     local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env" current=""
     [[ -f "$rt_file" ]] && current="$(fs_pm_env_get "$rt_file" VERSION)"
     [[ "$current" =~ ^[0-9]+$ ]] || current=""
+    # The current target is pinned too (so a later version finds it) but
+    # not handed out. From the state file, not its message: a version
+    # re-frozen after a force-push (ORPHANED TARGET) has no message.
+    [[ -z "$current" ]] \
+        || pm_review_history_pin "$project" "$tid" "review-v$current" "$(fs_pm_env_get "$rt_file" SHA)"
     local -A seen=()
-    local f set_value version value from sha name branch
+    local f set_value version value from sha name branch pinned
     for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
         [[ -e "$f" ]] || continue
         if [[ -n "$current" ]]; then
@@ -2970,15 +2996,14 @@ pm_review_history_refs() {
             version="$(pm_header "$f" X-Version)"
             sha="${set_value#* }"
             if [[ -n "$set_value" && "$version" =~ ^[1-9][0-9]*$ ]] \
-                && [[ "$sha" =~ ^[0-9a-f]{40}$ && "$set_value" == "${set_value%% *} $sha" ]]; then
+                && [[ "$sha" =~ ^[0-9a-f]{40}$ && "$set_value" == "${set_value%% *} $sha" ]] \
+                && (( version < current )); then
                 name="review-v$version"
-                if (( version < current )); then
-                    pm_review_history_add "$project" "$tid" "$name" "$sha" seen "$3"
-                else
-                    # The current target is pinned too (so a later
-                    # version finds it) but not handed out.
-                    pm_review_history_pin "$project" "$tid" "$name" "$sha"
-                fi
+                # An existing pin wins over the message: it records what the
+                # version was actually reviewed at.
+                pinned="$(git -C "$project" rev-parse --verify --quiet \
+                    "refs/fork-sandbox/review/$tid/$name^{commit}" 2>/dev/null)" || pinned=""
+                pm_review_history_add "$project" "$tid" "$name" "${pinned:-$sha}" seen "$3"
             fi
         fi
     done
@@ -3125,16 +3150,64 @@ pm_fetch_wait_gate() {
 }
 
 # A newer upstream-head announcement for <tid> supersedes whatever fetch-miss
-# wait the thread's seats have pending: each is made due now and loses its
-# key, so the next check starts a fresh window on the newest head.
+# wait the thread's seats have pending, of either kind: each is made due now
+# and loses its key, so the next check starts a fresh window -- on the newest
+# head, or on a review target pm_review_target_orphan has just re-frozen.
 pm_fetch_wait_supersede() {
     local tid="$1" f
     for f in "$FETCH_WAIT/$tid"/*; do
         [[ -f "$f" ]] || continue
-        [[ "$(fs_pm_env_get "$f" KIND)" == upstream-head ]] || continue
         pm_fetch_wait_write "$tid" "$(basename -- "$f")" "$(fs_pm_env_get "$f" TRIGGER)" \
             "$(fs_pm_env_get "$f" RETRY)" "$(fs_pm_env_get "$f" KIND)" "" 0 0 0
     done
+}
+
+# A review target that a force-push orphaned (see ORPHANED TARGET in the
+# header). Called before the review-target fetch gate with the thread's
+# current target <sha>. Returns 1 when there is nothing to do: the sha is in
+# the project repo or on origin's branch, or no newer upstream head differs
+# from it. Returns 0 having re-frozen the current version at the newest
+# upstream head (no seat has replied on it yet; the caller re-reads the
+# target), and 2 having flagged the thread and dropped <agent>'s wait
+# instead (a seat has; the caller must not wake).
+pm_review_target_orphan() {
+    local project="$1" tid="$2" agent="$3" branch="$4" sha="$5"
+    local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env"
+    local uh_file="$MAIL_ROOT/.postmaster/upstream-head/$tid.env"
+    [[ -f "$rt_file" && -f "$uh_file" ]] || return 1
+    local uh_branch uh_sha version
+    uh_branch="$(fs_pm_env_get "$uh_file" BRANCH)"
+    uh_sha="$(fs_pm_env_get "$uh_file" SHA)"
+    version="$(fs_pm_env_get "$rt_file" VERSION)"
+    [[ "$uh_sha" =~ ^[0-9a-f]{40}$ && "$uh_sha" != "$sha" && -n "$uh_branch" ]] || return 1
+    # Same-format UTC stamps, so they compare as strings. A head announced
+    # before the target was set is history, not a replacement for it.
+    [[ "$(fs_pm_env_get "$uh_file" SET_AT)" < "$(fs_pm_env_get "$rt_file" SET_AT)" ]] && return 1
+    git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null && return 1
+    git -C "$project" remote get-url origin >/dev/null 2>&1 \
+        && pm_target_sha_present "$project" "$branch" "$sha" && return 1
+
+    local f replied=0
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] || continue
+        [[ -n "$(pm_header "$f" X-AI-Persona)" ]] || continue
+        [[ -z "$(pm_header "$f" X-Review-Target-Set)" ]] || continue
+        [[ "$(pm_header "$f" X-Version)" == "$version" ]] || continue
+        replied=1
+        break
+    done
+    if (( replied )); then
+        pm_fetch_wait_drop "$tid" "$agent"
+        pm_flag "$tid" "review target $branch $sha orphaned by a force-push (newest head $uh_branch $uh_sha)" review-target
+        return 2
+    fi
+    if ! pm_write_review_target "$tid" "$uh_branch" "$uh_sha" "$version" "@postmaster"; then
+        pm_fetch_wait_drop "$tid" "$agent"
+        pm_flag "$tid" "review target not re-frozen after a force-push" review-target
+        return 2
+    fi
+    pm_event "review-target-refrozen thread=${tid:0:8} version=$version from=${sha:0:12} to=${uh_sha:0:12}"
+    return 0
 }
 
 # Writes the per-thread review-target state file for <tid>, atomically
@@ -3846,6 +3919,15 @@ pm_spawn_wake() {
             rt_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
             rt_sha="$(fs_pm_env_get "$rt_file" SHA)"
             rt_version="$(fs_pm_env_get "$rt_file" VERSION)"
+            if [[ -n "$rt_sha" ]]; then
+                local orphan_rc=0
+                pm_review_target_orphan "$project" "$tid" "$agent" "$rt_branch" "$rt_sha" || orphan_rc=$?
+                (( orphan_rc != 2 )) || return 0
+                if (( orphan_rc == 0 )); then
+                    rt_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
+                    rt_sha="$(fs_pm_env_get "$rt_file" SHA)"
+                fi
+            fi
             if [[ -n "$rt_sha" ]] \
                 && ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" review-target "$rt_branch" "$rt_sha"; then
                 return 0
