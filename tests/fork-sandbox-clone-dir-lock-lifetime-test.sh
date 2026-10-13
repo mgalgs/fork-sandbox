@@ -35,6 +35,7 @@ repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 launcher="$repo_dir/scripts/fork-sandbox.sh"
 
 export FORK_SANDBOX_RUN_SOURCE=test
+operator_home="$HOME"
 
 real_tmux="$(command -v tmux)"
 if [[ -z "$real_tmux" ]]; then
@@ -131,9 +132,14 @@ export FS_TEST_TMUX_SOCKET="$tmux_socket"
 # rather than acquiring the lock from inside the runner it hands off to,
 # fails exactly in this configuration: the new session's processes are
 # children of this older server, which never had that fd.
-"$real_tmux" -L "$tmux_socket" new-session -d -s keepalive -- sleep 120
-
+#
+# The run's pane takes its environment from this server, not from the
+# launcher, so the server must get the fixture HOME: started with the
+# operator's, the run archives its handoff into the operator's real
+# ~/.claude/sandbox-handoffs.
 home="$(mktmp_dir "$scratch/fs-locklife-home.XXXXXX")"
+HOME="$home" "$real_tmux" -L "$tmux_socket" new-session -d -s keepalive -- sleep 120
+
 proj="$(new_project "$home")"
 clone="$(mktmp_dir "$scratch/fs-locklife-clone.XXXXXX")"
 rmdir "$clone"
@@ -276,9 +282,9 @@ if ! grep -q '.probe-before-fetch' "$instr_dir/fork-sandbox-runner.sh"; then
 else
     tmux_socket2="fs-locklife2-$$"
     export FS_TEST_TMUX_SOCKET="$tmux_socket2"
-    "$real_tmux" -L "$tmux_socket2" new-session -d -s keepalive -- sleep 120
-
     home2="$(mktmp_dir "$scratch/fs-locklife-home2.XXXXXX")"
+    HOME="$home2" "$real_tmux" -L "$tmux_socket2" new-session -d -s keepalive -- sleep 120
+
     proj2="$(new_project "$home2")"
     clone2="$(mktmp_dir "$scratch/fs-locklife-clone2.XXXXXX")"
     rmdir "$clone2"
@@ -359,9 +365,9 @@ chmod +x "$stub_bin/claude-sandboxed"
 
 tmux_socket3="fs-locklife3-$$"
 export FS_TEST_TMUX_SOCKET="$tmux_socket3"
-"$real_tmux" -L "$tmux_socket3" new-session -d -s keepalive -- sleep 120
-
 home3="$(mktmp_dir "$scratch/fs-locklife-home3.XXXXXX")"
+HOME="$home3" "$real_tmux" -L "$tmux_socket3" new-session -d -s keepalive -- sleep 120
+
 proj3="$(new_project "$home3")"
 clone3="$(mktmp_dir "$scratch/fs-locklife-clone3.XXXXXX")"
 rmdir "$clone3"
@@ -397,6 +403,25 @@ if [[ -n "$run_dir3" ]]; then
 else
     no "at least one sandbox invocation ran and reported its fd state" "no run dir to probe"
     no "no sandbox invocation inherits the workspace lock fd" "no run dir to probe"
+fi
+
+printf '\n== fixture runs leave nothing in the operator home ==\n'
+leaked=""
+for rd in "${run_dir:-}" "${run_dir2:-}" "${run_dir3:-}"; do
+    [[ -z "$rd" ]] && continue
+    archive="$operator_home/.claude/sandbox-handoffs/$(basename "$rd").md"
+    [[ -e "$archive" ]] && leaked+="$archive "
+done
+if [[ -z "$leaked" ]]; then
+    ok "no run archived its handoff into the operator's ~/.claude/sandbox-handoffs"
+else
+    no "no run archived its handoff into the operator's ~/.claude/sandbox-handoffs" "$leaked"
+fi
+if [[ -n "${run_dir:-}" && -e "$home/.claude/sandbox-handoffs/$(basename "$run_dir").md" ]]; then
+    ok "the first run archived its handoff into the fixture HOME instead"
+else
+    no "the first run archived its handoff into the fixture HOME instead" \
+        "$(ls -A "$home/.claude/sandbox-handoffs" 2>&1)"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
