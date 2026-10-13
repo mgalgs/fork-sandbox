@@ -164,6 +164,9 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/kai.md" <<'EOF'
 Kai is the review-target: follow backend: k8s seat, used by the review-target tests.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/kye.md" <<'EOF'
+Kye is kai's fellow review-target: follow seat, so a panel has two followers.
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
@@ -204,9 +207,14 @@ agents:
   kai:
     backend: k8s
     review-target: follow
+  kye:
+    backend: k8s
+    review-target: follow
 lists:
   team:
     members: [alice, bob, carol]
+  panel:
+    members: [kai, kye]
 EOF
 
 if ! "$FLEET" check >/dev/null 2>&1; then
@@ -5834,6 +5842,86 @@ not_contains "orphaned target case 16: no re-freeze without an upstream head" \
     "$(cat "$work/once.out")" "review-target-refrozen"
 check "orphaned target case 16: the wait is pending, the thread unflagged" 1 \
     "$( [[ -f "$(fw_file "$ot16_tid" kai)" && ! -e "$PM_STATE_DIR/needs-operator/$ot16_tid" ]] && echo 1 || echo 0 )"
+
+# ot_panel_v1 <branch> <sha>: a v1 To the two-follower panel, routed once.
+ot_panel_v1() {
+    printf '%s\n' 'v1' > "$work/body.tmp"
+    OT_MID="$("$MAIL" send --from '@carol' --to '@panel' --subject "panel v1 $1" \
+        --body "$work/body.tmp" --hops 8 --review-target "$1:$2" 2>/dev/null)"
+    OT_TID="$(thread_of "$OT_MID")"
+    : > "$STUB_ARGV_LOG"
+    once
+}
+# The distinct --checkout shas in the argv log.
+ot_checkouts() { awk '$0=="--checkout"{getline; print}' "$STUB_ARGV_LOG" | sort -u; }
+
+# case 17: a replay of a real panel that stalled. v1 is posted To the panel
+# at a head a force-push had already orphaned; both seats' windows lapse and
+# flag the thread; the new head is then announced To the `sets` seat only.
+# The re-freeze must wake the whole panel at the new head and clear the
+# flag, with no operator mail.
+ot17_branch="feature/replay-stall"
+ot17_old="$(fw_commit "$ot17_branch")"
+ot_panel_v1 "$ot17_branch" "$ot17_old"; ot17_tid="$OT_TID"; ot17_short="${ot17_tid:0:8}"
+for s in kai kye; do
+    contains "orphaned target case 17 setup: $s waits on the orphaned v1" \
+        "$(cat "$work/once.out")" "pm defer thread=$ot17_short agent=$s reason=fetch-miss attempt=1"
+    fw_set "$ot17_tid" "$s" SINCE "$(( $(date +%s) - 130 ))"
+    fw_set "$ot17_tid" "$s" NOT_BEFORE 0
+done
+once
+contains "orphaned target case 17 setup: the lapsed windows flag the thread" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$ot17_tid" 2>/dev/null)" \
+    "review target $ot17_branch $ot17_old not found in the project repo"
+check "orphaned target case 17 setup: no seat is left waiting" 0 \
+    "$(find "$PM_STATE_DIR/fetch-wait/$ot17_tid" -type f 2>/dev/null | wc -l)"
+ot17_new="$(ot_unrelated 17)"
+fw_sync "$ot17_branch" "$ot17_new"
+: > "$STUB_ARGV_LOG"
+reply_msg '@ci-demo' "$OT_MID" 'force-pushed' --to '@ken' --upstream-head "$ot17_branch:$ot17_new" >/dev/null
+once
+contains "orphaned target case 17: v1 is re-frozen at the new head" "$(cat "$work/once.out")" \
+    "pm review-target-refrozen thread=$ot17_short version=1 from=${ot17_old:0:12} to=${ot17_new:0:12}"
+contains "orphaned target case 17: both followers are queued" "$(cat "$work/once.out")" \
+    "pm review-target-refrozen-wake thread=$ot17_short agents=kai,kye"
+for s in ken kai kye; do
+    check "orphaned target case 17: $s spawns exactly once, in the same pass" 1 \
+        "$(grep -c "^pm spawn thread=$ot17_short agent=$s " "$work/once.out")"
+done
+contains "orphaned target case 17: the panel is at the new head" "$(ot_checkouts)" "$ot17_new"
+not_contains "orphaned target case 17: no seat at the orphaned head" "$(ot_checkouts)" "$ot17_old"
+# The announcement itself clears the lapsed wait's flag (an upstream head
+# resets the thread), so no operator mail is needed for that either.
+check "orphaned target case 17: the flag is cleared without an operator" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$ot17_tid" ]] && echo 1 || echo 0 )"
+check "orphaned target case 17: no fetch-wait record is left" 0 \
+    "$(find "$PM_STATE_DIR/fetch-wait/$ot17_tid" -type f 2>/dev/null | wc -l)"
+once
+not_contains "orphaned target case 17: a later pass re-freezes and queues nothing" \
+    "$(cat "$work/once.out")" "review-target-refrozen"
+
+# case 18: the same, but the head is announced while both seats still wait:
+# never flagged, and each seat wakes exactly once.
+ot18_branch="feature/replay-in-window"
+ot18_old="$(fw_commit "$ot18_branch")"
+ot_panel_v1 "$ot18_branch" "$ot18_old"; ot18_tid="$OT_TID"; ot18_short="${ot18_tid:0:8}"
+ot18_new="$(ot_unrelated 18)"
+fw_sync "$ot18_branch" "$ot18_new"
+: > "$STUB_ARGV_LOG"
+reply_msg '@ci-demo' "$OT_MID" 'force-pushed' --to '@ken' --upstream-head "$ot18_branch:$ot18_new" >/dev/null
+once
+not_contains "orphaned target case 18: waiting seats are not queued twice" \
+    "$(cat "$work/once.out")" "review-target-refrozen-wake"
+# Counted from this thread's events: other threads' stub replies wake seats
+# in the same pass.
+for s in ken kai kye; do
+    check "orphaned target case 18: $s spawns exactly once" 1 \
+        "$(grep -c "^pm spawn thread=$ot18_short agent=$s " "$work/once.out")"
+done
+contains "orphaned target case 18: the panel is at the new head" "$(ot_checkouts)" "$ot18_new"
+not_contains "orphaned target case 18: no seat at the orphaned head" "$(ot_checkouts)" "$ot18_old"
+check "orphaned target case 18: the thread was never flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator-journal/$ot18_tid" ]] && echo 1 || echo 0 )"
 unset FORK_SANDBOX_POSTMASTER_FETCH_WINDOW
 
 refuses "fetch-miss: a non-numeric FETCH_WINDOW refuses deliver" \

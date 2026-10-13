@@ -310,7 +310,11 @@
 #     VERSION, SET_BY=@postmaster, event `review-target-refrozen` -- and the
 #     wake goes on to the gate with the new sha and a fresh window. The
 #     version's review-v<N> pin is then taken from the state file, and an
-#     existing pin outranks the version's message in PRIOR HEADS;
+#     existing pin outranks the version's message in PRIOR HEADS. Every
+#     other `follow` seat the version's message names in To: is woken too,
+#     on that message (event `review-target-refrozen-wake`), unless it is
+#     already running, waiting on a fetch or held: no operator mail is ever
+#     needed to restart the panel;
 #   - otherwise a review would be discarded: the thread is flagged at once
 #     (keyword review-target, reason "review target <branch> <sha> orphaned
 #     by a force-push (newest head <branch> <sha>)") without spending the
@@ -3207,7 +3211,41 @@ pm_review_target_orphan() {
         return 2
     fi
     pm_event "review-target-refrozen thread=${tid:0:8} version=$version from=${sha:0:12} to=${uh_sha:0:12}"
+    pm_refreeze_queue_followers "$tid" "$agent" "$version"
     return 0
+}
+
+# After a re-freeze, every `follow` seat the version's message addressed To:
+# must review the new sha, but nothing else will wake it: the mail that
+# triggered the re-freeze may name only the `sets` seat, and a seat whose
+# fetch window ran out was flagged and dropped. Each such seat is queued as a
+# due fetch-wait record on the version's message, so pm_fetch_wait_pass wakes
+# it through pm_followup_wake's gates. <agent> (whose own wake goes on) is
+# skipped, as is a seat already running, waiting or held.
+pm_refreeze_queue_followers() {
+    local tid="$1" agent="$2" version="$3" f vmid="" vto=""
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] || continue
+        [[ -n "$(pm_header "$f" X-Review-Target-Set)" ]] || continue
+        [[ "$(pm_header "$f" X-Version)" == "$version" ]] || continue
+        vmid="$(pm_header "$f" Message-ID)"
+        vto="$(pm_header "$f" To)"
+    done
+    [[ -n "$vmid" ]] || return 0
+    local PM_EXPAND_UNRESOLVED_FILE="" seat rt
+    local -a queued=()
+    while IFS= read -r seat; do
+        [[ -n "$seat" && "$seat" != "$agent" ]] || continue
+        [[ -e "$FETCH_WAIT/$tid/$seat" || -e "$STATE/held/$tid/$seat" ]] && continue
+        fs_pm_find_live_run "$seat" "$tid" >/dev/null && continue
+        # The 16th line of `fleet resolve` is review-target (see pm_spawn_wake).
+        rt="$("$FLEET" resolve "$seat" 2>/dev/null | sed -n 16p)" || continue
+        [[ "$rt" == follow ]] || continue
+        pm_fetch_wait_write "$tid" "$seat" "$vmid" 0 review-target "" 0 0 0
+        queued+=("$seat")
+    done < <(pm_expand_to "$vto")
+    (( ${#queued[@]} )) || return 0
+    pm_event "review-target-refrozen-wake thread=${tid:0:8} agents=$(IFS=,; printf '%s' "${queued[*]}")"
 }
 
 # Writes the per-thread review-target state file for <tid>, atomically
