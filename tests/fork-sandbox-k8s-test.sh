@@ -24196,5 +24196,170 @@ else
         "rc=$runner_probe_rc log=$(cat "$runner_probe_log") out=$(cat "$runner_probe_out")"
 fi
 
+printf '\n== install --postmaster --image ==\n'
+pm_img_cfg="$(pm_api_cfg)"
+refuses "--image without --postmaster is refused" "--image goes with install --postmaster" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG=/dev/null FORK_SANDBOX_CONFIG_DIR="$pm_img_cfg" \
+    "$k8s_sh" install --dry-run --image registry.example/you/fork-sandbox-postmaster:ffff
+refuses "an --image that is not an image reference is refused" "is not an image" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG=/dev/null FORK_SANDBOX_CONFIG_DIR="$pm_img_cfg" \
+    "$k8s_sh" install --postmaster --dry-run --image 'registry.example/x:a|b'
+pm_img_out="$(env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG=/dev/null FORK_SANDBOX_CONFIG_DIR="$pm_img_cfg" \
+    "$k8s_sh" install --postmaster --dry-run --image registry.example/other/pm:override1 2>/dev/null)"
+check "--image sets both containers' image, overriding K8S_POSTMASTER_IMAGE" \
+    "mail-api=registry.example/other/pm:override1 postmaster=registry.example/other/pm:override1" \
+    "$(yq -r 'select(.kind == "Deployment" and .metadata.name == "fork-sandbox-postmaster")
+        | .spec.template.spec.containers[] | "\(.name)=\(.image)"' <<< "$pm_img_out" | sort | paste -sd' ')"
+check "--image leaves k8s.env untouched" "1" \
+    "$(grep -cxF 'K8S_POSTMASTER_IMAGE=registry.example/you/fork-sandbox-postmaster:abc1234' "$pm_img_cfg/k8s.env")"
+
+printf '\n== upgrade-postmaster ==\n'
+# A git checkout holding the working tree's tracked files, so the verb's
+# own repo checks (clean, reachable from main) and the tag it derives run
+# against a fixture repo, not this one.
+up_repo="$(newdir)"; tmpdirs+=("$up_repo")
+git -C "$repo_dir" ls-files -z | tar -C "$repo_dir" --null -T - -cf - | tar -C "$up_repo" -xf -
+up_git() { git -C "$up_repo" -c user.name=t -c user.email=t@example.invalid "$@"; }
+up_git init -q -b main
+up_git add -A
+up_git commit -q -m fixture
+up_git update-ref refs/remotes/origin/main HEAD
+up_git checkout -q --detach
+up_sha="$(up_git rev-parse --short=10 HEAD)"
+up_ref="registry.example/you/fork-sandbox-postmaster:$up_sha"
+up_sh="$up_repo/scripts/fork-sandbox-k8s.sh"
+
+up_stub="$(newdir)"; tmpdirs+=("$up_stub")
+cat > "$up_stub/docker" <<'STUB'
+#!/usr/bin/env bash
+printf 'docker %s\n' "$*" >> "$UP_DOCKER_LOG"
+[[ "$1" == "${UP_DOCKER_FAIL:-}" ]] && exit 1
+exit 0
+STUB
+cat > "$up_stub/kubectl" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do
+    case "$a" in
+        rollout) printf '%s\n' "$*" >> "$K8S_STUB_LOG"; exit "${UP_ROLLOUT_RC:-0}" ;;
+        pods) printf '%s\n' "$*" >> "$K8S_STUB_LOG"; cat "${UP_PODS_FILE:-$UP_PODS_JSON}"; exit 0 ;;
+    esac
+done
+exec "$PM_STUB" "$@"
+STUB
+chmod +x "$up_stub/docker" "$up_stub/kubectl"
+
+# up_pods <file> <name=image:ready>...: one live pod plus one terminating
+# pod still on the old image, which verify must ignore.
+up_pods() {
+    local file="$1" spec c n rest
+    shift
+    spec="[]"
+    for c in "$@"; do
+        n="${c%%=*}"; rest="${c#*=}"
+        spec="$(jq -c --arg n "$n" --arg i "${rest%:*}" --argjson r "${rest##*:}" \
+            '. + [{name: $n, image: $i, ready: $r}]' <<< "$spec")"
+    done
+    jq -n --argjson c "$spec" '{items: [
+        {metadata: {name: "pm-old", deletionTimestamp: "2026-01-01T00:00:00Z"},
+         spec: {containers: [{name: "postmaster", image: "old"}]},
+         status: {containerStatuses: [{name: "postmaster", image: "old", ready: true}]}},
+        {metadata: {name: "pm-new"},
+         spec: {containers: [$c[] | {name, image}]},
+         status: {containerStatuses: $c}}]}' > "$file"
+}
+
+up_cfg="$(pm_api_cfg "K8S_POSTMASTER_BASE_IMAGE=registry.example/you/fork-sandbox:base")"
+up_out="" up_rc=0 up_wd=""
+# up_run <cfgdir> [VAR=value ...]: run the verb; stderr+stdout in $up_out.
+up_run() {
+    local cfg="$1"; shift
+    up_wd="$(newdir)"; tmpdirs+=("$up_wd")
+    [[ -f "$up_wd/pods.json" ]] || up_pods "$up_wd/pods.json" \
+        "postmaster=$up_ref:true" "mail-api=$up_ref:true"
+    up_out="$(env PATH="$up_stub:$PATH" PM_STUB="$pm_stub_bin/kubectl" \
+        K8S_STUB_LOG="$up_wd/kubectl.log" K8S_STUB_APPLY_CAPTURE="$up_wd/applied.yaml" \
+        UP_DOCKER_LOG="$up_wd/docker.log" UP_PODS_JSON="$up_wd/pods.json" \
+        FORK_SANDBOX_CONFIG_DIR="$cfg" "$@" "$up_sh" upgrade-postmaster 2>&1)"
+    up_rc=$?
+    touch "$up_wd/kubectl.log" "$up_wd/docker.log" "$up_wd/applied.yaml"
+}
+up_failed_at() { # <label> <step> [needle]
+    if (( up_rc != 0 )) && [[ "$up_out" == *"failed at step '$2'"* && "$up_out" == *"${3:-}"* ]]; then
+        ok "$1"
+    else
+        no "$1" "rc=$up_rc: $up_out"
+    fi
+}
+
+up_run "$up_cfg"
+if (( up_rc == 0 )); then ok "upgrade-postmaster succeeds end to end"; else no "upgrade-postmaster succeeds end to end" "$up_out"; fi
+check "it builds on K8S_POSTMASTER_BASE_IMAGE, tagged with HEAD's 10-char sha in K8S_POSTMASTER_IMAGE's repository" \
+    "1" "$(grep -cF "docker build --tag $up_ref --file $up_repo/images/postmaster/Dockerfile --build-arg BASE_IMAGE=registry.example/you/fork-sandbox:base" "$up_wd/docker.log")"
+check "it pushes that ref" "1" "$(grep -cxF "docker push $up_ref" "$up_wd/docker.log")"
+check "the Deployment it applies runs that ref in both containers" \
+    "mail-api=$up_ref postmaster=$up_ref" \
+    "$(yq -r 'select(.kind == "Deployment" and .metadata.name == "fork-sandbox-postmaster")
+        | .spec.template.spec.containers[] | "\(.name)=\(.image)"' "$up_wd/applied.yaml" 2>/dev/null | sort | paste -sd' ')"
+check "it waits for the rollout" "1" \
+    "$(grep -c 'rollout status deployment/fork-sandbox-postmaster --timeout=10m' "$up_wd/kubectl.log")"
+check "it reports both containers ready, ignoring the terminating pod" "1" \
+    "$(grep -cF "postmaster,mail-api ready on $up_ref" <<< "$up_out")"
+check "it says k8s.env still names the old image" "1" \
+    "$(grep -cF 'k8s.env still names registry.example/you/fork-sandbox-postmaster:abc1234' <<< "$up_out")"
+check "k8s.env is not written" "1" \
+    "$(grep -cxF 'K8S_POSTMASTER_IMAGE=registry.example/you/fork-sandbox-postmaster:abc1234' "$up_cfg/k8s.env")"
+
+up_cfg_nobase="$(pm_api_cfg)"
+up_run "$up_cfg_nobase"
+up_failed_at "no K8S_POSTMASTER_BASE_IMAGE: refused at preflight" preflight K8S_POSTMASTER_BASE_IMAGE
+check "no K8S_POSTMASTER_BASE_IMAGE: nothing built" "0" "$(grep -c . "$up_wd/docker.log")"
+
+printf 'scratch\n' > "$up_repo/untracked.txt"
+up_run "$up_cfg"
+up_failed_at "an untracked file: refused at preflight" preflight "uncommitted or untracked"
+check "an untracked file: nothing built" "0" "$(grep -c . "$up_wd/docker.log")"
+rm -f "$up_repo/untracked.txt"
+printf '# edit\n' >> "$up_repo/README.md"
+up_run "$up_cfg"
+up_failed_at "a modified file: refused at preflight" preflight "uncommitted or untracked"
+up_git checkout -q -- README.md
+
+up_git checkout -q -b feature
+up_git commit -q --allow-empty -m unmerged
+up_run "$up_cfg"
+up_failed_at "HEAD not reachable from origin/main: refused at preflight" preflight "not reachable from origin/main"
+check "HEAD not reachable from origin/main: nothing built" "0" "$(grep -c . "$up_wd/docker.log")"
+up_git checkout -q --detach main
+
+up_bad_cfg="$(pm_api_cfg "K8S_POSTMASTER_BASE_IMAGE=registry.example/you/fork-sandbox:base")"
+sed -i '/^K8S_POSTMASTER_REPO_URL=/d' "$up_bad_cfg/k8s.env"
+up_run "$up_bad_cfg"
+up_failed_at "a config install would refuse: refused at preflight, before a build" preflight "refused the config"
+check "a config install would refuse: nothing built" "0" "$(grep -c . "$up_wd/docker.log")"
+
+up_run "$up_cfg" UP_DOCKER_FAIL=build
+up_failed_at "a failed build names the build step" build
+check "a failed build pushes nothing" "0" "$(grep -c 'docker push' "$up_wd/docker.log")"
+
+up_run "$up_cfg" UP_DOCKER_FAIL=push
+up_failed_at "a failed push names the push step" push
+check "a failed push applies nothing" "0" "$(grep -c '^applied:' "$up_wd/kubectl.log")"
+
+up_run "$up_cfg" UP_ROLLOUT_RC=1
+up_failed_at "a rollout that does not finish names the rollout step" rollout
+
+up_stale_pods="$(newdir)/pods.json"; tmpdirs+=("$(dirname "$up_stale_pods")")
+up_pods "$up_stale_pods" "postmaster=$up_ref:true" "mail-api=registry.example/you/fork-sandbox-postmaster:abc1234:true"
+up_run "$up_cfg" UP_PODS_FILE="$up_stale_pods"
+up_failed_at "a container on another image fails verify, naming it" verify "pm-new/mail-api: spec=registry.example/you/fork-sandbox-postmaster:abc1234"
+
+up_pods "$up_stale_pods" "postmaster=$up_ref:true" "mail-api=$up_ref:false"
+up_run "$up_cfg" UP_PODS_FILE="$up_stale_pods"
+up_failed_at "a container that is not ready fails verify" verify "pm-new/mail-api: spec=$up_ref running=$up_ref ready=false"
+
+up_pods "$up_stale_pods" "postmaster=$up_ref:true"
+up_run "$up_cfg" UP_PODS_FILE="$up_stale_pods"
+up_failed_at "with the mail API configured, a pod without mail-api fails verify" verify "no 'mail-api' container"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

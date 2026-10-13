@@ -2,6 +2,9 @@
 # fork-sandbox-k8s.sh -- run a sandboxed agent as a Kubernetes Job
 #
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
+#        fork-sandbox-k8s.sh install [--dry-run] --postmaster [--image REF]
+#                            [--rotate-team-token]
+#        fork-sandbox-k8s.sh upgrade-postmaster [--timeout DURATION]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME [--model MODEL]
 #                            [--endpoint NAME] [--harness pi|claude|codex]
 #                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
@@ -83,6 +86,20 @@
 # fork-sandbox-mail-team, lets a teammate port-forward to the API and read
 # that one Secret; it is bound to nobody unless K8S_MAIL_TEAM_SUBJECTS is
 # set. See docs/mail-api.md, "Team access".
+#
+# install --postmaster --image REF deploys REF instead of
+# K8S_POSTMASTER_IMAGE, for one invocation; k8s.env is never written.
+#
+# upgrade-postmaster rolls the cluster postmaster to this checkout's HEAD in
+# one command, naming the step that failed: preflight (a clean tree whose
+# HEAD is reachable from origin/main, or main when there is no origin/main),
+# build (build-sandbox-image.sh --postmaster on K8S_POSTMASTER_BASE_IMAGE),
+# push, install (install --postmaster --image), rollout (`kubectl rollout
+# status`, --timeout, default 10m) and verify (every container of the
+# running pod is ready on the new image). The image is K8S_POSTMASTER_IMAGE's
+# repository tagged with HEAD's 10-character sha; that key's own tag is
+# ignored, so a later plain install --postmaster still deploys whatever tag
+# k8s.env names. See docs/cluster-postmaster.md, "Updating".
 #
 # submit renders a Job for one run, applies it, pushes the project's repo
 # into the pod over the same `kubectl exec` channel the work later returns
@@ -799,13 +816,22 @@
 #                         key-by-key by --label on a given invocation. See
 #                         --label above.
 #
-# The following keys are read only by `install --postmaster` and by the
-# postmaster pod's own init step; no other verb or key changes behavior
+# The following keys are read only by `install --postmaster`,
+# `upgrade-postmaster` and the postmaster pod's own init step; no other verb
+# or key changes behavior
 # based on them. See docs/cluster-postmaster.md.
 #   K8S_POSTMASTER_IMAGE= the image ref scripts/build-sandbox-image.sh
 #                         --postmaster built and you pushed. REQUIRED with
 #                         --postmaster, never defaulted, same reasoning as
-#                         K8S_IMAGE above.
+#                         K8S_IMAGE above. upgrade-postmaster reads only its
+#                         repository (the part before the tag) and pushes
+#                         there.
+#   K8S_POSTMASTER_BASE_IMAGE=
+#                         the plain sandbox image upgrade-postmaster builds
+#                         the postmaster image on (build-sandbox-image.sh
+#                         --postmaster --base). REQUIRED by
+#                         upgrade-postmaster. Not K8S_IMAGE, which may be a
+#                         project's own seat image.
 #   K8S_POSTMASTER_REPO_URL=
 #                         ssh URL of the project repo the postmaster pod
 #                         clones: ssh://[user@]host[:port]/path or the
@@ -1217,6 +1243,7 @@ K8S_RUN_LABELS="$(read_env_value "$k8s_env" K8S_RUN_LABELS || true)"
 # cmd_install, gated on --postmaster, so a plain install or any other verb
 # never fails over a key it does not use. See the header table above.
 K8S_POSTMASTER_IMAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_IMAGE || true)"
+K8S_POSTMASTER_BASE_IMAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_BASE_IMAGE || true)"
 K8S_POSTMASTER_REPO_URL="$(read_env_value "$k8s_env" K8S_POSTMASTER_REPO_URL || true)"
 K8S_POSTMASTER_PROJECT="$(read_env_value "$k8s_env" K8S_POSTMASTER_PROJECT || true)"
 K8S_POSTMASTER_GIT_KEY_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_GIT_KEY_FILE || true)"
@@ -1459,7 +1486,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE" "$K8S_AGENT_LIMITS_EPHEMERAL_STORAGE" \
         "$K8S_AGENT_PRIORITY_CLASS" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
-        "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
+        "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_BASE_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
         "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
         "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_MAIL_STORAGE" \
@@ -3672,18 +3699,26 @@ pm_plan_team_token() {
 }
 
 cmd_install() {
-    local dry_run=false postmaster=false rotate_team=false
+    local dry_run=false postmaster=false rotate_team=false image_override=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --postmaster) postmaster=true; shift ;;
             --rotate-team-token) rotate_team=true; shift ;;
+            --image) image_override="${2:?--image requires an image reference}"; shift 2 ;;
             *) echo "Error: unknown option '$1' for install." >&2; exit 1 ;;
         esac
     done
     if $rotate_team && ! $postmaster; then
         echo "Error: --rotate-team-token goes with install --postmaster." >&2
         exit 1
+    fi
+    if [[ -n "$image_override" ]]; then
+        if ! $postmaster; then
+            echo "Error: --image goes with install --postmaster." >&2
+            exit 1
+        fi
+        K8S_POSTMASTER_IMAGE="$image_override"
     fi
 
     if [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && ! $dry_run && ! kubectl get priorityclass "$K8S_AGENT_PRIORITY_CLASS" >/dev/null 2>&1; then
@@ -3736,6 +3771,13 @@ cmd_install() {
             echo "--postmaster needs the image ref build-sandbox-image.sh" >&2
             echo "--postmaster built and you pushed. Add a line:" >&2
             echo "  K8S_POSTMASTER_IMAGE=registry.example/you/fork-sandbox-postmaster:abc1234" >&2
+            exit 1
+        fi
+        # Lands unquoted in a sed replacement and a YAML scalar: this shape
+        # admits no '|', '&', space or quote.
+        if [[ ! "$K8S_POSTMASTER_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$ ]]; then
+            echo "Error: postmaster image '$K8S_POSTMASTER_IMAGE' is not an image" >&2
+            echo "reference (registry/repo:tag or registry/repo@sha256:...)." >&2
             exit 1
         fi
         if [[ -z "$K8S_POSTMASTER_REPO_URL" ]]; then
@@ -4974,6 +5016,114 @@ cmd_install() {
     fi
 
     echo "fork-sandbox-k8s: installed into namespace $K8S_NAMESPACE" >&2
+}
+
+upgrade_fail() {
+    local step="$1"; shift
+    echo "Error: upgrade-postmaster failed at step '$step'." >&2
+    (( $# )) && printf '%s\n' "$@" >&2
+    exit 1
+}
+
+cmd_upgrade_postmaster() {
+    local timeout=10m
+    while (( $# )); do
+        case "$1" in
+            --timeout) timeout="${2:?--timeout requires a duration}"; shift 2 ;;
+            *) echo "Error: unknown option '$1' for upgrade-postmaster." >&2; exit 1 ;;
+        esac
+    done
+    [[ "$timeout" =~ ^[1-9][0-9]*[smh]?$ ]] || \
+        upgrade_fail preflight "--timeout must be a duration such as 600s, 10m or 1h, got '$timeout'."
+
+    local self="$script_dir/fork-sandbox-k8s.sh" repo_root cli="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
+    repo_root="$(dirname "$script_dir")"
+
+    echo "upgrade-postmaster: preflight" >&2
+    [[ -n "$K8S_POSTMASTER_BASE_IMAGE" ]] || upgrade_fail preflight \
+        "K8S_POSTMASTER_BASE_IMAGE is not set in $k8s_env: name the plain sandbox" \
+        "image to build on (build-sandbox-image.sh without --postmaster)."
+    [[ -n "$K8S_POSTMASTER_IMAGE" ]] || upgrade_fail preflight \
+        "K8S_POSTMASTER_IMAGE is not set in $k8s_env; its repository is where" \
+        "the new image is pushed."
+    git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
+        upgrade_fail preflight "$repo_root is not a git checkout."
+    [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || upgrade_fail preflight \
+        "$repo_root has uncommitted or untracked files; the image would not match its tag."
+    local main_ref
+    if git -C "$repo_root" rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
+        main_ref=origin/main
+    elif git -C "$repo_root" rev-parse -q --verify refs/heads/main >/dev/null; then
+        main_ref=main
+    else
+        upgrade_fail preflight "$repo_root has neither origin/main nor main to check HEAD against."
+    fi
+    git -C "$repo_root" merge-base --is-ancestor HEAD "$main_ref" || upgrade_fail preflight \
+        "HEAD is not reachable from $main_ref; deploy only what has merged."
+
+    # Fixed length, not --short: git scales the default with the object
+    # count, so a shallow clone of the same commit would get another tag.
+    local sha repo ref
+    sha="$(git -C "$repo_root" rev-parse --short=10 HEAD)"
+    repo="${K8S_POSTMASTER_IMAGE%%@*}"
+    [[ "${repo##*/}" == *:* ]] && repo="${repo%:*}"
+    ref="$repo:$sha"
+    echo "upgrade-postmaster: target $ref" >&2
+
+    "$self" install --postmaster --image "$ref" --dry-run >/dev/null || \
+        upgrade_fail preflight "install --postmaster --dry-run refused the config (above)."
+
+    echo "upgrade-postmaster: build" >&2
+    "$script_dir/build-sandbox-image.sh" --postmaster \
+        --base "$K8S_POSTMASTER_BASE_IMAGE" --tag "$ref" || upgrade_fail build
+
+    echo "upgrade-postmaster: push" >&2
+    "$cli" push "$ref" || upgrade_fail push
+
+    echo "upgrade-postmaster: install" >&2
+    "$self" install --postmaster --image "$ref" || upgrade_fail install \
+        "$ref is pushed; the cluster may hold part of the install. Re-run once fixed."
+
+    echo "upgrade-postmaster: rollout" >&2
+    kubectl rollout status deployment/fork-sandbox-postmaster --timeout="$timeout" || \
+        upgrade_fail rollout "kubectl -n $K8S_NAMESPACE describe deployment/fork-sandbox-postmaster says why."
+
+    echo "upgrade-postmaster: verify" >&2
+    local pods_json rows
+    pods_json="$(kubectl get pods -l app=fork-sandbox-postmaster -o json)" || \
+        upgrade_fail verify "could not list the postmaster pods."
+    rows="$(jq -r '.items[] | select(.metadata.deletionTimestamp == null)
+        | .metadata.name as $pod | (.status.containerStatuses // []) as $st
+        | .spec.containers[] | .name as $n
+        | ([$st[] | select(.name == $n)][0] // {}) as $s
+        | [$pod, $n, .image, ($s.image // ""), ($s.ready // false | tostring)] | @tsv' \
+        <<< "$pods_json")" || upgrade_fail verify "could not read the pod list."
+    local pods
+    pods="$(cut -f1 <<< "$rows" | sort -u | grep -c . || true)"
+    (( pods == 1 )) || upgrade_fail verify "expected one live postmaster pod, found $pods."
+    local -a want=(postmaster)
+    [[ -z "$K8S_MAIL_API_TOKENS_FILE$K8S_MAIL_API_TOKENS_SECRET" ]] || want+=(mail-api)
+    local name
+    for name in "${want[@]}"; do
+        cut -f2 <<< "$rows" | grep -qxF "$name" || \
+            upgrade_fail verify "the pod has no '$name' container."
+    done
+    local pod spec_image run_image ready bad=()
+    while IFS=$'\t' read -r pod name spec_image run_image ready; do
+        # The runtime may report a normalized name (docker.io/... prefix).
+        if [[ "$spec_image" != "$ref" ]] || \
+            [[ "$run_image" != "$ref" && "$run_image" != */"$ref" ]] || \
+            [[ "$ready" != true ]]; then
+            bad+=("  $pod/$name: spec=$spec_image running=${run_image:-none} ready=$ready")
+        fi
+    done <<< "$rows"
+    (( ${#bad[@]} == 0 )) || upgrade_fail verify "not every container runs $ref and is ready:" "${bad[@]}"
+
+    echo "upgrade-postmaster: $(cut -f2 <<< "$rows" | paste -sd, -) ready on $ref" >&2
+    if [[ "$K8S_POSTMASTER_IMAGE" != "$ref" ]]; then
+        echo "Note: k8s.env still names $K8S_POSTMASTER_IMAGE; a plain" >&2
+        echo "install --postmaster would deploy that image, not $ref." >&2
+    fi
 }
 
 # Shared by --thread-dir and --attach-dir (Section 1 of the thread/attach
@@ -11179,6 +11329,7 @@ shift
 
 case "$verb" in
     install) cmd_install "$@" ;;
+    upgrade-postmaster) cmd_upgrade_postmaster "$@" ;;
     submit) cmd_submit "$@"; k8s_note_standalone_submit_keeper ;;
     run) cmd_run "$@" ;;
     resume) cmd_resume "$@" ;;
@@ -11189,7 +11340,7 @@ case "$verb" in
     rm) cmd_rm "$@" ;;
     check-grant) cmd_check_grant "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, submit, run, resume, wait, collect, fetch, say, rm or check-grant." >&2
+        echo "Error: unknown command '$verb'. Use install, upgrade-postmaster, submit, run, resume, wait, collect, fetch, say, rm or check-grant." >&2
         exit 1
         ;;
 esac

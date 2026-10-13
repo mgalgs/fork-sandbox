@@ -61,6 +61,7 @@ Do these in order.
    | key | required | meaning |
    |---|---|---|
    | `K8S_POSTMASTER_IMAGE` | yes | the image ref step 1 built and you pushed |
+   | `K8S_POSTMASTER_BASE_IMAGE` | for `upgrade-postmaster` | the plain sandbox image step 1 layered on; see "Updating" |
    | `K8S_POSTMASTER_REPO_URL` | yes | ssh URL of the project repo: `ssh://[user@]host[:port]/path` or the scp-like `user@host:path` form. Anything else (`https://`, a bare hostname) is refused. |
    | `K8S_POSTMASTER_PROJECT` | no | directory name under `$HOME/src` in the pod; defaults to the URL's last path component with a trailing `.git` stripped. Must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, so it can never be `.` or `..`. A `K8S_PROJECT_IMAGES` entry (see "Per-project and per-run images" in [docs/kubernetes-runs.md](kubernetes-runs.md)) keys on this same name, since a run the postmaster spawns resolves its default image from the project path it was handed, the same as any other run. |
    | `K8S_POSTMASTER_GIT_KEY_FILE` | yes, unless `K8S_POSTMASTER_GIT_SECRET` | laptop path to the deploy private key from step 2 |
@@ -166,8 +167,34 @@ Do these in order.
   `K8S_POSTMASTER_GIT_KEY_FILE` (or `K8S_POSTMASTER_KNOWN_HOSTS_FILE`) and
   run `install --postmaster` again. The Secret is part of the checksum, so
   the pod rolls and picks the new key up at init.
-- **A new fork-sandbox version** needs a new postmaster image and a new
-  `K8S_POSTMASTER_IMAGE` in `k8s.env`, then `install --postmaster` again.
+- **A new fork-sandbox version** needs a new postmaster image. From a
+  clean checkout of the version to deploy, one command does the whole
+  sequence:
+
+  ```
+  scripts/fork-sandbox-k8s.sh upgrade-postmaster [--timeout 10m]
+  ```
+
+  It needs `K8S_POSTMASTER_BASE_IMAGE` in `k8s.env`: the plain sandbox
+  image from setup step 1, never `K8S_IMAGE`. The new image is
+  `K8S_POSTMASTER_IMAGE`'s repository, tagged with HEAD's 10-character sha.
+  That key's own tag is ignored. The command runs these steps and, on
+  failure, names the step that failed:
+
+  | step | what it does |
+  |---|---|
+  | preflight | refuses untracked or uncommitted files, and a HEAD not reachable from `origin/main` (or `main` when there is no `origin/main`; a detached checkout of a merged sha passes). Then it runs `install --postmaster --dry-run` against the new image, so a config error stops it before a build. |
+  | build | `build-sandbox-image.sh --postmaster --base "$K8S_POSTMASTER_BASE_IMAGE"` |
+  | push | pushes the image with `$FORK_SANDBOX_CONTAINER_CLI` (default `docker`); the registry login is yours |
+  | install | `install --postmaster --image <ref>` |
+  | rollout | `kubectl rollout status deployment/fork-sandbox-postmaster` |
+  | verify | the one live pod runs every container (postmaster, and mail-api when the mail API is configured) ready on the new image |
+
+  `k8s.env` is never written. `install --postmaster --image <ref>` deploys
+  `<ref>` for that one install. Afterwards, `K8S_POSTMASTER_IMAGE` still
+  names the old tag, and a later plain `install --postmaster` would deploy
+  that tag. Either bump the key, or keep running config changes through
+  `upgrade-postmaster` too.
 - **New commits on the project repo** reach the pod only at pod start: the
   pod init clones once (or, on a restart, fetches and fast-forwards the
   existing clone to `origin`'s tip) and the postmaster itself never fetches
