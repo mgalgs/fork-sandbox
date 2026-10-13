@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck extended-analysis=false  # dataflow analysis of this file exceeds the 3G lint budget
 # fork-sandbox.sh — Run one unattended headless agent session in a sandboxed clone
 #
 # Usage: fork-sandbox.sh [options] <project-path> <handoff-file>
@@ -1766,8 +1767,8 @@ fi
 
 usage() {
     # The header block is the documentation: print it from line 2 down to the
-    # first non-comment line.
-    sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"
+    # first non-comment line, minus shellcheck directives.
+    sed -n '2,/^[^#]/{ /^# shellcheck /d; /^#/s/^# \?//p }' "$0"
 }
 
 display_config_path() {
