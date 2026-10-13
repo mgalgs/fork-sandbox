@@ -816,6 +816,12 @@
 #                         remote. REQUIRED with --postmaster and must be
 #                         non-empty: the pod never trusts a host on first
 #                         use.
+#   K8S_POSTMASTER_GIT_SECRET=
+#                         name of a Secret YOU create in K8S_NAMESPACE with
+#                         keys deploy-key and known_hosts, used instead of
+#                         the two file keys above (setting both is
+#                         refused). install only names it in the
+#                         Deployment; see "Secrets by reference" below.
 #   K8S_POSTMASTER_STORAGE_CLASS=
 #                         the storageClassName of both postmaster PVCs.
 #                         Optional; empty (the default) omits the field
@@ -880,6 +886,14 @@
 #                         `fork-sandbox-mail-api.py check` under
 #                         K8S_POSTMASTER_OPERATORS -- install refuses
 #                         otherwise. Rotating its content rolls the pod.
+#   K8S_MAIL_API_TOKENS_SECRET=
+#                         name of a Secret YOU create in K8S_NAMESPACE with
+#                         key tokens, used instead of
+#                         K8S_MAIL_API_TOKENS_FILE (setting both is
+#                         refused); it deploys the mail API the same way.
+#                         install keeps the team token's hash in a Secret
+#                         of its own (fork-sandbox-mail-api-team-hash),
+#                         mounted beside the tokens.
 #   K8S_MAIL_TEAM_SUBJECTS=
 #                         who may use the team token: comma-separated
 #                         user:<name> and group:<name> entries, no spaces,
@@ -916,6 +930,23 @@
 #                         when it expires. See docs/cluster-postmaster.md,
 #                         "Claude seats in a cluster postmaster". Rotating
 #                         its content rolls the pod.
+#   K8S_POSTMASTER_CLAUDE_SECRET=
+#                         name of a Secret YOU create in K8S_NAMESPACE with
+#                         key credentials.json, used instead of
+#                         K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE (setting
+#                         both, or this and the pool, is refused). Mounted
+#                         and announced to `fleet check` exactly as the
+#                         file is; the 7-day expiry check is yours to make.
+#
+#   Secrets by reference (the three *_SECRET keys above and
+#   K8S_POSTMASTER_HOOKS_SECRET): install never creates, reads or prints a
+#   referenced Secret, and it is not in the pod's config checksum, so
+#   changing its content does not roll the pod -- run `kubectl rollout
+#   restart` after a rotation. A missing Secret or key shows up as a pod
+#   that never starts. Each name must be a DNS-1123 subdomain other than
+#   this installer's own Secret names (PM_INSTALLER_SECRETS), and the
+#   references must name different Secrets, so the hooks can never be
+#   handed the deploy key or a credential.
 #
 #   K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL=
 #                         colon-separated absolute laptop credential paths;
@@ -1187,8 +1218,11 @@ K8S_POSTMASTER_SEAT_SERVICES="$(read_env_value "$k8s_env" K8S_POSTMASTER_SEAT_SE
 K8S_POSTMASTER_OPERATORS="$(read_env_value "$k8s_env" K8S_POSTMASTER_OPERATORS || true)"
 K8S_POSTMASTER_OPERATORS="${K8S_POSTMASTER_OPERATORS:-@operator}"
 K8S_POSTMASTER_HOOKS_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_HOOKS_SECRET || true)"
+K8S_POSTMASTER_GIT_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_GIT_SECRET || true)"
 K8S_MAIL_API_TOKENS_FILE="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_FILE || true)"
+K8S_MAIL_API_TOKENS_SECRET="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_SECRET || true)"
 K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE || true)"
+K8S_POSTMASTER_CLAUDE_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_SECRET || true)"
 K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL || true)"
 K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK || true)"
 K8S_POSTMASTER_HEADROOM_DIR="$(read_env_value "$k8s_env" K8S_POSTMASTER_HEADROOM_DIR || true)"
@@ -1418,6 +1452,8 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_ACCESS_MODE" \
         "$K8S_POSTMASTER_OPERATORS" "$K8S_POSTMASTER_HOOKS_SECRET" \
         "$K8S_MAIL_API_TOKENS_FILE" "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
+        "$K8S_POSTMASTER_GIT_SECRET" "$K8S_POSTMASTER_CLAUDE_SECRET" \
+        "$K8S_MAIL_API_TOKENS_SECRET" \
         "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" "$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" \
         "$K8S_POSTMASTER_HEADROOM_DIR" \
         "$K8S_MAIL_TEAM_SUBJECTS" \
@@ -3456,6 +3492,35 @@ EOF
 # The mail API's shared team token (docs/mail-api.md, "Team access"). Its raw
 # value lives in this Secret, key `token`; the server only ever gets its hash.
 PM_TEAM_SECRET=fork-sandbox-mail-api-team-token
+# Where the hash lives when the tokens Secret is referenced, not created.
+PM_TEAM_HASH_SECRET=fork-sandbox-mail-api-team-hash
+# Every Secret this installer writes. A referenced Secret may be none of
+# them: install would overwrite it, or a hook would be handed its content.
+PM_INSTALLER_SECRETS=(fork-sandbox-upstream-key fork-sandbox-postmaster-git
+    fork-sandbox-mail-api-tokens "$PM_TEAM_SECRET" "$PM_TEAM_HASH_SECRET"
+    fork-sandbox-postmaster-claude)
+
+# pm_validate_secret_ref KEY NAME: NAME, the value of k8s.env key KEY, is a
+# Secret name install may reference. Returns 1 with the reason on stderr.
+pm_validate_secret_ref() {
+    local key="$1" name="$2" own
+    if (( ${#name} > 253 )) || [[ ! "$name" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+        echo "Error: $key='$name' is not a" >&2
+        echo "valid Secret name: at most 253 characters matching" >&2
+        echo '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ (a DNS-1123 subdomain).' >&2
+        return 1
+    fi
+    for own in "${PM_INSTALLER_SECRETS[@]}"; do
+        if [[ "$name" == "$own" ]]; then
+            echo "Error: $key='$name' is one of" >&2
+            echo "this installer's own Secrets; install would overwrite it, and a" >&2
+            echo "hook must never be handed the provider key, the deploy key, a" >&2
+            echo "credential or the mail API tokens. Name a Secret you created for" >&2
+            echo "this purpose alone." >&2
+            return 1
+        fi
+    done
+}
 # Out parameters of pm_plan_team_token: the token's SHA-256, and the manifest
 # of the Secret to create (empty when the cluster already has one to keep).
 PM_TEAM_HASH=""
@@ -3605,8 +3670,57 @@ cmd_install() {
             echo "name. Set K8S_POSTMASTER_PROJECT explicitly." >&2
             exit 1
         fi
+        # Secrets by reference (see the header): each *_SECRET key replaces
+        # the file key(s) beside it, and no two references share a Secret.
+        local pm_ref_pair pm_ref_key pm_ref_name pm_ref_seen
+        local -A pm_ref_owner=()
+        for pm_ref_pair in \
+            "K8S_POSTMASTER_HOOKS_SECRET=$K8S_POSTMASTER_HOOKS_SECRET" \
+            "K8S_POSTMASTER_GIT_SECRET=$K8S_POSTMASTER_GIT_SECRET" \
+            "K8S_POSTMASTER_CLAUDE_SECRET=$K8S_POSTMASTER_CLAUDE_SECRET" \
+            "K8S_MAIL_API_TOKENS_SECRET=$K8S_MAIL_API_TOKENS_SECRET"; do
+            pm_ref_key="${pm_ref_pair%%=*}"
+            pm_ref_name="${pm_ref_pair#*=}"
+            [[ -n "$pm_ref_name" ]] || continue
+            pm_validate_secret_ref "$pm_ref_key" "$pm_ref_name" || exit 1
+            pm_ref_seen="${pm_ref_owner[$pm_ref_name]:-}"
+            if [[ -n "$pm_ref_seen" ]]; then
+                echo "Error: $pm_ref_seen and $pm_ref_key both name Secret '$pm_ref_name'." >&2
+                echo "Each reference mounts its whole Secret, so a shared one would hand" >&2
+                echo "one consumer the other's credential. Use one Secret per key." >&2
+                exit 1
+            fi
+            pm_ref_owner[$pm_ref_name]="$pm_ref_key"
+        done
+        if [[ -n "$K8S_POSTMASTER_GIT_SECRET" ]] \
+            && [[ -n "$K8S_POSTMASTER_GIT_KEY_FILE" || -n "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" ]]; then
+            echo "Error: K8S_POSTMASTER_GIT_SECRET replaces K8S_POSTMASTER_GIT_KEY_FILE and" >&2
+            echo "K8S_POSTMASTER_KNOWN_HOSTS_FILE; set the Secret or the files, not both." >&2
+            exit 1
+        fi
+        if [[ -n "$K8S_MAIL_API_TOKENS_SECRET" && -n "$K8S_MAIL_API_TOKENS_FILE" ]]; then
+            echo "Error: K8S_MAIL_API_TOKENS_SECRET and K8S_MAIL_API_TOKENS_FILE are mutually exclusive." >&2
+            exit 1
+        fi
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_SECRET" ]] \
+            && [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" || -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+            echo "Error: K8S_POSTMASTER_CLAUDE_SECRET is mutually exclusive with" >&2
+            echo "K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE and K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL." >&2
+            exit 1
+        fi
+    fi
+    # Which optional Secrets the pod gets, however each is supplied.
+    local pm_git_secret="${K8S_POSTMASTER_GIT_SECRET:-fork-sandbox-postmaster-git}"
+    local pm_claude_secret="${K8S_POSTMASTER_CLAUDE_SECRET:-fork-sandbox-postmaster-claude}"
+    local pm_tokens_secret="${K8S_MAIL_API_TOKENS_SECRET:-fork-sandbox-mail-api-tokens}"
+    local pm_have_claude=false pm_have_mail_api=false
+    [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL$K8S_POSTMASTER_CLAUDE_SECRET" ]] \
+        || pm_have_claude=true
+    [[ -z "$K8S_MAIL_API_TOKENS_FILE$K8S_MAIL_API_TOKENS_SECRET" ]] || pm_have_mail_api=true
+    if $postmaster && [[ -z "$K8S_POSTMASTER_GIT_SECRET" ]]; then
         if [[ -z "$K8S_POSTMASTER_GIT_KEY_FILE" ]]; then
-            echo "Error: K8S_POSTMASTER_GIT_KEY_FILE is not set in $k8s_env." >&2
+            echo "Error: K8S_POSTMASTER_GIT_KEY_FILE is not set in $k8s_env (nor" >&2
+            echo "K8S_POSTMASTER_GIT_SECRET)." >&2
             exit 1
         fi
         if [[ -z "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" ]]; then
@@ -3625,6 +3739,8 @@ cmd_install() {
             echo "populate it (e.g. ssh-keyscan) before install." >&2
             exit 1
         fi
+    fi
+    if $postmaster; then
         if [[ ! "$K8S_POSTMASTER_STORAGE" =~ ^[0-9]+(Mi|Gi|Ti)$ ]]; then
             echo "Error: K8S_POSTMASTER_STORAGE='$K8S_POSTMASTER_STORAGE' must match" >&2
             echo '^[0-9]+(Mi|Gi|Ti)$.' >&2
@@ -3644,24 +3760,6 @@ cmd_install() {
             echo "Error: K8S_POSTMASTER_SEAT_SERVICES='$K8S_POSTMASTER_SEAT_SERVICES' must be" >&2
             echo "true or false." >&2
             exit 1
-        fi
-        if [[ -n "$K8S_POSTMASTER_HOOKS_SECRET" ]]; then
-            if (( ${#K8S_POSTMASTER_HOOKS_SECRET} > 253 )) \
-                || [[ ! "$K8S_POSTMASTER_HOOKS_SECRET" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
-                echo "Error: K8S_POSTMASTER_HOOKS_SECRET='$K8S_POSTMASTER_HOOKS_SECRET' is not a" >&2
-                echo "valid Secret name: at most 253 characters matching" >&2
-                echo '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ (a DNS-1123 subdomain).' >&2
-                exit 1
-            fi
-            case "$K8S_POSTMASTER_HOOKS_SECRET" in
-                fork-sandbox-upstream-key|fork-sandbox-postmaster-git|fork-sandbox-mail-api-tokens|fork-sandbox-mail-api-team-token)
-                    echo "Error: K8S_POSTMASTER_HOOKS_SECRET='$K8S_POSTMASTER_HOOKS_SECRET' is one of" >&2
-                    echo "this installer's own Secrets; a hook must never be handed the" >&2
-                    echo "provider key, the deploy key or the mail API tokens. Name a" >&2
-                    echo "Secret you created for the hooks alone." >&2
-                    exit 1
-                    ;;
-            esac
         fi
         # FORK_SANDBOX_FLEET_FILE / FORK_SANDBOX_PERSONAS_DIR, when the
         # caller's shell sets them, let a site keep its fleet and personas
@@ -3724,7 +3822,7 @@ cmd_install() {
             FORK_SANDBOX_HANDLERS_DIR="$config_dir/handlers"
             FORK_SANDBOX_PRESETS_DIR="$config_dir/presets"
         )
-        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" || -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+        if $pm_have_claude; then
             pm_fleet_env+=(FORK_SANDBOX_CLUSTER_CLAUDE=1)
         fi
         if ! env "${pm_fleet_env[@]}" "$script_dir/fork-sandbox-fleet.sh" check --cluster; then
@@ -3918,7 +4016,7 @@ cmd_install() {
         # The operator's own $config_dir/claude.env, if any, is never
         # shipped -- it names laptop paths. This one line is the pod's
         # own, pointing at the mount the claude Secret (below) lands on.
-        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" || -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+        if $pm_have_claude; then
             # A global, not a local, and :- in the trap: the apply path
             # returns from cmd_install, so a local is out of scope when the
             # EXIT trap fires, and set -u aborts the trap with exit 1.
@@ -4453,22 +4551,32 @@ cmd_install() {
         # key is read at pod init, so rotating either must roll the pod.
         # Their text goes into the hash and the apply phase only -- never
         # to any output stream.
-        pm_git_secret_yaml="$(kubectl create secret generic fork-sandbox-postmaster-git \
-            --from-file="deploy-key=$K8S_POSTMASTER_GIT_KEY_FILE" \
-            --from-file="known_hosts=$K8S_POSTMASTER_KNOWN_HOSTS_FILE" \
-            --dry-run=client -o yaml)"
-        if [[ -n "$K8S_MAIL_API_TOKENS_FILE" ]]; then
-            # The team token's hash rides in the same Secret as the tokens
-            # file, as a sibling key the server reads (fork-sandbox-mail-api.py
-            # serve, "The team token"): the Deployment needs no new volume
-            # and the raw token never reaches the pod. The hash is not a
-            # secret, so --from-literal is fine.
-            pm_plan_team_token "$dry_run" "$rotate_team" || exit 1
-            pm_tokens_secret_yaml="$(kubectl create secret generic fork-sandbox-mail-api-tokens \
-                --from-file="tokens=$K8S_MAIL_API_TOKENS_FILE" \
-                --from-literal="team-token-sha256=$PM_TEAM_HASH" \
+        [[ -n "$K8S_POSTMASTER_GIT_SECRET" ]] || \
+            pm_git_secret_yaml="$(kubectl create secret generic fork-sandbox-postmaster-git \
+                --from-file="deploy-key=$K8S_POSTMASTER_GIT_KEY_FILE" \
+                --from-file="known_hosts=$K8S_POSTMASTER_KNOWN_HOSTS_FILE" \
                 --dry-run=client -o yaml)"
+        if $pm_have_mail_api; then
+            # The team token's hash is a sibling key the server reads beside
+            # the tokens (fork-sandbox-mail-api.py serve, "The team token"),
+            # so the raw token never reaches the pod. It rides in the tokens
+            # Secret when install makes that one, else in a Secret of its
+            # own; the projected mail-api-tokens volume joins the two. The
+            # hash is not a secret, so --from-literal is fine.
+            pm_plan_team_token "$dry_run" "$rotate_team" || exit 1
+            if [[ -n "$K8S_MAIL_API_TOKENS_FILE" ]]; then
+                pm_tokens_secret_yaml="$(kubectl create secret generic fork-sandbox-mail-api-tokens \
+                    --from-file="tokens=$K8S_MAIL_API_TOKENS_FILE" \
+                    --from-literal="team-token-sha256=$PM_TEAM_HASH" \
+                    --dry-run=client -o yaml)"
+            else
+                pm_tokens_secret_yaml="$(kubectl create secret generic "$PM_TEAM_HASH_SECRET" \
+                    --from-literal="team-token-sha256=$PM_TEAM_HASH" \
+                    --dry-run=client -o yaml)"
+            fi
         fi
+        local pm_team_hash_secret=fork-sandbox-mail-api-tokens
+        [[ -z "$K8S_MAIL_API_TOKENS_SECRET" ]] || pm_team_hash_secret="$PM_TEAM_HASH_SECRET"
         if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
             pm_claude_secret_yaml="$(kubectl create secret generic fork-sandbox-postmaster-claude \
                 "${pm_claude_secret_args[@]}" --dry-run=client -o yaml)"
@@ -4495,6 +4603,10 @@ cmd_install() {
             -e "s|__PM_CLAUDE_POOL__|$pm_claude_pool_value|g" \
             -e "s|__PM_CLAUDE_HOOK__|$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK|g" \
             -e "s|__PM_HOOKS_SECRET__|${K8S_POSTMASTER_HOOKS_SECRET:-(none)}|g" \
+            -e "s|__PM_GIT_SECRET__|$pm_git_secret|g" \
+            -e "s|__PM_CLAUDE_SECRET__|$pm_claude_secret|g" \
+            -e "s|__PM_TOKENS_SECRET__|$pm_tokens_secret|g" \
+            -e "s|__PM_TEAM_HASH_SECRET__|$pm_team_hash_secret|g" \
             "$manifests_dir/40-postmaster.yaml")"
         if [[ -z "$K8S_POSTMASTER_STORAGE_CLASS" ]]; then
             local pm_scline pm_stripped
@@ -4545,7 +4657,7 @@ cmd_install() {
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
         fi
-        if [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" && -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
+        if ! $pm_have_claude; then
             for tag in "claude-credentials env" "claude-credentials volumeMount" "claude-credentials volume"; do
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
@@ -4558,13 +4670,14 @@ cmd_install() {
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
         fi
-        if [[ -z "$K8S_MAIL_API_TOKENS_FILE" ]]; then
+        if ! $pm_have_mail_api; then
             for tag in "mail-api container" "mail-api volume" "mail-api service" \
                 "mail-team role" "mail-team binding"; do
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
             echo "fork-sandbox-k8s: the mail API is not deployed (K8S_MAIL_API_TOKENS_FILE is" >&2
-            echo "not set); see docs/cluster-postmaster.md to enable it." >&2
+            echo "not set, nor K8S_MAIL_API_TOKENS_SECRET); see docs/cluster-postmaster.md" >&2
+            echo "to enable it." >&2
             if [[ -n "$K8S_MAIL_TEAM_SUBJECTS" ]]; then
                 echo "fork-sandbox-k8s: K8S_MAIL_TEAM_SUBJECTS is ignored without the mail API." >&2
             fi
@@ -4634,17 +4747,20 @@ cmd_install() {
             $pm_have_hooks    && printf -- '---\n%s\n' "$pm_hooks_yaml"
             $pm_have_headroom && printf -- '---\n%s\n' "$pm_headroom_yaml"
             $pm_have_presets  && printf -- '---\n%s\n' "$pm_presets_yaml"
-            printf '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.\n'
+            [[ -n "$K8S_POSTMASTER_GIT_SECRET" ]] || \
+                printf '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.\n'
             [[ -z "$K8S_MAIL_API_TOKENS_FILE" ]] || \
                 printf '# (dry-run) would create Secret fork-sandbox-mail-api-tokens ... -- not shown.\n'
-            if [[ -n "$K8S_MAIL_API_TOKENS_FILE" ]]; then
+            [[ -z "$K8S_MAIL_API_TOKENS_SECRET" ]] || \
+                printf '# (dry-run) would create Secret %s ... -- not shown.\n' "$PM_TEAM_HASH_SECRET"
+            if $pm_have_mail_api; then
                 if $rotate_team; then
                     printf '# (dry-run) would REPLACE Secret %s with a new token ... -- not shown.\n' "$PM_TEAM_SECRET"
                 else
                     printf '# (dry-run) would create Secret %s if absent ... -- not shown.\n' "$PM_TEAM_SECRET"
                 fi
             fi
-            [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" && -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]] || \
+            [[ -z "$pm_claude_secret_yaml" ]] || \
                 printf '# (dry-run) would create Secret fork-sandbox-postmaster-claude ... -- not shown.\n'
             printf '%s\n' "$pm_file_rendered"
         fi
@@ -4688,8 +4804,9 @@ cmd_install() {
         $pm_have_hooks    && printf '%s\n' "$pm_hooks_yaml" | kubectl apply -f -
         $pm_have_headroom && printf '%s\n' "$pm_headroom_yaml" | kubectl apply -f -
         $pm_have_presets  && printf '%s\n' "$pm_presets_yaml" | kubectl apply -f -
-        printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f - \
-            --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts
+        [[ -z "$pm_git_secret_yaml" ]] || \
+            printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f - \
+                --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts
         # The team token, before the tokens Secret that carries its hash.
         # `create`, never `apply`: it fails when the Secret exists instead
         # of overwriting the token the team already holds. PM_TEAM_SECRET_YAML

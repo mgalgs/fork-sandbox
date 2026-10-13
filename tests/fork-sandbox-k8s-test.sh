@@ -18659,8 +18659,9 @@ check "tokens file: Service fork-sandbox-mail-api present" "fork-sandbox-mail-ap
     "$(yq -r 'select(.kind == "Service" and .metadata.name == "fork-sandbox-mail-api") | .metadata.name' <<< "$pm_api_out")"
 check "tokens file: the Service selects the postmaster pod on port 80 -> http" "app=fork-sandbox-postmaster 80 http" \
     "$(yq -r 'select(.kind == "Service" and .metadata.name == "fork-sandbox-mail-api") | "app=\(.spec.selector.app) \(.spec.ports[0].port) \(.spec.ports[0].targetPort)"' <<< "$pm_api_out")"
-check "tokens file: the mail-api-tokens volume is present" "fork-sandbox-mail-api-tokens" \
-    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "mail-api-tokens") | .secret.secretName')"
+check "tokens file: the mail-api-tokens volume projects tokens and the hash from install's Secret" \
+    "fork-sandbox-mail-api-tokens:tokens fork-sandbox-mail-api-tokens:team-token-sha256" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "mail-api-tokens") | .projected.sources[].secret | "\(.name):\(.items[0].key)"' | paste -sd' ')"
 check "tokens file: automountServiceAccountToken is false" "false" \
     "$(pm_api_dep '.spec.template.spec.automountServiceAccountToken')"
 check "tokens file: the postmaster container mounts sa-token at the SA path" "sa-token" \
@@ -18939,7 +18940,8 @@ pm_api_refused "a hooks Secret name ending in a dash refuses" "at most 253 chara
     "$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=site-hooks-)"
 pm_api_refused "a hooks Secret name over 253 characters refuses" "at most 253 characters" \
     "$(pm_api_cfg "K8S_POSTMASTER_HOOKS_SECRET=$(printf 'a%.0s' $(seq 1 254))")"
-for pm_own in fork-sandbox-upstream-key fork-sandbox-postmaster-git fork-sandbox-mail-api-tokens; do
+for pm_own in fork-sandbox-upstream-key fork-sandbox-postmaster-git fork-sandbox-mail-api-tokens \
+    fork-sandbox-postmaster-claude fork-sandbox-mail-api-team-hash; do
     pm_api_refused "the installer's own Secret $pm_own refuses as the hooks Secret" "one of" \
         "$(pm_api_cfg "K8S_POSTMASTER_HOOKS_SECRET=$pm_own")"
 done
@@ -19487,6 +19489,98 @@ pm_api_refused "team: the team token Secret cannot be named as the hooks Secret"
 pm_cfg_teamlabel="$(pm_api_cfg)"
 "$pm_api_mint" mint --role operator --label team | sed -n 2p >> "$pm_cfg_teamlabel/mail-api-tokens"
 pm_api_refused "team: a tokens-file entry labelled team is refused at install" "duplicate label 'team'" "$pm_cfg_teamlabel"
+
+# 14h. Secrets by reference: K8S_POSTMASTER_GIT_SECRET,
+# K8S_POSTMASTER_CLAUDE_SECRET and K8S_MAIL_API_TOKENS_SECRET name Secrets
+# that already exist in the cluster. install never creates or reads them;
+# it only names them in the Deployment, and keeps the team hash in a Secret
+# of its own.
+# pm_ref_cfg [extra k8s.env lines...]: the mail-API fixture with every file
+# key swapped for its *_SECRET reference, and a claude seat in the fleet. An
+# extra line replaces any line for the same key.
+pm_ref_cfg() {
+    local d line
+    d="$(pm_api_cfg)"
+    sed -i '/^K8S_POSTMASTER_GIT_KEY_FILE=/d; /^K8S_POSTMASTER_KNOWN_HOSTS_FILE=/d; /^K8S_MAIL_API_TOKENS_FILE=/d' "$d/k8s.env"
+    printf '%s\n' K8S_POSTMASTER_GIT_SECRET=site-git K8S_POSTMASTER_CLAUDE_SECRET=site-claude \
+        K8S_MAIL_API_TOKENS_SECRET=site-mail-tokens >> "$d/k8s.env"
+    printf 'agents:\n  alpha: {harness: claude, backend: k8s}\n' > "$d/fleet.yaml"
+    for line in "$@"; do
+        sed -i "/^${line%%=*}=/d" "$d/k8s.env"
+        printf '%s\n' "$line" >> "$d/k8s.env"
+    done
+    printf '%s' "$d"
+}
+pm_cfg_ref="$(pm_ref_cfg)"
+pm_api_install "$pm_cfg_ref"
+check "by reference: install exits 0" "0" "$pm_api_rc"
+check "by reference: the git volume names the site's Secret" "site-git" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "git") | .secret.secretName')"
+check "by reference: the claude volume names the site's Secret" "site-claude" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "claude-credentials") | .secret.secretName')"
+check "by reference: the tokens volume joins the site's tokens and install's hash" \
+    "site-mail-tokens:tokens fork-sandbox-mail-api-team-hash:team-token-sha256" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "mail-api-tokens") | .projected.sources[].secret | "\(.name):\(.items[0].key)"' | paste -sd' ')"
+check "by reference: the mail API is deployed" "postmaster mail-api" \
+    "$(pm_api_dep '.spec.template.spec.containers[].name' | paste -sd' ')"
+check "by reference: a claude credential is announced to the postmaster" "FORK_SANDBOX_CLUSTER_CLAUDE=1" \
+    "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_CLUSTER_CLAUDE=')"
+check "by reference: claude.env points at the mount" "CLAUDE_CREDENTIALS=/etc/fork-sandbox/claude/credentials.json" \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-config") | .data["claude.env"]' <<< "$pm_api_out")"
+check "by reference: install renders none of the referenced Secrets" "0" \
+    "$(grep -cE 'create secret generic (site-|fork-sandbox-postmaster-git|fork-sandbox-mail-api-tokens|fork-sandbox-postmaster-claude)' "$pm_api_log")"
+check "by reference: ... but does render the team hash Secret" "1" \
+    "$(grep -c 'create secret generic fork-sandbox-mail-api-team-hash' "$pm_api_log")"
+check "by reference: the dry-run names only the hash Secret as created" \
+    "# (dry-run) would create Secret fork-sandbox-mail-api-team-hash ... -- not shown." \
+    "$(grep '^# (dry-run) would create Secret fork-sandbox-' <<< "$pm_api_out" | grep -v 'team-token')"
+check "by reference: no leftover placeholders" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    check "yamllint: secrets by reference" "" "$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+fi
+# The claude seat above passed install's fleet check only because the
+# Secret counts as a credential: without it, the same fleet is refused.
+pm_cfg_ref_noclaude="$(pm_ref_cfg)"
+sed -i '/^K8S_POSTMASTER_CLAUDE_SECRET=/d' "$pm_cfg_ref_noclaude/k8s.env"
+pm_api_refused "by reference: without the claude Secret the claude seat is refused" \
+    "claude seats need a claude credential" "$pm_cfg_ref_noclaude"
+
+# A real install against the stub: the hash Secret is applied with the team
+# token's hash, before the Deployment, and nothing referenced is applied.
+pm_ref_st="$(newdir)"; tmpdirs+=("$pm_ref_st")
+pm_team_real "$pm_cfg_ref" "$pm_ref_st"
+check "by reference: a real install exits 0" "0" "$pm_team_rc"
+check "by reference: the hash Secret carries the team token's SHA-256" \
+    "$(printf '%s' "$(cat "$pm_ref_st/team-token")" | sha256sum | cut -d' ' -f1)" \
+    "$(yq -r 'select(.kind == "Secret" and .metadata.name == "fork-sandbox-mail-api-team-hash") | .data."team-token-sha256"' "$pm_ref_st/applied" | tr -d ' \n')"
+check "by reference: the only Secret applied is the hash" "fork-sandbox-mail-api-team-hash" \
+    "$(yq -r 'select(.kind == "Secret") | .metadata.name' "$pm_ref_st/applied" | grep -v '^fork-sandbox-upstream-key$' | sort -u | paste -sd' ')"
+check "by reference: the hash Secret goes in before the Deployment" "ok" \
+    "$(awk '/^applied:   name: fork-sandbox-mail-api-team-hash$/ && !h {h=NR} /^applied:   name: fork-sandbox-postmaster$/ {d=NR} END {print (h && d && h < d) ? "ok" : "bad"}' "$pm_ref_st/log")"
+
+# Refusals, before any kubectl call.
+pm_api_refused "by reference: the git Secret and the git files together refuse" \
+    "set the Secret or the files, not both" "$(pm_api_cfg K8S_POSTMASTER_GIT_SECRET=site-git)"
+pm_api_refused "by reference: the tokens Secret and file together refuse" \
+    "K8S_MAIL_API_TOKENS_SECRET and K8S_MAIL_API_TOKENS_FILE are mutually exclusive" \
+    "$(pm_api_cfg K8S_MAIL_API_TOKENS_SECRET=site-mail-tokens)"
+pm_cfg_ref_both_claude="$(pm_ref_cfg)"
+pm_claude_both_file="$(pm_claude_cred_file "$pm_cfg_ref_both_claude" "$(( ($(date +%s) + 30 * 86400) * 1000 ))")"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_both_file" >> "$pm_cfg_ref_both_claude/k8s.env"
+pm_api_refused "by reference: the claude Secret and file together refuse" \
+    "K8S_POSTMASTER_CLAUDE_SECRET is mutually exclusive" "$pm_cfg_ref_both_claude"
+pm_api_refused "by reference: two references to one Secret refuse" \
+    "K8S_POSTMASTER_HOOKS_SECRET and K8S_POSTMASTER_GIT_SECRET both name Secret 'site-git'" \
+    "$(pm_ref_cfg K8S_POSTMASTER_HOOKS_SECRET=site-git)"
+pm_api_refused "by reference: an installer-owned name refuses" \
+    "K8S_POSTMASTER_GIT_SECRET='fork-sandbox-postmaster-git' is one of" \
+    "$(pm_ref_cfg K8S_POSTMASTER_GIT_SECRET=fork-sandbox-postmaster-git)"
+pm_api_refused "by reference: an invalid name refuses" "K8S_MAIL_API_TOKENS_SECRET='Site_Tokens' is not a" \
+    "$(pm_ref_cfg K8S_MAIL_API_TOKENS_SECRET=Site_Tokens)"
+pm_cfg_ref_nogit="$(pm_ref_cfg)"
+sed -i '/^K8S_POSTMASTER_GIT_SECRET=/d' "$pm_cfg_ref_nogit/k8s.env"
+pm_api_refused "by reference: neither git Secret nor key file refuses, naming both" \
+    "K8S_POSTMASTER_GIT_SECRET" "$pm_cfg_ref_nogit"
 
 printf '\n== install --postmaster: K8S_AGENT_* keys reach a postmaster-launched seat ==\n'
 # The postmaster pod's own k8s.env IS the laptop's, shipped whole as a

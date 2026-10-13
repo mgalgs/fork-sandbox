@@ -36,15 +36,19 @@ does on a workstation.
 
 Do these in order.
 
-1. **Build and push the base image**, as for any other cluster run (see
+1. **Build and push the sandbox image**, `scripts/build-sandbox-image.sh`
+   with no `--postmaster` and no project `--base` (see
    [docs/kubernetes-runs.md](kubernetes-runs.md)), then build and push the
    postmaster image, a thin layer over it that adds `kubectl` and `ssh`:
 
    ```
-   scripts/build-sandbox-image.sh --postmaster --base "$K8S_IMAGE"
+   scripts/build-sandbox-image.sh --postmaster --base <sandbox-image>
    ```
 
-   Push the tag it prints to the registry the cluster pulls from.
+   The base is that plain sandbox image, not `K8S_IMAGE`: at a site whose
+   `K8S_IMAGE` is a project's seat image, layering on it would ship the
+   project's toolchain in the postmaster. Push the tag it prints to the
+   registry the cluster pulls from.
 
 2. **Create a read-only deploy key and a known_hosts file** for the project
    repo the postmaster clones. The key must be read-only on the remote (the
@@ -59,8 +63,9 @@ Do these in order.
    | `K8S_POSTMASTER_IMAGE` | yes | the image ref step 1 built and you pushed |
    | `K8S_POSTMASTER_REPO_URL` | yes | ssh URL of the project repo: `ssh://[user@]host[:port]/path` or the scp-like `user@host:path` form. Anything else (`https://`, a bare hostname) is refused. |
    | `K8S_POSTMASTER_PROJECT` | no | directory name under `$HOME/src` in the pod; defaults to the URL's last path component with a trailing `.git` stripped. Must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, so it can never be `.` or `..`. A `K8S_PROJECT_IMAGES` entry (see "Per-project and per-run images" in [docs/kubernetes-runs.md](kubernetes-runs.md)) keys on this same name, since a run the postmaster spawns resolves its default image from the project path it was handed, the same as any other run. |
-   | `K8S_POSTMASTER_GIT_KEY_FILE` | yes | laptop path to the deploy private key from step 2 |
-   | `K8S_POSTMASTER_KNOWN_HOSTS_FILE` | yes | laptop path to the known_hosts file from step 2 |
+   | `K8S_POSTMASTER_GIT_KEY_FILE` | yes, unless `K8S_POSTMASTER_GIT_SECRET` | laptop path to the deploy private key from step 2 |
+   | `K8S_POSTMASTER_KNOWN_HOSTS_FILE` | yes, unless `K8S_POSTMASTER_GIT_SECRET` | laptop path to the known_hosts file from step 2 |
+   | `K8S_POSTMASTER_GIT_SECRET` | no | name of a Secret you create with keys `deploy-key` and `known_hosts`, instead of the two files. See "Secrets by reference". |
    | `K8S_POSTMASTER_STORAGE_CLASS` | no | `storageClassName` of both PVCs; empty (the default) omits the field, so the cluster's default StorageClass applies |
    | `K8S_POSTMASTER_STORAGE` | no | the data volume's requested size; default `20Gi`; must match `^[0-9]+(Mi\|Gi\|Ti)$` |
    | `K8S_POSTMASTER_MAIL_STORAGE` | no | the mail volume's requested size; default `2Gi`; same pattern as `K8S_POSTMASTER_STORAGE` |
@@ -69,8 +74,10 @@ Do these in order.
    | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
    | `K8S_POSTMASTER_HOOKS_SECRET` | no | the name of a Secret you create in the namespace, to hand your hooks credentials. Install never creates or reads it, only references it. Must be a DNS-1123 subdomain name. See "Hooks". |
    | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |
+   | `K8S_MAIL_API_TOKENS_SECRET` | no | name of a Secret you create with key `tokens`, instead of the file; it deploys the mail API the same way. See "Secrets by reference". |
    | `K8S_MAIL_TEAM_SUBJECTS` | no | who may use the mail API's shared team token: comma-separated `user:<name>` and `group:<name>`, no spaces. When set, install binds Role `fork-sandbox-mail-team` to exactly those subjects; unset (the default) renders the Role and no binding. Only meaningful with `K8S_MAIL_API_TOKENS_FILE`. See "Team access" in [mail-api.md](mail-api.md). |
    | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` | no | laptop path to a claude credentials JSON; when set, claude seats are accepted in the cluster. See "Claude seats in a cluster postmaster". |
+   | `K8S_POSTMASTER_CLAUDE_SECRET` | no | name of a Secret you create with key `credentials.json`, instead of the file (not with the pool). See "Secrets by reference". |
    | `K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL` | no | colon-separated absolute laptop paths to Claude credential files; set with `K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK` instead of the single file. |
    | `K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK` | no | plugin name selected from `K8S_POSTMASTER_HEADROOM_DIR`; required with the pool. |
    | `K8S_POSTMASTER_HEADROOM_DIR` | no | laptop directory of executable headroom plugins, shipped as a ConfigMap and put on the postmaster's `PATH`. |
@@ -126,8 +133,9 @@ Do these in order.
    It then applies the base cluster manifests exactly as plain `install`
    does, and renders and applies the postmaster's own pieces: a
    ServiceAccount, Role and RoleBinding, two PVCs, a Secret holding the deploy
-   key and known_hosts, one or more ConfigMaps, and the Deployment itself
-   (plus the mail API's Secret and Service when it is enabled).
+   key and known_hosts (unless it is referenced), one or more ConfigMaps,
+   and the Deployment itself (plus the mail API's Secret and Service when it
+   is enabled).
    `--dry-run` prints everything it would apply, with each Secret's content
    replaced by a placeholder line — its bytes never reach stdout or stderr
    either way.
@@ -299,11 +307,50 @@ creates. Set `K8S_POSTMASTER_HOOKS_SECRET=<name>` in `k8s.env`. Install
 never creates or reads that Secret; it only references it. It is mounted
 read-only at `/etc/fork-sandbox/hook-secret` in the postmaster container
 only, and `FS_HOOK_SECRET_DIR` is set to that path in every hook's
-environment. The value must be a DNS-1123 subdomain name. Install also
-refuses its own Secret names, `fork-sandbox-upstream-key`,
-`fork-sandbox-postmaster-git`, `fork-sandbox-mail-api-tokens` and
-`fork-sandbox-mail-api-team-token`, so a typo
-cannot hand a hook the provider key.
+environment. The name follows the rules in "Secrets by reference" below,
+so a typo cannot hand a hook the provider key or another credential.
+
+## Secrets by reference
+
+Install can build every postmaster Secret from laptop files, which suits a
+single operator. A site that deploys from CI, or keeps credentials off
+laptops, can instead create the Secrets in the namespace itself and name
+them in `k8s.env`:
+
+| key | replaces | the Secret holds |
+|---|---|---|
+| `K8S_POSTMASTER_GIT_SECRET` | `K8S_POSTMASTER_GIT_KEY_FILE`, `K8S_POSTMASTER_KNOWN_HOSTS_FILE` | `deploy-key`, `known_hosts` |
+| `K8S_POSTMASTER_CLAUDE_SECRET` | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` | `credentials.json` |
+| `K8S_MAIL_API_TOKENS_SECRET` | `K8S_MAIL_API_TOKENS_FILE` | `tokens` |
+| `K8S_POSTMASTER_HOOKS_SECRET` | (no file form) | whatever your hooks read |
+
+Setting a reference and the file key it replaces is refused. Install never
+creates, reads or prints a referenced Secret; it only names it in the
+Deployment. That has consequences:
+
+- **The checks install makes on a file are yours to make.** It cannot see
+  the key's owner and mode, that `known_hosts` is non-empty, that the claude
+  token outlives the 7-day floor, or that the tokens pass
+  `fork-sandbox-mail-api.py check`. Run those before you load the Secret.
+- **Changing a referenced Secret does not roll the pod.** It is not in
+  `checksum/pm-config`. After a rotation, run
+  `kubectl rollout restart deployment/fork-sandbox-postmaster`.
+- **A missing Secret or key is a pod that never starts**, not an install
+  error. Wait for `kubectl rollout status` after installing.
+- **The team token's hash** lives in `fork-sandbox-mail-api-team-hash`, a
+  Secret install owns, mounted beside your `tokens`.
+
+Each name must be a DNS-1123 subdomain, must not be one of install's own
+Secrets (`fork-sandbox-upstream-key`, `fork-sandbox-postmaster-git`,
+`fork-sandbox-postmaster-claude`, `fork-sandbox-mail-api-tokens`,
+`fork-sandbox-mail-api-team-token`, `fork-sandbox-mail-api-team-hash`), and
+no two references may name the same Secret: each is mounted whole, so a
+shared one would hand the hooks the deploy key. Do not label a referenced
+Secret `fork-sandbox/context=true`, which would let a run mount it with
+`--context-secret`.
+
+Switching an existing install to a reference leaves install's old Secret in
+the namespace. Delete it once the new pod is up.
 
 ## Claude seats in a cluster postmaster
 

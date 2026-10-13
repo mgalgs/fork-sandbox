@@ -20,10 +20,16 @@
 #   __PM_CONFIG_CHECKSUM__
 #   __PM_OPERATORS__
 #   __PM_HOOKS_SECRET__
+# The git and claude-credentials volumes, and the mail API's tokens volume,
+# take their Secret names from placeholders too: install's own Secret names, unless k8s.env
+# names a Secret by reference (K8S_POSTMASTER_GIT_SECRET and friends). They
+# are not listed here because sed fills comments as well, and a filled name
+# here would outlive the stripping of an absent block.
 # This file is skipped by plain `install` (the same way
 # 31-claude-proxy.yaml is) since those placeholders have no value to take
 # without --postmaster. The mail-api container, its tokens volume and its
-# Service are stripped when K8S_MAIL_API_TOKENS_FILE is unset, and so is the
+# Service are stripped when neither K8S_MAIL_API_TOKENS_FILE nor
+# K8S_MAIL_API_TOKENS_SECRET is set, and so is the
 # team Role below (the "mail-team role" block); its RoleBinding (the
 # "mail-team binding" block) is stripped unless K8S_MAIL_TEAM_SUBJECTS is
 # set too, and when it is kept install replaces the one line below
@@ -32,10 +38,9 @@
 # The team token Secret is not in this file: install creates it with
 # `kubectl create`, so a re-install can never overwrite it. The
 # claude-credentials env/volumeMount/volume (postmaster container only)
-# are stripped when K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE is unset; when
-# set, they mount Secret fork-sandbox-postmaster-claude (created by
-# install, not a placeholder -- its name never varies) and tell
-# `fleet check --cluster` a claude credential is available.
+# are stripped when no claude credential is configured (file, pool or
+# K8S_POSTMASTER_CLAUDE_SECRET); otherwise they mount that Secret and
+# tell `fleet check --cluster` a claude credential is available.
 #
 # The trick that keeps this small: the data PVC below is mounted at the
 # scratch path a laptop postmaster uses (/var/tmp/claude-scratch), the mail
@@ -377,7 +382,7 @@ spec:
             name: fork-sandbox-postmaster-config
         - name: git
           secret:
-            secretName: fork-sandbox-postmaster-git
+            secretName: __PM_GIT_SECRET__
             defaultMode: 0440
         # The same volume Kubernetes automounts by default, so pod-init's
         # default service-account directory keeps working unchanged.
@@ -402,9 +407,22 @@ spec:
           emptyDir: {}
         - name: mail-api-tmp
           emptyDir: {}
+        # Two sources, one directory: the server reads team-token-sha256
+        # beside the tokens. Both name the same Secret unless the tokens
+        # Secret is referenced (K8S_MAIL_API_TOKENS_SECRET).
         - name: mail-api-tokens
-          secret:
-            secretName: fork-sandbox-mail-api-tokens
+          projected:
+            sources:
+              - secret:
+                  name: __PM_TOKENS_SECRET__
+                  items:
+                    - key: tokens
+                      path: tokens
+              - secret:
+                  name: __PM_TEAM_HASH_SECRET__
+                  items:
+                    - key: team-token-sha256
+                      path: team-token-sha256
             defaultMode: 0440
             # <<< mail-api volume
         # >>> personas volume
@@ -438,7 +456,7 @@ spec:
         # >>> claude-credentials volume
         - name: claude-credentials
           secret:
-            secretName: fork-sandbox-postmaster-claude
+            secretName: __PM_CLAUDE_SECRET__
             defaultMode: 0440
             # <<< claude-credentials volume
         # >>> headroom volume

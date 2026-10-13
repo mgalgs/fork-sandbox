@@ -105,7 +105,8 @@
 #                  harness is not `pi`. `pi` is always accepted; `claude`
 #                  is accepted only when FORK_SANDBOX_CLUSTER_CLAUDE=1 (set
 #                  by `install --postmaster` once
-#                  K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE names a
+#                  K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE, the pool or
+#                  K8S_POSTMASTER_CLAUDE_SECRET names a
 #                  credential); `codex` is always refused. A harness is
 #                  compared by its part before any `/` (a preset may
 #                  write `codex/<model>`); presets are read with
@@ -401,7 +402,7 @@ check_cluster() {
         if [[ "${eff_harness%%/*}" != pi ]] \
             && { [[ "${eff_harness%%/*}" != claude ]] || [[ "${FORK_SANDBOX_CLUSTER_CLAUDE:-}" != 1 ]]; }; then
             if [[ "${eff_harness%%/*}" == claude ]]; then
-                echo "Error: agents.$name.harness: claude seats need a claude credential installed -- set K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE and re-run install --postmaster." >&2
+                echo "Error: agents.$name.harness: claude seats need a claude credential installed -- set K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE (or K8S_POSTMASTER_CLAUDE_SECRET) and re-run install --postmaster." >&2
             else
                 echo "Error: agents.$name.harness: codex seats are not supported in a cluster postmaster; only pi, or claude with a credential installed (resolved harness '$eff_harness')." >&2
             fi
@@ -421,7 +422,7 @@ check_cluster() {
             if [[ "$preset_leg" != pi ]] \
                 && { [[ "$preset_leg" != claude ]] || [[ "${FORK_SANDBOX_CLUSTER_CLAUDE:-}" != 1 ]]; }; then
                 if [[ "$preset_leg" == claude ]]; then
-                    echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; claude seats need a claude credential installed -- set K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE and re-run install --postmaster." >&2
+                    echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; claude seats need a claude credential installed -- set K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE (or K8S_POSTMASTER_CLAUDE_SECRET) and re-run install --postmaster." >&2
                 else
                     echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; codex seats are not supported in a cluster postmaster; only pi, or claude with a credential installed." >&2
                 fi
