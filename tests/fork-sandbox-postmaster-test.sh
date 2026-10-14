@@ -6791,6 +6791,88 @@ check "k8s adopt-deferred: still not harvested" 0 \
     "$( [[ -e "$PM_STATE_DIR/harvested/$AD_RID" ]] && echo 1 || echo 0 )"
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
+# ---- shutdown drain: SIGTERM waits for wakes still submitting and hooks
+# still running, so a restart never cuts one off ----
+# A real spawn builds the run env and wake dir; the wake is then made to look
+# live and mid-submit: no summary.json, a live pid, and a k8s run.env that
+# expects an inputs push but has not recorded it. A hook record with a live
+# pid and no exit file stands in for a running hook, unless $1 is "nohook".
+drain_setup() {
+    local mid env rid k8s_run with_hook=1
+    [[ "${1:-}" != nohook ]] || with_hook=0
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    mid="$(send_msg '@carol' '@karen' 'drain topic' 'first' 8)"
+    STUB_K8S_NO_REPLY=1 once
+    env="$(latest_env_for_agent karen)"
+    rid="$(basename "$env" .env)"
+    DR_WAKE_DIR="$(env_val "$env" RUN_DIR)"
+    rm -f -- "$PM_STATE_DIR/harvested/$rid" "$DR_WAKE_DIR/summary.json" "$DR_WAKE_DIR/exit-code" \
+        "$DR_WAKE_DIR/pid-identity"
+    sleep 300 & DR_WAKE_PID=$!
+    printf '%s\n' "$DR_WAKE_PID" > "$DR_WAKE_DIR/pid"
+    new_root k8s_run
+    printf 'INPUTS_PUSH_EXPECTED=true\n' > "$k8s_run/run.env"
+    printf '%s' "$k8s_run" > "$DR_WAKE_DIR/k8s-run-dir"
+    DR_K8S_ENV="$k8s_run/run.env"
+    DR_LOG="$work/drain-deliver.log"
+    (( with_hook )) || return 0
+    DR_HOOK_REC="$PM_STATE_DIR/hooks/run/drain-hook"
+    mkdir -p -- "$DR_HOOK_REC"
+    printf 'on-harvest\n' > "$DR_HOOK_REC/event"
+    sleep 300 & DR_HOOK_PID=$!
+    printf '%s\n' "$DR_HOOK_PID" > "$DR_HOOK_REC/pid"
+}
+
+# Starts the loop, waits for its first pass, then sends SIGTERM.
+drain_start_and_term() {
+    FORK_SANDBOX_POSTMASTER_INTERVAL=1 FORK_SANDBOX_POSTMASTER_DRAIN_POLL=0.2 \
+        "$postmaster" deliver --project "$PROJECT_DIR" > "$DR_LOG" 2>&1 &
+    DR_PID=$!
+    for _ in $(seq 1 100); do [[ -e "$PM_STATE_DIR/project" ]] && break; sleep 0.1; done
+    sleep 1
+    kill -TERM "$DR_PID"
+}
+
+# 1 while $DR_PID still runs after up to $1 tenths of a second, else 0.
+drain_alive_after() {
+    local _
+    for _ in $(seq 1 "$1"); do kill -0 "$DR_PID" 2>/dev/null || { echo 0; return; }; sleep 0.1; done
+    kill -0 "$DR_PID" 2>/dev/null && echo 1 || echo 0
+}
+
+drain_setup
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=60 drain_start_and_term
+check "drain: SIGTERM with a wake submitting and a hook running does not exit" 1 \
+    "$(drain_alive_after 20)"
+contains "drain: pm drain event counts both" "$(cat "$DR_LOG")" "pm drain busy=2 timeout=60s"
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+check "drain: still waiting on the running hook once the wake has its inputs" 1 \
+    "$(drain_alive_after 10)"
+kill "$DR_HOOK_PID" 2>/dev/null; wait "$DR_HOOK_PID" 2>/dev/null
+check "drain: exits once nothing is submitting or running" 0 "$(drain_alive_after 50)"
+dr_rc=0; wait "$DR_PID" || dr_rc=$?
+check "drain: exit status 0" 0 "$dr_rc"
+contains "drain: pm drain done event, nothing cut off" "$(cat "$DR_LOG")" "pm drain done busy=0"
+check "drain: the wake was not harvested (the next postmaster adopts it)" 0 \
+    "$( [[ -n "$(ls -A "$PM_STATE_DIR/harvested" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+kill "$DR_WAKE_PID" 2>/dev/null; wait "$DR_WAKE_PID" 2>/dev/null
+
+# The bound: a wake that never finishes submitting is cut off at the timeout.
+drain_setup nohook
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=1 drain_start_and_term
+check "drain timeout: exits once the bound is spent" 0 "$(drain_alive_after 50)"
+wait "$DR_PID" 2>/dev/null || true
+contains "drain timeout: pm drain done names what was cut off" "$(cat "$DR_LOG")" "pm drain done busy=1"
+kill "$DR_WAKE_PID" 2>/dev/null; wait "$DR_WAKE_PID" 2>/dev/null
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=soon refuses \
+    "drain: a non-numeric DRAIN_TIMEOUT refuses deliver" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+
 # ---- review-target harvest: a `sets` seat's (ken) Version: header, and a
 # `follow` seat's (kai) spawn-time header stamping ----
 # review-target: sets/follow are k8s-only fleet keys, so hand-writing

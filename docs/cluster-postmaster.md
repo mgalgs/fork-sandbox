@@ -224,9 +224,16 @@ Do these in order.
 - **In-flight seats survive a rollout.** A restarted postmaster adopts
   still-running Jobs instead of re-spawning them, so a rollout does not
   lose a seat's work in progress. A Job whose submit never finished pushing
-  its inputs is the exception: it is refused and its objects deleted, not
-  adopted (see "The run directory is the join" in
-  [kubernetes-runs.md](kubernetes-runs.md)).
+  its inputs cannot be adopted: it is refused and its objects deleted (see
+  "The run directory is the join" in
+  [kubernetes-runs.md](kubernetes-runs.md)). So the old postmaster drains
+  before it exits. On SIGTERM it launches nothing more and waits until no
+  wake is still submitting and no hook is still running, for at most
+  `FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT` seconds (default 150). The pod's
+  `terminationGracePeriodSeconds` (180) covers that wait, and the
+  whole shutdown stays inside the mail client's 5 minute retry budget. A
+  `pm drain done busy=<n>` line with `n` above 0 means the timeout cut
+  something off.
 
 ## The mail API
 

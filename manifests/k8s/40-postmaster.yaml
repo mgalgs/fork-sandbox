@@ -183,7 +183,10 @@ spec:
       # one, so only the postmaster container mounts it (the sa-token
       # volume below). The API container must never get the token.
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 60
+      # Must exceed the postmaster's shutdown drain (default 150 s; see
+      # SHUTDOWN DRAIN in fork-sandbox-postmaster.sh), or a rollout kills
+      # wakes still submitting and the drain buys nothing.
+      terminationGracePeriodSeconds: 180
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

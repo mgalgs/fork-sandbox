@@ -23,7 +23,7 @@
 # state. --once does one scan-route-harvest pass and exits (the test
 # surface); without it, deliver loops -- scan, route, harvest, sleep
 # $FORK_SANDBOX_POSTMASTER_INTERVAL seconds (default 15) -- until
-# SIGTERM/SIGINT, then exits 0.
+# SIGTERM/SIGINT, then drains (SHUTDOWN DRAIN below) and exits 0.
 #
 # --cluster is for a postmaster running inside a pod, and changes exactly two
 # things. At startup, deliver runs `fork-sandbox-fleet.sh check --cluster`
@@ -171,6 +171,11 @@
 #                the run record's RUN_DIR is not one of this postmaster's own
 #                wake directories (pm-k8s-wake.* under the wake root), so it
 #                was not adopted and the seat is treated as dead.
+#   drain        busy=<n>, timeout=<s>; then busy=<n>, waited=<s> -- the
+#                loop stopped on SIGTERM/SIGINT with <n> wakes still
+#                submitting or hooks still running, and deliver waited for
+#                them before exiting; see SHUTDOWN DRAIN below. A final
+#                busy above 0 means the timeout cut them off.
 #   external-mail thread -- `deliver --cluster` only: a non-fleet sender
 #                that is not on the operator list ($FORK_SANDBOX_OPERATORS)
 #                posted to this thread; it routes like fleet mail and
@@ -725,6 +730,17 @@
 # stays the current reason) and deferral continues indefinitely -- a run
 # is never declared dead just because the cluster stayed unreachable. Any
 # later determinate probe (0, 1, or 2) clears probe-fail-count.
+#
+# SHUTDOWN DRAIN. Adoption covers a wake whose pod already has its inputs.
+# One killed earlier -- still submitting, before INPUTS_PUSH_COMPLETE lands
+# in its k8s run.env -- cannot be adopted (resume deletes the half-built
+# Job), and a hook killed mid-run is `lost`. So when the deliver loop stops
+# on SIGTERM/SIGINT it launches nothing more and waits until no wake is
+# submitting and no hook is running, at most
+# $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT seconds (default 150; 0 skips the
+# wait). The pod's terminationGracePeriodSeconds must exceed it, and it
+# should stay under the mail client's retry budget, since the mail API is
+# down for the whole shutdown. A non-numeric value refuses `deliver`.
 #
 # rule 4's live delivery (above) never reaches a k8s wake: there is no
 # inbox to deliver into (the wrapper drives one fork-sandbox.sh --k8s run
@@ -2782,6 +2798,16 @@ pm_parse_fetch_window() {
 
 pm_require_fetch_window() {
     pm_parse_fetch_window
+}
+
+# Validates $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT, the bound (seconds) on
+# the shutdown drain (see pm_drain). Unset or empty takes the default
+# (150); 0 is legal and exits at once, as before the drain existed.
+pm_require_drain_timeout() {
+    local raw="${FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT-}"
+    [[ -z "$raw" || "$raw" =~ ^[0-9]+$ ]] && return 0
+    echo "Error: postmaster: \$FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT '$raw' is not a non-negative integer (seconds)." >&2
+    return 1
 }
 
 # The cluster operator list: the From addresses whose mail carries rule-1
@@ -5699,6 +5725,63 @@ pm_harvest_pass() {
     done
 }
 
+# ---- shutdown drain ----
+
+# True while a k8s wake is still building its run: from spawn until the pod
+# has its inputs (INPUTS_PUSH_COMPLETE in the k8s run.env). A wake killed in
+# that window cannot be adopted -- resume deletes the half-built Job -- so a
+# restart must not land there. A wake past it is adopted by the next
+# postmaster, and a dead or finished one is harvest's business.
+pm_wake_submitting() {
+    local env_file="$1" run_dir k8s_run_dir
+    [[ "$(fs_pm_env_get "$env_file" BACKEND)" == k8s ]] || return 1
+    run_dir="$(fs_pm_env_get "$env_file" RUN_DIR)"
+    [[ -d "$run_dir" && ! -f "$run_dir/summary.json" ]] || return 1
+    pm_wake_is_dead "$run_dir" "$env_file" && return 1
+    # Same lookup as fork-sandbox-k8s-wake.sh's fs_k8s_wake_find_run_dir.
+    k8s_run_dir="$(cat -- "$run_dir/k8s-run-dir" 2>/dev/null)" || k8s_run_dir=""
+    [[ -n "$k8s_run_dir" ]] \
+        || k8s_run_dir="$(sed -n 's/^  run dir:  *//p' "$run_dir/launch.log" 2>/dev/null | head -n1)"
+    [[ -n "$k8s_run_dir" ]] || return 0
+    ! grep -qx 'INPUTS_PUSH_COMPLETE=true' "$k8s_run_dir/run.env" 2>/dev/null
+}
+
+# How many detached children a restart would cut off right now: k8s wakes
+# still submitting (pm_wake_submitting) plus hooks still running.
+pm_drain_busy() {
+    local n=0 f rid rec
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ -e "$HARVESTED/$rid" ]] && continue
+        pm_wake_submitting "$f" && n=$((n + 1))
+    done
+    for rec in "$STATE/hooks/run"/*/; do
+        [[ -d "$rec" ]] || continue
+        rec="${rec%/}"
+        [[ -f "$rec/exit" ]] && continue
+        pm_hook_is_gone "$rec" || n=$((n + 1))
+    done
+    printf '%s' "$n"
+}
+
+# Runs once the deliver loop has stopped on SIGTERM/SIGINT: spawns nothing
+# more and waits, at most $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT seconds,
+# for pm_drain_busy to reach 0. In a pod this process is pid 1, so its exit
+# kills every detached wake and hook with it.
+pm_drain() {
+    local timeout="${FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT:-150}" start busy
+    start="$(date +%s)"
+    busy="$(pm_drain_busy)"
+    (( busy == 0 )) && return 0
+    pm_event "drain busy=$busy timeout=${timeout}s"
+    while (( busy > 0 && $(date +%s) - start < timeout )); do
+        sleep "${FORK_SANDBOX_POSTMASTER_DRAIN_POLL:-2}" || true
+        busy="$(pm_drain_busy)"
+    done
+    pm_event "drain done busy=$busy waited=$(( $(date +%s) - start ))s"
+}
+
 # ---- retry pass ----
 
 # Fires a wake that pm_retry_schedule deferred, once its backoff has
@@ -6149,6 +6232,7 @@ cmd_deliver() {
     pm_require_retry_backoff || return 1
     pm_require_k8s_timeout || return 1
     pm_require_fetch_window || return 1
+    pm_require_drain_timeout || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1
@@ -6184,6 +6268,7 @@ cmd_deliver() {
         (( stop )) && break
         sleep "${FORK_SANDBOX_POSTMASTER_INTERVAL:-15}" || true
     done
+    pm_drain
     pm_lock_release
     trap - EXIT TERM INT
     exit 0
