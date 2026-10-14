@@ -375,6 +375,10 @@ Handle the mail, mark it `lane-mail.sh seen <lane> <id>...`, then launch
 `--wait` again. Relaunching before marking fires again at once on the same
 messages.
 
+`lane-mail.sh lanes` lists the lanes there are: registered, mailbox-only,
+remote ones that have written here, and peer hosts. The
+`lane-mail-register` skill wraps registration and explains the listing.
+
 ### Lane mail between hosts
 
 Sessions on different machines can mail each other's lanes, over the ssh

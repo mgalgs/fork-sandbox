@@ -55,5 +55,17 @@ else
     ok "a lane name with a leading @ is refused"
 fi
 
+printf '== lanes ==\n'
+
+# The registration above is still in place, so the lister must show it.
+lanes="$("$lane_mail" lanes 2>&1)"
+rc=$?
+if (( rc == 0 )); then ok "lanes succeeds"; else no "lanes succeeds" "rc=$rc: $lanes"; fi
+if grep -qx $'live\ttestlane' <<<"$lanes"; then
+    ok "lanes lists a registered lane as live"
+else
+    no "lanes lists a registered lane as live" "$lanes"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

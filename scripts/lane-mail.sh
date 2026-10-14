@@ -6,6 +6,12 @@
 #        lane-mail.sh unregister
 #        lane-mail.sh send|reply|show|tree|list|inbox|seen [args...]
 #        lane-mail.sh send --to @lane:host ...     (another host, over ssh)
+#        lane-mail.sh lanes                        (the lanes there are)
+#
+# `lanes` prints one `<source><TAB><lane>` line per lane: `live` (some
+# session registered it -- registrations are never cleaned up, so the
+# session may be gone), `mailbox`, `remote` (`lane:host` that has written
+# here) and `peer` (a host). `list` lists messages, not lanes.
 #
 # The fork-sandbox mail store (fork-sandbox-mail.sh; format and semantics in
 # this repo's docs/agent-mail.md), pointed at a root reserved for
@@ -278,6 +284,13 @@ case "$cmd" in
     show|tree|list|inbox|seen)
         export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
         exec "$mail_bin" "$@"
+        ;;
+    lanes)
+        # The lane-complete mod's lister already merges every source and
+        # reads its paths from these scripts; one lister, two callers.
+        lister="$script_dir/../mods/lane-complete/bin/list-lanes.sh"
+        [[ -x "$lister" ]] || die "lanes: $lister not found (lane-mail.sh must run from a fork-sandbox checkout)"
+        exec "$lister" "${@:2}"
         ;;
     -h|--help|"")
         usage
