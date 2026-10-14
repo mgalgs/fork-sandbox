@@ -810,6 +810,11 @@ Pick per leg, and say why in one line when you launch:
 | Work where the model quality decides the outcome | `--harness claude --model opus` | subscription |
 | A second opinion from outside the family | `--harness pi --model <openrouter-id>` or `--harness codex` | real money / ChatGPT sign-in |
 
+Within a family, `fork-sandbox-pipeline-spec.py --models` lists every
+`--pipeline` model weakest first. Start a leg at the lowest tier its row
+allows, and give the maintainer the strongest. The order says nothing
+across families.
+
 The review flags travel with `--harness`, not with this table: a round
 that moves off the machine's harness restates `--review-model` (and
 `--review-harness`, if the reviewer should run elsewhere) in names that

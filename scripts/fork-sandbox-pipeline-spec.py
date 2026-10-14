@@ -2,6 +2,7 @@
 """Compile a --pipeline spec into a preset document, for fork-sandbox.sh.
 
 Usage: fork-sandbox-pipeline-spec.py <spec>
+       fork-sandbox-pipeline-spec.py --models   (every model, ranked; see RANKS)
 
 A spec is a preset's composition name used as the preset itself:
 `-`-joined segments `<stage><model>[<harness>][<repeat>]`, e.g.
@@ -62,6 +63,20 @@ MODELS = {
     "terra": {"codex": "terra"},
     "sol": {"codex": "sol"},
     "astra": {"codex": "astra"},
+}
+
+# Each family's MODELS names, weakest and cheapest first: what a router reads
+# for "the cheapest capable tier" or "the strongest seat". The order holds
+# within a family only; nothing ranks a claude name against a codex one.
+# Every MODELS name appears exactly once, under its native harness
+# (check_ranks below), so a new tier cannot land unranked.
+#
+# terra resolves to an older codex generation than its neighbours (see
+# aliases.conf in docs/presets.md): weaker than sol at about sol's price, so
+# it is never the better pick over sol.
+RANKS = {
+    "claude": ("haiku", "sonnet", "opus", "fable"),
+    "codex": ("luna", "terra", "sol", "astra"),
 }
 
 HARNESSES = ("claude", "codex", "pi")
@@ -150,11 +165,44 @@ def compile_spec(spec):
     return "".join(line + "\n" for line in lines)
 
 
+def check_ranks():
+    """Problems with RANKS against MODELS, one string each; empty if none."""
+    problems = []
+    ranked = [name for names in RANKS.values() for name in names]
+    for name in sorted({n for n in ranked if ranked.count(n) > 1}):
+        problems.append(f"'{name}' is ranked more than once")
+    for family, names in RANKS.items():
+        for name in names:
+            if name not in MODELS:
+                problems.append(f"'{name}' is ranked but not in MODELS")
+            elif next(iter(MODELS[name])) != family:
+                problems.append(f"'{name}' is ranked under {family}, not its "
+                                f"native harness {next(iter(MODELS[name]))}")
+    for name in MODELS:
+        if name not in ranked:
+            problems.append(f"'{name}' is in MODELS but has no rank")
+    return problems
+
+
+def list_models():
+    """One `<family> <rank> <name>` line per model, weakest first."""
+    return "".join(f"{family} {rank} {name}\n"
+                   for family, names in RANKS.items()
+                   for rank, name in enumerate(names, 1))
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
         sys.stdout.write(__doc__)
         sys.exit(0)
+    if len(sys.argv) == 2 and sys.argv[1] == "--models":
+        problems = check_ranks()
+        if problems:
+            sys.stderr.write("".join(f"Error: RANKS: {p}\n" for p in problems))
+            sys.exit(1)
+        sys.stdout.write(list_models())
+        sys.exit(0)
     if len(sys.argv) != 2 or not sys.argv[1]:
-        sys.stderr.write("Usage: fork-sandbox-pipeline-spec.py <spec>\n")
+        sys.stderr.write("Usage: fork-sandbox-pipeline-spec.py <spec> | --models\n")
         sys.exit(1)
     sys.stdout.write(compile_spec(sys.argv[1]))

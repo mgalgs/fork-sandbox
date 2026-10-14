@@ -369,8 +369,11 @@ The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
   `scripts/sandbox-run-log.py` — a test in
   `tests/sandbox-run-log-test.sh` enforces the two stay in step, and
   skipping the second leaves the tier displaying under a hashed slug
-  in composition output instead of its name. A new *generation* of an
-  existing tier needs neither edit — see "Bumping a generation" below.
+  in composition output instead of its name. It also needs a place in
+  that script's `RANKS`, which orders each family's models weakest
+  first, and `fork-sandbox-pipeline-spec.py --models` refuses to list
+  them while any name is unranked. A new *generation* of an existing
+  tier needs none of these edits — see "Bumping a generation" below.
 - **harness**, optional, seats the model on a non-native harness
   (`csolpi2`); the table must carry the model's id for that harness.
 - **N**, optional and 1 by default, is the code agent's `repeat`, or a

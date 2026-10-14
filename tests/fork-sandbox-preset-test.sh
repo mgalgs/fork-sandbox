@@ -1906,6 +1906,38 @@ out="$(run --pipeline csonnetclaude 2>"$err")"
 check "a native harness suffix is accepted" \
     $'pipeline=csonnetclaude\nharness=claude\nmodel=sonnet' "$out"
 
+printf '\n== the spec compiler ranks its models ==\n'
+check "--models lists each family weakest first" \
+    "$(printf '%s\n' 'claude 1 haiku' 'claude 2 sonnet' 'claude 3 opus' \
+        'claude 4 fable' 'codex 1 luna' 'codex 2 terra' 'codex 3 sol' \
+        'codex 4 astra')" \
+    "$(python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" --models)"
+# check_ranks against doctored tables: loaded by path, since the filename's
+# hyphens are not a valid module name.
+rank_problems() {
+    python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ps", sys.argv[1])
+ps = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ps)
+exec(sys.argv[2])
+print("|".join(ps.check_ranks()))
+' "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" "$1"
+}
+check "the shipped RANKS cover MODELS exactly" "" "$(rank_problems 'pass')"
+check "a MODELS name without a rank is refused" \
+    "'nova' is in MODELS but has no rank" \
+    "$(rank_problems 'ps.MODELS["nova"] = {"codex": "nova"}')"
+check "a name ranked twice is refused" \
+    "'sol' is ranked more than once" \
+    "$(rank_problems 'ps.RANKS["codex"] = ("luna", "sol", "sol", "terra", "astra")')"
+check "a name ranked under another family is refused" \
+    "'sonnet' is ranked under codex, not its native harness claude" \
+    "$(rank_problems 'ps.RANKS = {"claude": ("haiku", "opus", "fable"), "codex": ("luna", "terra", "sol", "astra", "sonnet")}')"
+check "a ranked name missing from MODELS is refused" \
+    "'nova' is ranked but not in MODELS" \
+    "$(rank_problems 'ps.RANKS["codex"] = ps.RANKS["codex"] + ("nova",)')"
+
 printf '\n== the presets directory ==\n'
 
 alt="$tmp/alt-presets"
