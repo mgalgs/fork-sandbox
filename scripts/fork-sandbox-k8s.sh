@@ -635,6 +635,28 @@
 #                         queues requests or a long prefill. It bounds the
 #                         gap between two reads, not the whole response.
 #                         Unset renders exactly as before.
+#   K8S_PI_IDLE_TIMEOUT=
+#                         <digits><unit>, same shape as K8S_PROXY_READ_TIMEOUT
+#                         (unit one of ms s m h d, e.g. 20m) -- how long a
+#                         cluster pi seat waits on one OpenAI request before
+#                         giving up (pi's own httpIdleTimeoutMs, default
+#                         300000ms/300s, with no env override of its own).
+#                         Rendered pod-side as PI_HTTP_IDLE_TIMEOUT_MS (in
+#                         milliseconds); see synthesize_pi_config /
+#                         synthesize_pi_config_list in
+#                         fork-sandbox-k8s-entrypoint.sh, which merge it into
+#                         the generated ~/.pi/agent/settings.json alongside
+#                         defaultProvider/defaultModel. Defaults to
+#                         K8S_PROXY_READ_TIMEOUT when that key is set and
+#                         this one is not -- both bound the same silence on
+#                         the same request path (seat -> per-run proxy ->
+#                         upstream), so an install that raised one wants the
+#                         other raised too. Neither set means no change: the
+#                         pod gets no PI_HTTP_IDLE_TIMEOUT_MS and pi's
+#                         settings render exactly as before this key
+#                         existed. Anything that is not a positive whole
+#                         number with one of those units is a parse-time
+#                         error naming this key.
 #   K8S_DEFAULT_ENDPOINT= the K8S_PROXY_ENDPOINTS entry a run is wired to
 #                         when neither submit nor run names one with
 #                         --endpoint. Optional, and only meaningful on an
@@ -1075,6 +1097,36 @@ k8s_valid_label_key() {
     (( ${#key} <= 63 )) && [[ "$key" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
 }
 
+# Converts a <digits><unit> value in the K8S_PROXY_READ_TIMEOUT /
+# K8S_PI_IDLE_TIMEOUT shape (unit one of ms s m h d, already validated by the
+# caller) to a whole number of milliseconds, for PI_HTTP_IDLE_TIMEOUT_MS --
+# the only one of the two consumers that needs a number rather than an nginx
+# time literal it can forward as-is. Anything over K8S_PI_IDLE_TIMEOUT_MAX_MS
+# prints as one past it, so a huge digit string cannot wrap bash arithmetic.
+#
+# The cap is Node's largest timer delay: pi hands this value to undici and
+# AbortSignal timers, and a larger one fires almost at once instead of
+# never, so an over-long timeout would fail every request immediately.
+K8S_PI_IDLE_TIMEOUT_MAX_MS=2147483647
+k8s_timeout_to_ms() {
+    local value="$1" n unit ms
+    n="${value%%[a-z]*}"
+    unit="${value#"$n"}"
+    if (( ${#n} > 10 )); then
+        printf '%s' "$(( K8S_PI_IDLE_TIMEOUT_MAX_MS + 1 ))"
+        return
+    fi
+    case "$unit" in
+        ms) ms="$n" ;;
+        s)  ms="$(( n * 1000 ))" ;;
+        m)  ms="$(( n * 60000 ))" ;;
+        h)  ms="$(( n * 3600000 ))" ;;
+        d)  ms="$(( n * 86400000 ))" ;;
+    esac
+    (( ms <= K8S_PI_IDLE_TIMEOUT_MAX_MS )) || ms="$(( K8S_PI_IDLE_TIMEOUT_MAX_MS + 1 ))"
+    printf '%s' "$ms"
+}
+
 # check-grant runs no kubectl and touches no cluster -- it is the grant
 # parser alone -- so it must work with no k8s.env at all (the postmaster
 # round's kickoff tooling may call it before install has ever run). Every
@@ -1117,6 +1169,10 @@ K8S_PROXY_KEYS_SECRET="$(read_env_value "$k8s_env" K8S_PROXY_KEYS_SECRET || true
 # Opts endpoints in to the embeddings routes; see parse_proxy_endpoint_embeddings.
 K8S_PROXY_ENDPOINT_EMBEDDINGS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_EMBEDDINGS || true)"
 K8S_PROXY_READ_TIMEOUT="$(read_env_value "$k8s_env" K8S_PROXY_READ_TIMEOUT || true)"
+# A cluster pi seat's OpenAI request timeout; see the key's header entry
+# above for the default-from-K8S_PROXY_READ_TIMEOUT rule, resolved below
+# once both keys are validated.
+K8S_PI_IDLE_TIMEOUT="$(read_env_value "$k8s_env" K8S_PI_IDLE_TIMEOUT || true)"
 K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 # Default model for a run with no --model, on a K8S_PROXY_ENDPOINTS
 # install; see the model-requirement block in cmd_submit, which resolves
@@ -1435,6 +1491,25 @@ if [[ "${1-}" != check-grant && -n "$K8S_PROXY_READ_TIMEOUT" \
     echo "'$K8S_PROXY_READ_TIMEOUT'." >&2
     exit 1
 fi
+if [[ "${1-}" != check-grant && -n "$K8S_PI_IDLE_TIMEOUT" \
+    && ! "$K8S_PI_IDLE_TIMEOUT" =~ ^[1-9][0-9]*(ms|s|m|h|d)$ ]]; then
+    echo "Error: K8S_PI_IDLE_TIMEOUT in $k8s_env must be a positive whole" >&2
+    echo "number with a time unit (ms, s, m, h or d), e.g. 20m; got" >&2
+    echo "'$K8S_PI_IDLE_TIMEOUT'." >&2
+    exit 1
+fi
+if [[ "${1-}" != check-grant && -n "$K8S_PI_IDLE_TIMEOUT" ]] \
+    && (( $(k8s_timeout_to_ms "$K8S_PI_IDLE_TIMEOUT") > K8S_PI_IDLE_TIMEOUT_MAX_MS )); then
+    echo "Error: K8S_PI_IDLE_TIMEOUT in $k8s_env is over pi's limit of" >&2
+    echo "${K8S_PI_IDLE_TIMEOUT_MAX_MS}ms (about 24 days); got '$K8S_PI_IDLE_TIMEOUT'." >&2
+    exit 1
+fi
+# PI_HTTP_IDLE_TIMEOUT_MS's source value (still in <digits><unit> shape;
+# converted to milliseconds where it is rendered, in cmd_submit): this key
+# when set, else K8S_PROXY_READ_TIMEOUT, else empty -- see K8S_PI_IDLE_TIMEOUT's
+# header entry for why the two share a default. Computed here, after both
+# are validated, so cmd_submit and cmd_check_grant never re-derive it.
+K8S_PI_IDLE_TIMEOUT_SRC="${K8S_PI_IDLE_TIMEOUT:-$K8S_PROXY_READ_TIMEOUT}"
 if [[ "${1-}" != check-grant && -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_value "$K8S_RUN_OWNER"; then
     echo "Error: K8S_RUN_OWNER='$K8S_RUN_OWNER' in $k8s_env is not a valid" >&2
     echo "Kubernetes label value -- it must be at most 63 characters and" >&2
@@ -7210,6 +7285,26 @@ KEYS
 )"
     fi
 
+    # The pi-agent-settings.json ConfigMap key: this install's own copy of
+    # pi-agent/settings.json, next to this script -- the exact file
+    # agent-sandboxed seeds a local sealed run's ~/.pi/agent from (see its
+    # own header). Present only when that file exists: the base repo's
+    # pi-agent/ ships only a README, so an unmodified install renders no
+    # such key and fork-sandbox-k8s-entrypoint.sh's synthesize_pi_config /
+    # synthesize_pi_config_list see no such file, same as today.
+    # FORK_SANDBOX_PI_AGENT_SETTINGS is a test seam only -- it lets a test
+    # point this at a fixture file without writing into this checkout's own
+    # pi-agent/; a real run never sets it.
+    local pi_agent_settings_src="${FORK_SANDBOX_PI_AGENT_SETTINGS:-$script_dir/../pi-agent/settings.json}"
+    local pi_agent_settings_configmap_key=""
+    if [[ -r "$pi_agent_settings_src" ]]; then
+        pi_agent_settings_configmap_key=$'\n'"$(cat <<KEYS
+  pi-agent-settings.json: |
+$(indent_block < "$pi_agent_settings_src")
+KEYS
+)"
+    fi
+
     # The service-ready initContainer, rendered only when at least one
     # service declares a readyWhen (services_ready_checks, built above from
     # fork-sandbox-k8s-services-parse.py's ready-checks output) -- a spec
@@ -7286,6 +7381,28 @@ CENV
         allow_unlisted_model_env=$'\n'"$(cat <<CENV
             - name: ALLOW_UNLISTED_MODEL
               value: "1"
+CENV
+)"
+    fi
+
+    # PI_HTTP_IDLE_TIMEOUT_MS, rendered only when K8S_PI_IDLE_TIMEOUT or its
+    # K8S_PROXY_READ_TIMEOUT fallback (K8S_PI_IDLE_TIMEOUT_SRC, resolved
+    # once at parse time above) is set -- converted to milliseconds here,
+    # the one place that needs a number rather than the nginx time literal
+    # K8S_PROXY_READ_TIMEOUT's own render forwards as-is. See
+    # synthesize_pi_config / synthesize_pi_config_list in
+    # fork-sandbox-k8s-entrypoint.sh for where this lands in pi's settings.
+    # Only a K8S_PROXY_READ_TIMEOUT fallback can exceed the cap here (the
+    # key itself is refused at parse time), and it is clamped rather than
+    # refused: nginx accepts that value, and the proxy key must keep working.
+    local pi_idle_timeout_env="" pi_idle_ms
+    if [[ -n "$K8S_PI_IDLE_TIMEOUT_SRC" ]]; then
+        pi_idle_ms="$(k8s_timeout_to_ms "$K8S_PI_IDLE_TIMEOUT_SRC")"
+        (( pi_idle_ms <= K8S_PI_IDLE_TIMEOUT_MAX_MS )) \
+            || pi_idle_ms="$K8S_PI_IDLE_TIMEOUT_MAX_MS"
+        pi_idle_timeout_env=$'\n'"$(cat <<CENV
+            - name: PI_HTTP_IDLE_TIMEOUT_MS
+              value: "$pi_idle_ms"
 CENV
 )"
     fi
@@ -7503,7 +7620,7 @@ CENV
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${codex_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${pi_idle_timeout_env}${review_loop_env}${claude_env}${codex_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
             - name: FORK_SANDBOX_LEG_HANDOFF_DIR
               value: "$leg_handoff_dir"
           securityContext:
@@ -7633,7 +7750,7 @@ VYAML
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${pi_idle_timeout_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -7701,7 +7818,7 @@ $(indent_block < "$leg_loop_sh")
 $(printf 'FORK_SANDBOX_BROWSER=%q\n' "${FORK_SANDBOX_BROWSER:-auto}" | indent_block)
 $(declare -f fs_detect_pod_browser fs_emit_browser_section fs_expand_browser_prompt | sed 's/[[:blank:]]*$//' | indent_block)
   handoff.md: |
-$(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${refresh_configmap_keys}${services_env_configmap_key}${service_ready_configmap_key}
+$(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${refresh_configmap_keys}${services_env_configmap_key}${service_ready_configmap_key}${pi_agent_settings_configmap_key}
 ---
 apiVersion: batch/v1
 kind: Job

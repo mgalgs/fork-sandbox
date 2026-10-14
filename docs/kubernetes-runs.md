@@ -1789,6 +1789,29 @@ the rendered proxy config is byte-identical to before. The proxy still
 buffers responses; an upstream that streams should send
 `X-Accel-Buffering: no`, which nginx honours.
 
+pi's own OpenAI request timeout (`httpIdleTimeoutMs` in
+`~/.pi/agent/settings.json`, default 300000ms/300s) has no environment
+override, so a cluster pi seat gives up on a slow upstream at 300s
+regardless of `K8S_PROXY_READ_TIMEOUT` above. `K8S_PI_IDLE_TIMEOUT=<n><unit>`
+(same shape as `K8S_PROXY_READ_TIMEOUT`: unit one of `ms s m h d`, e.g.
+`20m`) sets it instead: fork-sandbox-k8s-entrypoint.sh's
+`synthesize_pi_config`/`synthesize_pi_config_list` convert it to
+milliseconds and merge it into the generated settings.json as
+`httpIdleTimeoutMs`, the same way `defaultProvider`/`defaultModel` are
+already generated, without dropping anything else the file holds -- including
+this install's own `pi-agent/settings.json`, which `submit` ships as the
+`pi-agent-settings.json` ConfigMap key whenever that file exists next to
+`fork-sandbox-k8s.sh`. Unset,
+it defaults to `K8S_PROXY_READ_TIMEOUT` when THAT key is set: both bound
+the same silence on the same request path (seat -> per-run proxy ->
+upstream), so an install that raised one wants the other raised too. With
+neither key set, pi's settings render exactly as before this key existed.
+Anything that is not a positive whole number with one of those units is a
+parse-time error naming the key, and so is a value over 2147483647ms
+(about 24 days). That is Node's largest timer delay; pi's timers fire at
+once past it. A longer `K8S_PROXY_READ_TIMEOUT` fallback is clamped to
+that limit instead, since the proxy key itself stays valid.
+
 `http://` is accepted here (and on `K8S_PROXY_UPSTREAM`) when the host is a
 literal private IPv4 address (RFC1918, loopback, or link-local), or when it
 is a Kubernetes Service DNS name — a host ending in

@@ -107,6 +107,19 @@
 #                   empty string argument would be a positional pi
 #                   rejects; see run_pi_coding_leg for how it is split
 #                   into an argv and never evaluated.
+#   PI_HTTP_IDLE_TIMEOUT_MS
+#                   milliseconds pi should wait on an OpenAI request before
+#                   giving up, set by fork-sandbox-k8s.sh's submit from
+#                   K8S_PI_IDLE_TIMEOUT (or, when that key is unset,
+#                   K8S_PROXY_READ_TIMEOUT -- both bound the same silence on
+#                   the same request path, seat -> per-run proxy ->
+#                   upstream). synthesize_pi_config / synthesize_pi_config_list
+#                   below merge it into the generated settings.json as
+#                   httpIdleTimeoutMs, the key pi reads its OpenAI request
+#                   timeout from (default 300000, pi's own 300s). Unset or
+#                   empty (neither k8s.env key set) means no change: the
+#                   generated settings.json carries no httpIdleTimeoutMs of
+#                   its own, same as before this existed.
 #   CLAUDE_PROXY_BASE_URL
 #                   the base URL of the per-run proxy that swaps the
 #                   placeholder credential below for the operator's real
@@ -228,11 +241,16 @@
 #                           shared refresh logic (sourced), the continuation
 #                           prompt's preamble, and the operator's own
 #                           hand-off file, verbatim.
-#   pi-agent-settings.json  optional; this repo's pi-agent/settings.json,
-#                           the same file agent-sandboxed seeds a sealed
-#                           local run's ~/.pi/agent from. Only the
-#                           defaultProvider/defaultModel keys are generated
-#                           fresh here; everything else in it survives.
+#   pi-agent-settings.json  optional; this install's own pi-agent/settings.json
+#                           (shipped by fork-sandbox-k8s.sh's submit only when
+#                           that file exists next to it -- today's base repo
+#                           carries none, so an unmodified install ships no
+#                           such key and this script sees no such file), the
+#                           same file agent-sandboxed seeds a sealed local
+#                           run's ~/.pi/agent from. Only the
+#                           defaultProvider/defaultModel/httpIdleTimeoutMs
+#                           keys are generated fresh here; everything else in
+#                           it survives.
 #   claude-credentials.json, inbox-hook.sh
 #                           present only when HARNESS=claude. The former is
 #                           the operator's own credential with the access
@@ -307,6 +325,7 @@ esac
 : "${MODEL_DISCOVERY:=}"
 : "${ALLOW_UNLISTED_MODEL:=}"
 : "${PI_ARGS:=}"
+: "${PI_HTTP_IDLE_TIMEOUT_MS:=}"
 : "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
 : "${RUN_DIR:=}"
 if [[ -n "$RUN_DIR" ]]; then
@@ -988,7 +1007,10 @@ run_image_provisioning
 # Builds ~/.pi/agent/models.json + settings.json pointed at the pi proxy,
 # for one primary model id and, optionally, a second (REVIEW_MODEL) --
 # both land in models.json so pi can resolve either by --model, while
-# defaultModel/defaultProvider still point at the primary one. Used for
+# defaultModel/defaultProvider still point at the primary one.
+# PI_HTTP_IDLE_TIMEOUT_MS, when set, merges in as settings.json's
+# httpIdleTimeoutMs the same way -- see that env var's own header entry.
+# Used for
 # the pi harness's own coding leg below (both ids, up front), and again
 # with just the review model right before the review loop when the
 # coding leg ran claude instead, which never synthesized any config at
@@ -1043,7 +1065,9 @@ synthesize_pi_config() {
         settings_base="$(cat "$HOME/.pi/agent/settings.json")"
     fi
     if ! jq -n --argjson base "$settings_base" --arg model "$model" \
-        '$base * { defaultProvider: "proxy", defaultModel: $model }' \
+        --argjson idle "${PI_HTTP_IDLE_TIMEOUT_MS:-null}" \
+        '$base * { defaultProvider: "proxy", defaultModel: $model }
+            * (if $idle == null then {} else { httpIdleTimeoutMs: $idle } end)' \
         > "$HOME/.pi/agent/settings.json.new"; then
         echo "Error: pi-agent/settings.json is not valid JSON, so the generated" >&2
         echo "model defaults cannot be merged into it." >&2
@@ -1374,7 +1398,10 @@ discover_pipeline_pi_facts() {
 # discover_pipeline_pi_facts "id ctx maxtok" lines) -- the runner-mode
 # counterpart to synthesize_pi_config above, which only ever handles one
 # or two ids sharing one pair of windows. $2 is the default model (the
-# first pi seat's own id in pipeline.json step order).
+# first pi seat's own id in pipeline.json step order). PI_HTTP_IDLE_TIMEOUT_MS,
+# when set, merges into settings.json as httpIdleTimeoutMs exactly as in
+# synthesize_pi_config above -- every pi leg of a composed run shares the
+# one ~/.pi/agent this writes (see leg-loop.sh's .leg-setup copy).
 synthesize_pi_config_list() {
     local facts="$1" default_model="$2" id ctx maxtok
     echo "fork-sandbox-k8s-entrypoint: synthesizing pi config for a runner-mode run" >&2
@@ -1402,7 +1429,9 @@ synthesize_pi_config_list() {
         settings_base="$(cat "$HOME/.pi/agent/settings.json")"
     fi
     if ! jq -n --argjson base "$settings_base" --arg model "$default_model" \
-        '$base * { defaultProvider: "proxy", defaultModel: $model }' \
+        --argjson idle "${PI_HTTP_IDLE_TIMEOUT_MS:-null}" \
+        '$base * { defaultProvider: "proxy", defaultModel: $model }
+            * (if $idle == null then {} else { httpIdleTimeoutMs: $idle } end)' \
         > "$HOME/.pi/agent/settings.json.new"; then
         echo "Error: pi-agent/settings.json is not valid JSON, so the generated" >&2
         echo "model defaults cannot be merged into it." >&2

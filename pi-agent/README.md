@@ -3,6 +3,9 @@
 This directory is pi's configuration for **sandboxed runs only**. Every
 `agent-sandboxed` run copies it to a per-run staging directory, and the shim
 inside the sandbox copies that into the ephemeral `$HOME` as `~/.pi/agent`.
+A cluster run (`fork-sandbox-k8s.sh submit`) ships `settings.json` the same
+way, as the `pi-agent-settings.json` ConfigMap key, whenever this directory
+carries one -- see docs/kubernetes-runs.md's `K8S_PI_IDLE_TIMEOUT` entry.
 
 Two consequences follow from the copy:
 

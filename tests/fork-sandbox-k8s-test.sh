@@ -4766,6 +4766,136 @@ rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err 
     /tmp/fs-k8s-test-svc-dns.out /tmp/fs-k8s-test-svc-dns.err \
     /tmp/fs-k8s-test-custom-domain.out /tmp/fs-k8s-test-custom-domain.err
 
+printf '\n== K8S_PI_IDLE_TIMEOUT -- a cluster pi seat own request timeout ==\n'
+# idle_fixture <dir> <K8S_PI_IDLE_TIMEOUT> <K8S_PROXY_READ_TIMEOUT>: the same
+# base $config_dir's k8s.env (legacy K8S_PROXY_UPSTREAM) plus either line,
+# left out when its value is empty.
+idle_fixture() {
+    cp "$config_dir/k8s.env" "$1/k8s.env"
+    [[ -n "$2" ]] && printf 'K8S_PI_IDLE_TIMEOUT=%s\n' "$2" >> "$1/k8s.env"
+    [[ -n "$3" ]] && printf 'K8S_PROXY_READ_TIMEOUT=%s\n' "$3" >> "$1/k8s.env"
+}
+idle_bad() { # <timeout>
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    idle_fixture "$d" "$1" ''
+    refuses "K8S_PI_IDLE_TIMEOUT='$1' is refused, naming the key" \
+        "K8S_PI_IDLE_TIMEOUT" env FORK_SANDBOX_CONFIG_DIR="$d" "$k8s_sh" install --dry-run
+}
+for idle_val in 60 0s 060s 1.5m '60 s' 60sec 1h30m 60S -5s; do
+    idle_bad "$idle_val"
+done
+# Over Node's largest timer delay, a timeout fires at once instead of never;
+# the 20-digit case would wrap bash arithmetic if the conversion trusted it.
+for idle_val in 2147483648ms 25d 99999999999999999999d; do
+    idle_bad "$idle_val"
+done
+
+# idle_submit <dir>: sets idle_out (the --dry-run stdout, stderr kept apart
+# the same way $submit_out above was captured) and idle_rc.
+idle_submit() {
+    local out_file; out_file="$(newdir)/idle-submit.yaml"; tmpdirs+=("$(dirname "$out_file")")
+    FORK_SANDBOX_CONFIG_DIR="$1" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+        "$proj_dir" "$handoff_file" > "$out_file" 2>/tmp/fs-k8s-test-idle.err
+    idle_rc=$?
+    idle_out="$(cat "$out_file")"
+}
+
+idle_set_dir="$(newdir)"; tmpdirs+=("$idle_set_dir")
+idle_fixture "$idle_set_dir" 20m ''
+idle_submit "$idle_set_dir"
+if (( idle_rc == 0 )) \
+    && [[ "$(grep -cF -- '- name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")" == 1 ]] \
+    && grep -A1 -F -- '- name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out" | grep -qF 'value: "1200000"'; then
+    ok "K8S_PI_IDLE_TIMEOUT=20m renders PI_HTTP_IDLE_TIMEOUT_MS=1200000"
+else
+    no "K8S_PI_IDLE_TIMEOUT=20m renders PI_HTTP_IDLE_TIMEOUT_MS=1200000" \
+        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+fi
+
+idle_fallback_dir="$(newdir)"; tmpdirs+=("$idle_fallback_dir")
+idle_fixture "$idle_fallback_dir" '' 90s
+idle_submit "$idle_fallback_dir"
+if (( idle_rc == 0 )) \
+    && grep -A1 -F -- '- name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out" | grep -qF 'value: "90000"'; then
+    ok "K8S_PROXY_READ_TIMEOUT=90s alone renders the derived PI_HTTP_IDLE_TIMEOUT_MS=90000"
+else
+    no "K8S_PROXY_READ_TIMEOUT=90s alone renders the derived PI_HTTP_IDLE_TIMEOUT_MS=90000" \
+        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+fi
+
+idle_cap_dir="$(newdir)"; tmpdirs+=("$idle_cap_dir")
+idle_fixture "$idle_cap_dir" 2147483647ms ''
+idle_submit "$idle_cap_dir"
+if (( idle_rc == 0 )) \
+    && grep -A1 -F -- '- name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out" | grep -qF 'value: "2147483647"'; then
+    ok "K8S_PI_IDLE_TIMEOUT at exactly the cap is accepted"
+else
+    no "K8S_PI_IDLE_TIMEOUT at exactly the cap is accepted" \
+        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err)"
+fi
+
+idle_clamp_dir="$(newdir)"; tmpdirs+=("$idle_clamp_dir")
+idle_fixture "$idle_clamp_dir" '' 30d
+idle_submit "$idle_clamp_dir"
+if (( idle_rc == 0 )) \
+    && grep -A1 -F -- '- name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out" | grep -qF 'value: "2147483647"'; then
+    ok "a K8S_PROXY_READ_TIMEOUT fallback over the cap is clamped, not refused"
+else
+    no "a K8S_PROXY_READ_TIMEOUT fallback over the cap is clamped, not refused" \
+        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+fi
+
+idle_both_dir="$(newdir)"; tmpdirs+=("$idle_both_dir")
+idle_fixture "$idle_both_dir" 5m 90s
+idle_submit "$idle_both_dir"
+if (( idle_rc == 0 )) \
+    && grep -A1 -F -- '- name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out" | grep -qF 'value: "300000"'; then
+    ok "K8S_PI_IDLE_TIMEOUT takes precedence over K8S_PROXY_READ_TIMEOUT when both are set"
+else
+    no "K8S_PI_IDLE_TIMEOUT takes precedence over K8S_PROXY_READ_TIMEOUT when both are set" \
+        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+fi
+
+idle_none_dir="$(newdir)"; tmpdirs+=("$idle_none_dir")
+idle_fixture "$idle_none_dir" '' ''
+idle_submit "$idle_none_dir"
+if [[ "$(grep -cF -- '- name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")" == 0 ]]; then
+    ok "neither key set carries no PI_HTTP_IDLE_TIMEOUT_MS env"
+else
+    no "neither key set carries no PI_HTTP_IDLE_TIMEOUT_MS env" "$idle_out"
+fi
+if [[ "$idle_out" == "$(cat "$submit_out")" ]]; then
+    ok "neither key set renders byte-identical to the baseline submit --dry-run"
+else
+    no "neither key set renders byte-identical to the baseline submit --dry-run" \
+        "$(diff "$submit_out" <(printf '%s' "$idle_out") | head -20)"
+fi
+
+printf '\n== pi-agent-settings.json ConfigMap key -- shipped only when the file exists ==\n'
+pias_dir="$(newdir)"; tmpdirs+=("$pias_dir")
+printf '{"theme":"dark"}' > "$pias_dir/settings.json"
+pias_out_file="$(newdir)/pias-submit.yaml"; tmpdirs+=("$(dirname "$pias_out_file")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" FORK_SANDBOX_PI_AGENT_SETTINGS="$pias_dir/settings.json" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$pias_out_file" 2>/tmp/fs-k8s-test-pias.err; then
+    ok "submit with FORK_SANDBOX_PI_AGENT_SETTINGS set exits 0"
+else
+    no "submit with FORK_SANDBOX_PI_AGENT_SETTINGS set exits 0" "$(cat /tmp/fs-k8s-test-pias.err)"
+fi
+if grep -qF '  pi-agent-settings.json: |' "$pias_out_file" \
+    && grep -qF '{"theme":"dark"}' "$pias_out_file"; then
+    ok "a present pi-agent/settings.json ships as the pi-agent-settings.json ConfigMap key"
+else
+    no "a present pi-agent/settings.json ships as the pi-agent-settings.json ConfigMap key" \
+        "$(cat "$pias_out_file")"
+fi
+if ! grep -qF '  pi-agent-settings.json: |' "$submit_out"; then
+    ok "the base install (no pi-agent/settings.json) ships no pi-agent-settings.json key"
+else
+    no "the base install (no pi-agent/settings.json) ships no pi-agent-settings.json key" "$submit_out"
+fi
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude ==\n'
 # The default (--harness pi, i.e. submit_out above) renders no claude-proxy
 # object at all -- the per-run proxy is entirely opt-in.
@@ -14505,6 +14635,46 @@ else
     no "synthesize_pi_config with no second model renders exactly one entry (executed)" \
         "rc=$synth_rc: $synth_out; models.json: $synth_models"
 fi
+# Same as synth_run, but also sets PI_HTTP_IDLE_TIMEOUT_MS ($1) and seeds
+# mounts_dir/pi-agent-settings.json with $2 (when non-empty) first, to prove
+# the httpIdleTimeoutMs merge neither fails to add the key nor drops an
+# existing one already in the file.
+synth_run_idle() {
+    local idle="$1" existing="$2" home mounts
+    shift 2
+    home="$(newdir)"; tmpdirs+=("$home")
+    mounts="$(newdir)"; tmpdirs+=("$mounts")
+    synth_home="$home"
+    [[ -n "$existing" ]] && printf '%s' "$existing" > "$mounts/pi-agent-settings.json"
+    synth_out="$(HOME="$home" mounts_dir="$mounts" \
+        PROXY_BASE_URL="http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/primary/v1" \
+        PI_HTTP_IDLE_TIMEOUT_MS="$idle" \
+        bash -c 'source "$1"; synthesize_pi_config \
+            "${2-}" "${3-}" "${4-}" "${5-}" "${6-}" "${7-}"' \
+        _ "$synth_fn_file" "$@" 2>&1)"
+    synth_rc=$?
+}
+
+synth_run_idle 1200000 '{"theme":"dark"}' coder "" 8192 2048 "" ""
+if (( synth_rc == 0 )) \
+    && [[ "$(jq -r '.httpIdleTimeoutMs' "$synth_home/.pi/agent/settings.json" 2>/dev/null)" == "1200000" ]] \
+    && [[ "$(jq -r '.theme' "$synth_home/.pi/agent/settings.json" 2>/dev/null)" == "dark" ]] \
+    && [[ "$(jq -r '.defaultModel' "$synth_home/.pi/agent/settings.json" 2>/dev/null)" == "coder" ]]; then
+    ok "synthesize_pi_config merges httpIdleTimeoutMs without dropping existing settings keys (executed)"
+else
+    no "synthesize_pi_config merges httpIdleTimeoutMs without dropping existing settings keys (executed)" \
+        "rc=$synth_rc: $synth_out; settings.json: $(cat "$synth_home/.pi/agent/settings.json" 2>/dev/null)"
+fi
+
+synth_run_idle '' '' coder "" 8192 2048 "" ""
+if (( synth_rc == 0 )) \
+    && [[ "$(jq 'has("httpIdleTimeoutMs")' "$synth_home/.pi/agent/settings.json" 2>/dev/null)" == "false" ]]; then
+    ok "synthesize_pi_config with no PI_HTTP_IDLE_TIMEOUT_MS writes no httpIdleTimeoutMs key (executed)"
+else
+    no "synthesize_pi_config with no PI_HTTP_IDLE_TIMEOUT_MS writes no httpIdleTimeoutMs key (executed)" \
+        "rc=$synth_rc: $synth_out; settings.json: $(cat "$synth_home/.pi/agent/settings.json" 2>/dev/null)"
+fi
+
 if grep -A1 -qF -- 'synthesize_pi_config "$MODEL" "$REVIEW_MODEL"' "$entrypoint_sh" \
     && grep -A1 -F 'synthesize_pi_config "$MODEL" "$REVIEW_MODEL"' "$entrypoint_sh" \
         | grep -qF -- '"$CTX" "$MAX_TOKENS" "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"'; then
@@ -21068,7 +21238,7 @@ fi
 rd_block_run() {
     local mix="$1" runsh_body="$2" extra="${3:-}"
     local rund mounts work home clone stub_dir calls_file out
-    local RD_MODEL_DISCOVERY=""
+    local RD_MODEL_DISCOVERY="" RD_PI_HTTP_IDLE_TIMEOUT_MS=""
     rund="$(newdir)"; tmpdirs+=("$rund")
     mounts="$(newdir)"; tmpdirs+=("$mounts")
     work="$(newdir)"; tmpdirs+=("$work")
@@ -21093,6 +21263,7 @@ rd_block_run() {
     if [[ -n "$extra" ]]; then eval "$extra"; fi
     out="$(PATH="$stub_dir:$PATH" HOME="$home" TMPDIR="$work" \
         RUN_DIR="$rund" HARNESS=pi MODEL="" MODEL_DISCOVERY="$RD_MODEL_DISCOVERY" ALLOW_UNLISTED_MODEL="" \
+        PI_HTTP_IDLE_TIMEOUT_MS="$RD_PI_HTTP_IDLE_TIMEOUT_MS" \
         PROXY_BASE_URL="http://fs-k8s-test-proxy.invalid" \
         CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" \
         mounts_dir="$mounts" work_dir="$work" clone_dir="$clone" inbox_dir="$work/inbox" \
@@ -21152,6 +21323,14 @@ if [[ -f "$RD_BLOCK_PI_MODEL_MAP" ]] && [[ "$(jq -c . < "$RD_BLOCK_PI_MODEL_MAP"
 else
     no "RUN_DIR arm: a mixed pipeline.json with no discovery writes an empty pi-model-map.json" \
         "$(cat "$RD_BLOCK_PI_MODEL_MAP" 2>/dev/null) -- $RD_BLOCK_OUT"
+fi
+
+rd_block_run mixed 'exit 0' 'RD_PI_HTTP_IDLE_TIMEOUT_MS=1200000'
+if [[ "$(jq -r '.httpIdleTimeoutMs' "$RD_BLOCK_HOME/.pi/agent/settings.json" 2>/dev/null)" == "1200000" ]]; then
+    ok "RUN_DIR arm: PI_HTTP_IDLE_TIMEOUT_MS lands in the shared pi settings.json (synthesize_pi_config_list)"
+else
+    no "RUN_DIR arm: PI_HTTP_IDLE_TIMEOUT_MS lands in the shared pi settings.json (synthesize_pi_config_list)" \
+        "$(cat "$RD_BLOCK_HOME/.pi/agent/settings.json" 2>/dev/null) -- $RD_BLOCK_OUT"
 fi
 
 # The listing-spelling rewrite (pi-model-map.json, consumed by
