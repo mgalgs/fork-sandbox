@@ -45,6 +45,8 @@
 #                            <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
+#        fork-sandbox-k8s.sh peek <run-dir> [--after BYTES] [--max BYTES]
+#                            [--file NAME]
 #        fork-sandbox-k8s.sh rm --branch NAME
 #        fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
 #                            [--reach-probe HOST:PORT]...
@@ -199,6 +201,70 @@
 # blanket-approved specifically because its write is bounded to one
 # structurally constrained host directory, and kubectl exec would replace
 # that argument with a far larger one. This is a separate command instead.
+#
+# peek streams the transcript of the leg running right now, read-only --
+# it never writes to the pod, the cluster or the run directory, never reaps
+# and never changes run state, so it is safe to call from a polling loop
+# every few seconds while a run is still going. Unlike every other
+# per-run verb, it takes <run-dir> -- the directory submit printed for
+# this run, where run.env lives -- rather than --branch: that is the
+# handle a caller watching a run already has, and peek reads BRANCH (and,
+# for a composed --run-dir run, RUNNER) back out of it rather than asking
+# the caller to track either separately. It needs the same RBAC say and
+# fetch already need in the run's namespace -- list/get on pods, plus
+# pods/exec -- and grants nothing beyond that.
+#
+# A single-leg run's transcript lives at /work/events*.jsonl inside the
+# pod and lands at <run-dir>/evidence/ once collect runs; a composed
+# run's finished per-leg transcripts live under RUN_DIR itself and land
+# there unchanged. The two shapes
+# read from different places WHILE a leg is live, though: a single-leg
+# run's transcript grows in place at /work/events*.jsonl, but a composed
+# run's own leg runs in the separate "leg" container (see
+# fs_run_leg_split in fork-sandbox-runner.sh and "Composed pipelines on
+# --k8s" in docs/kubernetes-runs.md), whose live stdout lands at
+# $K8S_LEG_HANDOFF_DIR/<n>-<token>/stdout in the leg-handoff volume --
+# read-only in the agent container peek execs into -- and is only copied
+# onto RUN_DIR's own events-*.jsonl file, in one burst, after the leg
+# reports done. So for a composed run peek reads the CURRENT request's
+# own handoff stdout directly, never RUN_DIR's events*.jsonl, which stays
+# truncated to empty for as long as that leg is still running. "Current"
+# means the highest-numbered $RUN_DIR/.leg-req/<n> whose token file
+# exists: that counter, and the token each entry names, are written only
+# by the trusted agent container (RUN_DIR is read-only in the leg
+# container), so a leg cannot forge or pre-empt either one, even though
+# the handoff volume itself is leg-writable and the file it eventually
+# points at is not. A single-leg run instead treats the events*.jsonl
+# file with the newest mtime as "the leg running now": a fresh leg always
+# truncates its own file before writing a byte (see run_leg in
+# fork-sandbox-runner.sh and the top-level events file in
+# fork-sandbox-k8s-entrypoint.sh), so the active leg's file is always the
+# newest one, and a finished leg's file stops growing and falls behind.
+# Either way, only a plain, non-symlinked regular file is ever read -- a
+# transcript name, or a composed run's handoff stdout, that is anything
+# else is skipped as if it were not there, never followed. See "Reading a
+# run back" in docs/kubernetes-runs.md.
+#
+# The pod not existing yet, the agent container not having started (or
+# having already exited) and no leg having written a transcript yet are
+# three faces of the same "nothing to show" case: peek prints nothing on
+# stdout and exits 0 for all three, rather than making a polling caller
+# special-case each one. The one thing that is NOT this is the cluster
+# itself being unreachable on the initial pod lookup, which exits non-zero
+# with a message, same as a missing run directory or a bad flag -- and so
+# does an exec that times out or that RBAC forbids.
+#
+# --after BYTES/--file NAME echo the previous call's own trailer (see
+# below) back in; --max BYTES bounds how many bytes one call returns
+# (default 32 KiB). On success the transcript bytes go to stdout, nothing
+# else, ending on a line boundary except when a single line is itself
+# over --max (then that slice goes out anyway, so polling still makes
+# progress); the last line on stderr is always `peek: file=<basename>
+# next=<offset>`, where next is the --after to pass on the following
+# call. --file is only ever compared against the current leg's own name,
+# never used to pick a file to read: if it names a different file than
+# the one currently active, the leg has moved on, and peek reads the new
+# one from byte 0 regardless of --after.
 #
 # rm deletes the run's Job, its pod, and its ConfigMap.
 #
@@ -1216,6 +1282,13 @@ K8S_RUN_TTL="${K8S_RUN_TTL:-3600}"
 # leg's own stdout/stderr should never come close.
 K8S_LEG_VOLUME_SIZE_LIMIT="$(read_env_value "$k8s_env" K8S_LEG_VOLUME_SIZE_LIMIT || true)"
 K8S_LEG_VOLUME_SIZE_LIMIT="${K8S_LEG_VOLUME_SIZE_LIMIT:-8Gi}"
+# The composed (--run-dir) pod shape's leg-handoff volume mount path, read
+# here by cmd_peek to find a running leg's live stdout under it -- same
+# fixed pod-side constant cmd_submit's own pod spec mounts it at. Not a
+# k8s.env key, like K8S_PEEK_MAX_BYTES_DEFAULT below: this names a path
+# inside the pod this script itself controls, not a cluster setting an
+# operator would ever need to tune.
+K8S_LEG_HANDOFF_DIR="/handoff"
 # Per-run services caps -- see docs/sandbox-services.md's cluster section.
 # A repo must not be able to claim the namespace: these bound how many
 # services, how much cpu/memory, and how long a startup window a committed
@@ -7589,7 +7662,7 @@ CENV
     # /work/.run-complete early could fool a client's `wait` into fetching
     # a half-finished branch, which is exactly the kind of forged
     # end-of-run state this split exists to prevent.
-    local leg_handoff_dir="/handoff"
+    local leg_handoff_dir="$K8S_LEG_HANDOFF_DIR"
     # Named so it can be handed to the leg container as FORK_SANDBOX_CLONE_DIR
     # below -- unlike the agent container, which discovers this same path as
     # a local variable inside fork-sandbox-k8s-entrypoint.sh, leg-loop.sh has
@@ -8825,6 +8898,302 @@ cmd_say() {
         printf 'tool-call floor, around long commands, before each commit, and\n'
         printf 'before its final report.\n'
     fi
+}
+
+# peek's own bounded-read knobs: a "tens of KiB, not MiB" default for
+# --max, and the request timeout its two kubectl calls (the pod lookup,
+# then the exec) both carry. Neither is a k8s.env key -- unlike
+# K8S_RUN_TTL and its neighbors above, these describe this one verb's own
+# read, not an install-wide cluster setting, so there is nothing for an
+# operator to tune per-cluster.
+K8S_PEEK_MAX_BYTES_DEFAULT=$((32 * 1024))
+K8S_PEEK_REQUEST_TIMEOUT=10
+
+# The script cmd_peek execs inside the pod to find and read a bounded,
+# line-aligned slice of whichever leg's transcript is currently growing.
+# Plain POSIX sh (the base image's /bin/sh is dash) -- no bashisms, since
+# this never runs through bash. Positional, not interpolated: cmd_peek
+# passes scan_dir/file_arg/after/max/handoff_dir as argv to `sh -c
+# "$SCRIPT" sh ...`, so nothing a caller gives this verb -- --file is
+# validated against a fixed pattern before it ever gets here, and
+# --after/--max against digits-only -- ever becomes part of the command
+# text itself. handoff_dir is empty for a single-leg run and
+# $K8S_LEG_HANDOFF_DIR (a fixed constant this script itself controls,
+# never a caller-supplied value) for a composed one.
+#
+# Single-leg ($handoff_dir empty): picks the events*.jsonl entry with the
+# newest mtime as the active leg's own file -- see this verb's own header
+# comment above for why that is always the leg running now.
+#
+# Composed ($handoff_dir set): RUN_DIR's own events*.jsonl stays at the
+# zero bytes run_leg truncated it to for as long as its leg is running
+# (see this verb's own header comment above) -- so the file actually read
+# is $handoff_dir/<n>-<token>/stdout, for the highest-numbered request
+# directory under .leg-req that has a token, found by request number, not
+# mtime: a composed run's .leg-req is written only by the trusted agent
+# container (read-only in the leg container), so the highest n there is
+# never something a leg can forge or race ahead of (see "Composed
+# pipelines on --k8s" in docs/kubernetes-runs.md). The name reported back
+# as this leg's "file", `events-leg-<n>.jsonl`, is synthetic -- no such
+# path exists in the pod -- it exists only so a caller's --file round-trip
+# still matches the fixed events*.jsonl pattern and still changes when,
+# and only when, the request number advances.
+#
+# Either way, only a plain regular file is ever a candidate: `[ -f ] &&
+# [ ! -L ]` at the scan, then the file is opened ONCE on fd 3 and kept only
+# if /proc/$$/fd/3 resolves to exactly the expected path and is a regular
+# file; every later read goes through /proc/$$/fd/3, never the name. That
+# closes the check-then-read race on the composed shape's handoff stdout,
+# whose volume is leg-writable: a leg swapping its "stdout" (or its
+# <n>-<token> directory) for a symlink into the AGENT container's
+# filesystem -- the one that may mount a --context-secret -- fails the
+# readlink comparison instead of being read. Finding none at all, or
+# finding only disqualified entries, is not reported as a failure: no
+# PEEK_FILE marker goes out on stderr, which cmd_peek reads as "nothing to
+# show yet".
+#
+# --file is used only to decide whether --after still applies: a
+# mismatch (including a null --file) means the leg changed since the
+# caller's last poll, so the read starts at byte 0 of the file that is
+# current now, not whatever --file named. The byte range read is trimmed
+# to end on the last complete line found, UNLESS the whole range up to
+# --max contains no newline at all -- a single line longer than --max --
+# in which case the capped slice goes out as-is, so a caller polling a
+# pathological transcript still makes progress instead of looping forever
+# on 0 bytes. No temp files are ever written -- peek must never write to
+# the pod, not even its own /tmp -- every slice is instead re-read
+# straight from the transcript itself, as many times as the arithmetic
+# below needs; the window read is always the same already-size-bounded
+# [use_after, use_after+take) range regardless of how much more has
+# landed in the file by the time of the later re-reads. The number of
+# bytes about to be emitted is independently verified, by re-reading and
+# counting that exact range, immediately before it is ever written to
+# stdout, so a read that fails partway through -- a filled emptyDir, a
+# file that vanished -- is never mistaken for success: "next" only moves
+# past bytes actually sent, never past bytes a failed read merely meant
+# to send.
+# shellcheck disable=SC2016  # runs in the pod's own sh, not this shell
+K8S_PEEK_REMOTE_SCRIPT='
+scan_dir="$1"; req_file="$2"; req_after="$3"; max="$4"; handoff_dir="$5"
+cd "$scan_dir" 2>/dev/null || exit 0
+
+cur="" read_path=""
+if [ -n "$handoff_dir" ]; then
+    max_n=-1
+    for d in .leg-req/*/; do
+        [ -d "$d" ] || continue
+        b="${d%/}"; b="${b##*/}"
+        case "$b" in ""|*[!0-9]*) continue ;; esac
+        if [ "$b" -gt "$max_n" ]; then
+            max_n="$b"
+        fi
+    done
+    [ "$max_n" -ge 0 ] || exit 0
+    tokenfile=".leg-req/$max_n/token"
+    [ -f "$tokenfile" ] && [ ! -L "$tokenfile" ] || exit 0
+    token="$(cat -- "$tokenfile" 2>/dev/null)"
+    case "$token" in ""|*/*) exit 0 ;; esac
+    handoff_dir="$(cd "$handoff_dir" 2>/dev/null && pwd -P)" || exit 0
+    read_path="$handoff_dir/$max_n-$token/stdout"
+    [ -f "$read_path" ] && [ ! -L "$read_path" ] || exit 0
+    cur="events-leg-$max_n.jsonl"
+else
+    cur_mtime=-1
+    for f in events*.jsonl; do
+        [ -f "$f" ] || continue
+        [ -L "$f" ] && continue
+        m="$(stat -c "%Y" -- "$f" 2>/dev/null)" || continue
+        case "$m" in ""|*[!0-9]*) continue ;; esac
+        if [ "$m" -gt "$cur_mtime" ]; then
+            cur_mtime="$m"
+            cur="$f"
+        fi
+    done
+    [ -n "$cur" ] || exit 0
+    [ -f "$cur" ] && [ ! -L "$cur" ] || exit 0
+    read_path="$cur"
+fi
+
+case "$read_path" in
+    /*) want="$read_path" ;;
+    *) want="$(pwd -P)/$read_path" ;;
+esac
+{ exec 3< "$read_path"; } 2>/dev/null || exit 0
+[ "$(readlink "/proc/$$/fd/3" 2>/dev/null)" = "$want" ] || exit 0
+read_path="/proc/$$/fd/3"
+[ -f "$read_path" ] || exit 0
+
+size="$(wc -c < "$read_path" 2>/dev/null)" || exit 0
+case "$size" in ""|*[!0-9]*) exit 0 ;; esac
+
+use_after=0
+case "$req_after" in ""|*[!0-9]*) use_after=0 ;; *) use_after="$req_after" ;; esac
+if [ -n "$req_file" ] && [ "$req_file" = "$cur" ]; then
+    :
+else
+    use_after=0
+fi
+if [ "$use_after" -gt "$size" ]; then
+    use_after="$size"
+fi
+
+avail=$((size - use_after))
+take="$max"
+if [ "$take" -gt "$avail" ]; then
+    take="$avail"
+fi
+
+if [ "$take" -le 0 ]; then
+    printf "PEEK_FILE=%s\n" "$cur" >&2
+    printf "PEEK_NEXT=%s\n" "$use_after" >&2
+    exit 0
+fi
+
+last_byte="$(tail -c "+$((use_after + take))" -- "$read_path" 2>/dev/null | head -c 1)"
+if [ -n "$last_byte" ]; then
+    cut="$(tail -c "+$((use_after + 1))" -- "$read_path" 2>/dev/null | head -c "$take" | LC_ALL=C awk "
+        { if (NR > 1) sum += prevlen + 1; prevlen = length(\$0) }
+        END { print sum + 0 }
+    " 2>/dev/null)"
+    case "$cut" in ""|*[!0-9]*) cut=0 ;; esac
+else
+    cut="$take"
+fi
+
+emit=0
+if [ "$cut" -gt 0 ]; then
+    emit="$cut"
+elif [ "$take" -eq "$max" ]; then
+    emit="$take"
+fi
+
+next="$use_after"
+if [ "$emit" -gt 0 ]; then
+    got="$(tail -c "+$((use_after + 1))" -- "$read_path" 2>/dev/null | head -c "$emit" | wc -c 2>/dev/null)"
+    case "$got" in ""|*[!0-9]*) got=0 ;; esac
+    if [ "$got" -eq "$emit" ]; then
+        tail -c "+$((use_after + 1))" -- "$read_path" 2>/dev/null | head -c "$emit"
+        next=$((use_after + emit))
+    fi
+fi
+
+printf "PEEK_FILE=%s\n" "$cur" >&2
+printf "PEEK_NEXT=%s\n" "$next" >&2
+'
+
+cmd_peek() {
+    local run_dir="" file_arg="" after=0 max="$K8S_PEEK_MAX_BYTES_DEFAULT"
+    while (( $# )); do
+        case "$1" in
+            --after) after="${2:?--after requires a byte count}"; shift 2 ;;
+            --max) max="${2:?--max requires a byte count}"; shift 2 ;;
+            --file) file_arg="${2:?--file requires a transcript file name}"; shift 2 ;;
+            -*) echo "Error: unknown option '$1' for peek." >&2; exit 1 ;;
+            *)
+                if [[ -z "$run_dir" ]]; then
+                    run_dir="$1"
+                else
+                    echo "Error: peek takes exactly one run directory." >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$run_dir" ]] || { echo "Error: peek requires a run directory." >&2; exit 1; }
+    [[ "$after" =~ ^[0-9]+$ ]] \
+        || { echo "Error: --after must be a non-negative whole number of bytes, got '$after'." >&2; exit 1; }
+    [[ "$max" =~ ^[1-9][0-9]*$ ]] \
+        || { echo "Error: --max must be a positive whole number of bytes, got '$max'." >&2; exit 1; }
+    if [[ -n "$file_arg" ]] && [[ ! "$file_arg" =~ ^events[A-Za-z0-9._-]*\.jsonl$ ]]; then
+        echo "Error: --file must name a transcript file (events*.jsonl, no '/'), got '$file_arg'." >&2
+        exit 1
+    fi
+    [[ -d "$run_dir" ]] || { echo "Error: peek: no such run directory: $run_dir" >&2; exit 1; }
+    local env_file="$run_dir/run.env"
+    [[ -f "$env_file" ]] \
+        || { echo "Error: peek: $run_dir has no run.env; not a fork-sandbox-k8s run directory." >&2; exit 1; }
+
+    local branch runner scan_dir handoff_dir=""
+    branch="$(read_env_value "$env_file" BRANCH || true)"
+    [[ -n "$branch" ]] || { echo "Error: peek: $env_file lacks BRANCH." >&2; exit 1; }
+    fs_reject_unsafe_chars "$branch" || exit 1
+    runner="$(read_env_value "$env_file" RUNNER || true)"
+    if [[ "$runner" == 1 ]]; then
+        # A composed run's own RUN_DIR is mounted at the identical
+        # absolute path this run directory already has on the host -- see
+        # run_dir_volume_mount's own comment above, in cmd_submit's
+        # pod-spec render. That mountPath is validate_run_dir_flag's own
+        # canonicalized form ($FS_REALPATH -m), not whatever string the
+        # caller happened to pass to submit, so this has to canonicalize
+        # <run-dir> the same way: a relative path, a trailing "..", or a
+        # symlinked parent all name the same directory on disk but would
+        # otherwise make the in-pod `cd` below miss the mount entirely.
+        scan_dir="$("$FS_REALPATH" -m "$run_dir")"
+        handoff_dir="$K8S_LEG_HANDOFF_DIR"
+    else
+        scan_dir="/work"
+    fi
+
+    local safe_name legacy_name pod_name
+    safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
+    legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
+    if ! pod_name="$(k8s_probe_find_pod "$safe_name" "$legacy_name" "$K8S_PEEK_REQUEST_TIMEOUT")"; then
+        echo "Error: peek: could not reach the cluster to look up branch '$branch' (job $safe_name)." >&2
+        exit 1
+    fi
+    # No pod: never started, or already fetched and removed. Silent, per
+    # this verb's own "gone or not started is not an error" contract.
+    [[ -n "$pod_name" ]] || exit 0
+
+    local exec_out exec_err exec_rc=0
+    exec_out="$(mktemp)"
+    exec_err="$(mktemp)"
+    # --request-timeout bounds the request, not an established exec stream,
+    # so the hard cap is $FS_TIMEOUT. It runs the kubectl binary, not this
+    # script's kubectl() wrapper: --context and -n must stay spelled out.
+    "$FS_TIMEOUT" "$((K8S_PEEK_REQUEST_TIMEOUT + 5))s" \
+        kubectl --context="$K8S_CONTEXT" -n "$K8S_NAMESPACE" \
+        exec --request-timeout="${K8S_PEEK_REQUEST_TIMEOUT}s" -c agent "$pod_name" -- \
+        sh -c "$K8S_PEEK_REMOTE_SCRIPT" sh "$scan_dir" "$file_arg" "$after" "$max" "$handoff_dir" \
+        > "$exec_out" 2> "$exec_err" || exec_rc=$?
+
+    # The exec itself failing -- the agent container not started yet,
+    # already exited, or the pod gone between the lookup above and here --
+    # is read the same way as the script finding no transcript: neither
+    # ever reaches this far with a PEEK_FILE marker, so both fall through
+    # to the same silent exit 0 below. A timeout or an RBAC refusal is not
+    # "nothing yet" and would otherwise look like it forever, so those two
+    # are loud. Parsed as plain text, not with grep/cut, so a no-match here
+    # never trips this script's own set -o pipefail.
+    local err_text peek_file="" peek_next="" line
+    err_text="$(cat -- "$exec_err" 2>/dev/null || true)"
+    rm -f -- "$exec_err"
+    if (( exec_rc == 124 )); then
+        rm -f -- "$exec_out"
+        echo "Error: peek: exec into pod $pod_name timed out." >&2
+        exit 1
+    fi
+    if (( exec_rc != 0 )) && [[ "${err_text,,}" == *forbidden* ]]; then
+        rm -f -- "$exec_out"
+        echo "Error: peek: exec into pod $pod_name was forbidden; peek needs pods/exec in namespace $K8S_NAMESPACE." >&2
+        exit 1
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            PEEK_FILE=*) peek_file="${line#PEEK_FILE=}" ;;
+            PEEK_NEXT=*) peek_next="${line#PEEK_NEXT=}" ;;
+        esac
+    done <<< "$err_text"
+
+    if [[ -z "$peek_file" ]]; then
+        rm -f -- "$exec_out"
+        exit 0
+    fi
+
+    cat -- "$exec_out"
+    rm -f -- "$exec_out"
+    printf 'peek: file=%s next=%s\n' "$peek_file" "$peek_next" >&2
 }
 
 cmd_rm() {
@@ -11454,10 +11823,11 @@ case "$verb" in
     collect) cmd_collect "$@" ;;
     fetch) cmd_fetch "$@" ;;
     say) cmd_say "$@" ;;
+    peek) cmd_peek "$@" ;;
     rm) cmd_rm "$@" ;;
     check-grant) cmd_check_grant "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, upgrade-postmaster, submit, run, resume, wait, collect, fetch, say, rm or check-grant." >&2
+        echo "Error: unknown command '$verb'. Use install, upgrade-postmaster, submit, run, resume, wait, collect, fetch, say, peek, rm or check-grant." >&2
         exit 1
         ;;
 esac

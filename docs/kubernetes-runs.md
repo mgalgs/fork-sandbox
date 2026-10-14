@@ -484,6 +484,112 @@ nothing (condition 2) yet writes its verdict to the outbox, so condition
 artifact-only task may produce a file and no commits. It is the
 *conjunction* that marks a dead seat.
 
+### Watching a run live: `peek`
+
+Everything above reaches a run's transcript only at collect, after the
+run is already over — the whole point of the evidence pull-back is that
+it happens right before the fetch ends the pod. Something watching a run
+while it is still going — a caller holding the run directory `submit`
+printed, polling every few seconds — has no host-side copy of anything
+yet. `fork-sandbox-k8s.sh peek <run-dir> [--after BYTES] [--max BYTES]
+[--file NAME]` is the read-only answer: it never writes to the pod, the
+cluster or the run directory, never reaps and never changes run state,
+so it is safe to call from a polling loop. It needs the same RBAC `say`
+and `fetch` already need in the run's namespace — list/get on pods, plus
+`pods/exec` — and grants nothing beyond that.
+
+Unlike every other per-run verb, `peek` takes the run directory itself
+rather than `--branch`: that is the handle a caller watching a run
+already has, and `peek` reads `BRANCH` (and, for a composed `--run-dir`
+run, the `RUNNER=1` marker — see "Composed pipelines on `--k8s`" below)
+back out of `run.env` rather than asking the caller to track either
+separately.
+
+**Which file, and why that one is "the leg running now."** A single-leg
+run's transcript lives at `/work/events*.jsonl` inside the pod, the same
+files the evidence pull-back above reads, and lands at
+`<run-dir>/evidence/` once `collect` runs. `peek` treats the
+`events*.jsonl` entry with the newest mtime as the active leg's own
+file: a fresh leg always truncates its own file before writing a byte
+(`run_leg` in `fork-sandbox-runner.sh`; the top-level `events` file in
+`fork-sandbox-k8s-entrypoint.sh`), so the leg running now always owns the
+newest one, and a finished leg's file stops growing and falls behind.
+
+A composed run's finished transcripts land directly in `<run-dir>`
+itself, unchanged, as one of the allowlisted artifacts "Composed
+pipelines on `--k8s`" describes — but that is only true once a leg is
+*done*. While it runs, that leg is a separate "leg" container (see
+`fs_run_leg_split` in `fork-sandbox-runner.sh` and "Composed pipelines on
+`--k8s`" below): `run_leg` truncates `RUN_DIR`'s own `events*.jsonl` to
+empty before the leg starts and only fills it, in one burst, after the
+leg reports done, so that file stays empty for the leg's entire run. The
+leg's actual live stdout instead lands at
+`$K8S_LEG_HANDOFF_DIR/<n>-<token>/stdout` in the leg-handoff volume —
+read-only in the agent container `peek` execs into — so a composed run's
+`peek` reads that file instead, for the highest-numbered request under
+`RUN_DIR/.leg-req` whose token exists. That counter and its tokens are
+written only by the trusted agent container (`RUN_DIR` is read-only in
+the leg container), so a leg can never forge or race ahead of either one,
+even though the handoff volume itself is leg-writable. The name `peek`
+reports back for a composed run, `events-leg-<n>.jsonl`, is synthetic —
+nothing by that name exists in the pod — it exists only so the `--file`
+round-trip still matches the fixed `events*.jsonl` pattern and still
+changes exactly when the request number does.
+
+Either way, only a plain, non-symlinked regular file is ever a
+candidate — anything else is read as "nothing there yet," never
+followed. This matters for a single-leg run because the agent controls
+the contents of its own working tree and the agent container can hold
+mounted Secrets; it matters even more for a composed run's handoff
+stdout, because that volume is leg-writable, so a leg could otherwise
+swap its own stdout (or its request directory) for a symlink reaching
+into the agent container's filesystem rather than its own. A check
+before the read alone would leave a race, so the file is opened once and
+every read goes through that open descriptor, kept only when it resolves
+to exactly the expected path.
+
+**The three "nothing to show" cases are one case, not three.** The pod
+not existing yet (never started, or already fetched and removed), the
+pod existing but its agent container not having started yet (or having
+already exited) — which surfaces as the one `kubectl exec` beyond the
+pod lookup simply failing — and no leg having written a transcript yet
+all print nothing on stdout and exit 0, with no stderr either. A caller
+polling in a loop should never have to special-case any of these
+separately from "check back later." The one thing that is NOT folded
+into this is the cluster being unreachable on the pod lookup itself,
+which is a real, loud, non-zero exit, same as a missing or invalid run
+directory or a bad flag — `peek` tells "the API answered: no pod" apart
+from "could not ask" the same way `wait --probe` already does (see
+`k8s_probe_find_pod`). Two exec failures are loud too: an exec that
+times out, and one the cluster forbids because the caller lacks
+`pods/exec` in the run's namespace. Either would otherwise look like
+"nothing yet" forever.
+
+**The offset/file trailer.** On a call that found a transcript, the last
+line on stderr is always `peek: file=<basename> next=<offset>` — `next`
+is the `--after` to pass on the following call, and `--file` is that
+call's own basename, echoed back for the caller to pass in turn. `--file`
+is compared against whichever file is current now, never used to select
+one: when the leg has moved on since the caller's last poll, `--file`
+no longer names the current file, and `peek` reads the new one from byte
+0 regardless of what `--after` said — an offset never carries across a
+leg change. Otherwise the read picks up where it left off. `--max`
+(default 32 KiB — tens of KiB, never MiB, so neither a hung API server
+nor a huge transcript can flood or hang a poller) bounds how many bytes
+one call returns, and the read is always trimmed to end on the last
+complete line it found, so the caller never has to reassemble a half
+line across two calls — except when a single line already exceeds
+`--max`, in which case that capped slice goes out anyway, so a
+pathological transcript still makes progress one `--max`-sized bite at a
+time instead of stalling forever on a line break `--max` will never let
+it see.
+
+Every `kubectl` call `peek` makes — the pod lookup and the exec alike —
+carries a request-timeout bound, the same discipline every other bounded
+read in this file follows. The exec also runs under a hard `timeout`,
+because a request timeout does not bound an exec stream that is already
+open.
+
 ## The durable run log
 
 Every local `fork-sandbox.sh` run ends by appending one line to

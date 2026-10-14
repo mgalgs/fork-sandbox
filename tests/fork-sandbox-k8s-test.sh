@@ -375,6 +375,27 @@
 #     field and the key; a malformed key value is refused naming k8s.env,
 #     not the spec; and `validate-services` applies the same resolution
 #     and prints which rule it used.
+#   - `peek <run-dir>`, driven against the same kind of stubbed kubectl the
+#     rest of this file uses, its own exec call re-run for real (through the
+#     stub) against a fixture directory standing in for the pod's own
+#     scan directory, so this is the real embedded read script under test,
+#     not a duplicate of its logic: a pod that does not exist yet, one
+#     whose exec fails (not started, or already gone), and a leg that has
+#     not written a transcript yet are all silent, exit 0, no stdout and no
+#     stderr; a legacy (no --run-dir) run.env scans /work, a RUNNER=1
+#     (composed) one scans the run directory itself; a second call with
+#     --file/--after matching the first call's own trailer picks up only
+#     the new bytes, while a stale --file naming a leg that has since
+#     finished resets the read to byte 0 of whichever file is current now;
+#     --max cuts the read at the last complete line, except a single line
+#     already longer than --max, which still goes out whole so polling
+#     keeps making progress; the only matching transcript being a symlink
+#     is read as "nothing there yet", never followed, and so is a
+#     composed run's symlinked request directory; an exec that times out
+#     or is forbidden is a loud non-zero error; a malformed --file/
+#     --after/--max and a missing or non-run-directory argument are all
+#     refused before any kubectl call; and every kubectl call -- the pod
+#     lookup and the exec alike -- carries the same request-timeout bound.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -15257,22 +15278,39 @@ printf '\n== fork-sandbox-k8s.sh: the GNU tools go through their resolved names 
 #     1 rather than 0 documents the exception: if the bootstrap moves or
 #     a second raw readlink appears, this test says so instead of passing
 #     silently.
+#
+# K8S_PEEK_REMOTE_SCRIPT is data, not code this file ever runs itself: it
+# is a string `peek` hands to the POD's own /bin/sh over `kubectl exec`,
+# which (see "The agent pod" in docs/kubernetes-runs.md) is always the
+# Debian-family sandbox image, never the operator's own machine -- so the
+# macOS-BSD-tools concern these three patterns exist to catch does not
+# apply to anything inside it. Stripped out before every scan below,
+# rather than listing its own raw `stat -c` calls in the exclusion
+# alongside the shimmed form, so a later pod-side `realpath`/`timeout`
+# addition there does not need its own exemption either.
+k8s_sh_host_only="$(newdir)/fork-sandbox-k8s-host-only.sh"; tmpdirs+=("$(dirname "$k8s_sh_host_only")")
+awk '
+    /^K8S_PEEK_REMOTE_SCRIPT='"'"'$/ { skip = 1; next }
+    skip && /^'"'"'$/ { skip = 0; next }
+    skip { next }
+    { print }
+' "$k8s_sh" > "$k8s_sh_host_only"
 # shellcheck disable=SC2016  # the shimmed form is meant literally, not expanded
-raw_stat_hits="$(grep -n 'stat -c' "$k8s_sh" | grep -vF -- '"$FS_STAT" ' || true)"
+raw_stat_hits="$(grep -n 'stat -c' "$k8s_sh_host_only" | grep -vF -- '"$FS_STAT" ' || true)"
 if [[ -z "$raw_stat_hits" ]]; then
     ok "fork-sandbox-k8s.sh: no raw 'stat -c' outside the $FS_STAT shim"
 else
     no "fork-sandbox-k8s.sh: no raw 'stat -c' outside the $FS_STAT shim" "$raw_stat_hits"
 fi
 # shellcheck disable=SC2016  # the shimmed form is meant literally, not expanded
-raw_realpath_hits="$(grep -nE 'realpath -[mse]' "$k8s_sh" | grep -vF -- '"$FS_REALPATH" ' || true)"
+raw_realpath_hits="$(grep -nE 'realpath -[mse]' "$k8s_sh_host_only" | grep -vF -- '"$FS_REALPATH" ' || true)"
 if [[ -z "$raw_realpath_hits" ]]; then
     ok "fork-sandbox-k8s.sh: no raw 'realpath -m/-s/-e' outside the $FS_REALPATH shim"
 else
     no "fork-sandbox-k8s.sh: no raw 'realpath -m/-s/-e' outside the $FS_REALPATH shim" "$raw_realpath_hits"
 fi
 # shellcheck disable=SC2016  # the pattern is meant literally, not expanded
-raw_timeout_hits="$(grep -nE '(^|[;&|(])[[:space:]]*timeout[[:space:]]' "$k8s_sh" || true)"
+raw_timeout_hits="$(grep -nE '(^|[;&|(])[[:space:]]*timeout[[:space:]]' "$k8s_sh_host_only" || true)"
 if [[ -z "$raw_timeout_hits" ]]; then
     ok "fork-sandbox-k8s.sh: no bare 'timeout' command outside the $FS_TIMEOUT shim"
 else
@@ -24539,6 +24577,395 @@ up_failed_at "a container that is not ready fails verify" verify "pm-new/mail-ap
 up_pods "$up_stale_pods" "postmaster=$up_ref:true"
 up_run "$up_cfg" UP_PODS_FILE="$up_stale_pods"
 up_failed_at "with the mail API configured, a pod without mail-api fails verify" verify "no 'mail-api' container"
+
+printf '\n== fork-sandbox-k8s.sh peek streams the current legs own transcript ==\n'
+# No live cluster (see this file's own header): a stub kubectl ahead of the
+# real one on PATH answers the pod lookup from K8S_STUB_PEEK_POD, and for
+# the exec call re-runs the SAME argv peek built -- `sh -c SCRIPT sh
+# SCANDIR FILEARG AFTER MAX HANDOFFDIR` -- for real, with SCANDIR swapped
+# for K8S_STUB_PEEK_SCAN_DIR and HANDOFFDIR for K8S_STUB_PEEK_HANDOFF_DIR
+# when those are set: the real cmd_peek passes the literal in-pod paths
+# (/work or the canonicalized run directory, and the fixed /handoff
+# constant), which this test host cannot write to directly, so each test
+# that needs real files under either one points it at a fixture directory
+# instead. So the thing under test on every exec call below is the actual
+# script cmd_peek ships, read off its own argv, never a reimplementation
+# of its logic in the stub.
+peekstub_dir="$(newdir)"; tmpdirs+=("$peekstub_dir")
+cat > "$peekstub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *" get pod -l job-name="*)
+        [[ -n "${K8S_STUB_PEEK_POD:-}" ]] && printf '%s\n' "$K8S_STUB_PEEK_POD"
+        exit "${K8S_STUB_PEEK_GETPOD_RC:-0}" ;;
+    *" exec --request-timeout="*)
+        if [[ -n "${K8S_STUB_PEEK_EXEC_RC:-}" ]]; then
+            [[ -n "${K8S_STUB_PEEK_EXEC_ERR:-}" ]] && printf '%s\n' "$K8S_STUB_PEEK_EXEC_ERR" >&2
+            exit "$K8S_STUB_PEEK_EXEC_RC"
+        fi
+        args=("$@"); n=${#args[@]}; dashdash=-1
+        for (( i = 0; i < n; i++ )); do
+            if [[ "${args[$i]}" == "--" ]]; then dashdash=$i; break; fi
+        done
+        (( dashdash >= 0 )) || exit 1
+        rest=("${args[@]:$((dashdash + 1))}")
+        # rest is: sh -c SCRIPT sh SCANDIR FILEARG AFTER MAX HANDOFFDIR --
+        # index 4 is the scan directory peek itself computed (/work, or
+        # the composed run's own run-dir); the last element is the
+        # leg-handoff directory (empty for a legacy/single-leg run). Only
+        # swap either when a test asked to.
+        [[ -n "${K8S_STUB_PEEK_SCAN_DIR:-}" ]] && rest[4]="$K8S_STUB_PEEK_SCAN_DIR"
+        [[ -n "${K8S_STUB_PEEK_HANDOFF_DIR:-}" ]] && rest[$((${#rest[@]} - 1))]="$K8S_STUB_PEEK_HANDOFF_DIR"
+        "${rest[@]}"
+        exit $? ;;
+esac
+exit 0
+STUB
+chmod +x "$peekstub_dir/kubectl"
+
+# $1 = kubectl log, $2 = stdout capture, $3 = stderr capture, rest = peek args.
+peek_run() {
+    local log="$1" out="$2" err="$3"; shift 3
+    PATH="$peekstub_dir:$PATH" K8S_STUB_LOG="$log" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" peek "$@" > "$out" 2> "$err"
+}
+# $1 = branch, rest = extra run.env lines. Prints the new run directory.
+peek_mk_rundir() {
+    local branch="$1" d; shift
+    d="$(newdir)"; tmpdirs+=("$d")
+    printf 'BRANCH=%s\n' "$branch" > "$d/run.env"
+    local line
+    for line in "$@"; do printf '%s\n' "$line" >> "$d/run.env"; done
+    printf '%s' "$d"
+}
+peek_pod_name=fs-k8s-test-peek-pod-0
+
+# 1. No pod at all (never started, or already fetched and removed): silent,
+# exit 0, nothing on either stream, and no exec call -- the lookup alone
+# answers "nothing here".
+peek_rd1="$(peek_mk_rundir fs-k8s-test-peek-gone)"
+peek_log1="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$peek_log1")")
+peek_out1="$(newdir)/out"; peek_err1="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out1")" "$(dirname "$peek_err1")")
+if peek_run "$peek_log1" "$peek_out1" "$peek_err1" "$peek_rd1"; then
+    if [[ ! -s "$peek_out1" && ! -s "$peek_err1" ]] && ! grep -q ' exec ' "$peek_log1"; then
+        ok "peek: no pod found is silent and exits 0, with no exec call"
+    else
+        no "peek: no pod found is silent and exits 0, with no exec call" \
+            "stdout=$(cat "$peek_out1") stderr=$(cat "$peek_err1") log=$(cat "$peek_log1")"
+    fi
+else
+    no "peek: no pod found is silent and exits 0, with no exec call" "exited non-zero"
+fi
+
+# 2. The pod lookup itself cannot reach the cluster: a real, loud,
+# non-zero-exit error -- the one thing peek does not treat as "gone".
+peek_rd2="$(peek_mk_rundir fs-k8s-test-peek-unreachable)"
+peek_log2="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$peek_log2")")
+peek_out2="$(newdir)/out"; peek_err2="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out2")" "$(dirname "$peek_err2")")
+if K8S_STUB_PEEK_GETPOD_RC=1 peek_run "$peek_log2" "$peek_out2" "$peek_err2" "$peek_rd2"; then
+    no "peek: an unreachable cluster on the pod lookup is a real, non-zero error" \
+        "exited 0: $(cat "$peek_err2")"
+else
+    check "peek: an unreachable cluster on the pod lookup is a real, non-zero error" \
+        "1" "$(grep -c . "$peek_err2")"
+fi
+
+# 3. The pod exists but the exec itself fails -- the agent container has
+# not started yet, or the pod is already gone: still silent, still exit 0.
+peek_rd3="$(peek_mk_rundir fs-k8s-test-peek-notstarted)"
+peek_log3="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$peek_log3")")
+peek_out3="$(newdir)/out"; peek_err3="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out3")" "$(dirname "$peek_err3")")
+if K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_EXEC_RC=1 \
+    peek_run "$peek_log3" "$peek_out3" "$peek_err3" "$peek_rd3" \
+    && [[ ! -s "$peek_out3" && ! -s "$peek_err3" ]]; then
+    ok "peek: a pod whose exec fails (not started, or already gone) is silent and exits 0"
+else
+    no "peek: a pod whose exec fails (not started, or already gone) is silent and exits 0" \
+        "stdout=$(cat "$peek_out3") stderr=$(cat "$peek_err3")"
+fi
+
+# 4. A legacy (no --run-dir) run: cmd_peek scans /work on the pod -- proven
+# from the UNMODIFIED exec argv the stub logged, before any
+# K8S_STUB_PEEK_SCAN_DIR substitution -- and, with the scan dir swapped to
+# a fixture holding one events.jsonl, reads it whole and reports it as the
+# current file with next = its own size.
+peek_rd4="$(peek_mk_rundir fs-k8s-test-peek-legacy)"
+peek_fs4="$(newdir)"; tmpdirs+=("$peek_fs4")
+printf '{"a":1}\n{"b":2}\n' > "$peek_fs4/events.jsonl"
+peek_log4="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$peek_log4")")
+peek_out4="$(newdir)/out"; peek_err4="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out4")" "$(dirname "$peek_err4")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_SCAN_DIR="$peek_fs4" \
+    peek_run "$peek_log4" "$peek_out4" "$peek_err4" "$peek_rd4"
+if grep -qF -- ' -- sh -c ' "$peek_log4" && grep -qF 'sh /work  0 32768' "$peek_log4"; then
+    ok "peek: a legacy run.env (no RUNNER) scans /work on the pod"
+else
+    no "peek: a legacy run.env (no RUNNER) scans /work on the pod" "$(cat "$peek_log4")"
+fi
+if [[ "$(cat "$peek_out4")" == "$(printf '{"a":1}\n{"b":2}')" ]] \
+    && [[ "$(cat "$peek_err4")" == "peek: file=events.jsonl next=16" ]]; then
+    ok "peek: reads a legacy pod's transcript whole and reports file/next on stderr"
+else
+    no "peek: reads a legacy pod's transcript whole and reports file/next on stderr" \
+        "stdout=$(cat "$peek_out4") stderr=$(cat "$peek_err4")"
+fi
+
+# 5. A composed (RUNNER=1) run: its leg runs in a SEPARATE "leg" container
+# (see fs_run_leg_split in fork-sandbox-runner.sh), whose live stdout
+# lands under the leg-handoff volume, mounted at the fixed /handoff
+# constant and read-only in the agent container peek execs into -- never
+# RUN_DIR's own events*.jsonl, which run_leg truncates to empty at the
+# start of every leg and only fills, in one burst, once that leg reports
+# done. Stale content in RUN_DIR's events.jsonl here proves peek never
+# reads it for a composed run. The scan directory itself needs no
+# substitution -- the run directory already IS a real directory on this
+# host -- but /handoff does, since this test host cannot write there.
+peek_rd5="$(peek_mk_rundir fs-k8s-test-peek-composed RUNNER=1)"
+printf '{"stale":true}\n' > "$peek_rd5/events.jsonl"
+mkdir -p "$peek_rd5/.leg-req/1"
+printf 'tok1' > "$peek_rd5/.leg-req/1/token"
+touch "$peek_rd5/.leg-req/1/go"
+peek_handoff5="$(newdir)"; tmpdirs+=("$peek_handoff5")
+mkdir -p "$peek_handoff5/1-tok1"
+printf '{"start":true}\n' > "$peek_handoff5/1-tok1/stdout"
+peek_log5="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$peek_log5")")
+peek_out5="$(newdir)/out"; peek_err5="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5")" "$(dirname "$peek_err5")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_HANDOFF_DIR="$peek_handoff5" \
+    peek_run "$peek_log5" "$peek_out5" "$peek_err5" "$peek_rd5"
+if grep -qF "sh $peek_rd5  0 32768 /handoff" "$peek_log5" \
+    && [[ "$(cat "$peek_out5")" == '{"start":true}' ]] \
+    && [[ "$(cat "$peek_err5")" == "peek: file=events-leg-1.jsonl next=15" ]]; then
+    ok "peek: a composed run reads the current request's own live handoff stdout, never RUN_DIR's own events.jsonl"
+else
+    no "peek: a composed run reads the current request's own live handoff stdout, never RUN_DIR's own events.jsonl" \
+        "log=$(cat "$peek_log5") stdout=$(cat "$peek_out5") stderr=$(cat "$peek_err5")"
+fi
+
+# 5b. Offset continuation within the same composed leg: a second call with
+# --file/--after matching the first call's own trailer picks up only the
+# bytes appended to the SAME request's handoff stdout since.
+printf '{"more":true}\n' >> "$peek_handoff5/1-tok1/stdout"
+peek_out5b="$(newdir)/out"; peek_err5b="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5b")" "$(dirname "$peek_err5b")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_HANDOFF_DIR="$peek_handoff5" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out5b" "$peek_err5b" "$peek_rd5" --file events-leg-1.jsonl --after 15
+if [[ "$(cat "$peek_out5b")" == '{"more":true}' ]] \
+    && [[ "$(cat "$peek_err5b")" == "peek: file=events-leg-1.jsonl next=29" ]]; then
+    ok "peek: a composed run's offset continuation picks up only the bytes appended to the current leg's handoff stdout"
+else
+    no "peek: a composed run's offset continuation picks up only the bytes appended to the current leg's handoff stdout" \
+        "stdout=$(cat "$peek_out5b") stderr=$(cat "$peek_err5b")"
+fi
+
+# 5c. Leg change resets the offset in a composed run too: a later request
+# (the next leg, or any other call routed through fs_run_leg_split) gets a
+# fresh request number and a fresh, unguessable token, so its handoff
+# stdout is a different directory entirely -- a stale --file naming the
+# previous leg is never read from the --after it came with.
+mkdir -p "$peek_rd5/.leg-req/2"
+printf 'tok2' > "$peek_rd5/.leg-req/2/token"
+touch "$peek_rd5/.leg-req/2/go"
+mkdir -p "$peek_handoff5/2-tok2"
+printf '{"leg2":true}\n' > "$peek_handoff5/2-tok2/stdout"
+peek_out5c="$(newdir)/out"; peek_err5c="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5c")" "$(dirname "$peek_err5c")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_HANDOFF_DIR="$peek_handoff5" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out5c" "$peek_err5c" "$peek_rd5" --file events-leg-1.jsonl --after 29
+if [[ "$(cat "$peek_out5c")" == '{"leg2":true}' ]] \
+    && [[ "$(cat "$peek_err5c")" == "peek: file=events-leg-2.jsonl next=14" ]]; then
+    ok "peek: a composed run's leg change resets the offset to byte 0 of the new leg's own handoff stdout"
+else
+    no "peek: a composed run's leg change resets the offset to byte 0 of the new leg's own handoff stdout" \
+        "stdout=$(cat "$peek_out5c") stderr=$(cat "$peek_err5c")"
+fi
+
+# 5d. A symlinked handoff stdout is refused in a composed run exactly like
+# a symlinked events*.jsonl is in a single-leg one (test 10 below) -- this
+# is the shape that matters most: the leg-handoff volume is leg-writable,
+# so a leg could otherwise swap its own stdout for a symlink reaching into
+# the AGENT container's filesystem instead of its own.
+mkdir -p "$peek_rd5/.leg-req/3"
+printf 'tok3' > "$peek_rd5/.leg-req/3/token"
+touch "$peek_rd5/.leg-req/3/go"
+mkdir -p "$peek_handoff5/3-tok3"
+printf 'not-a-transcript\n' > "$peek_handoff5/.secret"
+ln -s "$peek_handoff5/.secret" "$peek_handoff5/3-tok3/stdout"
+peek_out5d="$(newdir)/out"; peek_err5d="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5d")" "$(dirname "$peek_err5d")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_HANDOFF_DIR="$peek_handoff5" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out5d" "$peek_err5d" "$peek_rd5"
+if [[ ! -s "$peek_out5d" && ! -s "$peek_err5d" ]]; then
+    ok "peek: a symlinked handoff stdout in a composed run is never followed -- read as nothing there yet"
+else
+    no "peek: a symlinked handoff stdout in a composed run is never followed -- read as nothing there yet" \
+        "stdout=$(cat "$peek_out5d") stderr=$(cat "$peek_err5d")"
+fi
+
+# 5e. A composed run's <run-dir> is canonicalized before it becomes the
+# in-pod scan path: the pod mounts RUN_DIR at validate_run_dir_flag's own
+# canonicalized form ($FS_REALPATH -m), so an unnormalized spelling of the
+# identical directory -- here, one routed through a trailing "/." -- must
+# still resolve to that same absolute path, not a literal string the
+# pod's own `cd` would miss.
+peek_rd5e="$(peek_mk_rundir fs-k8s-test-peek-relpath RUNNER=1)"
+peek_log5e="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$peek_log5e")")
+peek_out5e="$(newdir)/out"; peek_err5e="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5e")" "$(dirname "$peek_err5e")")
+K8S_STUB_PEEK_POD="$peek_pod_name" \
+    peek_run "$peek_log5e" "$peek_out5e" "$peek_err5e" "$peek_rd5e/."
+if grep -qF "sh $peek_rd5e  0 32768 /handoff" "$peek_log5e"; then
+    ok "peek: an unnormalized --run-dir spelling is canonicalized to the pod's own mount path"
+else
+    no "peek: an unnormalized --run-dir spelling is canonicalized to the pod's own mount path" "$(cat "$peek_log5e")"
+fi
+
+# 5f. A leg replacing its <n>-<token> DIRECTORY with a symlink, around a
+# plain regular "stdout", is refused too: the [ ! -L ] test only sees the
+# last component, so the read goes through an fd whose resolved path must
+# be exactly the expected one.
+mkdir -p "$peek_rd5/.leg-req/4"
+printf 'tok4' > "$peek_rd5/.leg-req/4/token"
+peek_elsewhere5f="$(newdir)"; tmpdirs+=("$peek_elsewhere5f")
+printf 'not-a-transcript\n' > "$peek_elsewhere5f/stdout"
+ln -s "$peek_elsewhere5f" "$peek_handoff5/4-tok4"
+peek_out5f="$(newdir)/out"; peek_err5f="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5f")" "$(dirname "$peek_err5f")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_HANDOFF_DIR="$peek_handoff5" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out5f" "$peek_err5f" "$peek_rd5"
+if [[ ! -s "$peek_out5f" && ! -s "$peek_err5f" ]]; then
+    ok "peek: a symlinked handoff request directory in a composed run is never followed"
+else
+    no "peek: a symlinked handoff request directory in a composed run is never followed" \
+        "stdout=$(cat "$peek_out5f") stderr=$(cat "$peek_err5f")"
+fi
+
+# 5g. An exec that times out, or that RBAC forbids, is a loud non-zero
+# error, not the silent "nothing yet" a not-started container gets: either
+# would otherwise leave a polling caller showing nothing forever.
+peek_out5g="$(newdir)/out"; peek_err5g="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5g")" "$(dirname "$peek_err5g")")
+if K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_EXEC_RC=124 \
+    peek_run "$(newdir)/kubectl.log" "$peek_out5g" "$peek_err5g" "$peek_rd5"; then
+    no "peek: a timed-out exec is a non-zero error" "exited 0"
+else
+    check "peek: a timed-out exec is a non-zero error" "1" "$(grep -c 'timed out' "$peek_err5g")"
+fi
+peek_out5h="$(newdir)/out"; peek_err5h="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out5h")" "$(dirname "$peek_err5h")")
+if K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_EXEC_RC=1 \
+    K8S_STUB_PEEK_EXEC_ERR='Error from server (Forbidden): pods "x" is forbidden: cannot create resource "pods/exec"' \
+    peek_run "$(newdir)/kubectl.log" "$peek_out5h" "$peek_err5h" "$peek_rd5"; then
+    no "peek: a forbidden exec is a non-zero error naming pods/exec" "exited 0"
+else
+    check "peek: a forbidden exec is a non-zero error naming pods/exec" "1" "$(grep -c 'needs pods/exec' "$peek_err5h")"
+fi
+
+# 6. Offset continuation: a second call with --file/--after matching the
+# first call's own trailer picks up only the bytes appended since.
+printf '{"second":true}\n' >> "$peek_fs4/events.jsonl"
+peek_out6="$(newdir)/out"; peek_err6="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out6")" "$(dirname "$peek_err6")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_SCAN_DIR="$peek_fs4" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out6" "$peek_err6" "$peek_rd4" --file events.jsonl --after 16
+if [[ "$(cat "$peek_out6")" == '{"second":true}' ]] \
+    && [[ "$(cat "$peek_err6")" == "peek: file=events.jsonl next=32" ]]; then
+    ok "peek: --file/--after matching the current file picks up only the new bytes"
+else
+    no "peek: --file/--after matching the current file picks up only the new bytes" \
+        "stdout=$(cat "$peek_out6") stderr=$(cat "$peek_err6")"
+fi
+
+# 7. Leg change resets the offset: a stale --file naming a leg that has
+# since finished is never read from the --after it came with -- the leg
+# that is current now starts over at byte 0, and its own name goes out on
+# the trailer.
+peek_fs7="$(newdir)"; tmpdirs+=("$peek_fs7")
+printf '{"old":true}\n' > "$peek_fs7/events.jsonl"
+sleep 1.1
+printf '{"new-leg":true}\n' > "$peek_fs7/events-review-1.jsonl"
+peek_out7="$(newdir)/out"; peek_err7="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out7")" "$(dirname "$peek_err7")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_SCAN_DIR="$peek_fs7" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out7" "$peek_err7" "$peek_rd4" --file events.jsonl --after 13
+if [[ "$(cat "$peek_out7")" == '{"new-leg":true}' ]] \
+    && [[ "$(cat "$peek_err7")" == "peek: file=events-review-1.jsonl next=17" ]]; then
+    ok "peek: a stale --file naming a finished leg resets the read to byte 0 of the current leg"
+else
+    no "peek: a stale --file naming a finished leg resets the read to byte 0 of the current leg" \
+        "stdout=$(cat "$peek_out7") stderr=$(cat "$peek_err7")"
+fi
+
+# 8. --max cuts the read at the last complete line: three 8-byte lines,
+# --max 20 fits two whole lines (16 bytes) but not a third, so the third
+# is held back for the next call.
+peek_fs8="$(newdir)"; tmpdirs+=("$peek_fs8")
+printf 'AAAAAAA\nBBBBBBB\nCCCCCCC\n' > "$peek_fs8/events.jsonl"
+peek_out8="$(newdir)/out"; peek_err8="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out8")" "$(dirname "$peek_err8")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_SCAN_DIR="$peek_fs8" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out8" "$peek_err8" "$peek_rd4" --max 20
+if [[ "$(cat "$peek_out8")" == "$(printf 'AAAAAAA\nBBBBBBB')" ]] \
+    && [[ "$(cat "$peek_err8")" == "peek: file=events.jsonl next=16" ]]; then
+    ok "peek: --max cuts the read at the last complete line, holding the rest back"
+else
+    no "peek: --max cuts the read at the last complete line, holding the rest back" \
+        "stdout=$(cat "$peek_out8") stderr=$(cat "$peek_err8")"
+fi
+
+# 9. A single line already longer than --max still goes out whole, so
+# polling a pathological transcript keeps making progress instead of
+# waiting forever for a line break that --max will never let it see.
+peek_fs9="$(newdir)"; tmpdirs+=("$peek_fs9")
+head -c 200 /dev/zero | tr '\0' x > "$peek_fs9/events.jsonl"
+peek_out9="$(newdir)/out"; peek_err9="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out9")" "$(dirname "$peek_err9")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_SCAN_DIR="$peek_fs9" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out9" "$peek_err9" "$peek_rd4" --max 50
+if [[ "$(wc -c < "$peek_out9")" == 50 ]] \
+    && [[ "$(cat "$peek_err9")" == "peek: file=events.jsonl next=50" ]]; then
+    ok "peek: a single line longer than --max is emitted whole at the cap, so polling still progresses"
+else
+    no "peek: a single line longer than --max is emitted whole at the cap, so polling still progresses" \
+        "bytes=$(wc -c < "$peek_out9") stderr=$(cat "$peek_err9")"
+fi
+
+# 10. The only matching transcript entry being a symlink is read as
+# "nothing there yet" -- never followed, no matter what it points at.
+peek_fs10="$(newdir)"; tmpdirs+=("$peek_fs10")
+printf 'not-a-transcript\n' > "$peek_fs10/.secret"
+ln -s "$peek_fs10/.secret" "$peek_fs10/events.jsonl"
+peek_out10="$(newdir)/out"; peek_err10="$(newdir)/err"; tmpdirs+=("$(dirname "$peek_out10")" "$(dirname "$peek_err10")")
+K8S_STUB_PEEK_POD="$peek_pod_name" K8S_STUB_PEEK_SCAN_DIR="$peek_fs10" \
+    peek_run "$(newdir)/kubectl.log" "$peek_out10" "$peek_err10" "$peek_rd4"
+if [[ ! -s "$peek_out10" && ! -s "$peek_err10" ]]; then
+    ok "peek: a symlinked transcript is never followed -- read as nothing there yet"
+else
+    no "peek: a symlinked transcript is never followed -- read as nothing there yet" \
+        "stdout=$(cat "$peek_out10") stderr=$(cat "$peek_err10")"
+fi
+
+# 11. Argument validation, all refused before any kubectl call.
+peek_log11="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$peek_log11")")
+touch "$peek_log11"
+refuses "peek: a --file with a slash is refused" \
+    "--file must name a transcript file" \
+    env PATH="$peekstub_dir:$PATH" K8S_STUB_LOG="$peek_log11" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" peek "$peek_rd4" --file ../events.jsonl
+refuses "peek: a --file outside the events*.jsonl pattern is refused" \
+    "--file must name a transcript file" \
+    env PATH="$peekstub_dir:$PATH" K8S_STUB_LOG="$peek_log11" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" peek "$peek_rd4" --file notes.txt
+refuses "peek: a non-numeric --after is refused" \
+    "--after must be a non-negative whole number" \
+    env PATH="$peekstub_dir:$PATH" K8S_STUB_LOG="$peek_log11" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" peek "$peek_rd4" --after nope
+refuses "peek: a non-positive --max is refused" \
+    "--max must be a positive whole number" \
+    env PATH="$peekstub_dir:$PATH" K8S_STUB_LOG="$peek_log11" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" peek "$peek_rd4" --max 0
+refuses "peek: a missing run directory is refused" \
+    "no such run directory" \
+    env PATH="$peekstub_dir:$PATH" K8S_STUB_LOG="$peek_log11" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" peek "$(newdir)/does-not-exist"
+check "peek: none of the argument-validation refusals above touched kubectl" "0" "$(grep -c . "$peek_log11")"
+
+# 12. Every cluster call -- the pod lookup in test 4 and the exec in test 4
+# -- carries the same request-timeout bound.
+if grep -q -- ' get pod -l job-name=.*--request-timeout=10s' "$peek_log4" \
+    && grep -q -- ' exec --request-timeout=10s -c agent ' "$peek_log4"; then
+    ok "peek: both the pod lookup and the exec carry the same request-timeout bound"
+else
+    no "peek: both the pod lookup and the exec carry the same request-timeout bound" "$(cat "$peek_log4")"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
