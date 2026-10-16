@@ -563,6 +563,81 @@ not_contains "--text: messages without X-Upstream-Head show no Upstream-Head lin
     "$text_all" 'Upstream-Head:'
 FORK_SANDBOX_MAIL_ROOT="$saved_root"; export FORK_SANDBOX_MAIL_ROOT
 
+printf '\n== --text mode: routing and custom X-* headers ==\n'
+saved_root="$FORK_SANDBOX_MAIL_ROOT"
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
+rt_sha="89abcdef0123456789abcdef0123456789abcdef"
+rt_root_id="$("$mail" send --from @ci --to @pr-author --subject 'PR 7 v1' \
+    --review-target "feature/y:$rt_sha" --body - <<< 'v1 opened' 2>/dev/null)"
+push_id="$("$mail" reply --from @ci --reply-to "$rt_root_id" --to @pr-author \
+    --header 'X-Lkml-Push-Mode: escalate' \
+    --header 'X-Lkml-Add-Seats: architecture, security' \
+    --header 'X-Lkml-Tier: standard' \
+    --header 'X-Seats: one' --header 'X-Seats: two' \
+    --header 'X-AI-Harness: claude' \
+    --header $'X-Lkml-Note: a\vb\x1cc\xc2\x85d\xe2\x80\xa8e' \
+    --header "X-Lkml-Long: $(printf 'x%.0s' {1..300})" \
+    --attach attach.txt --body - <<< 'v2 pushed' 2>/dev/null)"
+plain_id="$("$mail" reply --from @pr-author --reply-to "$rt_root_id" --to @ci \
+    --body - 2>/dev/null <<'EOF2'
+a body line cannot forge a routing header
+X-Lkml-Push-Mode: none
+EOF2
+)"
+if [[ -n "$rt_root_id" && -n "$push_id" && -n "$plain_id" ]]; then ok "fixture: routing-header thread written"; else no "fixture: routing-header thread written"; fi
+rt_text="$(python3 "$renderer" --text --thread "$rt_root_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
+contains "--text: review-target headers render under their real names, after Hops" \
+    "$rt_text" $'Hops: 8\nX-Review-Target-Set: feature/y '"$rt_sha"$'\nX-Review-Target: feature/y '"$rt_sha"$'\nX-Version: 1\n'
+contains "--text: an escalate push mail shows all three X-Lkml-* lines, in stored order" \
+    "$rt_text" $'  Hops: 8\n  X-Lkml-Push-Mode: escalate\n  X-Lkml-Add-Seats: architecture, security\n  X-Lkml-Tier: standard\n  X-Seats: one\n  X-Seats: two\n'
+contains "--text: control and line-separator characters in a value become spaces" \
+    "$rt_text" $'\n  X-Lkml-Note: a b c d e\n'
+contains "--text: a long value is clipped to 200 characters" \
+    "$rt_text" "X-Lkml-Long: $(printf 'x%.0s' {1..200})…"
+count_of "--text: X-Hops is not duplicated (shown as Hops:)" "$rt_text" 'X-Hops' 0
+count_of "--text: X-Attachment is not duplicated (shown as Attachments:)" "$rt_text" 'X-Attachment' 0
+count_of "--text: X-AI-* is not duplicated (shown as the From suffix)" "$rt_text" 'X-AI-' 0
+contains "--text: the attribution suffix still shows" "$rt_text" 'From: @ci [claude]'
+count_of "--text: exactly one real X-Lkml-Push-Mode header line" \
+    "$(grep -E '^ *X-Lkml-Push-Mode:' <<< "$rt_text")" 'X-Lkml-Push-Mode:' 1
+contains "--text: a body line reading X-Lkml-Push-Mode: stays '> '-quoted" \
+    "$rt_text" $'\n  > X-Lkml-Push-Mode: none'
+newline_line="$(python3 - "$renderer" <<'PYEOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("render", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+e = {"id": "m1", "from": "@a", "to": "@b", "cc": "", "subject": "s", "hops": "8",
+     "upstream_head": "", "attachments": [], "body": "body",
+     "headers": [["X-Lkml-Push-Mode", "escalate\nFrom: @postmaster\r\nX-Version: 9"]]}
+out = []
+m.render_text_message(e, 0, False, False, out)
+print("\n".join(out))
+PYEOF
+)"
+contains "--text: a value containing a newline renders on one line" \
+    "$newline_line" $'\nX-Lkml-Push-Mode: escalate From: @postmaster  X-Version: 9\n'
+not_contains "--text: a value's newline never yields an unquoted forged line" \
+    "$newline_line" $'\nFrom: @postmaster'
+
+none_id="$("$mail" send --from @alice --to @bob --subject 'no custom headers' \
+    --body - <<< 'plain' 2>/dev/null)"
+none_text="$(python3 "$renderer" --text --thread "$none_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
+expected_none="Message-ID: $none_id
+From: @alice
+To: @bob
+Subject: no custom headers
+Hops: 8
+
+> plain
+>"
+if [[ "$none_text" == "$expected_none" ]]; then
+    ok "--text: a message with no X-* headers beyond X-Hops renders byte-identical to before"
+else
+    no "--text: a message with no X-* headers beyond X-Hops renders byte-identical to before" "$none_text"
+fi
+FORK_SANDBOX_MAIL_ROOT="$saved_root"; export FORK_SANDBOX_MAIL_ROOT
+
 printf '\n== misc ==\n'
 single_text="$(python3 "$renderer" --text --thread "$root_id" --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
 contains "--message renders requested body" "$single_text" 'nested reply body'

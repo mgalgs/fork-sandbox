@@ -41,8 +41,25 @@ messages, reply nesting shown by indentation, headers abbreviated to
 Message-ID/From/To/Cc/Subject/hops (deliberately no Date, to save prompt
 tokens), plus an 'Upstream-Head: <branch> <sha>' line, right after Hops, on
 a message carrying X-Upstream-Head (`mail reply --upstream-head`: the
-upstream moved to that commit -- the only X-* header shown, because a seat
-has to see it to act on it); From carries a bracketed [X-AI-* attribution] suffix when the
+upstream moved to that commit). After it comes one '<Name>: <value>' line
+per remaining X-* header, under its real name, in stored order with
+repeats: the routing headers (X-Version, X-Review-Target, X-Review-Target-
+Set, X-Upstream-State, X-Thread-Budget, X-Grant) and every custom header a
+sender set with --header. Seats and personas are told to act on these, so
+they must see them. Skipped, because the view already shows them another
+way: X-Hops, X-Attachment, X-Upstream-Head and X-AI-*. Each value has its
+control, format and line-separator characters turned into spaces and is
+clipped to 200 characters, so a header can never yield a second unquoted
+line. Who can write which header: a seat's reply file carries only
+To/Cc/Subject/Reply-To-Id/Version, never a custom header, and its
+Version: becomes X-Version only through the postmaster's checks; `mail
+--header` takes only ^X-[A-Za-z0-9-]+$ names and refuses the ones the
+store writes itself; and the mail API also refuses X-Version and
+X-Review-Target* to every remote caller (docs/mail-api.md). So a custom
+header's value comes from whoever holds the send identity, and the view
+shows it as theirs, beside their From line. A message with no such header
+renders exactly as it did before this list existed. From carries a
+bracketed [X-AI-* attribution] suffix when the
 message has one (see attribution_str), byte-identical to before that
 existed when it doesn't. The Message-ID is included even though nothing
 else needs it, because it is the handle every id-taking verb (reply
@@ -117,6 +134,7 @@ import stat
 import sys
 import tempfile
 import time
+import unicodedata
 
 
 def esc(s):
@@ -573,6 +591,37 @@ def build_html(mail_root, thread_ids, title, live=None):
 """
 
 
+ROUTING_HEADER_NAME = re.compile(r"X-[A-Za-z0-9-]+")
+# Shown elsewhere in the --text view: as Hops:, Attachments:, Upstream-Head:
+# (consumers match that spelling) and the From attribution suffix.
+ROUTING_HEADER_SKIP = {"X-HOPS", "X-ATTACHMENT", "X-UPSTREAM-HEAD"}
+ROUTING_HEADER_MAX = 200
+
+
+def one_line_value(value):
+    """A header value made safe to print as one unquoted line: every
+    control, format or line/paragraph-separator character becomes a space
+    (str.splitlines breaks on more than \\n), then the result is clipped."""
+    value = "".join(
+        " " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
+        for ch in value
+    ).strip()
+    if len(value) > ROUTING_HEADER_MAX:
+        value = value[:ROUTING_HEADER_MAX] + "…"
+    return value
+
+
+def routing_headers(e):
+    """(name, value) for every X-* header the --text view prints on its own
+    line, in stored order with repeats; see the module docstring."""
+    for name, value in e["headers"]:
+        upper = name.upper()
+        if (not ROUTING_HEADER_NAME.fullmatch(name)
+                or upper in ROUTING_HEADER_SKIP or upper.startswith("X-AI-")):
+            continue
+        yield name, one_line_value(value)
+
+
 def render_text_message(e, depth, orphaned, is_error, out):
     # This quoting grammar is a wake trust boundary, not cosmetic: changing
     # body prefixes or emitting an unquoted body-derived line breaks the
@@ -595,6 +644,8 @@ def render_text_message(e, depth, orphaned, is_error, out):
     out.append(f"{indent}Hops: {e['hops']}")
     if e["upstream_head"]:
         out.append(f"{indent}Upstream-Head: {e['upstream_head']}")
+    for name, value in routing_headers(e):
+        out.append(f"{indent}{name}: {value}")
     if e["attachments"]:
         out.append(f"{indent}Attachments: " + ", ".join(e["attachments"]))
     out.append("")

@@ -1082,9 +1082,10 @@ before.
 
 The seat sees the announcement in its thread view: `mail-render --text`
 prints an `Upstream-Head: <branch> <sha>` line right after `Hops:` for a
-message carrying `X-Upstream-Head` (the only `X-*` header it shows). Like
-every header line it is unquoted, while a body line reading
-`Upstream-Head: ...` renders `> `-quoted, so a body cannot forge one.
+message carrying `X-Upstream-Head`. Like every header line it is
+unquoted, while a body line reading `Upstream-Head: ...` renders
+`> `-quoted, so a body cannot forge one. The other `X-*` headers follow
+it under their real names (see `--text` under the renderer below).
 
 Local (non-k8s) seats get no `upstream` branch: the postmaster only logs an
 `upstream-head-local-seat` event when a local `sets` seat wakes on a
@@ -2168,6 +2169,24 @@ to Message-ID / From / To / Cc / Subject / hops. There is deliberately no
 `Date`, to save prompt tokens. The Message-ID stays, because it is the
 handle every id-taking verb needs, and a view an agent cannot act on is
 not a view.
+
+After `Hops:` (and `Upstream-Head:`, when present) comes one line per
+remaining `X-*` header, under its real name, in stored order with
+repeats: the routing headers `X-Version`, `X-Review-Target`,
+`X-Review-Target-Set`, `X-Upstream-State`, `X-Thread-Budget` and
+`X-Grant`, and every custom header a sender set with `--header`. A
+persona told to act on `X-Lkml-Push-Mode` sees exactly
+`X-Lkml-Push-Mode: escalate`. Skipped, because the view shows them another
+way: `X-Hops` (`Hops:`), `X-Attachment` (`Attachments:`),
+`X-Upstream-Head` (`Upstream-Head:`) and `X-AI-*` (the From suffix). Each
+value has control, format and line-separator characters turned into
+spaces and is clipped to 200 characters, so a header never yields a
+second unquoted line. A message with no such header renders as it did
+before. A seat cannot set a custom header: its reply file carries only
+To/Cc/Subject/Reply-To-Id/Version, and `Version:` becomes `X-Version`
+only through the postmaster's own checks. A custom header comes from whoever
+holds the sending identity, and the mail API refuses the routing ones to
+every remote caller ([docs/mail-api.md](mail-api.md)).
 
 **`--message ID`** requires both `--text` and `--thread ID` and renders one
 message at depth zero, using the same anti-forgery grammar. It is used for a
