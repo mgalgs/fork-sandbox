@@ -71,6 +71,11 @@ naming the postmaster's per-seat wake gate, $HOOKS_DIR/wake-when.<suffix>
 (see docs/agent-mail.md). Unlike `grant` it is legal on a handler seat: the
 gate guards a spawn, whatever the seat is.
 
+`on-silence` is fleet.yaml-only and LLM-only. Its one value, `flag`, has
+the postmaster flag the thread when a wake of the seat exits 0 having
+posted nothing (see docs/agent-mail.md). Leave it unset on a seat whose
+protocol allows a silent wake.
+
 `review-target` is fleet.yaml-only too, same reason as `backend`: a seat
 must not know it is the one moving a review thread's shared target.
 Value is the literal string `sets` or `follow` (see docs/agent-mail.md
@@ -112,7 +117,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (eighteen lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (nineteen lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -130,6 +135,7 @@ routine instead of two.
     agent\t<name>\treview-target\t<value>
     agent\t<name>\twake-when\t<value>
     agent\t<name>\tservices\t<value>
+    agent\t<name>\ton-silence\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -192,7 +198,7 @@ WAKE_WHEN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
           "handler", "command", "backend", "endpoint", "grant",
-          "review-target", "wake-when", "services")
+          "review-target", "wake-when", "services", "on-silence")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
@@ -205,7 +211,8 @@ FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
 # all), which applies to a handler exactly as it does an LLM seat.
 LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
                     "persona", "refresh-at", "preset", "backend",
-                    "endpoint", "grant", "review-target", "services")
+                    "endpoint", "grant", "review-target", "services",
+                    "on-silence")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -560,6 +567,15 @@ def check_wake_when(value, path, errors):
     return value
 
 
+def check_on_silence(value, path, errors):
+    """The only accepted value is 'flag'. Absent means a wake that posts
+    nothing is a valid outcome, which is the default."""
+    if value != "flag":
+        errors.append(f"{path}: takes 'flag', not '{value}'")
+        return ""
+    return value
+
+
 def check_backend_fields_pair(backend, endpoint, grant, path, errors):
     """endpoint/grant only mean anything to the k8s spawn path; on any
     other backend they would silently do nothing, so refuse the
@@ -695,6 +711,10 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["wake-when"] = check_wake_when(v, path, errors)
+            elif prop == "on-silence":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["on-silence"] = check_on_silence(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],

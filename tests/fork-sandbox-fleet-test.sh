@@ -537,8 +537,8 @@ check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PE
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (wake-when) is empty, as it is for tuner.
-check "resolve: output is exactly eighteen lines" "18" "$("$fleet" resolve tuner | wc -l)"
+# (on-silence) is empty, as it is for tuner.
+check "resolve: output is exactly nineteen lines" "19" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -1255,8 +1255,8 @@ agents:
   tuner: {harness: pi, backend: k8s, services: true}
 EOF
 check "services: booleans pass check" 0 "$("$fleet" check >/dev/null 2>&1; echo $?)"
-check "services: false resolves as the final field" false "$("$fleet" resolve riffler | tail -n1)"
-check "services: true resolves as the final field" true "$("$fleet" resolve tuner | tail -n1)"
+check "services: false resolves as the 18th line" false "$("$fleet" resolve riffler | sed -n 18p)"
+check "services: true resolves as the 18th line" true "$("$fleet" resolve tuner | sed -n 18p)"
 bad "services: non-boolean is refused" "agents.riffler.services: must be a YAML boolean" <<'EOF'
 agents:
   riffler: {backend: k8s, services: 'false'}
@@ -1325,6 +1325,42 @@ EOF
 printf '%s\n' "$saved_riffler_persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
 
 printf '%s\n' "$saved_fleet_for_wake_when" > "$FORK_SANDBOX_FLEET_FILE"
+
+printf '\n== on-silence ==\n'
+
+saved_fleet_for_on_silence="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    on-silence: flag
+    services: false
+  tuner: {}
+EOF
+check "on-silence: flag passes check" 0 "$("$fleet" check >/dev/null 2>&1; echo $?)"
+check "on-silence: resolves as the 19th line" flag "$("$fleet" resolve riffler | sed -n 19p)"
+check "on-silence: services keeps the 18th beside it" false "$("$fleet" resolve riffler | sed -n 18p)"
+check "on-silence: empty on a seat that sets none" "" "$("$fleet" resolve tuner | sed -n 19p)"
+bad "on-silence: any other value is refused" "agents.riffler.on-silence: takes 'flag', not 'ignore'" <<'EOF'
+agents:
+  riffler:
+    on-silence: ignore
+EOF
+bad "on-silence: a handler seat may not carry it" "agents.riffler.on-silence: not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: some-handler
+    on-silence: flag
+EOF
+saved_riffler_persona="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+printf '%s\n' "---" "on-silence: flag" "---" "persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+bad "on-silence: persona frontmatter refuses it as an unknown key" \
+    "frontmatter.on-silence: unknown key" <<'EOF'
+agents:
+  riffler: {}
+EOF
+printf '%s\n' "$saved_riffler_persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+printf '%s\n' "$saved_fleet_for_on_silence" > "$FORK_SANDBOX_FLEET_FILE"
 
 printf '\n== expand ==\n'
 

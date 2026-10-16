@@ -589,6 +589,8 @@ agents:
     triage: false              # Cc wake always spawns, skips the classifier
   alice:
     wake-when: ready            # a spawn of alice asks wake-when.ready first (rule 5)
+  auditor:
+    on-silence: flag            # a clean wake that posts nothing flags the thread
   notifier:
     handler: exec              # a deterministic script seat, not an LLM
     command: notify-slack       # bare name, resolved under $FORK_SANDBOX_HANDLERS_DIR
@@ -684,6 +686,15 @@ executable exists is the postmaster's question at spawn time, not
 `check`'s, and a missing one fails open. Any seat may carry it, a
 handler seat included.
 
+A per-agent `on-silence: flag` says that every wake of the seat owes a
+reply. A wake of such a seat that exits 0 having written no reply file
+flags the thread `silent-wake`; see "Silent wakes" under "Replies". Leave it
+unset on a seat whose protocol allows a silent wake (a reviewer told to
+stay quiet until others answer, say): unset, a clean exit with an empty
+outbox is a valid outcome. It is fleet.yaml-only and LLM-only: a persona
+file naming it is refused as an unknown key, and so is a handler seat
+carrying it. `flag` is the only value.
+
 An optional top-level `budget-reserve:` block holds back the last spawns
 of a thread's budget for named seats (routing rule 3 below):
 
@@ -706,12 +717,12 @@ other seat would be refused from a thread's first message.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # eighteen lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # nineteen lines: harness, model, thinking,
                                       # network, persona-path, description,
                                       # wake-on-cc, refresh-at, triage,
                                       # preset, handler, command, backend,
                                       # endpoint, grant, review-target,
-                                      # wake-when, services
+                                      # wake-when, services, on-silence
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -730,7 +741,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly eighteen lines;
+than stopping at the first. `resolve` always prints exactly nineteen lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
@@ -1335,9 +1346,9 @@ replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>; the `wake-exit` flag adds `log=<run-id>`, the entry
 of `status --thread --json`'s `wake_failures` that holds that attempt's log
 tail, and omits it when no entry could be written), `flag-clear` (thread,
-agent, reason=wake-exit, run=<failed run id>, by=<recovering run id>,
+agent, reason=wake-exit|silent-wake, run=<failed run id>, by=<recovering run id>,
 flagged=yes|no — a seat's successful wake cleared its earlier wake-exit
-flag; `flagged` says whether the thread is still flagged for something
+flag, or a seat's reply cleared its earlier silent-wake flag; `flagged` says whether the thread is still flagged for something
 else; one line per cleared attempt), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
 `defer` (thread, agent, reason=wake-when — a seat's wake gate said not
@@ -1863,6 +1874,21 @@ call that itself fails — is skipped and flags the thread with the
 filename and the reason. It never costs the run's other, well-formed
 replies. The run is then marked harvested exactly once.
 
+#### Silent wakes
+
+A wake that exits 0 with no reply file in its outbox is, by default, a
+valid outcome: the postmaster does not know a seat's protocol, and some
+protocols want silence (a seat told to wait until other seats have
+answered). A seat that always owes a reply says so with `on-silence: flag`
+in fleet.yaml. A clean wake of that seat that writes no `mail-*.md` flags
+the thread `wake for <agent> posted no reply (run <id>)` (keyword
+`silent-wake`). A wake whose only reply files are malformed already flags
+for them and is not counted as silent. A failed wake is a wake-exit, never
+also a silence. The seat's next wake that posts a reply clears the flag
+(journal `clear` line, `flag-clear` event with `reason=silent-wake`), the
+same way a clean exit clears a wake-exit flag: the flag is replaced by the
+newest reason left standing, or removed when none is.
+
 Posted replies are new unrouted messages. The next scan routes them. That
 loop is the whole conversation.
 
@@ -2020,8 +2046,8 @@ own thread scans never see it:
 |---|---|
 | `lock` | a `flock`'d file; the pid inside is for messages only — the mutual exclusion is the kernel's advisory lock, so a killed postmaster cannot leave a stale hold |
 | `routed/<message-id>` | routing already decided for this message |
-| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake) |
 | `route-pending/<message-id>/` | the message's seats not yet handed to a wake: `thread`, `band` (the reserve-band verdict it was judged under), `seats` (one per line, in order) and `inflight` (`<agent> <attempts>`, the seat in hand). Removed once the last seat is handled — see "A message's seats survive a restart" |
+| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake), `ON_SILENCE` (the seat's `on-silence` at spawn, read back at harvest) |
 | `handler-outbox/<run-id>` | a handler wake's outbox; unlike an LLM wake's (part of its ephemeral scratch run dir), this sits under this same persistent state tree, so the postmaster removes it itself once harvested — nothing here outlives its own wake |
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |

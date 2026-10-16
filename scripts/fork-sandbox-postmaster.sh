@@ -816,6 +816,15 @@
 # but also flag the thread, since an empty outbox from a crashed wake is
 # not the documented "no reply is a valid outcome" and needs an
 # operator's eyes.
+#
+# SILENT WAKE. A clean exit with nothing in the outbox is a valid outcome
+# by default: whether a seat owed a reply is the seat's protocol, which the
+# postmaster does not know. A seat that always owes one says so with
+# `on-silence: flag` (fleet resolve's 19th line, copied into the run record
+# as ON_SILENCE at spawn). Such a wake flags the thread `wake for <agent>
+# posted no reply (run <id>)` (keyword `silent-wake`), and the seat's next
+# wake that posts a reply clears it, the same way a clean exit clears a
+# wake-exit flag (see pm_wake_exit_clear).
 # A malformed reply file (bad address, unparseable stanza, or a
 # `mail.sh` call that itself fails) is skipped and flags the thread with
 # the filename and the reason -- it never costs the run's other,
@@ -2036,6 +2045,7 @@ pm_flag_keyword() {
         "run dir for"*"vanished"*) printf 'run-vanished' ;;
         "wake never produced summary.json"*) printf 'no-summary' ;;
         "wake for"*"exited"*) printf 'wake-exit' ;;
+        "wake for"*"posted no reply"*) printf 'silent-wake' ;;
         "wake for"*"failed after"*"retries"*) printf 'retry-exhausted' ;;
         "no grant for k8s seat"*) printf 'no-grant' ;;
         "review target "*|"Version: "*) printf 'review-target' ;;
@@ -2313,7 +2323,9 @@ pm_wake_exit_mark_cleared() {
 }
 
 # A wake of $2 on thread $1 exited 0 (run $3): clears the wake-exit flag
-# reason(s) that seat's earlier failed wakes raised, and nothing else.
+# reason(s) that seat's earlier failed wakes raised, and nothing else. $4/$5
+# swap in another per-seat keyword and reason prefix: the silent-wake flag
+# (SILENT WAKE in the header) is cleared the same way once the seat replies.
 #
 # The flag file holds one reason (pm_flag overwrites, see pm_flag_keyword),
 # so what a thread is flagged for is read from its journal: every `flag`
@@ -2333,11 +2345,12 @@ pm_wake_exit_mark_cleared() {
 # emitted per cleared attempt. Silent, and touching nothing, when this
 # agent has no open wake-exit flag -- every ordinary successful wake.
 pm_wake_exit_clear() {
-    local tid="$1" agent="$2" rid="$3"
+    local tid="$1" agent="$2" rid="$3" key="${4:-wake-exit}"
+    local pref="${5:-wake for $2 exited }"
     local jf="$NEEDS_OPERATOR_JOURNAL/$tid"
     [[ -f "$jf" ]] || return 0
     local scan
-    scan="$(awk -F'\t' -v agent="$agent" '
+    scan="$(awk -F'\t' -v key="$key" -v pref="$pref" '
         function runid(s) {
             if (match(s, /\(run [^)]+\)/)) return substr(s, RSTART + 5, RLENGTH - 6)
             return ""
@@ -2348,17 +2361,16 @@ pm_wake_exit_clear() {
         $2 == "clear"  { r = runid(reason); if (r != "") cleared[r] = 1; next }
         $2 == "flag"   { n++; kw[n] = $3; rs[n] = reason; next }
         END {
-            pref = "wake for " agent " exited "
             for (i = 1; i <= n; i++) {
                 r = runid(rs[i])
-                if (kw[i] == "wake-exit" && index(rs[i], pref) == 1 && !(r in cleared) && !(r in seen)) {
+                if (kw[i] == key && index(rs[i], pref) == 1 && !(r in cleared) && !(r in seen)) {
                     if (r != "") seen[r] = 1
                     print "open\t" (r == "" ? "-" : r) "\t" rs[i]
                 }
             }
             for (i = n; i >= 1; i--) {
                 r = runid(rs[i])
-                if (kw[i] == "wake-exit" && (index(rs[i], pref) == 1 || r in cleared)) continue
+                if (kw[i] == key && (index(rs[i], pref) == 1 || r in cleared)) continue
                 print "keep\t" kw[i] "\t" rs[i]
                 break
             }
@@ -2377,9 +2389,9 @@ pm_wake_exit_clear() {
     [[ -f "$NEEDS_OPERATOR/$tid" ]] && cur="$(cat -- "$NEEDS_OPERATOR/$tid" 2>/dev/null || true)"
     for i in "${!open_runs[@]}"; do
         pm_wake_exit_mark_cleared "$tid" "$agent" "${open_runs[$i]}" "$rid"
-        pm_flag_journal_append "$tid" clear wake-exit "${open_reasons[$i]} cleared by run $rid"
+        pm_flag_journal_append "$tid" clear "$key" "${open_reasons[$i]} cleared by run $rid"
     done
-    if [[ "$cur" == "wake for $agent exited "* ]]; then
+    if [[ "$cur" == "$pref"* ]]; then
         if (( have_keep )); then
             printf '%s\n' "$keep_reason" > "$NEEDS_OPERATOR/$tid"
         else
@@ -2390,9 +2402,9 @@ pm_wake_exit_clear() {
     [[ -e "$NEEDS_OPERATOR/$tid" ]] && flagged=yes
     for i in "${!open_runs[@]}"; do
         if [[ "${open_runs[$i]}" =~ $PM_WAKE_EXIT_ID_RE ]]; then
-            pm_event "flag-clear thread=${tid:0:8} agent=$agent reason=wake-exit run=${open_runs[$i]} by=$rid flagged=$flagged"
+            pm_event "flag-clear thread=${tid:0:8} agent=$agent reason=$key run=${open_runs[$i]} by=$rid flagged=$flagged"
         else
-            pm_event "flag-clear thread=${tid:0:8} agent=$agent reason=wake-exit by=$rid flagged=$flagged"
+            pm_event "flag-clear thread=${tid:0:8} agent=$agent reason=$key by=$rid flagged=$flagged"
         fi
     done
 }
@@ -3915,7 +3927,7 @@ pm_spawn_wake() {
     fi
     local harness model thinking network persona_path description wake_on_cc \
           refresh_at triage preset handler command backend endpoint grant \
-          review_target wake_when seat_services
+          review_target wake_when seat_services on_silence
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
@@ -3944,6 +3956,7 @@ pm_spawn_wake() {
            read -r refresh_at; read -r triage; read -r preset; read -r handler; \
            read -r command; read -r backend; read -r endpoint; read -r grant; \
            read -r review_target; read -r wake_when; read -r seat_services; \
+           read -r on_silence; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
@@ -4300,6 +4313,7 @@ pm_spawn_wake() {
             printf 'VIA=%s\n' "$via"
             printf 'BACKEND=k8s\n'
             printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
+            printf 'ON_SILENCE=%s\n' "$on_silence"
             if [[ -n "$rt_sha" ]]; then
                 printf 'REVIEW_TARGET_BRANCH=%s\n' "$rt_branch"
                 printf 'REVIEW_TARGET_SHA=%s\n' "$rt_sha"
@@ -4391,6 +4405,7 @@ pm_spawn_wake() {
         printf 'VIA=%s\n' "$via"
         printf 'BACKEND=local\n'
         printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
+        printf 'ON_SILENCE=%s\n' "$on_silence"
     } > "$RUNS/$run_id.env"
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
@@ -5578,7 +5593,7 @@ pm_harvest_run() {
     # Set by either failure branch below (not by run-dir-vanished, which
     # returns early); gates the FAILS/retry bookkeeping done once, after
     # the pending-message read near the end of this function.
-    local was_failure=0
+    local was_failure=0 clean_exit=0
     # Set only by the k8s wait-timeout branch below: the Job this harvest
     # just flagged may still be running, so the pending-message block near
     # the end of this function must not wake this seat again on top of
@@ -5727,6 +5742,7 @@ pm_harvest_run() {
             # A clean exit also answers this seat's earlier wake-exit
             # flag(s) on the thread -- see pm_wake_exit_clear.
             pm_wake_exit_clear "$tid" "$agent" "$rid" || true
+            clean_exit=1
         fi
     fi
 
@@ -5751,10 +5767,11 @@ pm_harvest_run() {
     [[ -n "$trigger_file" ]] && trigger_hops="$(pm_header "$trigger_file" X-Hops)"
     [[ "$trigger_hops" =~ ^[0-9]+$ ]] || trigger_hops=0
 
-    local mf replies=0
+    local mf replies=0 reply_files=0
     PM_HARVEST_POSTED=()
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
+        reply_files=$(( reply_files + 1 ))
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network" \
                 "$project" "$review_target" "$branch" \
                 "$review_target_branch" "$review_target_sha" "$review_target_version"; then
@@ -5763,6 +5780,13 @@ pm_harvest_run() {
     done
     pm_event "harvest thread=${tid:0:8} agent=$agent replies=$replies"
     local -a posted_ids=("${PM_HARVEST_POSTED[@]}")
+    # SILENT WAKE in the header. A malformed reply file has flagged already,
+    # so only an outbox with no reply file at all counts as silence.
+    if (( clean_exit && replies > 0 )); then
+        pm_wake_exit_clear "$tid" "$agent" "$rid" silent-wake "wake for $agent posted no reply " || true
+    elif (( clean_exit && reply_files == 0 )) && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == flag ]]; then
+        pm_flag_unless_closed "$tid" "wake for $agent posted no reply (run $rid)" silent-wake
+    fi
 
     mkdir -p -- "$HARVESTED"
     : > "$HARVESTED/$rid"

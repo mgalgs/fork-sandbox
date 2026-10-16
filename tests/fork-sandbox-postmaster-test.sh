@@ -143,6 +143,9 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/gina.md" <<'EOF'
 Gina is the preset seat used by the --preset passthrough tests.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/sam.md" <<'EOF'
+Sam always owes a reply (on-silence: flag), used by the silent-wake tests.
+EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/karen.md" <<'EOF'
 Karen is a plain backend: k8s seat with no grant requirement.
 EOF
@@ -182,6 +185,8 @@ agents:
     model: vendor/model
   dana:
     wake-on-cc: false
+  sam:
+    on-silence: flag
   gina:
     harness: pi
     model: vendor/ginamodel
@@ -2599,6 +2604,61 @@ finish_run() {
         printf '{"session_id":null,"session_state":"x"}\n' > "$run_dir/summary.json"
     fi
 }
+
+# ============================================================
+printf '\n== Silent wake: an on-silence: flag seat that exits 0 having posted nothing flags ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+sw_mid="$(send_msg '@dana' '@sam, @carol' 'silent topic' 'answer me' 8)"
+sw_tid="$(thread_of "$sw_mid")"
+sw_flag() { cat "$PM_STATE_DIR/needs-operator/$sw_tid" 2>/dev/null || true; }
+sw_val() { sed -n "s/^$2=//p" "$1" | tail -n1; }
+once
+sw_env="$(live_env_for_agent sam)"
+sw_rid="$(basename "$sw_env" .env)"
+check "silent wake: the run record carries ON_SILENCE=flag" "flag" "$(sw_val "$sw_env" ON_SILENCE)"
+check "silent wake: a seat without the key records it empty" "" \
+    "$(sw_val "$(live_env_for_agent carol)" ON_SILENCE)"
+finish_run carol 0
+once
+check "silent wake: carol (no on-silence) exiting 0 with nothing is not flagged" "" "$(sw_flag)"
+finish_run sam 0
+once
+check "silent wake: sam exiting 0 with nothing flags the thread" \
+    "wake for sam posted no reply (run $sw_rid)" "$(sw_flag)"
+contains "silent wake: flag event keyword silent-wake" "$(cat "$work/once.out")" \
+    "pm flag thread=${sw_tid:0:8} reason=silent-wake"
+
+# The seat's next wake replies: that answers the silence, as a clean exit
+# answers a wake-exit.
+reply_msg '@dana' "$sw_mid" 'still waiting' --to '@sam' >/dev/null
+once
+sw_env2="$(live_env_for_agent sam)"
+sw_rid2="$(basename "$sw_env2" .env)"
+finish_run sam 0
+printf 'Subject: answer\n\nhere it is\n' > "$(sw_val "$sw_env2" RUN_DIR)/outbox/mail-1.md"
+once
+check "silent wake: the seat's next reply clears the flag" "" "$(sw_flag)"
+contains "silent wake: flag-clear event names the silent run" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=${sw_tid:0:8} agent=sam reason=silent-wake run=$sw_rid by=$sw_rid2 flagged=no"
+check "silent wake: the journal records the clear" 1 \
+    "$(awk -F'\t' '$2=="clear" && $3=="silent-wake"' "$PM_STATE_DIR/needs-operator-journal/$sw_tid" | wc -l)"
+
+# A failed wake is a wake-exit, never also a silence.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+sw_mid="$(send_msg '@dana' '@sam' 'silent topic 2' 'answer me' 8)"
+sw_tid="$(thread_of "$sw_mid")"
+once
+finish_run sam 3
+once
+contains "silent wake: a non-zero exit flags wake-exit" "$(sw_flag)" "wake for sam exited 3"
+check "silent wake: ... and no silent-wake line is journaled" 0 \
+    "$(awk -F'\t' '$3=="silent-wake"' "$PM_STATE_DIR/needs-operator-journal/$sw_tid" | wc -l)"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
