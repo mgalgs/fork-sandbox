@@ -742,6 +742,20 @@
 # should stay under the mail client's retry budget, since the mail API is
 # down for the whole shutdown. A non-numeric value refuses `deliver`.
 #
+# ROUTE PLAN. A message's routed marker is written before its seats are
+# woken, so a process that dies part-way through a multi-seat message (a
+# pod replaced mid-pass, SIGKILL after the grace period, a set -e exit)
+# would never revisit the seats it had not reached. Before the marker, the
+# seats are written to $STATE/route-pending/<message-id>/seats, and each is
+# removed once pm_wake_or_pend (or the reserve refusal) has handled it. The
+# next route pass resumes any plan whose message is routed (event
+# `route-resume`) before it routes new mail. The seat that was in hand when
+# the process died is skipped when a run with this trigger exists for it;
+# otherwise it is tried once more, and a second death on the same seat
+# flags the thread (`route-interrupted`) instead of looping. On SIGTERM/INT
+# the pass hands no further seat to a wake (event `route-paused`) and leaves
+# the plan for the next process.
+#
 # rule 4's live delivery (above) never reaches a k8s wake: there is no
 # inbox to deliver into (the wrapper drives one fork-sandbox.sh --k8s run
 # to completion, not an interactive sandbox with a polling inbox dir), so
@@ -1234,6 +1248,14 @@ PM_SEAT_RECORD_DIRS=("$WAKE_DEFERRED" "$BUDGET_RESERVED")
 # One pending fetch-miss re-check per seat, $FETCH_WAIT/<thread-id>/<agent>
 # -- see FETCH MISS in the header. Under $STATE, so it survives a restart.
 FETCH_WAIT="$STATE/fetch-wait"
+# One route plan per message whose seats are not all handled yet,
+# $ROUTE_PENDING/<message-id>/ (thread, band, seats, inflight) -- see
+# ROUTE PLAN in the header. Written before the message's routed marker, so a
+# process that dies mid-message leaves the rest of its seats here.
+ROUTE_PENDING="$STATE/route-pending"
+# Set by cmd_deliver's TERM/INT trap: the route pass hands nothing more to
+# pm_wake_or_pend once it is set, and leaves the rest to the next process.
+PM_STOP_REQUESTED=0
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
 # same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
@@ -2018,6 +2040,7 @@ pm_flag_keyword() {
         "no grant for k8s seat"*) printf 'no-grant' ;;
         "review target "*|"Version: "*) printf 'review-target' ;;
         "upstream head "*) printf 'upstream-head' ;;
+        "routing interrupted:"*) printf 'route-interrupted' ;;
         *) printf 'other' ;;
     esac
 }
@@ -4711,6 +4734,9 @@ pm_process_message() {
         done
     fi
 
+    if [[ -z "$gate_reason" ]] && (( ${#candidates[@]} )); then
+        pm_route_plan_write "$tid" "$mid" "$in_reserve_band" "${candidates[@]}"
+    fi
     : > "$ROUTED/$mid"
 
     # Cc's equivalent of the To: block above -- an @-shaped Cc name that
@@ -4777,21 +4803,118 @@ pm_process_message() {
         return 0
     fi
 
-    local agent
-    for agent in "${candidates[@]}"; do
-        [[ -n "$agent" ]] || continue
-        if (( in_reserve_band )) && ! pm_reserved_seat "$agent"; then
-            pm_refuse_reserved "$tid" "$agent" "$mid"
+    [[ ! -d "$ROUTE_PENDING/$mid" ]] || pm_route_seats "$project" "$mid"
+}
+
+# Writes <mid>'s route plan (see ROUTE PLAN in the header): the thread, the
+# reserve-band verdict the message was judged under, and its seats in order.
+# The plan directory is assembled aside and renamed into place, so a reader
+# never sees a plan without its seats.
+pm_route_plan_write() {
+    local tid="$1" mid="$2" band="$3"; shift 3
+    local dir="$ROUTE_PENDING/$mid" tmp a
+    mkdir -p -- "$ROUTE_PENDING"
+    tmp="$(mktemp -d "$ROUTE_PENDING/.tmp.XXXXXX")"
+    printf '%s\n' "$tid" > "$tmp/thread"
+    printf '%s\n' "$band" > "$tmp/band"
+    for a in "$@"; do
+        [[ -n "$a" ]] && printf '%s\n' "$a"
+    done > "$tmp/seats"
+    rm -rf -- "$dir"
+    mv -- "$tmp" "$dir"
+}
+
+# Drops the first seat of <dir>'s plan; removes the plan once it is empty.
+pm_route_plan_pop() {
+    local dir="$1" tmp
+    tmp="$(mktemp "$dir/.seats.XXXXXX")"
+    tail -n +2 -- "$dir/seats" > "$tmp"
+    mv -- "$tmp" "$dir/seats"
+    rm -f -- "$dir/inflight"
+    [[ -s "$dir/seats" ]] || rm -rf -- "$dir"
+}
+
+# Whether a run of <agent> on <tid> already carries <mid>, as its trigger or
+# as a message pended onto a live run.
+pm_seat_has_run_for() {
+    local tid="$1" agent="$2" mid="$3" rid f
+    [[ -f "$SEQ/$tid" ]] || return 1
+    while IFS= read -r rid; do
+        f="$RUNS/$rid.env"
+        [[ -f "$f" && "$(fs_pm_env_get "$f" AGENT)" == "$agent" ]] || continue
+        [[ "$(fs_pm_env_get "$f" TRIGGER)" == "$mid" ]] && return 0
+        [[ ",$(fs_pm_env_get "$f" PENDING_MSGS)," == *",$mid,"* ]] && return 0
+    done < "$SEQ/$tid"
+    return 1
+}
+
+# Hands each seat left in <mid>'s plan to pm_wake_or_pend (or the reserve
+# refusal), popping it once handled. `inflight` names the seat in hand and
+# how many processes have started on it, which is what pm_route_resume reads
+# after a death.
+pm_route_seats() {
+    local project="$1" mid="$2"
+    local dir="$ROUTE_PENDING/$mid" tid band agent in_agent in_attempts attempts
+    tid="$(cat -- "$dir/thread")"
+    band="$(cat -- "$dir/band")"
+    while [[ -s "$dir/seats" ]]; do
+        if (( PM_STOP_REQUESTED )); then
+            pm_event "route-paused thread=${tid:0:8} msg=${mid:0:8} seats=$(wc -l < "$dir/seats")"
+            return 0
+        fi
+        agent="$(head -n1 -- "$dir/seats")"
+        attempts=1
+        if [[ -f "$dir/inflight" ]] && read -r in_agent in_attempts < "$dir/inflight" \
+            && [[ "$in_agent" == "$agent" && "$in_attempts" =~ ^[0-9]+$ ]]; then
+            attempts=$(( in_attempts + 1 ))
+        fi
+        printf '%s %s\n' "$agent" "$attempts" > "$dir/inflight"
+        if [[ -n "$agent" ]]; then
+            if (( band )) && ! pm_reserved_seat "$agent"; then
+                pm_refuse_reserved "$tid" "$agent" "$mid"
+            else
+                pm_wake_or_pend "$project" "$agent" "$tid" "$mid"
+            fi
+        fi
+        pm_route_plan_pop "$dir"
+    done
+}
+
+# Finishes every plan a dead process left behind. A plan whose message never
+# got its routed marker is dropped: the message itself routes again, plan
+# and all. For the seat in hand at the death, see ROUTE PLAN in the header.
+pm_route_resume() {
+    local project="$1" dir mid tid agent attempts
+    for dir in "$ROUTE_PENDING"/*/; do
+        [[ -d "$dir" ]] || continue
+        (( ! PM_STOP_REQUESTED )) || return 0
+        dir="${dir%/}"
+        mid="$(basename -- "$dir")"
+        if [[ ! -e "$ROUTED/$mid" || ! -s "$dir/seats" || ! -f "$dir/thread" ]]; then
+            rm -rf -- "$dir"
             continue
         fi
-        pm_wake_or_pend "$project" "$agent" "$tid" "$mid"
+        tid="$(cat -- "$dir/thread")"
+        pm_event "route-resume thread=${tid:0:8} msg=${mid:0:8} seats=$(wc -l < "$dir/seats")"
+        if [[ -f "$dir/inflight" ]] && read -r agent attempts < "$dir/inflight" \
+            && [[ "$agent" == "$(head -n1 -- "$dir/seats")" ]]; then
+            if pm_seat_has_run_for "$tid" "$agent" "$mid"; then
+                pm_route_plan_pop "$dir"
+            elif [[ "$attempts" =~ ^[0-9]+$ ]] && (( attempts >= 2 )); then
+                pm_flag "$tid" "routing interrupted: woke no run for $agent on $mid after $attempts attempts" route-interrupted
+                pm_route_plan_pop "$dir"
+            fi
+        fi
+        [[ ! -d "$dir" ]] || pm_route_seats "$project" "$mid"
     done
 }
 
 pm_route_pass() {
     local project="$1" f
+    [[ ! -d "$ROUTE_PENDING" ]] || pm_route_resume "$project"
     for f in "$MAIL_ROOT"/threads/*/*.msg; do
         [[ -e "$f" ]] || continue
+        (( ! PM_STOP_REQUESTED )) || return 0
         pm_process_message "$project" "$f"
     done
 }
@@ -6255,7 +6378,7 @@ cmd_deliver() {
     fi
 
     local stop=0
-    trap 'stop=1' TERM INT
+    trap 'stop=1; PM_STOP_REQUESTED=1' TERM INT
     while (( ! stop )); do
         pm_hook_reap
         pm_route_pass "$project"
@@ -6276,7 +6399,9 @@ cmd_deliver() {
 
 # How many of a thread's messages have no routed marker yet. A routed marker
 # is named for the message's Message-ID header (see pm_process_message), not
-# for its file; a message the debounce gate is holding is unrouted too.
+# for its file; a message the debounce gate is holding is unrouted too. A
+# message whose route plan still has seats is routed: a wake gate runs while
+# its own message's plan is open, and must not see that message as unrouted.
 pm_thread_unrouted_count() {
     local tid="$1" f mid unrouted=0
     for f in "$MAIL_ROOT/threads/$tid"/*.msg; do

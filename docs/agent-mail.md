@@ -1368,7 +1368,11 @@ reason=fleet-sender|malformed — see "Upstream closed" above),
 `triage-skip` (agent, thread), `handler` (agent,
 thread, exit=<status>), `hook` (thread, hook=<event>, file=<basename>,
 exit=<n|timeout|lost|launch>; a hook finished or failed to launch; it
-has no `agent` field; see "Hooks" below), and `route-dead`
+has no `agent` field; see "Hooks" below), `route-resume` (thread,
+msg=<8 hex>, seats=<n> — a route pass is finishing a message a previous
+process left part-woken; see "A message's seats survive a restart"),
+`route-paused` (thread, msg=<8 hex>, seats=<n> — SIGTERM/SIGINT stopped
+a message's seats mid-way; the next process resumes them), and `route-dead`
 (thread, unresolved=<count> — one
 or more `To:` names in rule 0's expansion were @-shaped but did not
 resolve as a fleet agent, so the thread is also separately flag'd with
@@ -1980,6 +1984,33 @@ to a held seat supersedes the record (`TRIGGER` moves to the new message,
 file exists or the seat no longer resolves `grant: required` at all — see
 "Cluster seats" above.
 
+### A message's seats survive a restart
+
+Routing a message decides its seats, writes its `routed/` marker, and then
+wakes the seats one by one. A postmaster that dies part-way through (a pod
+replaced mid-pass and killed at the end of its grace period, or any crash)
+would otherwise leave the seats it had not reached with no run, no retry, no
+deferral and no flag, and nothing would ever revisit them: the marker says
+the message is done.
+
+So the seats are written to `route-pending/<message-id>/` before the marker,
+and each is removed as it is handled. Every route pass first finishes any
+plan a previous process left (`route-resume`), then routes new mail. For
+the seat that was in hand at the death:
+
+- if a run of that seat already carries this message (as its trigger, or
+  pended onto a live run), the seat is done and is dropped;
+- otherwise it is tried once more;
+- if a second process dies on the same seat, the thread is flagged
+  `routing interrupted: woke no run for <agent> on <message-id> after <n>
+  attempts` (keyword `route-interrupted`) and the seat is dropped, so a
+  seat that crashes the postmaster cannot wedge every later pass.
+
+SIGTERM/SIGINT stops the pass between seats (`route-paused`): the seat in
+hand finishes, and the rest wait in the plan for the next process. A seat
+whose spawn was launched but not yet recorded when the process died can be
+woken twice; the window is the few lines between launch and the run record.
+
 ### Router state
 
 Under `$FORK_SANDBOX_MAIL_ROOT/.postmaster/`, dot-prefixed so the store's
@@ -1990,6 +2021,7 @@ own thread scans never see it:
 | `lock` | a `flock`'d file; the pid inside is for messages only — the mutual exclusion is the kernel's advisory lock, so a killed postmaster cannot leave a stale hold |
 | `routed/<message-id>` | routing already decided for this message |
 | `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake) |
+| `route-pending/<message-id>/` | the message's seats not yet handed to a wake: `thread`, `band` (the reserve-band verdict it was judged under), `seats` (one per line, in order) and `inflight` (`<agent> <attempts>`, the seat in hand). Removed once the last seat is handled — see "A message's seats survive a restart" |
 | `handler-outbox/<run-id>` | a handler wake's outbox; unlike an LLM wake's (part of its ephemeral scratch run dir), this sits under this same persistent state tree, so the postmaster removes it itself once harvested — nothing here outlives its own wake |
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |

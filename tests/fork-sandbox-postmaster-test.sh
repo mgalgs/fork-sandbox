@@ -245,6 +245,25 @@ if [[ -n "${STUB_BALANCE_LOG:-}" ]]; then
     [[ -f "${FS_BALANCE_ROOT_HEADERS_FILE:-}" ]] && \
         cat "$FS_BALANCE_ROOT_HEADERS_FILE" >> "$STUB_BALANCE_LOG"
 fi
+# STUB_SIGNAL_PARENT ("<signal> <n> <counter-file>"): the n-th call counted
+# in <counter-file> sends <signal> to the postmaster that launched it -- a
+# pod replaced mid-pass. KILL dies before launching; TERM launches normally.
+if [[ -n "${STUB_SIGNAL_PARENT:-}" ]]; then
+    read -r _sig _n _counter <<< "$STUB_SIGNAL_PARENT"
+    echo x >> "$_counter"
+    if (( $(wc -l < "$_counter") == _n )); then
+        # The launch runs inside a command substitution, so the parent may
+        # be a subshell: signal the outermost postmaster ancestor.
+        _p="$PPID" _target=""
+        while [[ "$_p" -gt 1 ]] && tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null \
+                | grep -q 'fork-sandbox-postmaster\.sh'; do
+            _target="$_p"
+            _p="$(awk '{print $4}' "/proc/$_p/stat")"
+        done
+        kill "-$_sig" "${_target:-$PPID}"
+        [[ "$_sig" != KILL ]] || exit 1
+    fi
+fi
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
 
 # A `--k8s` invocation stands in for the whole `fork-sandbox-k8s.sh run`
@@ -448,6 +467,116 @@ contains "spawn event: To wake (bob) logged on stdout with via=to" \
 contains "spawn event: Cc wake (carol) logged on stdout with via=cc" \
     "$(cat "$work/once.out")" \
     "pm spawn thread=$short agent=carol run=$(basename -- "$run_dir_carol") via=cc"
+
+# ============================================================
+printf '\n== Route plan: a postmaster that dies mid-message leaves its unwoken seats to the next ==\n'
+# ============================================================
+# A three-seat message (@team: alice, bob, carol) whose route pass is cut
+# off while waking bob. The routed marker is already written by then, so
+# without a plan bob and carol would never be woken by anyone.
+
+rp_spawns() { grep -c -- "^sbx-mail-${rp_short}-$1-" "$STUB_ARGV_LOG" || true; }
+rp_runs() {
+    local n=0 f
+    for f in "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env; do
+        [[ -e "$f" ]] || continue
+        grep -q "^AGENT=$1\$" "$f" && grep -q "^THREAD=$rp_tid\$" "$f" && n=$(( n + 1 ))
+    done
+    echo "$n"
+}
+rp_new() {
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    rp_mid="$(send_msg '@dana' '@team' 'route plan topic' 'three seats' 8)"
+    rp_tid="$(thread_of "$rp_mid")"
+    rp_short="${rp_tid:0:8}"
+    rp_plan="$PM_STATE_DIR/route-pending/$rp_mid"
+    rp_counter="$(mktemp "$work/rp-counter.XXXXXX")"
+}
+
+rp_new
+rp_rc=0
+STUB_SIGNAL_PARENT="KILL 2 $rp_counter" once || rp_rc=$?
+check "killed mid-message: the postmaster died (SIGKILL)" 137 "$rp_rc"
+check "killed mid-message: the message is marked routed" 1 \
+    "$( [[ -e "$PM_STATE_DIR/routed/$rp_mid" ]] && echo 1 || echo 0 )"
+check "killed mid-message: alice was woken" 1 "$(rp_runs alice)"
+check "killed mid-message: carol was never reached" 0 "$(rp_spawns carol)"
+check "killed mid-message: the plan keeps bob and carol" "bob carol" \
+    "$(tr '\n' ' ' < "$rp_plan/seats" | sed 's/ $//')"
+check "killed mid-message: bob is the seat in hand, first attempt" "bob 1" \
+    "$(cat "$rp_plan/inflight" 2>/dev/null)"
+
+once
+contains "resume: route-resume event names the message" "$(cat "$work/once.out")" \
+    "pm route-resume thread=$rp_short msg=${rp_mid:0:8} seats=2"
+check "resume: bob is woken" 1 "$(rp_runs bob)"
+check "resume: carol is woken" 1 "$(rp_runs carol)"
+check "resume: alice is not woken twice" 1 "$(rp_spawns alice)"
+check "resume: the plan is gone" 0 "$( [[ -e "$rp_plan" ]] && echo 1 || echo 0 )"
+once
+check "a later pass wakes no one again" "1 1 1" \
+    "$(rp_spawns alice) $(rp_runs bob) $(rp_runs carol)"
+
+# The seat in hand already has a run for this trigger (the death came after
+# its spawn was recorded): resume pops it rather than waking it again.
+rp_new
+STUB_SIGNAL_PARENT="KILL 2 $rp_counter" once || true
+printf 'alice 1\n' > "$rp_plan/inflight"
+printf 'alice\nbob\ncarol\n' > "$rp_plan/seats"
+once
+check "in-hand seat with a run for the trigger: not woken again" 1 "$(rp_spawns alice)"
+check "in-hand seat with a run for the trigger: the rest still wake" "1 1" \
+    "$(rp_runs bob) $(rp_runs carol)"
+
+# A seat that a second process also died on is flagged and dropped, not
+# retried forever.
+rp_new
+STUB_SIGNAL_PARENT="KILL 2 $rp_counter" once || true
+STUB_SIGNAL_PARENT="KILL 3 $rp_counter" once || true
+check "second death on the same seat: it is still in hand, attempt 2" "bob 2" \
+    "$(cat "$rp_plan/inflight" 2>/dev/null)"
+once
+check "second death on the same seat: bob is not tried a third time" 2 "$(rp_spawns bob)"
+check "second death on the same seat: carol still wakes" 1 "$(rp_runs carol)"
+contains "second death on the same seat: the thread is flagged" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$rp_tid" 2>/dev/null)" \
+    "routing interrupted: woke no run for bob on $rp_mid after 2 attempts"
+check "second death on the same seat: journal keyword route-interrupted" 1 \
+    "$(awk -F'\t' '$2=="flag" && $3=="route-interrupted"' "$PM_STATE_DIR/needs-operator-journal/$rp_tid" | wc -l)"
+
+# A plan whose message never got its routed marker is the message's own
+# business: it is dropped, and the message routes again as a whole.
+rp_new
+mkdir -p -- "$rp_plan"
+printf '%s\n' "$rp_tid" > "$rp_plan/thread"
+printf '0\n' > "$rp_plan/band"
+printf 'carol\n' > "$rp_plan/seats"
+once
+check "plan for an unrouted message: every seat wakes once" "1 1 1" \
+    "$(rp_runs alice) $(rp_runs bob) $(rp_runs carol)"
+
+# SIGTERM (a rollout's first signal) mid-message: the seat in hand finishes,
+# nothing more is woken, the plan holds the rest, and the next process
+# wakes them.
+rp_new
+rp_log="$work/rp-deliver.log"
+STUB_SIGNAL_PARENT="TERM 1 $rp_counter" FORK_SANDBOX_POSTMASTER_INTERVAL=1 \
+    FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=0 \
+    "$postmaster" deliver --project "$PROJECT_DIR" > "$rp_log" 2>&1 &
+rp_pid=$!
+for _ in $(seq 1 100); do kill -0 "$rp_pid" 2>/dev/null || break; sleep 0.1; done
+kill -KILL "$rp_pid" 2>/dev/null
+rp_rc=0; wait "$rp_pid" || rp_rc=$?
+check "SIGTERM mid-message: the loop exits 0" 0 "$rp_rc"
+check "SIGTERM mid-message: the seat in hand was woken" 1 "$(rp_runs alice)"
+check "SIGTERM mid-message: no further seat was launched" "0 0" "$(rp_spawns bob) $(rp_spawns carol)"
+contains "SIGTERM mid-message: route-paused event" "$(cat "$rp_log")" \
+    "pm route-paused thread=$rp_short msg=${rp_mid:0:8} seats=2"
+once
+check "SIGTERM mid-message: the next process wakes the rest" "1 1 1" \
+    "$(rp_spawns alice) $(rp_runs bob) $(rp_runs carol)"
 
 # ============================================================
 printf '\n== Cc wakes: wake-on-cc:false suppresses, sender-in-cc never wakes, both-headers dedup ==\n'
