@@ -104,3 +104,21 @@ writing a detailed handoff so nothing gets dropped.
 
 5. **Confirm** to the user that the handoff is ready and the new session
    is running in the split beside this one.
+
+6. **Say whether this pane may be closed.** Background Bash commands
+   (`run_in_background`), port-forwards, drivers and watchers this
+   session started are its child processes: closing the pane kills them
+   mid-run. List them (your own background task IDs, plus
+   `ps -o pid,etime,args --ppid` on any PIDs you know of). The
+   lane-mail watcher is the exception: it goes with the unregistered lane.
+   - If there are none, say the pane can be closed.
+   - If there are any, name them in the handoff's In Progress section as
+     owned by the old session. Have the continuation adopt whatever it
+     can relaunch cleanly. Keep watching the rest here. Then make the
+     **last line** of your final message, on its own, exactly:
+
+     **Don't close this session until its ongoing tasks complete. I'll
+     tell you when it's safe to close.**
+
+     Then keep that promise: when the last of them exits, tell the user
+     the pane is safe to close.
