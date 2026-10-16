@@ -9458,10 +9458,26 @@ fi
 # is what actually executes it, in the pod, which is this process's own
 # last act too, exactly like the legacy --k8s exec far above. The
 # forwarded-flag set below is the subset that still means something in
-# runner mode: --review-loop/--review-model/--pi-args/--session-*/
-# --refresh-* either render a second copy of something the pod's own
-# preamble already rendered, or name a shape the coherence block above
-# already refused against any composed preset.
+# runner mode: --review-loop/--review-model/--pi-args/--refresh-* either
+# render a second copy of something the pod's own preamble already
+# rendered, or name a shape the coherence block above already refused
+# against any composed preset.
+#
+# --session-state/--resume-session/--session-id are NOT in that redundant
+# set, even though the preamble also bakes session_state/resume_session
+# in (as plain strings, for fork-sandbox-runner.sh's own per-leg wiring):
+# cmd_submit's own handling of these three flags does something the
+# preamble cannot -- tars up the HOST's --session-state directory and
+# pushes it into the pod's /work/session-store before the pod's first
+# leg ever runs (fs_run_leg_split then reads that same host-pushed
+# directory live), records session_state in run.env so a later `collect`
+# pulls the pod's own updated store back out to the SAME host directory,
+# and resolves --resume-session into the discovered id cmd_submit's own
+# validation call needs to see. None of that is the preamble's job, so
+# dropping these here would silently turn --session-state into a build-
+# time-only flag for every composed --k8s run: the pod-side wiring this
+# round added would have nothing to seed from, and nothing it writes
+# would ever reach the host.
 if [[ "$k8s_runner_mode" == true ]]; then
     k8s_argv=(run --run-dir "$run_dir")
     [[ -n "$k8s_timeout" ]] && k8s_argv+=(--timeout "$k8s_timeout")
@@ -9470,6 +9486,15 @@ if [[ "$k8s_runner_mode" == true ]]; then
     [[ -n "$k8s_image" ]] && k8s_argv+=(--image "$k8s_image")
     [[ -n "$k8s_outbox_dir" ]] && k8s_argv+=(--outbox-dir "$k8s_outbox_dir")
     [[ -n "$checkout_ref" ]] && k8s_argv+=(--checkout "$checkout_ref")
+    # fork-sandbox-k8s.sh's own cmd_submit has its own $allow_existing_
+    # branch, read from this same flag on ITS OWN argv (k8s_argv here),
+    # never inherited from this process's -- so --base's fast-forward
+    # (fs_resume_main's own --branch/--checkout/--allow-existing-branch
+    # trio, forwarded here like any other flag through $checkout_ref
+    # just above and $branch below) needs this forwarded too, or
+    # cmd_submit's own fs_check_branch_free refuses the reused branch
+    # name outright, on every composed run, --resume or not.
+    $allow_existing_branch && k8s_argv+=(--allow-existing-branch)
     [[ -n "$services_trust_ref" ]] && k8s_argv+=(--services-trust-ref "$services_trust_ref")
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
@@ -9491,6 +9516,16 @@ if [[ "$k8s_runner_mode" == true ]]; then
     [[ "$k8s_step1_harness" == "pi-local" ]] && k8s_step1_harness="pi"
     k8s_argv+=(--harness "$k8s_step1_harness")
     [[ -n "$composed_step1_model" ]] && k8s_argv+=(--model "$composed_step1_model")
+    # --session-state was already validated (and resolved to a realpath)
+    # above, against the pipeline's own first code step's real harness,
+    # not this phantom seat's; --resume-session and --session-id were
+    # already regex-checked there too -- see the comment above this
+    # block for why these three, unlike the rest of the composed
+    # coherence block's "redundant with the preamble" flags, still have
+    # to reach cmd_submit.
+    [[ -n "$session_state" ]] && k8s_argv+=(--session-state "$session_state")
+    [[ -n "$resume_session" ]] && k8s_argv+=(--resume-session "$resume_session")
+    [[ -n "$session_id_arg" ]] && k8s_argv+=(--session-id "$session_id_arg")
     k8s_argv+=(--branch "$branch" "$project_path" "$handoff_file")
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
 fi

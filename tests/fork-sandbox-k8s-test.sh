@@ -23134,6 +23134,285 @@ if ! kill -0 "$lsplit_loop_pid" 2>/dev/null; then
 else
     no "the leg loop exits cleanly on .leg-shutdown after carrying the whole walk" "still running: $lsplit_loop_pid"
 fi
+# The negative case for the --session-state wiring tested just below: the
+# leg-split walk just above never passed --session-state at all, so this
+# is a free check (no extra walk) that the whole session.tar mechanism is
+# a complete no-op for the common case -- fs_run_leg_split only ever
+# writes $reqdir/session.tar when fs_leg_wants_session is 1, which only
+# ever happens when $session_state is non-empty (see _fs_impl_attempt's
+# own gate in fork-sandbox-runner.sh).
+if [[ ! -e "$lsplit_run_dir/.leg-req/1/session.tar" ]]; then
+    ok "with no --session-state at all, the leg-split walk's own leg 1 never gets a session.tar"
+else
+    no "with no --session-state at all, the leg-split walk's own leg 1 never gets a session.tar" \
+        "$(find "$lsplit_run_dir/.leg-req" 2>&1)"
+fi
+
+printf '\n== composed pipeline on --k8s: --session-state wires into the pipeline'"'"'s first code step'"'"'s own leg only ==\n'
+# The brief this round adds: --session-state (and --resume-session) used
+# to be refused outright against any composed preset; now they wire into
+# the pipeline's own first code step's leg (and that step's own
+# --refresh-at continuations) exactly like impl_sandbox_cmd/
+# cont_sandbox_cmd do for a legacy-shaped run, while every other leg
+# (self-review, fix, review, maintain -- steps 2 through 4 of the SAME
+# "walk" preset the leg-split section above already drives end to end)
+# stays exactly as before. This section proves the pod-side half of that:
+# a real fork-sandbox-k8s-leg-loop.sh process actually seeds leg 1's own
+# $HOME/.claude/projects from $reqdir/session.tar before leg 1 runs, a
+# real fs_run_leg_split actually snapshots leg 1's own result back into
+# the agent container's session-store afterward, --resume reaches leg 1's
+# own claude argv when --resume-session was given, and no other leg (2
+# through 5, in request-number terms) ever sees a session.tar or anything
+# seeded into its own $HOME at all.
+#
+# A dedicated stub, not walk_stub_bin: identical scripted vocabulary
+# (commit/findings/approved/fail) and verdict-filename extraction, plus
+# two additions walk_stub_bin has no reason to carry since no other
+# section needs them -- a per-call snapshot of $HOME/.claude/projects
+# (gated on WSESS_HOME_REPORT, unset everywhere else) taken before the
+# scripted action runs, and a fake "the leg wrote a new transcript line"
+# write, gated on this request's own $RUN_DIR/.leg-req/<n>/session.tar
+# existing (read-only here, same file fork-sandbox-k8s-leg-loop.sh's own
+# header documents as never planted by any OTHER leg, since $reqdir is
+# read-only in this container) -- simulating what the real claude CLI
+# would otherwise do on its own, so the round trip has real new content to
+# prove moved, not just the unmodified seed echoed back.
+wsess_stub_bin="$(newdir)"; tmpdirs+=("$wsess_stub_bin")
+cat > "$wsess_stub_bin/claude" <<'STUB'
+#!/usr/bin/env bash
+clone_dir="$PWD"
+prompt="$(cat)"
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_ARGV_LOG"
+if [[ -n "${WSESS_HOME_REPORT:-}" ]]; then
+    {
+        printf '== call %s HOME=%s ==\n' "$n" "$HOME"
+        find "$HOME/.claude/projects" -type f 2>/dev/null | sort
+    } >> "$WSESS_HOME_REPORT"
+fi
+if [[ -n "${RUN_DIR:-}" && -f "$RUN_DIR/.leg-req/$n/session.tar" ]]; then
+    wsess_slug="${clone_dir//\//-}"
+    mkdir -p "$HOME/.claude/projects/$wsess_slug"
+    printf '{"leg-wrote":"call %s"}\n' "$n" > "$HOME/.claude/projects/$wsess_slug/leg-written-$n.jsonl"
+fi
+action="$(sed -n "${n}p" "$FAKE_SCRIPT" 2>/dev/null)"
+verdict_name="$(printf '%s\n' "$prompt" | sed -nE 's#.*\.git/(s[0-9]+-verdict\.md|maintainer-verdict\.md).*#\1#p' | head -1)"
+[[ -n "$verdict_name" ]] || verdict_name=review-verdict.md
+case "$action" in
+commit)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "stub leg $n"
+    ;;
+findings)
+    printf 'FINDINGS\n\nfile.txt:1 the stub found a problem\n' > "$clone_dir/.git/$verdict_name"
+    ;;
+approved)
+    printf 'APPROVED\n\nChecked: everything.\n' > "$clone_dir/.git/$verdict_name"
+    ;;
+fail)
+    printf 'stub: scripted failure on call %s\n' "$n" >&2
+    exit 1
+    ;;
+esac
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+cp "$wsess_stub_bin/claude" "$wsess_stub_bin/pi"
+chmod +x "$wsess_stub_bin/claude" "$wsess_stub_bin/pi"
+
+# fs_run_leg_split's own FORK_SANDBOX_K8S_MOUNTS_DIR test seam (see its
+# comment in fork-sandbox-runner.sh) wants a real copy of
+# fork-sandbox-k8s-context-extract.sh under the ConfigMap key name a real
+# pod mounts it at -- walk_mounts already stands in for that ConfigMap
+# mount for claude-credentials.json/lib.sh above, so it gets this file
+# too, rather than standing up a second mounts fixture.
+cp "$repo_dir/scripts/fork-sandbox-k8s-context-extract.sh" "$walk_mounts/context-extract.sh"
+
+# A --session-state directory, under the scratch root fs_validate_scratch_dir
+# requires, and a well-formed --resume-session id (fs_validate_session_flags's
+# own ^[0-9a-f][0-9a-f-]{7,63}$ regex) -- also used as this transcript's own
+# filename stem, the same convention claude itself uses.
+wsess_sstate="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-test-wsess-sstate.XXXXXX)"
+tmpdirs+=("$wsess_sstate")
+wsess_resume_id="deadbeef-0000-0000-0000-000000000000"
+
+wsess_sweep_target_file="$(newdir)/sweep-target"; tmpdirs+=("$(dirname "$wsess_sweep_target_file")")
+printf '999999999' > "$wsess_sweep_target_file"
+
+wsess_pod_work="$(newdir)"; tmpdirs+=("$wsess_pod_work")
+wsess_branch="fs-k8s-test-wsess-$$"
+if walk_dispatch_flags "$wsess_pod_work" "$wsess_branch" \
+    --session-state "$wsess_sstate" --resume-session "$wsess_resume_id"; then
+    ok "a composed --k8s dispatch with --session-state and --resume-session stages successfully"
+else
+    no "a composed --k8s dispatch with --session-state and --resume-session stages successfully" \
+        "$(cat "$WALK_STAGE_OUT")"
+fi
+wsess_run_dir="$WALK_RUN_DIR"
+
+mkdir -p "$wsess_pod_work/outbox" "$wsess_pod_work/inbox"
+git clone -q "$walk_proj" "$wsess_pod_work/clone"
+git -C "$wsess_pod_work/clone" checkout -q -b "$wsess_branch" "$walk_base_sha"
+
+# Pre-seeds the agent container's own already-pulled-in session store --
+# POD_SESSION_DIR's "/work/session-store" convention, here at
+# "$wsess_pod_work/session-store" via the SAME FORK_SANDBOX_K8S_WORK_DIR
+# test seam walk_dispatch_flags above already used (to bake clone_dir into
+# run.sh) and the agent-side arm below will use again (so
+# fs_run_leg_split reads this same directory live, instead of the real
+# /work no test may write to) -- with a small fixture transcript, so
+# there is something real for leg 1 to be seeded from and snapshot back.
+mkdir -p "$wsess_pod_work/session-store"
+printf '{"seed":true,"id":"%s"}\n' "$wsess_resume_id" > "$wsess_pod_work/session-store/$wsess_resume_id.jsonl"
+
+wsess_count="$(mktemp)"; tmpdirs+=("$wsess_count")
+wsess_argv_log="$(mktemp)"; tmpdirs+=("$wsess_argv_log")
+wsess_script_file="$(mktemp)"; tmpdirs+=("$wsess_script_file")
+printf 'commit\nfindings\ncommit\napproved\napproved\n' > "$wsess_script_file"
+wsess_home_report="$(mktemp)"; tmpdirs+=("$wsess_home_report")
+wsess_pod_home="$(newdir)"; tmpdirs+=("$wsess_pod_home")
+wsess_leg_home="$(newdir)"; tmpdirs+=("$wsess_leg_home")
+wsess_handoff_dir="$(newdir)"; tmpdirs+=("$wsess_handoff_dir")
+wsess_loop_log="$(newdir)/leg-loop.log"; tmpdirs+=("$(dirname "$wsess_loop_log")")
+wsess_leg_tmp="$(newdir)"; tmpdirs+=("$wsess_leg_tmp")
+
+env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
+    RUN_DIR="$wsess_run_dir" FORK_SANDBOX_LEG_HANDOFF_DIR="$wsess_handoff_dir" \
+    HOME="$wsess_leg_home" PATH="$wsess_stub_bin:$PATH" \
+    TMPDIR="$wsess_leg_tmp" FORK_SANDBOX_LEG_LOOP_YAMA_PATH="$leg_loop_yama_safe_file" \
+    FORK_SANDBOX_CLONE_DIR="$wsess_pod_work/clone" \
+    CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+    FAKE_COUNT_FILE="$wsess_count" FAKE_ARGV_LOG="$wsess_argv_log" FAKE_SCRIPT="$wsess_script_file" \
+    WSESS_HOME_REPORT="$wsess_home_report" \
+    FORK_SANDBOX_LEG_LOOP_SWEEP_TARGET_FILE="$wsess_sweep_target_file" \
+    bash "$leg_loop_sh" > "$wsess_loop_log" 2>&1 &
+wsess_loop_pid=$!
+
+# The agent-side RUN_DIR arm, the same invocation the leg-split section
+# above makes, with two differences: FORK_SANDBOX_K8S_WORK_DIR and
+# FORK_SANDBOX_K8S_MOUNTS_DIR, fs_run_leg_split's own test seams (its
+# comments in fork-sandbox-runner.sh), point its session-store read/write
+# and its context-extract.sh call at this section's own fixtures instead
+# of the real /work and /mnt/fork-sandbox no test may touch.
+wsess_arm_out="$(PATH="$wsess_stub_bin:$PATH" HOME="$wsess_pod_home" \
+    RUN_DIR="$wsess_run_dir" HARNESS=claude MODEL=sonnet MODEL_DISCOVERY="" ALLOW_UNLISTED_MODEL="" \
+    PROXY_BASE_URL="http://fs-k8s-test-walk-proxy.invalid" \
+    CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+    mounts_dir="$walk_mounts" work_dir="$wsess_pod_work" clone_dir="$wsess_pod_work/clone" \
+    inbox_dir="$wsess_pod_work/inbox" \
+    FORK_SANDBOX_K8S_PI_MODEL_MAP="$wsess_pod_work/pi-model-map.json" \
+    SESSION_HARNESS_STORE=0 RESUME_SESSION="" \
+    FORK_SANDBOX_LEG_HANDOFF_DIR="$wsess_handoff_dir" FS_LEG_RETRY_DELAYS="0 0" \
+    FORK_SANDBOX_K8S_WORK_DIR="$wsess_pod_work" FORK_SANDBOX_K8S_MOUNTS_DIR="$walk_mounts" \
+    bash "$rd_block_file" 2>&1)"
+wsess_pi_rc="$(grep -o 'RD_BLOCK_PI_RC=.*' <<<"$wsess_arm_out" | tail -1 | cut -d= -f2)"
+
+touch "$wsess_run_dir/.leg-shutdown"
+wsess_shutdown_deadline=$(( $(date +%s) + 10 ))
+while kill -0 "$wsess_loop_pid" 2>/dev/null; do
+    if (( $(date +%s) >= wsess_shutdown_deadline )); then
+        kill -KILL "$wsess_loop_pid" 2>/dev/null
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ "$wsess_pi_rc" == "0" ]]; then
+    ok "the --session-state walk's run.sh exits 0"
+else
+    no "the --session-state walk's run.sh exits 0" \
+        "rc=$wsess_pi_rc out=$wsess_arm_out loop-log=$(cat "$wsess_loop_log" 2>/dev/null)"
+fi
+check "the --session-state walk makes exactly 5 leg calls, same as the plain leg-split walk" \
+    "5" "$(cat "$wsess_count" 2>/dev/null)"
+check "the --session-state walk's progress.json shows every step done" \
+    "done,done,done,done" "$(jq -r '[.steps[].state] | join(",")' "$wsess_run_dir/progress.json" 2>/dev/null)"
+
+# The positive case: request 1 is the pipeline's own first code step's
+# pass 1 -- the one leg _fs_impl_attempt sets fs_leg_wants_session for --
+# so it, and only it, gets a session.tar.
+if [[ -f "$wsess_run_dir/.leg-req/1/session.tar" ]]; then
+    ok "the first code step's own leg (request 1) gets a session.tar"
+else
+    no "the first code step's own leg (request 1) gets a session.tar" \
+        "$(find "$wsess_run_dir/.leg-req" 2>&1)"
+fi
+# The negative case: every other leg this walk makes (self-review, fix,
+# review, maintain -- requests 2 through 5) must never see one, no matter
+# which harness or step kind it is -- run_leg's own unconditional
+# fs_leg_wants_session=0 (fork-sandbox-runner.sh) is what this proves,
+# pod-side.
+wsess_later_leaks=""
+for wsess_later_n in 2 3 4 5; do
+    [[ -e "$wsess_run_dir/.leg-req/$wsess_later_n/session.tar" ]] \
+        && wsess_later_leaks="$wsess_later_leaks $wsess_later_n"
+done
+if [[ -z "$wsess_later_leaks" ]]; then
+    ok "no later leg (requests 2-5: self-review, fix, review, maintain) ever gets a session.tar"
+else
+    no "no later leg (requests 2-5: self-review, fix, review, maintain) ever gets a session.tar" \
+        "leaked to request(s):$wsess_later_leaks"
+fi
+
+# --resume-session threads into request 1's own claude argv (fs_build_
+# sandbox_cmd's k8s_runner_mode branch, session_mode "resume"), never into
+# any later leg's.
+if grep -q -- "--resume $wsess_resume_id" <<<"$(sed -n '1p' "$wsess_argv_log")"; then
+    ok "--resume-session reaches the first code step's own leg's claude argv as --resume"
+else
+    no "--resume-session reaches the first code step's own leg's claude argv as --resume" \
+        "$(sed -n '1p' "$wsess_argv_log")"
+fi
+if sed -n '2,5p' "$wsess_argv_log" | grep -q -- '--resume '; then
+    no "no later leg's claude/pi argv ever carries --resume" "$(sed -n '2,5p' "$wsess_argv_log")"
+else
+    ok "no later leg's claude/pi argv ever carries --resume"
+fi
+
+# The seed side: request 1's own HOME report (taken before its scripted
+# action runs) must show the seeded transcript already pulled into
+# $HOME/.claude/projects -- both at the top level (the plain tar
+# extraction) and flattened into this leg's own clone-slug directory (the
+# same trick fork-sandbox-k8s-entrypoint.sh's legacy single-leg claude arm
+# already does) -- before this leg does anything else.
+wsess_call1_report="$(awk '/^== call 1 /{f=1;next} /^== call 2 /{f=0} f' "$wsess_home_report")"
+if grep -q "$wsess_resume_id.jsonl" <<<"$wsess_call1_report"; then
+    ok "request 1's own \$HOME/.claude/projects already holds the seeded transcript before it runs"
+else
+    no "request 1's own \$HOME/.claude/projects already holds the seeded transcript before it runs" \
+        "$wsess_call1_report"
+fi
+wsess_call1_slug_hits="$(grep -c "$wsess_resume_id.jsonl" <<<"$wsess_call1_report" 2>/dev/null || true)"
+check "...and it was flattened into the leg's own clone-slug directory too (2 copies: top-level + flattened)" \
+    "2" "${wsess_call1_slug_hits:-0}"
+
+# The negative seed side: request 2 (self-review -- no session.tar) must
+# see a completely empty $HOME/.claude/projects, same as every ordinary
+# leg today -- leg_reset_home_and_tmp wipes $HOME every leg, and nothing
+# re-seeds it without a session.tar.
+wsess_call2_report="$(awk '/^== call 2 /{f=1;next} /^== call 3 /{f=0} f' "$wsess_home_report")"
+check "request 2's own \$HOME/.claude/projects is empty (no session.tar for a self-review leg)" \
+    "" "$wsess_call2_report"
+
+# The round trip: after the walk, the agent container's own session-store
+# equivalent carries the new content this stub "wrote" into request 1's
+# $HOME/.claude/projects -- proof fs_run_leg_split's own snapshot-back
+# (session-out.tar, through context-extract.sh, atomically swapped in)
+# actually ran, not just that the seed going in worked.
+if find "$wsess_pod_work/session-store" -name 'leg-written-1.jsonl' 2>/dev/null | grep -q .; then
+    ok "after the walk, the pod's own session-store carries request 1's own new transcript content"
+else
+    no "after the walk, the pod's own session-store carries request 1's own new transcript content" \
+        "$(find "$wsess_pod_work/session-store" 2>&1)"
+fi
+if ! kill -0 "$wsess_loop_pid" 2>/dev/null; then
+    ok "the --session-state walk's leg loop exits cleanly on .leg-shutdown"
+else
+    no "the --session-state walk's leg loop exits cleanly on .leg-shutdown" "still running: $wsess_loop_pid"
+fi
 
 printf '\n== composed pipeline on --k8s: an oversized verdict file fails the step, not the agent container ==\n'
 # The clone is leg-writable on a composed pod, so a leg controls

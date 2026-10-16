@@ -416,7 +416,8 @@ while true; do
             case "$leg_transcript_file" in
                 "$HOME/.claude/projects/$leg_pod_slug/"*) continue ;;
             esac
-            cp -p "$leg_transcript_file" "$HOME/.claude/projects/$leg_pod_slug/" 2>/dev/null || true
+            cp -p "$leg_transcript_file" \
+                "$HOME/.claude/projects/$leg_pod_slug/" 2>/dev/null || true
         done < <(find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' \
             -type f -print0 2>/dev/null)
         unset leg_pod_slug leg_transcript_file

@@ -605,8 +605,97 @@ else
     no "empty note is flagged, keeps the Job, and removes proxy credentials"
 fi
 
+# ---------------------------------------------------------------------------
+printf '\n== --resume --k8s --base: the SAME two-submit continuity flow, against\n   a composed preset instead of a legacy (--harness/--model) seat ==\n'
+# ---------------------------------------------------------------------------
+# Everything above drives --resume against the fixed single-leg skeleton
+# (--harness claude --model ...). --session-state used to be refused
+# outright against any composed preset; now it wires into the pipeline's
+# own first code step, and fork-sandbox.sh --resume itself is documented
+# (fork-sandbox-resume-lib.sh's own header: "a composed preset/review-loop
+# is not refused, but is not what this was built or tested against") as
+# merely not-refused there, never actually proven end to end. This proves
+# it: the identical K8S_STUB_SESSION_DIR-driven round trip -- submit 1
+# discovers a session id, submit 2 (--base, reusing the branch) threads it
+# in as resume_session, and discovers a new one of its own -- against
+# --pipeline copus1-ropus2-mopus1 (one code, one review x2, one maintain
+# step, all claude/opus -- composed on --k8s specifically because a
+# maintain step has no legacy --k8s skeleton to run on, see
+# preset_is_legacy_shaped's own k8s-mode flip in fork-sandbox.sh) instead
+# of --harness/--model. A fresh state dir and its own session fixtures,
+# not rd1/rd2's, so this section cannot be mistaken for reusing the
+# legacy run's own discovered id.
+composed_state_dir="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-composed-state.XXXXXX)"
+composed_session_fixture_1="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-composed-sess1.XXXXXX)"
+mkdir -p "$composed_session_fixture_1/proj-enc"
+printf '{"type":"summary"}\n' > "$composed_session_fixture_1/proj-enc/cccc3333cccc3333cccc3333cccc3333.jsonl"
+composed_session_fixture_2="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-composed-sess2.XXXXXX)"
+mkdir -p "$composed_session_fixture_2/proj-enc"
+printf '{"type":"summary"}\n' > "$composed_session_fixture_2/proj-enc/dddd4444dddd4444dddd4444dddd4444.jsonl"
+composed_note1="$notes_dir/composed-note1.md"; printf 'composed first note\n' > "$composed_note1"
+composed_note2="$notes_dir/composed-note2.md"; printf 'composed second note\n' > "$composed_note2"
+
+printf 'composed first agent reply\n' > "$outbox_fixture/reply.md"
+printf 'composed first run event\n' > "$evidence_fixture/events.jsonl"
+export K8S_STUB_SESSION_DIR="$composed_session_fixture_1" K8S_STUB_BASE_SHA="$proj_head"
+composed_rd1="$(run_fs --resume "$composed_state_dir" --k8s --pipeline copus1-ropus2-mopus1 \
+    "$proj_dir" "$composed_note1")"
+composed_rc1=$?
+check "composed submit 1: exits 0" "0" "$composed_rc1"
+if wait_for_summary "$composed_rd1"; then
+    ok "composed submit 1: the backgrounded submit+wait+collect actually finished"
+else
+    no "composed submit 1: the backgrounded submit+wait+collect actually finished" \
+        "no summary.json after 30s"
+fi
+check "composed submit 1: summary.json exit_code" "0" \
+    "$(jq -r '.exit_code' "$composed_rd1/summary.json" 2>/dev/null)"
+check "composed submit 1: run.env carries session_state (the composed k8s_argv now forwards it)" \
+    "$composed_state_dir/.fork-sandbox/session-store" \
+    "$(sed -n 's/^session_state=//p' "$composed_rd1/run.env" 2>/dev/null | tail -1)"
+check "composed submit 1: summary.json's session_id is the fixture's discovered id" \
+    "cccc3333cccc3333cccc3333cccc3333" "$(jq -r '.session_id' "$composed_rd1/summary.json" 2>/dev/null)"
+
+composed_branch1="$(sed -n 's/^branch=//p' "$composed_rd1/run.env" 2>/dev/null | head -1)"
+if [[ -n "$composed_branch1" ]]; then
+    ok "composed submit 1: a fresh branch was minted"
+else
+    no "composed submit 1: a fresh branch was minted" "no branch= in run.env"
+fi
+
+composed_branch1_tip="$(git -C "$proj_dir" rev-parse "$composed_branch1")"
+printf 'composed second agent reply\n' > "$outbox_fixture/reply.md"
+printf 'composed second run event\n' > "$evidence_fixture/events.jsonl"
+export K8S_STUB_SESSION_DIR="$composed_session_fixture_2" K8S_STUB_BASE_SHA="$composed_branch1_tip"
+composed_rd2="$(run_fs --resume "$composed_state_dir" --base "$composed_branch1" --k8s \
+    --pipeline copus1-ropus2-mopus1 "$proj_dir" "$composed_note2")"
+composed_rc2=$?
+check "composed submit 2 (--base): exits 0" "0" "$composed_rc2"
+if wait_for_summary "$composed_rd2"; then
+    ok "composed submit 2: the backgrounded submit+wait+collect actually finished"
+else
+    no "composed submit 2: the backgrounded submit+wait+collect actually finished" \
+        "no summary.json after 30s"
+fi
+check "composed submit 2: summary.json exit_code" "0" \
+    "$(jq -r '.exit_code' "$composed_rd2/summary.json" 2>/dev/null)"
+composed_branch2="$(sed -n 's/^branch=//p' "$composed_rd2/run.env" 2>/dev/null | head -1)"
+check "composed submit 2: reuses the exact same branch name (needs --allow-existing-branch forwarded too)" \
+    "$composed_branch1" "$composed_branch2"
+check "composed submit 2: the branch now carries BOTH fetched commits (fast-forwarded)" \
+    "3" "$(git -C "$proj_dir" rev-list --count "$composed_branch1" 2>/dev/null)"
+check "composed submit 2: run.env carries resume_session with run 1's own discovered id" \
+    "resume_session=cccc3333cccc3333cccc3333cccc3333" \
+    "$(grep '^resume_session=' "$composed_rd2/run.env" 2>/dev/null)"
+check "composed submit 2: summary.json's session_id moved on to the newly-discovered one" \
+    "dddd4444dddd4444dddd4444dddd4444" "$(jq -r '.session_id' "$composed_rd2/summary.json" 2>/dev/null)"
+check "composed submit 1: agent reply remains its own" "composed first agent reply" \
+    "$(cat "$composed_rd1/outbox/reply.md" 2>/dev/null)"
+check "composed submit 2: agent reply belongs to this run" "composed second agent reply" \
+    "$(cat "$composed_rd2/outbox/reply.md" 2>/dev/null)"
+
 tmpdirs+=("$rd1" "$rd2" "$rd_failed" "$rd3" "$shared_rd1" "$shared_rd2" \
-    "$reply_rd" "$empty_rd")
+    "$reply_rd" "$empty_rd" "$composed_rd1" "$composed_rd2")
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
