@@ -24937,6 +24937,111 @@ up_pods "$up_stale_pods" "postmaster=$up_ref:true"
 up_run "$up_cfg" UP_PODS_FILE="$up_stale_pods"
 up_failed_at "with the mail API configured, a pod without mail-api fails verify" verify "no 'mail-api' container"
 
+printf '\n== deploy-main ==\n'
+# Local file:// repos only: two upstreams ("a" moves, "b" stays put) and a
+# bare deploy repo whose pins.env names them.
+dm_root="$(newdir)"; tmpdirs+=("$dm_root")
+dm_git() { git -c user.name=t -c user.email=t@example.invalid -c init.defaultBranch=main "$@"; }
+for dm_name in a b; do
+    dm_git init -q "$dm_root/$dm_name"
+    dm_git -C "$dm_root/$dm_name" commit -q --allow-empty -m "$dm_name 1"
+done
+dm_a_old="$(git -C "$dm_root/a" rev-parse HEAD)"
+dm_b="$(git -C "$dm_root/b" rev-parse HEAD)"
+dm_git init -q --bare "$dm_root/deploy.git"
+dm_git clone -q "$dm_root/deploy.git" "$dm_root/seed" 2>/dev/null
+printf 'A_REPO=file://%s/a\nA_SHA=%s\nB_REPO=file://%s/b\nB_SHA=%s\n' \
+    "$dm_root" "$dm_a_old" "$dm_root" "$dm_b" > "$dm_root/seed/pins.env"
+dm_git -C "$dm_root/seed" add pins.env
+dm_git -C "$dm_root/seed" commit -q -m seed
+dm_git -C "$dm_root/seed" push -q origin HEAD:main
+dm_git -C "$dm_root/a" commit -q --allow-empty -m "a 2"
+dm_a_new="$(git -C "$dm_root/a" rev-parse HEAD)"
+
+dm_cfg="$(newdir)"; tmpdirs+=("$dm_cfg")
+printf 'K8S_CONTEXT=test-ctx\nK8S_POSTMASTER_DEPLOY_REPO=file://%s/deploy.git\n' "$dm_root" > "$dm_cfg/k8s.env"
+dm_out="" dm_rc=0
+# dm_run <cfgdir> [deploy-main args...]: stderr+stdout in $dm_out.
+dm_run() {
+    local cfg="$1"; shift
+    dm_out="$(env FORK_SANDBOX_CONFIG_DIR="$cfg" \
+        GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid \
+        GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid \
+        "$repo_dir/scripts/fork-sandbox-k8s.sh" deploy-main "$@" 2>&1)"
+    dm_rc=$?
+}
+dm_has() { if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "'$3' not in: $2"; fi; }
+dm_lacks() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "'$3' unexpectedly in: $2"; fi; }
+dm_pin() { git -C "$dm_root/deploy.git" show main:pins.env | sed -n "s/^$1_SHA=//p"; }
+dm_commits() { git -C "$dm_root/deploy.git" rev-list --count main; }
+
+dm_run "$dm_cfg" --dry-run
+check "deploy-main --dry-run exits 0" "0" "$dm_rc"
+dm_has "deploy-main --dry-run prints the moved pin" "$dm_out" "+A_SHA=$dm_a_new"
+dm_lacks "deploy-main --dry-run does not change a pin already at main" "$dm_out" "+B_SHA="
+check "deploy-main --dry-run pushes nothing" "$dm_a_old" "$(dm_pin A)"
+
+dm_run "$dm_cfg"
+check "deploy-main exits 0" "0" "$dm_rc"
+check "deploy-main pins A to the head of a's main" "$dm_a_new" "$(dm_pin A)"
+check "deploy-main leaves B where it was" "$dm_b" "$(dm_pin B)"
+check "deploy-main's commit names only what moved" "Pin A ${dm_a_new:0:10}" \
+    "$(git -C "$dm_root/deploy.git" log -1 --format=%s main)"
+check "deploy-main keeps the REPO lines" "2" "$(git -C "$dm_root/deploy.git" show main:pins.env | grep -c '_REPO=file://')"
+
+dm_before="$(dm_commits)"
+dm_run "$dm_cfg"
+check "deploy-main at main: exits 0" "0" "$dm_rc"
+dm_has "deploy-main at main: says so" "$dm_out" "already at main"
+check "deploy-main at main: no new commit" "$dm_before" "$(dm_commits)"
+
+dm_run "$dm_cfg" --force
+check "deploy-main refuses an unknown option" "1" "$dm_rc"
+
+dm_nokey="$(newdir)"; tmpdirs+=("$dm_nokey")
+printf 'K8S_CONTEXT=test-ctx\n' > "$dm_nokey/k8s.env"
+dm_run "$dm_nokey"
+check "deploy-main without K8S_POSTMASTER_DEPLOY_REPO exits 1" "1" "$dm_rc"
+dm_has "deploy-main without the key names it" "$dm_out" "K8S_POSTMASTER_DEPLOY_REPO is not set"
+
+dm_badurl="$(newdir)"; tmpdirs+=("$dm_badurl")
+printf 'K8S_CONTEXT=test-ctx\nK8S_POSTMASTER_DEPLOY_REPO=%s/deploy.git\n' "$dm_root" > "$dm_badurl/k8s.env"
+dm_run "$dm_badurl"
+dm_has "deploy-main refuses a deploy repo that is not a URL" "$dm_out" "must be an https://, ssh:// or file:// URL"
+
+# A pin whose repo is a command-running transport is refused before git
+# sees it: the marker file is never created.
+dm_git -C "$dm_root/a" commit -q --allow-empty -m "a 3"
+dm_git -C "$dm_root/seed" pull -q origin main
+printf 'C_REPO=ext::sh -c touch%%20%s/pwned\nC_SHA=%s\n' "$dm_root" "$dm_b" >> "$dm_root/seed/pins.env"
+dm_git -C "$dm_root/seed" commit -q -am "add C"
+dm_git -C "$dm_root/seed" push -q origin HEAD:main
+dm_before="$(dm_commits)"
+dm_run "$dm_cfg"
+check "deploy-main refuses an ext:: pin repo" "1" "$dm_rc"
+dm_has "deploy-main names the bad pin repo" "$dm_out" "C_REPO must be an https://, ssh:// or file:// URL"
+check "deploy-main ran nothing from the ext:: URL" "0" "$( [[ -e "$dm_root/pwned" ]] && echo 1 || echo 0 )"
+check "deploy-main pushed nothing after the refusal" "$dm_before" "$(dm_commits)"
+
+sed -i '/^C_/d' "$dm_root/seed/pins.env"
+printf 'C_SHA=%s\n' "$dm_b" >> "$dm_root/seed/pins.env"
+dm_git -C "$dm_root/seed" commit -q -am "C without a repo"
+dm_git -C "$dm_root/seed" push -q origin HEAD:main
+dm_run "$dm_cfg"
+dm_has "deploy-main refuses a _SHA with no _REPO" "$dm_out" "C_SHA but no C_REPO"
+
+sed -i '/^C_/d' "$dm_root/seed/pins.env"
+dm_git -C "$dm_root/seed" commit -q -am "drop C"
+dm_git -C "$dm_root/seed" push -q origin HEAD:main
+printf '#!/bin/sh\nexit 1\n' > "$dm_root/deploy.git/hooks/pre-receive"
+chmod +x "$dm_root/deploy.git/hooks/pre-receive"
+dm_before="$(dm_commits)"
+dm_run "$dm_cfg"
+check "deploy-main: a refused push exits 1" "1" "$dm_rc"
+dm_has "deploy-main: a refused push says nothing is deployed" "$dm_out" "nothing is deployed"
+check "deploy-main: a refused push leaves main alone" "$dm_before" "$(dm_commits)"
+rm -f "$dm_root/deploy.git/hooks/pre-receive"
+
 printf '\n== fork-sandbox-k8s.sh peek streams the current legs own transcript ==\n'
 # No live cluster (see this file's own header): a stub kubectl ahead of the
 # real one on PATH answers the pod lookup from K8S_STUB_PEEK_POD, and for

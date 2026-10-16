@@ -5,6 +5,7 @@
 #        fork-sandbox-k8s.sh install [--dry-run] --postmaster [--image REF]
 #                            [--rotate-team-token]
 #        fork-sandbox-k8s.sh upgrade-postmaster [--timeout DURATION]
+#        fork-sandbox-k8s.sh deploy-main [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME [--model MODEL]
 #                            [--endpoint NAME] [--harness pi|claude|codex]
 #                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
@@ -103,6 +104,14 @@
 # repository tagged with HEAD's 10-character sha; that key's own tag is
 # ignored, so a later plain install --postmaster still deploys whatever tag
 # k8s.env names. See docs/cluster-postmaster.md, "Updating".
+#
+# deploy-main is the operator's half of a CI-driven deploy: it clones the
+# deploy repo K8S_POSTMASTER_DEPLOY_REPO names, sets every <NAME>_SHA in its
+# pins.env to the current head of `main` on the repo its <NAME>_REPO line
+# names, commits, and pushes to the deploy repo's main, never forced. The
+# deploy repo's CI does the rest. It takes no sha, so it can only deploy
+# what has already merged; --dry-run prints the pin diff and pushes
+# nothing. See docs/cluster-postmaster.md, "Deploying from a deploy repo".
 #
 # submit renders a Job for one run, applies it, pushes the project's repo
 # into the pod over the same `kubectl exec` channel the work later returns
@@ -931,7 +940,7 @@
 #                         --label above.
 #
 # The following keys are read only by `install --postmaster`,
-# `upgrade-postmaster` and the postmaster pod's own init step; no other verb
+# `upgrade-postmaster`, `deploy-main` and the postmaster pod's own init step; no other verb
 # or key changes behavior
 # based on them. See docs/cluster-postmaster.md.
 #   K8S_POSTMASTER_IMAGE= the image ref scripts/build-sandbox-image.sh
@@ -946,6 +955,10 @@
 #                         --postmaster --base). REQUIRED by
 #                         upgrade-postmaster. Not K8S_IMAGE, which may be a
 #                         project's own seat image.
+#   K8S_POSTMASTER_DEPLOY_REPO=
+#                         git URL (https://, ssh:// or file://) of the deploy
+#                         repo whose pins.env deploy-main bumps. REQUIRED by
+#                         deploy-main, read by nothing else.
 #   K8S_POSTMASTER_REPO_URL=
 #                         ssh URL of the project repo the postmaster pod
 #                         clones: ssh://[user@]host[:port]/path or the
@@ -1401,6 +1414,7 @@ K8S_RUN_LABELS="$(read_env_value "$k8s_env" K8S_RUN_LABELS || true)"
 # never fails over a key it does not use. See the header table above.
 K8S_POSTMASTER_IMAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_IMAGE || true)"
 K8S_POSTMASTER_BASE_IMAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_BASE_IMAGE || true)"
+K8S_POSTMASTER_DEPLOY_REPO="$(read_env_value "$k8s_env" K8S_POSTMASTER_DEPLOY_REPO || true)"
 K8S_POSTMASTER_REPO_URL="$(read_env_value "$k8s_env" K8S_POSTMASTER_REPO_URL || true)"
 K8S_POSTMASTER_PROJECT="$(read_env_value "$k8s_env" K8S_POSTMASTER_PROJECT || true)"
 K8S_POSTMASTER_GIT_KEY_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_GIT_KEY_FILE || true)"
@@ -1668,6 +1682,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_AGENT_PRIORITY_CLASS" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
         "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_BASE_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
+        "$K8S_POSTMASTER_DEPLOY_REPO" \
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
         "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
         "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_MAIL_STORAGE" \
@@ -5247,6 +5262,81 @@ cmd_upgrade_postmaster() {
         echo "Note: k8s.env still names $K8S_POSTMASTER_IMAGE; a plain" >&2
         echo "install --postmaster would deploy that image, not $ref." >&2
     fi
+}
+
+deploy_fail() {
+    echo "Error: deploy-main: $1" >&2
+    (( $# > 1 )) && printf '%s\n' "${@:2}" >&2
+    exit 1
+}
+
+# The only URL shapes deploy-main hands to git. The scheme check alone is
+# not the guard: git also runs under GIT_ALLOW_PROTOCOL=https:ssh:file, so
+# no URL, including one inside a submodule or redirect, can reach a
+# transport that runs a command (ext::, fd::).
+deploy_url_ok() {
+    [[ "$1" =~ ^(https|ssh|file)://[^[:space:]]+$ ]]
+}
+
+cmd_deploy_main() {
+    local dry_run=0
+    while (( $# )); do
+        case "$1" in
+            --dry-run) dry_run=1; shift ;;
+            *) echo "Error: unknown option '$1' for deploy-main." >&2; exit 1 ;;
+        esac
+    done
+    [[ -n "$K8S_POSTMASTER_DEPLOY_REPO" ]] || deploy_fail \
+        "K8S_POSTMASTER_DEPLOY_REPO is not set in $k8s_env: name the deploy repo's git URL."
+    deploy_url_ok "$K8S_POSTMASTER_DEPLOY_REPO" || deploy_fail \
+        "K8S_POSTMASTER_DEPLOY_REPO must be an https://, ssh:// or file:// URL, got '$K8S_POSTMASTER_DEPLOY_REPO'."
+    export GIT_ALLOW_PROTOCOL=https:ssh:file
+
+    local work
+    work="$(mktemp -d)"
+    # shellcheck disable=SC2064 # expand now: $work is local
+    trap "rm -rf -- '$work'" EXIT
+    git clone --quiet --depth 1 --branch main -- "$K8S_POSTMASTER_DEPLOY_REPO" "$work/deploy" || \
+        deploy_fail "could not clone main of $K8S_POSTMASTER_DEPLOY_REPO."
+    local pins="$work/deploy/pins.env"
+    [[ -f "$pins" ]] || deploy_fail "the deploy repo has no pins.env."
+
+    local -a names=()
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([A-Z][A-Z0-9_]*)_SHA= ]] && names+=("${BASH_REMATCH[1]}")
+    done < "$pins"
+    (( ${#names[@]} )) || deploy_fail "pins.env holds no <NAME>_SHA line."
+
+    local name url sha old
+    local -a moved=()
+    for name in "${names[@]}"; do
+        url="$(read_env_value "$pins" "${name}_REPO" || true)"
+        [[ -n "$url" ]] || deploy_fail "pins.env has ${name}_SHA but no ${name}_REPO naming its repo."
+        deploy_url_ok "$url" || deploy_fail "${name}_REPO must be an https://, ssh:// or file:// URL, got '$url'."
+        sha="$(git ls-remote "$url" refs/heads/main | cut -f1)" || true
+        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || deploy_fail "could not read the head of main from $url."
+        old="$(read_env_value "$pins" "${name}_SHA" || true)"
+        [[ "$old" == "$sha" ]] && continue
+        sed -i "s/^${name}_SHA=.*/${name}_SHA=$sha/" "$pins"
+        moved+=("$name ${sha:0:10}")
+    done
+
+    if (( ${#moved[@]} == 0 )); then
+        echo "deploy-main: every pin is already at main; nothing to deploy." >&2
+        return 0
+    fi
+    git -C "$work/deploy" diff
+    if (( dry_run )); then
+        echo "deploy-main: dry run; nothing pushed." >&2
+        return 0
+    fi
+    local msg
+    msg="Pin $(printf '%s\n' "${moved[@]}" | paste -sd, - | sed 's/,/, /g')"
+    git -C "$work/deploy" commit --quiet -am "$msg" || deploy_fail "could not commit the pin change."
+    git -C "$work/deploy" push --quiet origin HEAD:main || deploy_fail \
+        "the push was refused, so nothing is deployed. If the deploy repo's main moved, run deploy-main again."
+    echo "deploy-main: pushed $(git -C "$work/deploy" rev-parse --short=10 HEAD) ($msg) to the deploy repo's main; its CI deploys it." >&2
 }
 
 # Shared by --thread-dir and --attach-dir (Section 1 of the thread/attach
@@ -12092,6 +12182,7 @@ shift
 case "$verb" in
     install) cmd_install "$@" ;;
     upgrade-postmaster) cmd_upgrade_postmaster "$@" ;;
+    deploy-main) cmd_deploy_main "$@" ;;
     submit) cmd_submit "$@"; k8s_note_standalone_submit_keeper ;;
     run) cmd_run "$@" ;;
     resume) cmd_resume "$@" ;;
@@ -12104,7 +12195,7 @@ case "$verb" in
     rm) cmd_rm "$@" ;;
     check-grant) cmd_check_grant "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, upgrade-postmaster, submit, run, resume, adopt, wait, collect, fetch, say, peek, rm or check-grant." >&2
+        echo "Error: unknown command '$verb'. Use install, upgrade-postmaster, deploy-main, submit, run, resume, adopt, wait, collect, fetch, say, peek, rm or check-grant." >&2
         exit 1
         ;;
 esac

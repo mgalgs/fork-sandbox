@@ -62,6 +62,7 @@ Do these in order.
    |---|---|---|
    | `K8S_POSTMASTER_IMAGE` | yes | the image ref step 1 built and you pushed |
    | `K8S_POSTMASTER_BASE_IMAGE` | for `upgrade-postmaster` | the plain sandbox image step 1 layered on; see "Updating" |
+   | `K8S_POSTMASTER_DEPLOY_REPO` | for `deploy-main` | git URL (`https://`, `ssh://` or `file://`) of a deploy repo whose CI runs `upgrade-postmaster`; see "Deploying from a deploy repo" |
    | `K8S_POSTMASTER_REPO_URL` | yes | ssh URL of the project repo: `ssh://[user@]host[:port]/path` or the scp-like `user@host:path` form. Anything else (`https://`, a bare hostname) is refused. |
    | `K8S_POSTMASTER_PROJECT` | no | directory name under `$HOME/src` in the pod; defaults to the URL's last path component with a trailing `.git` stripped. Must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, so it can never be `.` or `..`. A `K8S_PROJECT_IMAGES` entry (see "Per-project and per-run images" in [docs/kubernetes-runs.md](kubernetes-runs.md)) keys on this same name, since a run the postmaster spawns resolves its default image from the project path it was handed, the same as any other run. |
    | `K8S_POSTMASTER_GIT_KEY_FILE` | yes, unless `K8S_POSTMASTER_GIT_SECRET` | laptop path to the deploy private key from step 2 |
@@ -246,6 +247,41 @@ Do these in order.
   that is what `fork-sandbox adopt` is for, called by whatever the
   consumer's own re-adoption logic is. See "Re-adopting a run whose
   host-side driver died" in [kubernetes-runs.md](kubernetes-runs.md).
+
+## Deploying from a deploy repo
+
+`upgrade-postmaster` can run in CI instead of on a workstation. The site
+keeps a private deploy repo that holds its `k8s.env`, `fleet.yaml` and
+hooks, plus a `pins.env` naming the exact commits to deploy. CI runs
+`upgrade-postmaster` from a checkout at those pins on every push to the
+deploy repo's `main`. A deploy is then a change to `pins.env`.
+
+`deploy-main` makes that change for you:
+
+```
+scripts/fork-sandbox-k8s.sh deploy-main [--dry-run]
+```
+
+`pins.env` holds one pair of lines per repo the deploy pins:
+
+```
+FORK_SANDBOX_REPO=https://example.com/you/fork-sandbox.git
+FORK_SANDBOX_SHA=<40-hex sha>
+```
+
+The verb clones the deploy repo named by `K8S_POSTMASTER_DEPLOY_REPO` in
+`k8s.env`. It sets every `<NAME>_SHA` to the current head of `main` on
+`<NAME>_REPO`, then commits and pushes to the deploy repo's `main`. It
+never force-pushes: if `main` moved meanwhile, the push is refused,
+nothing is deployed, and you run it again. If every pin is already at
+`main`, it says so and pushes nothing. `--dry-run` prints the pin diff
+and pushes nothing.
+
+It takes no sha on purpose. It can only deploy what has already merged to
+`main`, so an operator can allow it without a prompt and still review
+every deploy where the code is merged. Git runs with
+`GIT_ALLOW_PROTOCOL=https:ssh:file`, and every URL must use one of those
+schemes. To roll back to an older sha, edit `pins.env` by hand.
 
 ## The mail API
 
