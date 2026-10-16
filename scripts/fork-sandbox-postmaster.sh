@@ -161,8 +161,12 @@
 #                its Job is still running or finished-but-uncollected, so
 #                a new wrapper was launched with `--adopt` to wait for and
 #                collect it instead of declaring the seat dead. At most 2
-#                per run (`adopt-count` in the wake dir); see ADOPTION
+#                per run (`adopt-count` in the wake dir); a trailing
+#                `handed-off` marks one that spent none; see ADOPTION
 #                below.
+#   handed-off   agent, thread, run=<run id> -- the shutdown drain marked a
+#                live k8s wake for the next postmaster to adopt; see
+#                SHUTDOWN DRAIN below.
 #   adopt-deferred agent, thread, run=<run id>, probe_rc=<n> -- the
 #                adoption probe could not reach the cluster (exit 4, or any
 #                code outside its 0/1/2 contract), so the run is left live
@@ -741,6 +745,10 @@
 # wait). The pod's terminationGracePeriodSeconds must exceed it, and it
 # should stay under the mail client's retry budget, since the mail API is
 # down for the whole shutdown. A non-numeric value refuses `deliver`.
+# Last, every live k8s wake past submit gets a `handed-off` file in its wake
+# dir: the next postmaster's adoption of it spends no `adopt-count` and
+# removes the file. Without this, a run outliving two rollouts would be
+# declared dead while its Job still ran, and its seat woken a second time.
 #
 # ROUTE PLAN. A message's routed marker is written before its seats are
 # woken, so a process that dies part-way through a multi-seat message (a
@@ -5519,10 +5527,11 @@ pm_try_adopt() {
             return 1
         fi
     fi
-    local count
+    local count handed_off=0
     count="$(pm_trim "$(cat -- "$run_dir/adopt-count" 2>/dev/null || true)")"
     [[ "$count" =~ ^[0-9]+$ ]] || count=0
-    (( count >= 2 )) && return 1
+    [[ -f "$run_dir/handed-off" ]] && handed_off=1
+    (( count >= 2 && ! handed_off )) && return 1
     [[ -n "$branch" ]] || return 1
     local k8s="${FORK_SANDBOX_POSTMASTER_K8S:-$script_dir/fork-sandbox-k8s.sh}" probe_rc=0
     "$k8s" wait --branch "$branch" --probe --timeout 5 >/dev/null 2>&1 || probe_rc=$?
@@ -5547,11 +5556,16 @@ pm_try_adopt() {
             ;;
     esac
     rm -f -- "$run_dir/probe-fail-count"
-    count=$((count + 1))
-    local tmp
-    tmp="$(mktemp "$run_dir/.tmp.XXXXXX")"
-    printf '%s\n' "$count" > "$tmp"
-    mv -- "$tmp" "$run_dir/adopt-count"
+    if (( handed_off )); then
+        # Consumed here, so a death of the adopting wrapper itself counts.
+        rm -f -- "$run_dir/handed-off"
+    else
+        count=$((count + 1))
+        local tmp
+        tmp="$(mktemp "$run_dir/.tmp.XXXXXX")"
+        printf '%s\n' "$count" > "$tmp"
+        mv -- "$tmp" "$run_dir/adopt-count"
+    fi
     # The dead wake's pid file stays until the adopting wake rewrites it
     # (its first act), so a pass that lands in between must not read the
     # stale pid as another death and adopt twice: drop it and let the
@@ -5559,7 +5573,11 @@ pm_try_adopt() {
     rm -f -- "$run_dir/pid" "$run_dir/pid-identity"
     touch -- "$RUNS/$rid.env"
     pm_k8s_wake_launch "$run_dir" 1 || return 2
-    pm_event "adopt thread=${tid:0:8} agent=$agent run=$rid attempt=$count"
+    if (( handed_off )); then
+        pm_event "adopt thread=${tid:0:8} agent=$agent run=$rid attempt=$count handed-off"
+    else
+        pm_event "adopt thread=${tid:0:8} agent=$agent run=$rid attempt=$count"
+    fi
     return 0
 }
 
@@ -5920,13 +5938,36 @@ pm_drain() {
     local timeout="${FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT:-150}" start busy
     start="$(date +%s)"
     busy="$(pm_drain_busy)"
-    (( busy == 0 )) && return 0
-    pm_event "drain busy=$busy timeout=${timeout}s"
-    while (( busy > 0 && $(date +%s) - start < timeout )); do
-        sleep "${FORK_SANDBOX_POSTMASTER_DRAIN_POLL:-2}" || true
-        busy="$(pm_drain_busy)"
+    if (( busy > 0 )); then
+        pm_event "drain busy=$busy timeout=${timeout}s"
+        while (( busy > 0 && $(date +%s) - start < timeout )); do
+            sleep "${FORK_SANDBOX_POSTMASTER_DRAIN_POLL:-2}" || true
+            busy="$(pm_drain_busy)"
+        done
+        pm_event "drain done busy=$busy waited=$(( $(date +%s) - start ))s"
+    fi
+    pm_mark_handed_off
+}
+
+# Marks every k8s wake this exit is about to orphan with its inputs in hand
+# (wrapper alive, past submit, no summary.json) `handed-off` in its wake dir,
+# so the next postmaster adopts it without spending one of its adoptions: a
+# rollout is not a failure of the wake. A wake cut off mid-submit is not
+# marked; resume refuses it whatever the count says.
+pm_mark_handed_off() {
+    local f rid run_dir
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ -e "$HARVESTED/$rid" ]] && continue
+        [[ "$(fs_pm_env_get "$f" BACKEND)" == k8s ]] || continue
+        run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
+        [[ -d "$run_dir" && ! -f "$run_dir/summary.json" ]] || continue
+        pm_wake_is_dead "$run_dir" "$f" && continue
+        pm_wake_submitting "$f" && continue
+        : > "$run_dir/handed-off"
+        pm_event "handed-off thread=$(fs_pm_env_get "$f" THREAD | cut -c1-8) agent=$(fs_pm_env_get "$f" AGENT) run=$rid"
     done
-    pm_event "drain done busy=$busy waited=$(( $(date +%s) - start ))s"
 }
 
 # ---- retry pass ----

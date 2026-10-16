@@ -234,7 +234,10 @@ Do these in order.
   `terminationGracePeriodSeconds` (180) covers that wait, and the
   whole shutdown stays inside the mail client's 5 minute retry budget. A
   `pm drain done busy=<n>` line with `n` above 0 means the timeout cut
-  something off.
+  something off. A run may be adopted at most twice, but an adoption after
+  a clean shutdown does not count: the drain marks each live wake
+  `handed-off` (a `pm handed-off` line), so a long seat survives any number
+  of rollouts. Only a wrapper that dies some other way spends one.
 
   This is the postmaster adopting its own restarted wake wrapper
   (`fork-sandbox-k8s-wake.sh --adopt`, which calls `fork-sandbox-k8s.sh

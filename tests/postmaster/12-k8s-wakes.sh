@@ -575,9 +575,10 @@ contains "k8s status: held section names the thread and agent" "$k11_status" "${
 # summary.json/exit-code gone, its harvested marker cleared, its pid a
 # process that has exited -- which is what a postmaster host restart leaves.
 # $1 label, $2 probe exit code, $3 adopt-count on file ("" = none),
-# $4 backend override for the run env ("" = leave k8s).
+# $4 backend override for the run env ("" = leave k8s), $5 "handed-off" to
+# leave the shutdown drain's marker in the wake dir.
 adopt_case() {
-    local label="$1" probe_rc="$2" count="$3" backend="${4:-}"
+    local label="$1" probe_rc="$2" count="$3" backend="${4:-}" handed_off="${5:-}"
     local mid tid env rid wake_dir
     new_scratch_root FORK_SANDBOX_MAIL_ROOT
     export FORK_SANDBOX_MAIL_ROOT
@@ -593,6 +594,7 @@ adopt_case() {
         "$wake_dir/k8s-run-dir" "$wake_dir/k8s-timeout" "$wake_dir/pid-identity"
     dead_pid_of > "$wake_dir/pid"
     [[ -z "$count" ]] || printf '%s\n' "$count" > "$wake_dir/adopt-count"
+    [[ -z "$handed_off" ]] || : > "$wake_dir/handed-off"
     [[ -z "$backend" ]] || sed -i "s/^BACKEND=.*/BACKEND=$backend/" "$env"
     printf '%s\n' "$probe_rc" > "$K8S_WAKE_BIN/probe-rc"
     rm -f -- "$K8S_WAKE_BIN/probe-calls.log" "$K8S_WAKE_BIN/resume-calls.log"
@@ -638,6 +640,28 @@ check "k8s adopt (count 2): harvested as before" 1 "$ADOPT_HARVESTED"
 check "k8s adopt (count 2): the cluster is not even probed" 0 "$ADOPT_PROBES"
 check "k8s adopt (count 2): nothing adopted" 0 "$ADOPT_RESUMES"
 check "k8s adopt (count 2): adopt-count left at 2" 2 "$(cat "$ADOPT_WAKE_DIR/adopt-count")"
+
+# A wake the previous postmaster handed off on a clean shutdown is adopted
+# even with its adoptions used up, and spends none: a rollout is not a death.
+adopt_case "handed off, adoptions used up" 1 2 "" handed-off
+check "k8s adopt (handed off, count 2): not flagged" 0 "$ADOPT_FLAG"
+check "k8s adopt (handed off, count 2): not harvested" 0 "$ADOPT_HARVESTED"
+check "k8s adopt (handed off, count 2): adopted (resume ran)" 1 "$ADOPT_RESUMES"
+check "k8s adopt (handed off, count 2): adopt-count left at 2" 2 "$(cat "$ADOPT_WAKE_DIR/adopt-count")"
+check "k8s adopt (handed off, count 2): the marker is consumed" 0 \
+    "$( [[ -e "$ADOPT_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+contains "k8s adopt (handed off, count 2): pm adopt event says handed-off" "$(cat "$work/once.out")" \
+    "pm adopt thread=${ADOPT_TID:0:8} agent=karen run=$ADOPT_RID attempt=2 handed-off"
+
+adopt_case "handed off, first adoption" 1 "" "" handed-off
+check "k8s adopt (handed off, first): adopted (resume ran)" 1 "$ADOPT_RESUMES"
+check "k8s adopt (handed off, first): no adopt-count written" 0 \
+    "$( [[ -e "$ADOPT_WAKE_DIR/adopt-count" ]] && echo 1 || echo 0 )"
+
+# The marker never revives a seat the cluster says is gone.
+adopt_case "handed off, pod gone" 2 "" "" handed-off
+check "k8s adopt (handed off, probe 2): flagged as before" 1 "$ADOPT_FLAG"
+check "k8s adopt (handed off, probe 2): nothing adopted" 0 "$ADOPT_RESUMES"
 
 adopt_case "local wake" 1 "" local
 check "k8s adopt (local backend): flagged as before" 1 "$ADOPT_FLAG"
@@ -813,6 +837,9 @@ check "drain: exit status 0" 0 "$dr_rc"
 contains "drain: pm drain done event, nothing cut off" "$(cat "$DR_LOG")" "pm drain done busy=0"
 check "drain: the wake was not harvested (the next postmaster adopts it)" 0 \
     "$( [[ -n "$(ls -A "$PM_STATE_DIR/harvested" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+check "drain: the live wake past submit is marked handed-off" 1 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+contains "drain: pm handed-off event" "$(cat "$DR_LOG")" "pm handed-off thread="
 kill "$DR_WAKE_PID" 2>/dev/null; wait "$DR_WAKE_PID" 2>/dev/null
 
 # The bound: a wake that never finishes submitting is cut off at the timeout.
@@ -821,6 +848,8 @@ FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=1 drain_start_and_term
 check "drain timeout: exits once the bound is spent" 0 "$(drain_alive_after 50)"
 wait "$DR_PID" 2>/dev/null || true
 contains "drain timeout: pm drain done names what was cut off" "$(cat "$DR_LOG")" "pm drain done busy=1"
+check "drain timeout: a wake cut off mid-submit is not marked handed-off" 0 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
 kill "$DR_WAKE_PID" 2>/dev/null; wait "$DR_WAKE_PID" 2>/dev/null
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
