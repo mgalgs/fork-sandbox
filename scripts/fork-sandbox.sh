@@ -295,9 +295,10 @@
 #                        pipeline's own first code step -- the same leg (and
 #                        its --refresh-at continuations) a legacy-shaped
 #                        preset's code seat already resumes. Refused, by
-#                        name, when that step's own seat is not claude (a
-#                        composed step's seat has no transcript store), or
-#                        when the pipeline has no code step at all.
+#                        name, when that step is not step 1, when its seat
+#                        is not claude (a composed step's seat has no
+#                        transcript store), or when the pipeline has no
+#                        code step at all.
 #                        A sealed pi run (--harness pi --network sealed, and
 #                        its pi-local alias) dispatches through
 #                        agent-sandboxed rather than execing pi directly, but
@@ -2449,8 +2450,9 @@ if [[ -n "$preset_name" ]]; then
     # The pipeline's own first code step, by action rather than by position
     # (step 1 may be a review or plan step -- see fork-sandbox-preset-
     # parse.py's own first_code_agent scan, which this mirrors): the one
-    # seat --session-state can wire into for a composed preset, below. Empty
-    # when the pipeline has no code step at all.
+    # seat --session-state can wire into for a composed preset, and only
+    # when it is step 1 (refused below otherwise). Empty when the pipeline
+    # has no code step at all.
     preset_session_step_idx=""
     preset_session_step_agent=""
     for ((preset_sess_k = 1; preset_sess_k <= preset_step_count; preset_sess_k++)); do
@@ -3558,6 +3560,15 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
             echo "Error: --session-state cannot be combined with preset '$preset_name':" >&2
             echo "this pipeline has no code step, so there is no coding leg for a" >&2
             echo "transcript store to attach to." >&2
+            exit 1
+        fi
+        # The runner wires the store only into a code leg that runs as step
+        # 1 (fs_impl_leg_ran_at_step1); a later code step runs through
+        # run_leg and fs_refresh_chain, which never carry it.
+        if [[ "$preset_session_step_idx" != 1 ]]; then
+            echo "Error: --session-state cannot be combined with preset '$preset_name':" >&2
+            echo "its first code step is step $preset_session_step_idx, not step 1. A" >&2
+            echo "transcript store attaches only to a code step that opens the pipeline." >&2
             exit 1
         fi
         preset_session_step_harness="${preset_agent_harness[$preset_session_step_agent]}"

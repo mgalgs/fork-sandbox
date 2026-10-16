@@ -17,8 +17,8 @@
 # runs at a time (a second note while one is active is refused, never
 # raced), and, with --base, fast-forwards one moving branch instead of
 # minting a fresh one per run. Scope: the default (single implement leg)
-# pipeline, local or --k8s; a composed preset/review-loop is not refused,
-# but is not what this was built or tested against.
+# pipeline, local or --k8s, and a composed preset whose step 1 is a claude
+# code step, which then holds the store (see docs/presets.md).
 #
 # fork-sandbox's own bookkeeping for a state dir lives under
 # <state-dir>/.fork-sandbox/ -- never session.json, which is the client's

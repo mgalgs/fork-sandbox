@@ -462,17 +462,17 @@ edges are the flags' own — plus the edges of the two preset-only knobs:
   runs, what collect lands, and the handful of seat shapes (codex, a
   sealed/pi-local network, a model-less claude or pi seat) still refused
   by name.
-- **`--session-state` wires into a composed preset's own first code
-  step**, the pipeline's first step whose action is `code` (by order, not
-  necessarily step 1 — a review-first pipeline's first code step may sit
-  anywhere) — the same leg, and the same `--refresh-at` continuations of
-  it, a legacy-shaped preset's code seat already resumes. Every other
-  step (review, maintain, a fix seat, a later code step) never sees it,
-  on `--k8s` or locally. Only a `claude` seat can hold a store today:
-  `--session-state` is refused by name, naming the step and agent, when
-  the first code step's harness is `pi`/`pi-local`/`codex`, or when the
-  pipeline has no code step at all (`--review-only` over a preset, or a
-  review/maintain-only pipeline with every `fix_agent` named explicitly).
+- **`--session-state` wires into a composed preset's first code step**,
+  which must be step 1. That step's first pass, and its `--refresh-at`
+  continuations, get the store, exactly as a legacy-shaped preset's code
+  seat does. Every other leg (review, maintain, a fix seat, a repeat pass,
+  a later code step) never sees it, on `--k8s` or locally. Only a
+  `claude` seat can hold a store today. `--session-state` is refused by
+  name when step 1 is not a code step (a plan- or review-first
+  pipeline), when that step's harness is `pi`/`pi-local`/`codex`, or when
+  the pipeline has no code step at all (`--review-only` over a preset, or
+  a review/maintain-only pipeline with every `fix_agent` named
+  explicitly).
 - **`--review-only` refuses review and maintainer flags**, so it refuses
   a preset that carries loops — and one whose code seat repeats, since
   there is no coding leg to repeat. A preset with only a code step works

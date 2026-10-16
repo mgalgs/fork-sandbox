@@ -1386,8 +1386,8 @@ have to stat the run directory separately to find out.
   the refresh-chain flags) — unchanged from the fixed-skeleton shapes
   above.
 - `--session-state` (and `--resume-session`/`--session-id` with it) is
-  refused only when the pipeline's first code step is not a `claude`
-  seat, or when the pipeline has no code step at all -- see "Getting
+  refused only when step 1 is not a code step on a `claude` seat, or
+  when the pipeline has no code step at all -- see "Getting
   files in: --session-state, --resume-session, --session-id" below,
   which now covers a composed run too, not just the fixed-skeleton
   shapes.

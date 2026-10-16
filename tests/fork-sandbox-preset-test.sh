@@ -3462,6 +3462,8 @@ if rd_session="$(run_stubbed --preset composed-session \
         "$leg1_argv" "--session-state $composed_session_run_state"
     contains "the first code step's leg carries --resume-session" \
         "$leg1_argv" "--resume-session $composed_session_sid"
+    contains "the first code step's leg runs its own seat's model" \
+        "$leg1_argv" "--model sonnet"
     lacks "the review leg carries no --session-state" "$leg2_argv" "--session-state"
     lacks "the review leg carries no --resume-session" "$leg2_argv" "--resume-session"
     lacks "a LATER code step's leg carries no --session-state" "$leg3_argv" "--session-state"
@@ -4956,6 +4958,30 @@ EOF
 refuses "--session-state is refused against a composed pipeline with no code step at all" \
     "this pipeline has no code step" \
     --preset nocodefix --session-state "$composed_session_state_dir"
+
+# A claude code step that is not step 1: the runner wires the store only
+# into a code leg that opens the pipeline, so this is refused too.
+cat > "$presets_dir/reviewfirst.yaml" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: code
+    agent: coder
+EOF
+refuses "--session-state is refused when the first code step is not step 1" \
+    "its first code step is step 2, not step 1" \
+    --preset reviewfirst --session-state "$composed_session_state_dir"
+refuses "--k8s + --session-state is refused when the first code step is not step 1" \
+    "its first code step is step 2, not step 1" \
+    --preset reviewfirst --k8s --session-state "$composed_session_state_dir"
 
 # Legacy shapes keep their routes: --pi-args reaches a separately built pi
 # review seat, as it always has.
