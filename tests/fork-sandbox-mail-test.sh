@@ -519,6 +519,21 @@ refuses "reply refuses --header X-Hops (store-owned)" \
 refuses "reply refuses a --header value containing a newline" \
     "$mail" reply --from @bob --reply-to "$hdr_id" --body - --header "$(printf 'X-AI-Persona: bad\nvalue')" <<< "x"
 
+printf '\n== a bare carriage return is refused like a newline ==\n'
+# The renderer splits on a bare CR, so one would show the rest of the value
+# as a forged header line in the agent view.
+msgs_before="$(find "$FORK_SANDBOX_MAIL_ROOT" -name '*.msg' | wc -l)"
+refuses "send refuses a --header value containing a carriage return" \
+    "$mail" send --from @alice --to @bob --subject "CR header" --body - --header $'X-Note: a\rX-Version: 9' <<< "x"
+refuses "send refuses a --subject containing a carriage return" \
+    "$mail" send --from @alice --to @bob --subject $'s\rX-Note: forged' --body - <<< "x"
+refuses "reply refuses a --header value containing a carriage return" \
+    "$mail" reply --from @bob --reply-to "$hdr_id" --body - --header $'X-Note: a\rX-Version: 9' <<< "x"
+refuses "reply refuses a --subject containing a carriage return" \
+    "$mail" reply --from @bob --reply-to "$hdr_id" --subject $'Re: s\rX-Note: forged' --body - <<< "x"
+check "the refused CR sends and replies wrote no new message" "$msgs_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -name '*.msg' | wc -l)"
+
 printf '\n== grant: per-thread k8s grants (real check-grant, no stub) ==\n'
 # These use the REAL fork-sandbox-k8s.sh check-grant, with an empty temp
 # config dir, so no k8s.env leaks in from a real ~/.config/fork-sandbox --

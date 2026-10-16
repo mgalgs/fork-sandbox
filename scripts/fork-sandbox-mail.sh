@@ -324,11 +324,13 @@ mail_validate_inbox_name() {
 # Rejects a value containing a raw newline. Header values are joined into
 # the header block with newlines and everything up to the first blank
 # line is parsed as a header, so a newline inside a value (e.g. a
-# caller-supplied --subject) would forge or truncate header lines.
+# caller-supplied --subject) would forge or truncate header lines. A bare
+# CR counts too: the renderer reads the store with universal newlines, so
+# it splits there and shows the rest as a header line of its own.
 mail_validate_no_newline() {
     local val="$1" field="$2"
-    if [[ "$val" == *$'\n'* ]]; then
-        echo "Error: $field must not contain a newline." >&2
+    if [[ "$val" == *[$'\n\r']* ]]; then
+        echo "Error: $field must not contain a newline or carriage return." >&2
         return 1
     fi
     return 0
