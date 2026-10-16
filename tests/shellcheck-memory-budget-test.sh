@@ -10,9 +10,9 @@
 # RSS on tests/fork-sandbox-k8s-test.sh and got OOM-killed, taking a whole
 # unattended sandbox run down with it (systemd's default OOMPolicy=stop
 # takes the rest of that unit down with the process it killed). That file
-# and tests/fork-sandbox-postmaster-test.sh now carry a per-file
-# "# shellcheck extended-analysis=false" directive for exactly this reason
-# -- never remove those two lines. This suite is the guard that says
+# and the postmaster suite's files (tests/postmaster/*.sh) now carry a
+# per-file "# shellcheck extended-analysis=false" directive for exactly this
+# reason -- never remove those lines. This suite is the guard that says
 # whether some OTHER file needs the same treatment: it runs shellcheck on
 # every tracked script under a hard memory cap, one file at a time (never
 # in parallel -- the point is not to OOM the machine running this test),
