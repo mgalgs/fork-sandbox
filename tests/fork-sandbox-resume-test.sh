@@ -926,6 +926,164 @@ else
     fi
 fi
 
+# R9e, extended to a genuinely COMPOSED pipeline (not just a preset shaped
+# like the fixed code/review skeleton, which "revcheck" above already is):
+# three steps, code -> review -> review, the smallest shape that is neither
+# 1-step, 2-step code+(review|maintain), nor the 3-step code+review+maintain
+# pattern fork-sandbox.sh still special-cases as "legacy-shaped" -- so this
+# exercises the composed per-step build loop ("s<K>_sandbox_cmd"/
+# "s<K>cont_sandbox_cmd"), not the legacy impl_sandbox_cmd/cont_sandbox_cmd
+# pair "revcheck" already covers.
+composed_resume_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+mkdir -p "$composed_resume_home/.claude/skills"
+cp -R "$repo_dir/skills/code-review-portable" "$composed_resume_home/.claude/skills/"
+composed_resume_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+composed_resume_cfg="$(mktmp_dir "$scratch/fs-resume-cfg.XXXXXX")"
+mkdir -p "$composed_resume_cfg/presets"
+cat > "$composed_resume_cfg/presets/composed-refresh.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    refresh-at: 0.5
+    refresh-max: 2
+  reviewer:
+    harness: claude
+  reviewer2:
+    harness: claude
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: review
+    repeat: 1
+    agent: reviewer2
+EOF
+composed_resume_sid=0123abcd-4567-89ab-cdef-0123456789ab
+composed_resume_handoff_dir="$(mktmp_dir "$scratch/fs-resume-ho.XXXXXX")"
+composed_resume_handoff="$composed_resume_handoff_dir/handoff.md"
+printf 'do the task\n' > "$composed_resume_handoff"
+composed_resume_argv="$(mktemp "$scratch/fs-resume-argv.XXXXXX")"
+tmpdirs+=("$composed_resume_argv")
+# FAKE_HANDOFF_ON_CALL=1 forces exactly one --refresh-at continuation after
+# the first code step's own pass 1; FAKE_COMMIT_ON_CALL=2 commits on that
+# continuation leg, so the review step after it has a diff to look at.
+composed_resume_out="$(HOME="$composed_resume_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$composed_resume_cfg" FAKE_ARGV_FILE="$composed_resume_argv" \
+    FAKE_HANDOFF_ON_CALL=1 FAKE_COMMIT_ON_CALL=2 \
+    timeout 120 "$launcher" --foreground --preset composed-refresh \
+    --session-state "$composed_resume_state" --resume-session "$composed_resume_sid" \
+    "$(new_project "$composed_resume_home")" "$composed_resume_handoff" 2>&1)"
+composed_resume_rc=$?
+
+if (( composed_resume_rc != 0 )); then
+    no "a composed pipeline's first code step and its refresh continuation ran" \
+        "run failed: $composed_resume_out"
+elif [[ ! -f "$composed_resume_argv.3" ]]; then
+    no "a composed pipeline's first code step and its refresh continuation ran" \
+        "only $(cat "$composed_resume_argv.count" 2>/dev/null) leg(s) launched"
+else
+    ok "a composed pipeline's first code step and its refresh continuation ran"
+    if argv_has_flag_value "$composed_resume_argv.1" --resume-session "$composed_resume_sid"; then
+        ok "the first code step's pass 1 resumes the caller's session"
+    else
+        no "the first code step's pass 1 resumes the caller's session" \
+            "$(cat "$composed_resume_argv.1")"
+    fi
+    if argv_has_word "$composed_resume_argv.2" --session-state \
+        && ! argv_has_word "$composed_resume_argv.2" --resume-session; then
+        ok "the first code step's refresh continuation carries the store, never a resume"
+    else
+        no "the first code step's refresh continuation carries the store, never a resume" \
+            "$(cat "$composed_resume_argv.2")"
+    fi
+    if argv_has_word "$composed_resume_argv.3" --session-state \
+        || argv_has_word "$composed_resume_argv.3" --resume-session; then
+        no "the review step after it gets neither session flag" \
+            "$(cat "$composed_resume_argv.3")"
+    else
+        ok "the review step after it gets neither session flag"
+    fi
+fi
+
+# A second composed run against the SAME store continues the conversation
+# in its first code step's leg, exactly as a second legacy run already
+# does: the first run's discovered session_id (fs_session_discover_id,
+# via FAKE_TRANSCRIPTS standing in for the CLI's own transcript) threads
+# into the second run's own --resume-session, the same way a consumer
+# driving `--resume <dir>` would read it from the first run's summary.json.
+composed_chain_home1="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+composed_chain_home2="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+composed_chain_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+composed_chain_cfg="$(mktmp_dir "$scratch/fs-resume-cfg.XXXXXX")"
+mkdir -p "$composed_chain_cfg/presets"
+cat > "$composed_chain_cfg/presets/composed-chain.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+  reviewer:
+    harness: claude
+  reviewer2:
+    harness: claude
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: review
+    repeat: 1
+    agent: reviewer2
+EOF
+composed_chain_sid=aaaabbbb-1111-2222-3333-444455556666
+composed_chain_handoff_dir1="$(mktmp_dir "$scratch/fs-resume-ho.XXXXXX")"
+composed_chain_handoff1="$composed_chain_handoff_dir1/handoff.md"
+printf 'do the task\n' > "$composed_chain_handoff1"
+export FAKE_TRANSCRIPTS="$composed_chain_sid@1700000200"
+composed_chain_out1="$(HOME="$composed_chain_home1" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$composed_chain_cfg" \
+    timeout 120 "$launcher" --foreground --preset composed-chain \
+    --session-state "$composed_chain_state" \
+    "$(new_project "$composed_chain_home1")" "$composed_chain_handoff1" 2>&1)"
+composed_chain_rc1=$?
+unset FAKE_TRANSCRIPTS
+composed_chain_run_dir1=""
+(( composed_chain_rc1 == 0 )) && composed_chain_run_dir1="$(printf '%s\n' "$composed_chain_out1" \
+    | sed -n 's/^  run dir:  *//p' | head -1)"
+[[ -n "$composed_chain_run_dir1" ]] && tmpdirs+=("$composed_chain_run_dir1")
+composed_chain_discovered_id="$(jq -r '.session_id' "$composed_chain_run_dir1/summary.json" 2>/dev/null)"
+
+if (( composed_chain_rc1 != 0 )) || [[ -z "$composed_chain_run_dir1" ]]; then
+    no "a composed run's first submit discovers a session_id to resume" \
+        "run failed: $composed_chain_out1"
+elif [[ "$composed_chain_discovered_id" != "$composed_chain_sid" ]]; then
+    no "a composed run's first submit discovers a session_id to resume" \
+        "$(jq -r '.' "$composed_chain_run_dir1/summary.json" 2>/dev/null)"
+else
+    ok "a composed run's first submit discovers a session_id to resume"
+    composed_chain_argv2="$(mktemp "$scratch/fs-resume-argv.XXXXXX")"
+    tmpdirs+=("$composed_chain_argv2")
+    composed_chain_handoff_dir2="$(mktmp_dir "$scratch/fs-resume-ho.XXXXXX")"
+    composed_chain_handoff2="$composed_chain_handoff_dir2/handoff.md"
+    printf 'do the task\n' > "$composed_chain_handoff2"
+    composed_chain_out2="$(HOME="$composed_chain_home2" PATH="$stub_bin:$PATH" \
+        FORK_SANDBOX_CONFIG_DIR="$composed_chain_cfg" FAKE_ARGV_FILE="$composed_chain_argv2" \
+        timeout 120 "$launcher" --foreground --preset composed-chain \
+        --session-state "$composed_chain_state" --resume-session "$composed_chain_discovered_id" \
+        "$(new_project "$composed_chain_home2")" "$composed_chain_handoff2" 2>&1)"
+    composed_chain_rc2=$?
+    if (( composed_chain_rc2 != 0 )); then
+        no "a second composed run resumes the first run's session in its first code leg" \
+            "run failed: $composed_chain_out2"
+    elif argv_has_flag_value "$composed_chain_argv2.1" --resume-session "$composed_chain_discovered_id"; then
+        ok "a second composed run resumes the first run's session in its first code leg"
+    else
+        no "a second composed run resumes the first run's session in its first code leg" \
+            "$(cat "$composed_chain_argv2.1" 2>/dev/null)"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 printf '\n== summary.json: session_state and session_id ==\n'
 # ---------------------------------------------------------------------------

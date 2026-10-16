@@ -207,6 +207,32 @@ fs_run_leg_split() {
         printf '%s' "$token" > "$reqdir/token"
         printf '%s\0' "$@" > "$reqdir/argv"
         cat <&0 > "$reqdir/stdin"
+        # fs_leg_wants_session is set by the one or two callers -- the
+        # implement leg's own attempt function and its --refresh-at
+        # continuations -- allowed to carry the transcript store onto a pod
+        # seat; see those functions' own comments, and run_leg's
+        # unconditional reset of this flag for every other leg kind. The
+        # store itself lives at the agent container's own /work/session-
+        # store (POD_SESSION_DIR in fork-sandbox-k8s.sh, pushed there by
+        # cmd_submit before this run ever starts) -- this container's own
+        # trusted copy, read here directly, no kubectl round trip needed.
+        # $reqdir is read-only in the leg container, same as every other
+        # request file, so a leg sees exactly the snapshot taken here, never
+        # a later run of it. A plain tar, not context-extract.sh's
+        # path-traversal guard: this direction writes INTO the untrusted
+        # leg container, which already runs arbitrary code and gains
+        # nothing from a hostile member of its own output.
+        # FORK_SANDBOX_K8S_WORK_DIR, read here with the same /work default
+        # fork-sandbox.sh's own pod_work_dir uses, is the SAME test-only seam
+        # that variable already documents ("so a test can drive the
+        # entrypoint's RUN_DIR arm against a throwaway directory instead of
+        # the real /work no test may write to") -- this is just a second
+        # read site for it, live at pod-run time rather than baked into
+        # run.sh's own preamble, since a real pod never sets it and always
+        # gets /work.
+        if [[ "${fs_leg_wants_session:-0}" == 1 ]]; then
+            tar cf "$reqdir/session.tar" -C "${FORK_SANDBOX_K8S_WORK_DIR:-/work}/session-store" . 2>/dev/null || true
+        fi
         touch "$reqdir/go"
 
         exec {reqlockfd}<"$lockfile"
@@ -283,6 +309,57 @@ fs_run_leg_split() {
         done
         flock -u "$reqlockfd" 2>/dev/null || true
         exec {reqlockfd}<&-
+
+        # The leg's own snapshot of the store, taken after it ran -- unlike
+        # the seed above, THIS direction crosses out of the untrusted leg
+        # container, so it gets the same treatment stdout/stderr already
+        # do: fs_leg_handoff_read's bounded, symlink-refusing read (never a
+        # raw `cat`, which a leg-planted FIFO or oversized file could turn
+        # into an unbounded block or a disk-filling read), and then
+        # fork-sandbox-k8s-context-extract.sh's own path-traversal guard
+        # (the exact same script cmd_submit's own push already runs,
+        # pod-side, for --context-ro/--thread-dir/--attach-dir) before any
+        # of it ever lands on this container's filesystem. Staged into a
+        # fresh ".new" directory and swapped in, so a request whose leg
+        # never wrote a session-out.tar at all (an ordinary leg this flag
+        # was never set for, or a session leg that crashed before writing
+        # one) leaves the store exactly as this leg found it, and a
+        # rejected snapshot (caught by either guard) does too -- never a
+        # partial extraction half-replacing it.
+        if [[ "${fs_leg_wants_session:-0}" == 1 ]]; then
+            local session_out_tmp session_store_dir
+            session_out_tmp="$(mktemp)"
+            # Same FORK_SANDBOX_K8S_WORK_DIR test-only seam as the seed
+            # above, and the same ConfigMap-mount-relative seam
+            # FORK_SANDBOX_K8S_MOUNTS_DIR adds for context-extract.sh below
+            # -- a real pod never sets either, and always gets /work and
+            # /mnt/fork-sandbox.
+            session_store_dir="${FORK_SANDBOX_K8S_WORK_DIR:-/work}/session-store"
+            # A transcript store routinely outgrows fs_leg_handoff_read's
+            # 16 MiB default (sized for ordinary stdout/stderr) -- raised
+            # here to the same 256 MiB ceiling cmd_submit's own session-
+            # store push already caps at (CONTEXT_MAX_BYTES in fork-
+            # sandbox-k8s.sh), and the read's own timeout with it, so a
+            # legitimately large store is read in full rather than silently
+            # treated as "no snapshot" the moment it crosses 16 MiB.
+            if FORK_SANDBOX_LEG_OUTPUT_MAX_BYTES=$((256 * 1024 * 1024)) \
+                FORK_SANDBOX_LEG_OUTPUT_TIMEOUT=60 \
+                fs_leg_handoff_read "$leg_handoff_dir/session-out.tar" \
+                > "$session_out_tmp" 2>/dev/null; then
+                rm -rf -- "$session_store_dir.new"
+                if FS_EXTRACT_INPUT_FILE="$session_out_tmp" \
+                    sh "${FORK_SANDBOX_K8S_MOUNTS_DIR:-/mnt/fork-sandbox}/context-extract.sh" \
+                    "$session_store_dir.new" "$((256 * 1024 * 1024))" \
+                    context 2>&1; then
+                    rm -rf -- "$session_store_dir"
+                    mv -- "$session_store_dir.new" "$session_store_dir"
+                else
+                    echo "fork-sandbox: the leg's own session-store snapshot was rejected; keeping the store this leg started from" >&2
+                    rm -rf -- "$session_store_dir.new"
+                fi
+            fi
+            rm -f -- "$session_out_tmp"
+        fi
 
         leg_rc="$(fs_leg_handoff_read "$leg_handoff_dir/rc" 2>/dev/null)"
         [[ "$leg_rc" =~ ^-?[0-9]+$ ]] || leg_rc=1
@@ -542,6 +619,17 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
             impl_sandbox_cmd=("${_fs_first_cmd[@]}")
             sandbox_cmd=("${_fs_first_cmd[@]}")
             unset -n _fs_first_cmd
+            # The launcher only emits "s<K>cont_sandbox_cmd" for this same
+            # step when --session-state was given (see fs_build_sandbox_cmd's
+            # composed build loop); every other run has no such array to
+            # read, so check for it rather than reading it unconditionally.
+            _fs_first_cont_var="${run_step_idx[$_fs_step]}cont_sandbox_cmd"
+            if declare -p "$_fs_first_cont_var" &>/dev/null; then
+                declare -n _fs_first_cont_cmd="$_fs_first_cont_var"
+                cont_sandbox_cmd=("${_fs_first_cont_cmd[@]}")
+                unset -n _fs_first_cont_cmd
+            fi
+            unset _fs_first_cont_var
             break
         fi
     done
@@ -1001,6 +1089,12 @@ _fs_impl_attempt() {
     local _fs_impl_cmd=("${impl_sandbox_cmd[@]}")
     (( _fs_impl_attempt_n > 0 )) && _fs_impl_cmd=("${cont_sandbox_cmd[@]}")
     (( _fs_impl_attempt_n++ ))
+    # This is the one leg (and its own retries) allowed to carry the
+    # transcript store on a pod seat -- see fs_run_leg_split's own read of
+    # this flag, and run_leg's unconditional reset of it for every other
+    # leg kind, which this function never calls.
+    fs_leg_wants_session=0
+    [[ -n "$session_state" ]] && fs_leg_wants_session=1
     if [[ -n "$formatter" ]]; then
         { fs_run_lock_closed "${_fs_impl_cmd[@]}" < "$handoff" \
             2>&1 1>&3 | tee -a "$sandbox_log" >&2
@@ -1016,6 +1110,7 @@ _fs_impl_attempt() {
             | tee -a "$events"
     fi
     _fs_leg_attempt_rc="${PIPESTATUS[0]:-1}"
+    fs_leg_wants_session=0
 }
 fs_run_claude_leg_with_retry "$harness" "$events" "$sandbox_log" \
     "the implement leg" _fs_impl_attempt "$formatter"
@@ -1600,6 +1695,12 @@ if [[ "$refresh_enabled" == "1" && "$fs_impl_leg_ran_at_step1" == 1 ]]; then
             refresh_leg_head_before="$(clone_branch_head)"
             refresh_leg_outbox_before="$(fs_refresh_outbox_sig "$outbox_dir")"
             _fs_cont_attempt() {
+                # A --refresh-at continuation of step 1's pass 1 is still
+                # that same conversation -- see fs_run_leg_split's own read
+                # of this flag, and run_leg's unconditional reset of it for
+                # every other leg kind, which this function never calls.
+                fs_leg_wants_session=0
+                [[ -n "$session_state" ]] && fs_leg_wants_session=1
                 if [[ -n "$formatter" ]]; then
                     fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
                         2> >(tee -a "$sandbox_log" >&2) \
@@ -1611,6 +1712,7 @@ if [[ "$refresh_enabled" == "1" && "$fs_impl_leg_ran_at_step1" == 1 ]]; then
                         | tee -a "$events" -a "$cont_events"
                 fi
                 _fs_leg_attempt_rc="${PIPESTATUS[0]:-1}"
+                fs_leg_wants_session=0
             }
             # events.jsonl (the run's own cumulative log, appended by every
             # attempt in turn) is never archived or truncated here -- only
@@ -1775,6 +1877,16 @@ review_loop_detail=""
 # fs_harness_error).
 run_leg() {
     local kind="$1" n="$2" prompt="$3" step_idx="${4:-}"
+    # Every leg this function dispatches -- review, maintainer, fix, plan,
+    # tidy, a later code step, and a repeat pass of the first code step
+    # itself (pass 1 alone runs outside this function, in
+    # _fs_impl_attempt/the refresh continuation loop below) -- is its own,
+    # fresh conversation, never the transcript store's. Reset here,
+    # unconditionally, rather than trust every caller that sets it to 1 to
+    # also reset it afterward: this is the one place a leg that should
+    # never see the store is guaranteed not to, no matter what ran before
+    # it in this same shell.
+    fs_leg_wants_session=0
     # A legacy-shaped run never passes step_idx, so leg_tag is exactly
     # today's "$kind-$n"; a composed run's own step-indexed tag (decision 4)
     # unifies "fix" and "mntfix" onto one "-fix-" segment, since a composed

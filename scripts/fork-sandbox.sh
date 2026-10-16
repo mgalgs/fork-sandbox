@@ -291,6 +291,13 @@
 #                        bound directory into the pod and pulls it back at
 #                        collect time -- see "Cluster seats" in
 #                        docs/agent-mail.md.
+#                        Against a preset, "the coding leg" below means the
+#                        pipeline's own first code step -- the same leg (and
+#                        its --refresh-at continuations) a legacy-shaped
+#                        preset's code seat already resumes. Refused, by
+#                        name, when that step's own seat is not claude (a
+#                        composed step's seat has no transcript store), or
+#                        when the pipeline has no code step at all.
 #                        A sealed pi run (--harness pi --network sealed, and
 #                        its pi-local alias) dispatches through
 #                        agent-sandboxed rather than execing pi directly, but
@@ -2439,6 +2446,22 @@ if [[ -n "$preset_name" ]]; then
         esac
     done <<< "$preset_tsv"
 
+    # The pipeline's own first code step, by action rather than by position
+    # (step 1 may be a review or plan step -- see fork-sandbox-preset-
+    # parse.py's own first_code_agent scan, which this mirrors): the one
+    # seat --session-state can wire into for a composed preset, below. Empty
+    # when the pipeline has no code step at all.
+    preset_session_step_idx=""
+    preset_session_step_agent=""
+    for ((preset_sess_k = 1; preset_sess_k <= preset_step_count; preset_sess_k++)); do
+        if [[ "${preset_step_action[$preset_sess_k]}" == code ]]; then
+            preset_session_step_idx=$preset_sess_k
+            preset_session_step_agent="${preset_step_agent[$preset_sess_k]}"
+            break
+        fi
+    done
+    unset preset_sess_k
+
     # A pipeline shaped exactly like the fixed skeleton this replaces (one
     # code step, then at most one review step, then at most one maintain
     # step, in that order) still drives the existing flag-compile block
@@ -3518,14 +3541,34 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
         echo "composed pipeline; give the agent its own codex-args key instead." >&2
         exit 1
     fi
-    # The transcript store is wired into the implement seat's commands only
-    # (impl_sandbox_cmd/cont_sandbox_cmd), never into a composed step's own
-    # seat, so the first code step's leg and its continuations would run
-    # without the store, or without the seat's model and arguments.
+    # The transcript store wires into the pipeline's own first code step's
+    # seat -- that step's "s<K>_sandbox_cmd" (and a "s<K>cont_sandbox_cmd"
+    # for its --refresh-at continuations), built below the same way
+    # impl_sandbox_cmd/cont_sandbox_cmd are for a legacy-shaped run -- never
+    # into any other step's seat, so this is never the seat's model and
+    # arguments going missing, the way patching a bare --model/--harness
+    # into the wrong seat would be. Only a claude seat can hold a store
+    # today (claude-sandboxed's own --session-state bind, and this pod
+    # leg's own claude invocation, below): refuse a pipeline with no code
+    # step at all, or whose first code step sits a different harness,
+    # naming which seat and why, rather than silently running without
+    # continuity.
     if [[ -n "$session_state" ]]; then
-        echo "Error: --session-state cannot be combined with preset '$preset_name':" >&2
-        echo "composed pipeline; a composed step's seat has no transcript store." >&2
-        exit 1
+        if [[ -z "$preset_session_step_idx" ]]; then
+            echo "Error: --session-state cannot be combined with preset '$preset_name':" >&2
+            echo "this pipeline has no code step, so there is no coding leg for a" >&2
+            echo "transcript store to attach to." >&2
+            exit 1
+        fi
+        preset_session_step_harness="${preset_agent_harness[$preset_session_step_agent]}"
+        if [[ "$preset_session_step_harness" != claude ]]; then
+            echo "Error: --session-state cannot be combined with preset '$preset_name':" >&2
+            echo "step $preset_session_step_idx (agent '$preset_session_step_agent') is the" >&2
+            echo "pipeline's first code step, and its seat's harness is" >&2
+            echo "'$preset_session_step_harness' -- a transcript store wires into a claude" >&2
+            echo "seat only." >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -3850,8 +3893,31 @@ if [[ "$k8s_mode" == true ]]; then
     # refuses exactly what a local run refuses, with the same messages,
     # before anything is submitted to the cluster. See
     # fs_validate_session_flags in fork-sandbox-lib.sh.
-    session_state="$(fs_validate_session_flags "$harness" "$session_state" \
-        "$resume_session" "$session_id_arg")" || exit 1
+    #
+    # $harness is the legacy single-leg seat's value -- for a composed
+    # (non-legacy-shaped) preset it is a phantom that names no real seat at
+    # all, and by this point in a --k8s run it has already been defaulted
+    # to "pi" (the k8s-mode default a few hundred lines up, since a
+    # composed preset never sets --harness). Passing that phantom value
+    # here would validate the wrong seat's capability: the pipeline's own
+    # first code step -- the one --session-state actually wires into, per
+    # the composed-specific check just above -- already proved to be a
+    # claude seat whenever session_state is non-empty, which is the one
+    # case this call's capability checks (FS_HARNESS_RESUMABLE/
+    # FS_HARNESS_ID_MODE) matter; a "pi" harness has no --resume-session
+    # (discover) capability, so an otherwise-valid composed run would be
+    # refused here by an accident of the phantom seat's default, never by
+    # anything about the real seat. Format/scratch-dir validation
+    # (resume_session's regex, session_state's realpath) applies
+    # regardless of harness, so the call itself still has to run -- only
+    # the harness it is told about needs to be the real one.
+    k8s_session_check_harness="$harness"
+    if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
+        k8s_session_check_harness="${preset_session_step_harness:-}"
+    fi
+    session_state="$(fs_validate_session_flags "$k8s_session_check_harness" \
+        "$session_state" "$resume_session" "$session_id_arg")" || exit 1
+    unset k8s_session_check_harness
 
     # Unlike fork-sandbox-k8s.sh run, this script generates a branch name
     # when one is not given -- the same convenience --branch has locally.
@@ -4428,9 +4494,22 @@ fi
 # those run: a caller asking what a run would do must be told the flag is
 # refused, and must be shown the resolved directory. The k8s dispatch above
 # already ran this same check, with the same messages, before its own exec
-# -- see fs_validate_session_flags in fork-sandbox-lib.sh.
-session_state="$(fs_validate_session_flags "$harness" "$session_state" \
-    "$resume_session" "$session_id_arg")" || exit 1
+# -- see fs_validate_session_flags in fork-sandbox-lib.sh. A --k8s composed
+# run falls through to here too (dry-run, and every other local-path check
+# below, run for it exactly as for a local run -- see the comment beside
+# "same local-path code every ordinary run executes next" above), so this
+# needs the identical composed-vs-phantom-harness substitution the k8s
+# dispatch's own call just made, for the identical reason: $harness names
+# no real seat for a composed preset, and is defaulted to "pi" for --k8s
+# regardless, which would wrongly refuse a claude-seated pipeline's own
+# --resume-session.
+k8s_session_check_harness="$harness"
+if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
+    k8s_session_check_harness="${preset_session_step_harness:-}"
+fi
+session_state="$(fs_validate_session_flags "$k8s_session_check_harness" \
+    "$session_state" "$resume_session" "$session_id_arg")" || exit 1
+unset k8s_session_check_harness
 
 # --clone-dir, validated the same way as --session-state just above and for
 # the same reason (a directory an unattended session writes into is a
@@ -7804,9 +7883,17 @@ fs_build_sandbox_cmd() {
     # A --k8s pod seat: no sandbox backend, no claude-sandboxed/pi wrapper
     # -- fork-sandbox-k8s-leg.sh, staged under the run dir's own scripts/
     # (runner_script_dir), is this leg's whole command. session_mode is
-    # not read here: --session-state and its siblings are refused against
-    # any composed preset well before this point, so there is no resume/
-    # durable-store shape for a pod seat to carry.
+    # read only for a claude seat (--session-state's composed refusal
+    # above only ever lets this through for one): "resume" adds --resume
+    # to this leg's own claude argv, exactly as fork-sandbox-k8s-leg.sh's
+    # own header comment anticipates; "state" adds nothing here, since
+    # claude's argv is identical whether this leg is seeding a fresh
+    # conversation or continuing one already under way -- what differs is
+    # the transcript store the leg container seeds its $HOME from and
+    # snapshots back afterward, which rides a side channel fs_run_leg_split/
+    # fork-sandbox-k8s-leg-loop.sh own (see their own comments), not this
+    # argv, because the store's CONTENT, not just a flag naming it, has to
+    # reach a container this function never runs in.
     if [[ "${k8s_runner_mode:-false}" == true ]]; then
         out=("$runner_script_dir/fork-sandbox-k8s-leg.sh" \
             --harness "$b_harness" --model "$b_model" --clone "$clone_dir" --)
@@ -7818,6 +7905,9 @@ fs_build_sandbox_cmd() {
             claude)
                 if [[ -n "$inbox_settings" ]]; then
                     out+=(--settings "$(fs_leg_settings_for_prefix "$prefix")")
+                fi
+                if [[ "$session_mode" == resume && -n "$resume_session" ]]; then
+                    out+=(--resume "$resume_session")
                 fi
                 ;;
             pi)
@@ -8408,15 +8498,16 @@ fi
 # defined yet up there, and its body reads globals (sockets_dir,
 # review_kit_flags, inbox_dir, outbox_dir, ...) that this script only
 # finishes computing between here and there. session_mode is left at its
-# "none" default for every step, including a composed pipeline's own first
-# code step: resume/state are wiring for the top-level implement leg's own
-# --refresh-at continuation machinery alone (decision 8 scopes refresh to
-# "first-code-step-first-pass only" there, not to any per-step build here),
-# so no composed step ever needs anything but "none". The composed launch
-# path that would read "s<K>_sandbox_cmd"/"s<K>fix_sandbox_cmd" is still
-# refused further up for now, so this loop's output has no reader yet --
-# same "additive, nothing reads it yet" property the seat-resolution loop
-# above already has.
+# "none" default for every step but one: with --session-state given (only
+# possible when preset_session_step_idx names a claude seat -- the
+# composed refusal above refuses every other case), the pipeline's own
+# first code step gets "resume" instead, the same way impl_sandbox_cmd does
+# for a legacy-shaped run, and a second array, "s<K>cont_sandbox_cmd", is
+# built in "state" mode for that step's --refresh-at continuations -- see
+# fork-sandbox-runner.sh's own composed-aliasing block for how run_step_kind
+# 1's s<K>_sandbox_cmd/s<K>cont_sandbox_cmd become impl_sandbox_cmd/
+# cont_sandbox_cmd there. Every other step, review/maintain/fix/plan/tidy
+# legs and fix seats included, stays "none".
 if [[ "$preset_is_legacy_shaped" != true ]]; then
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         # Review-kit binds are added by fs_build_sandbox_cmd, while pi needs
@@ -8451,7 +8542,12 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                 unset -n kit_k_fix_cmd
             fi
         done
-        fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
+        if [[ -n "$session_state" && "$preset_k" == "$preset_session_step_idx" ]]; then
+            fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd" resume
+            fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}cont_sandbox_cmd" state
+        else
+            fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
+        fi
         if [[ "${preset_step_action[$preset_k]}" != code \
             && "${preset_step_action[$preset_k]}" != plan \
             && "$preset_ro_multi" != true ]]; then
@@ -9240,6 +9336,16 @@ fs_emit_run_sh_preamble() {
             printf 's%d_sandbox_cmd=(' "$preset_k"
             printf '%q ' "${preset_k_cmd_ref[@]}"
             printf ')\n'
+            # Only the pipeline's own first code step gets one, and only on
+            # a --session-state run -- see the "s<K>_*"/fs_build_sandbox_cmd
+            # loop above, where this array is built in "state" mode. Every
+            # other step never has a same-named array to read here.
+            if [[ -n "$session_state" && "$preset_k" == "$preset_session_step_idx" ]]; then
+                declare -n preset_k_cmd_ref="s${preset_k}cont_sandbox_cmd"
+                printf 's%dcont_sandbox_cmd=(' "$preset_k"
+                printf '%q ' "${preset_k_cmd_ref[@]}"
+                printf ')\n'
+            fi
             if [[ "${preset_step_action[$preset_k]}" != code \
                 && "${preset_step_action[$preset_k]}" != plan \
                 && "$preset_ro_multi" != true ]]; then

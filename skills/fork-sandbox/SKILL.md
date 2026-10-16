@@ -600,6 +600,16 @@ preset that would tidy locally instead gets `tidy: skipped (...)`
 recorded in its summary, never a rewrite. See "Composed pipelines on
 `--k8s`" in `docs/kubernetes-runs.md` for the full account.
 
+**`--session-state` now wires into a composed pipeline's own first code
+step**, both locally and on `--k8s` — the same leg (and its
+`--refresh-at` continuations) a legacy `--harness`-only run already
+resumes, found by pipeline order rather than by a fixed "implement" name.
+Every other leg (review, maintain, fix, plan, tidy, and any code step
+after the first) is unaffected: a fresh conversation, same as before this
+existed. It still only wires into a `claude` seat — refused by name, with
+the step and agent it would have used, when the first code step is `pi`
+or `codex`, or when the pipeline has no code step at all.
+
 ### Review-shaped tasks on the cluster
 
 `--review-only` and a read-only `--pipeline` are both refused with `--k8s`, but that refuses a flag, not the task: a cluster review is an ordinary run whose handoff is a review brief. The recipe, proven end to end:

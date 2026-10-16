@@ -31,10 +31,26 @@
 #   argv    NUL-separated argv for the leg's own command
 #   stdin   the leg's stdin (its prompt), verbatim
 #   token   a fresh random token fs_run_leg_split generated for request n
+#   session.tar   OPTIONAL -- only on the pipeline's first code step's own
+#                 request and its --refresh-at continuations, when the run
+#                 carries --session-state: a plain tar of the agent
+#                 container's own /work/session-store, seeded into this
+#                 leg's $HOME/.claude/projects (and flattened into this
+#                 leg's own cwd-derived project slug, the same trick fork-
+#                 sandbox-k8s-entrypoint.sh's legacy single-leg claude arm
+#                 uses) before the leg runs. Absent for every other leg.
 #   go      written LAST -- its mere existence is the request
 # and reads the response back from $FORK_SANDBOX_LEG_HANDOFF_DIR/<n>-<token>/:
 #   stdout, stderr   the leg's own output streams, captured whole
 #   rc               its exit code
+#   session-out.tar   OPTIONAL -- written only when session.tar was
+#                 present above: a plain tar of this leg's own, possibly
+#                 updated $HOME/.claude/projects, taken after the sweep
+#                 below so nothing the leg started can still be writing to
+#                 it. fs_run_leg_split treats this exactly as untrusted as
+#                 stdout/stderr -- a bounded, symlink-refusing read, then
+#                 fork-sandbox-k8s-context-extract.sh's own path-traversal
+#                 guard -- before any of it reaches /work/session-store.
 #   done             written LAST -- but NOT the signal the runner actually
 #                    trusts (see $RUN_DIR/.leg-req/lock below): the whole
 #                    hand-off volume is leg-writable, so a leg can write its
@@ -372,6 +388,40 @@ while true; do
     handoff="$FORK_SANDBOX_LEG_HANDOFF_DIR/$n-$token"
     mkdir -p "$handoff"
 
+    # $reqdir/session.tar, present only for the one leg (and its own
+    # --refresh-at continuations) fs_run_leg_split is allowed to put it
+    # there for (see that function's own comment in fork-sandbox-
+    # runner.sh), is this run's transcript store, snapshotted from the
+    # agent container's own trusted /work/session-store moments ago. $reqdir
+    # is read-only here, so this is exactly what the agent container wrote,
+    # never anything a PRIOR leg in this same container could have planted.
+    # Seeded into this fresh $HOME exactly the way fork-sandbox-k8s-
+    # entrypoint.sh's own legacy single-leg claude arm seeds it -- pulled in
+    # whole, then flattened into THIS leg's own cwd-derived project slug
+    # too, since claude looks up a --resume id only inside the current
+    # project's own slug directory and a transcript may have landed under a
+    # different one (a prior leg's pod, or a local run's own clone path).
+    # A plain tar extraction: this direction is agent-authored, not leg-
+    # authored, so it carries none of the suspicion session-out.tar below
+    # (coming the other way) has to.
+    leg_session_in=0
+    if [[ -f "$reqdir/session.tar" ]]; then
+        leg_session_in=1
+        mkdir -p "$HOME/.claude/projects"
+        tar -xf "$reqdir/session.tar" -C "$HOME/.claude/projects" \
+            --no-same-owner --no-same-permissions 2>/dev/null || true
+        leg_pod_slug="${FORK_SANDBOX_CLONE_DIR//\//-}"
+        mkdir -p "$HOME/.claude/projects/$leg_pod_slug"
+        while IFS= read -r -d '' leg_transcript_file; do
+            case "$leg_transcript_file" in
+                "$HOME/.claude/projects/$leg_pod_slug/"*) continue ;;
+            esac
+            cp -p "$leg_transcript_file" "$HOME/.claude/projects/$leg_pod_slug/" 2>/dev/null || true
+        done < <(find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' \
+            -type f -print0 2>/dev/null)
+        unset leg_pod_slug leg_transcript_file
+    fi
+
     # Held from here -- strictly before the leg's own process can run a
     # single instruction -- until after the sweep and the rc/done write
     # below. See this script's own header and fs_run_leg_split's comment
@@ -477,6 +527,22 @@ while true; do
     if [[ -e "$handoff/rc" ]] && { [[ -L "$handoff/rc" ]] || [[ ! -f "$handoff/rc" ]]; }; then
         rc_type_tampered=1
         rm -rf -- "$handoff/rc" 2>/dev/null || true
+    fi
+
+    # This leg's own snapshot of the store, taken only now -- strictly
+    # after the $handoff type checks just above, so this always writes
+    # into a known-good, freshly-verified-or-recreated directory, never
+    # through a symlink a tampering leg could have left in $handoff's own
+    # place -- and only for the one leg that was handed a session.tar to
+    # begin with. Written into $handoff (this container's own, leg-
+    # writable), never directly to /work/session-store: that volume is
+    # not mounted here at all (see "Why this exists" at the top of this
+    # file), so the agent container's own fs_run_leg_split is what
+    # actually extracts this back into the trusted store, with its own
+    # path-traversal guard -- this tar is leg-container output like
+    # stdout/stderr, and gets no more trust than they do.
+    if (( leg_session_in )); then
+        tar cf "$handoff/session-out.tar" -C "$HOME/.claude/projects" . 2>/dev/null || true
     fi
     # Under `set -e`, a plain write failing against a mode-only problem
     # (chmod 500 on $handoff) would also kill this loop outright, so still

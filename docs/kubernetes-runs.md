@@ -1383,8 +1383,14 @@ have to stat the run directory separately to find out.
 - `--review-only`, a read-only pipeline, and the universal `--k8s` flag
   refusals (`--claude-args`/`--pi-args`/`--codex-args`,
   `--prompts-dir`, `--kit-skill`, `--sandbox-args`, `--network sealed`,
-  session-state flags, the refresh-chain flags) — unchanged from the
-  fixed-skeleton shapes above.
+  the refresh-chain flags) — unchanged from the fixed-skeleton shapes
+  above.
+- `--session-state` (and `--resume-session`/`--session-id` with it) is
+  refused only when the pipeline's first code step is not a `claude`
+  seat, or when the pipeline has no code step at all -- see "Getting
+  files in: --session-state, --resume-session, --session-id" below,
+  which now covers a composed run too, not just the fixed-skeleton
+  shapes.
 
 **The tidy-history leg never runs in a pod, and is recorded as skipped,
 not refused.** A preset that ends in an approving maintain step — the
@@ -2768,6 +2774,56 @@ pulled back. `cmd_collect` pulls `/work/session-store` back into DIR before
 in `summary.json` (`session_id`/`session_state`) the way a local run's own
 summary does — a failed pull leaves DIR untouched and reports the previous
 id, so the seat keeps its persona and loses only that one wake's turn.
+
+### A composed run: scoped to the first code step's leg alone
+
+A composed (`--run-dir`) pipeline's own "agent" container still owns
+`/work/session-store` exactly as above -- `cmd_submit`'s push and
+`cmd_collect`'s pull are unchanged, and do not care whether the run is
+legacy-shaped or composed. What differs is how that store reaches the
+leg that actually runs the harness: a composed leg executes in the
+SEPARATE leg container (see "Composed pipelines on `--k8s`" above),
+which never mounts `/work` at all, so the agent
+container's `fork-sandbox-runner.sh` (specifically `fs_run_leg_split`,
+the pod-relay half of every leg dispatch) bridges the two over the same
+request/response files a leg's argv and stdin already cross on:
+
+- Before writing a request's `go` file, `fs_run_leg_split` tars
+  `/work/session-store` into that request's own `session.tar` -- but
+  only for the pipeline's first code step's own leg (its pass 1 and its
+  `--refresh-at` continuations), never for a review, maintain, fix, plan
+  or tidy leg, and never for a later code step. Every other leg's
+  request carries no such file at all, exactly as if `--session-state`
+  had never been given.
+- `fork-sandbox-k8s-leg-loop.sh`, seeing `session.tar` on a request, seeds
+  it into that leg's own fresh `$HOME/.claude/projects` and flattens it
+  into the leg's own cwd-derived project slug too -- the identical trick
+  the legacy entrypoint's own seeding, just above, already does, for the
+  identical reason: claude's `--resume` lookup is scoped to the current
+  project's slug, and a transcript may have landed under a different
+  one on a prior leg or pod.
+- After the leg exits and the sweep (see the same section) has killed
+  everything it could have started, the loop tars that leg's own,
+  possibly updated `$HOME/.claude/projects` into `session-out.tar` in the
+  response directory. `fs_run_leg_split` reads it back with the same
+  bounded, symlink-refusing care `rc`/`stdout`/`stderr` already get
+  (`FORK_SANDBOX_LEG_OUTPUT_MAX_BYTES` raised to 256 MiB for this one
+  read, since a transcript store routinely outgrows the 16 MiB default
+  sized for ordinary leg output), then extracts it through the exact
+  same path-traversal guard (`fork-sandbox-k8s-context-extract.sh`,
+  `caller=context`) `--context-ro`'s own pod-side push already runs,
+  staged into a fresh directory and swapped into `/work/session-store`
+  only on success -- a rejected or absent snapshot (an ordinary leg that
+  was never handed `session.tar` to begin with, or a session leg that
+  crashed before writing one) leaves the store exactly as that leg found
+  it.
+
+Nothing here reaches `--resume` on its own: the claude argv itself still
+only ever gets `--resume <id>` (the one-shot-per-leg equivalent of the
+legacy entrypoint's own splice) on the first code step's pass 1, when
+`--resume-session` was given, and never on its own continuations --
+identical to `impl_sandbox_cmd`/`cont_sandbox_cmd`'s split for a legacy-
+shaped run.
 
 ### A claude pod refreshes its own context: `--refresh-at`
 

@@ -3419,6 +3419,70 @@ else
     no "fetch_back=0 rerun setup" "the fetch_back=1 pass failed to launch"
 fi
 
+printf '\n== --session-state wires into a composed pipeline'"'"'s first code step alone ==\n'
+
+# code(coder) -> review(reviewer) -> code(coder2): three legs, three
+# different claude seats, so a session flag showing up on the wrong one's
+# argv cannot be mistaken for another seat's own. coder2 is a LATER code
+# step -- the one shape that proves the store does not simply follow
+# "every code leg", only the pipeline's FIRST one.
+cat > "$real_presets/composed-session.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+  coder2:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: code
+    agent: coder2
+EOF
+composed_session_sid=0123abcd-4567-89ab-cdef-0123456789ab
+composed_session_run_state="$(mktemp -d /var/tmp/claude-scratch/fs-preset-session-run.XXXXXX)"
+tmpdirs+=("$composed_session_run_state")
+prep_stub $'commit\napproved\ncommit'
+if rd_session="$(run_stubbed --preset composed-session \
+    --session-state "$composed_session_run_state" --resume-session "$composed_session_sid" \
+    --branch "sandbox-test-composed-session-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_session")
+    check "the composed-session walk runs exactly 3 legs" "3" "$(cat "$count")"
+    leg1_argv="$(sed -n 1p "$argv_log")"
+    leg2_argv="$(sed -n 2p "$argv_log")"
+    leg3_argv="$(sed -n 3p "$argv_log")"
+    contains "the first code step's leg carries --session-state" \
+        "$leg1_argv" "--session-state $composed_session_run_state"
+    contains "the first code step's leg carries --resume-session" \
+        "$leg1_argv" "--resume-session $composed_session_sid"
+    lacks "the review leg carries no --session-state" "$leg2_argv" "--session-state"
+    lacks "the review leg carries no --resume-session" "$leg2_argv" "--resume-session"
+    lacks "a LATER code step's leg carries no --session-state" "$leg3_argv" "--session-state"
+    lacks "a LATER code step's leg carries no --resume-session" "$leg3_argv" "--resume-session"
+else
+    no "composed-session walk launch succeeds"
+fi
+
+# With no --session-state at all, a composed pipeline behaves exactly as
+# before this feature existed: no leg, first code step included, ever
+# carries the flag.
+prep_stub $'commit\napproved\ncommit'
+if rd_session_off="$(run_stubbed --preset composed-session \
+    --branch "sandbox-test-composed-session-off-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_session_off")
+    lacks "with no --session-state, the first code step's leg carries none either" \
+        "$(sed -n 1p "$argv_log")" "--session-state"
+else
+    no "composed-session (no --session-state) walk launch succeeds"
+fi
+
 printf '\n== the engine: a plan stage (--foreground, stubs) ==\n'
 
 cat > "$real_presets/plan-code-review.yaml" <<'EOF'
@@ -4805,13 +4869,46 @@ refuses "--codex-args is refused against a composed pipeline preset" \
     "cannot be combined with preset 'composed-cargs'" \
     --preset composed-cargs --codex-args '-c model_reasoning_effort=high'
 
-# The transcript store rides the implement seat's commands only, so a
-# composed step's seat would run without it (and its continuations without
-# the seat's model and arguments).
-composed_session_state_dir="$(mktemp -d)"; tmpdirs+=("$composed_session_state_dir")
-refuses "--session-state is refused against a composed pipeline preset" \
-    "a composed step's seat has no transcript store" \
+# The transcript store wires into the pipeline's own first code step's
+# seat now, not just the legacy implement seat -- composed-cargs's first
+# code step (coder, harness claude) is exactly the one shape this is
+# allowed for. composed-pargs's first code step is harness pi; its own
+# dry-run acceptance is covered beside its other claude-args/pi-args
+# routing checks above, but here it is the negative case: --session-state
+# is still refused against it, by name, since a pi seat has no transcript
+# store to wire into. A pipeline with no code step at all (a composed
+# --review-only run, which drops every code step) is refused the same way,
+# for the same underlying reason (no coding leg to attach a store to), with
+# its own message naming that instead of a harness.
+composed_session_state_dir="$(mktemp -d /var/tmp/claude-scratch/fs-preset-session-state.XXXXXX)"
+tmpdirs+=("$composed_session_state_dir")
+accepts "--session-state is accepted against a composed pipeline whose first code step is claude" \
     --preset composed-cargs --session-state "$composed_session_state_dir"
+refuses "--session-state is refused against a composed pipeline whose first code step is not claude" \
+    "a transcript store wires into a claude" \
+    --preset composed-pargs --session-state "$composed_session_state_dir"
+
+# No code step at all: a review/maintain-only pipeline with every fix_agent
+# named explicitly is not read-only (there is a fix seat to run), so it is
+# not caught by --review-only's own, more specific "no coding leg" refusal
+# -- this is the one shape that reaches this check's own message instead.
+cat > "$presets_dir/nocodefix.yaml" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+  fixer:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: review
+    repeat: 2
+    agent: reviewer
+    fix_agent: fixer
+EOF
+refuses "--session-state is refused against a composed pipeline with no code step at all" \
+    "this pipeline has no code step" \
+    --preset nocodefix --session-state "$composed_session_state_dir"
 
 # Legacy shapes keep their routes: --pi-args reaches a separately built pi
 # review seat, as it always has.
@@ -4911,9 +5008,11 @@ refuses "--k8s + --pi-args against a composed preset names the flag" \
 refuses "--k8s + --codex-args against a composed preset names the flag" \
     "cannot be combined with preset 'composed-cargs'" \
     --preset composed-cargs --k8s --codex-args '-c model_reasoning_effort=high'
-refuses "--k8s + --session-state against a composed preset names the flag" \
-    "a composed step's seat has no transcript store" \
-    --preset composed-cargs --k8s --session-state "$composed_session_state_dir"
+k8s_composed_dryrun "--k8s + --session-state against a composed preset whose first code step is claude dispatches through --k8s" \
+    --preset composed-cargs --session-state "$composed_session_state_dir" --k8s
+refuses "--k8s + --session-state against a composed preset whose first code step is not claude names the seat" \
+    "a transcript store wires into a claude" \
+    --preset composed-pargs --k8s --session-state "$composed_session_state_dir"
 
 # The same resolved seats reach the composed cluster runner.
 for codex_preset in composed-codex-step composed-codex-fix; do
