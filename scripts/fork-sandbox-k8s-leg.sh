@@ -25,7 +25,8 @@
 # for a pi leg's --session-state continuity, --resume for a claude
 # implement leg resuming a prior session. These ride verbatim into the
 # harness's own argv, in the position each harness expects them (see
-# below); this script does not interpret any of them.
+# below); this script interprets only a claude leg's --resume, to rerun
+# fresh when the resume finds no transcript.
 
 set -euo pipefail
 
@@ -82,8 +83,15 @@ case "$harness" in
         guard_state="$hook_dir/stop-guard-refusals"
         claude_argv=(claude --dangerously-skip-permissions --print --verbose
             --output-format stream-json --model "$claude_model"
-            --include-hook-events "$@")
-        exec env \
+            --include-hook-events)
+        orig_args=("$@") fresh_args=() resuming=0
+        while (( $# )); do
+            if [[ "$1" == --resume && $# -ge 2 ]]; then
+                resuming=1; shift 2; continue
+            fi
+            fresh_args+=("$1"); shift
+        done
+        claude_env=(env
             ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL" \
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
             DISABLE_AUTOUPDATER=1 \
@@ -94,8 +102,28 @@ case "$harness" in
             FORK_SANDBOX_NUDGE_REMINDED="$hook_dir/nudge-reminded" \
             FORK_SANDBOX_STALE_REMINDED="$hook_dir/stale-reminded" \
             FORK_SANDBOX_INBOX_SEEN="$hook_dir/inbox-seen" \
-            FORK_SANDBOX_NUDGE_BASELINE="$hook_dir/nudge-baseline" \
-            "${claude_argv[@]}"
+            FORK_SANDBOX_NUDGE_BASELINE="$hook_dir/nudge-baseline")
+        if (( ! resuming )); then
+            exec "${claude_env[@]}" "${claude_argv[@]}" "${fresh_args[@]}"
+        fi
+        # A resume that finds no usable transcript reruns fresh, as the
+        # single-leg entrypoint does. The pattern must match claude-sandboxed
+        # RESUME_FAIL_RE literally; a false positive reruns finished work.
+        resume_fail_re='no conversation found with session id:'
+        resume_fail_re+='|corrupt.*(session|transcript|conversation)'
+        resume_fail_re+='|failed to (load|parse|read).*(session|transcript|conversation)'
+        prompt_file="$hook_dir/prompt" resume_err="$hook_dir/resume-stderr"
+        cat > "$prompt_file"
+        rc=0
+        "${claude_env[@]}" "${claude_argv[@]}" "${orig_args[@]}" \
+            < "$prompt_file" 2> "$resume_err" || rc=$?
+        cat -- "$resume_err" >&2
+        if (( rc == 0 )) || ! grep -qiE "$resume_fail_re" "$resume_err"; then
+            exit "$rc"
+        fi
+        echo "fork-sandbox-k8s-leg: resume failed, retrying fresh" >&2
+        exec "${claude_env[@]}" "${claude_argv[@]}" "${fresh_args[@]}" \
+            < "$prompt_file"
         ;;
     pi)
         # The listing-spelling rewrite: a pi model id a run was launched

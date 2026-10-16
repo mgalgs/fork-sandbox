@@ -21865,6 +21865,61 @@ CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" \
 check "leg wrapper (claude): a non-alias model id is not rewritten" \
     "yes" "$(grep -qF -- '--model claude-haiku-4-5 ' "$leg_record" && echo yes || echo no)"
 
+# claude leg with --resume: a resume that finds no transcript reruns
+# fresh, with the same prompt and without --resume; any other failure,
+# and a resume that works, run once.
+leg_resume_dir="$(newdir)"; tmpdirs+=("$leg_resume_dir")
+cat > "$leg_resume_dir/claude" <<'STUB'
+#!/usr/bin/env bash
+printf 'argv:%s|stdin:%s\n' "$*" "$(cat)" >> "$LEG_RECORD"
+case " $* " in
+    *" --resume "*)
+        echo "${LEG_RESUME_ERR:-}" >&2
+        exit "${LEG_RESUME_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$leg_resume_dir/claude"
+leg_contains() {
+    if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "no '$3' in '$2'"; fi
+}
+leg_lacks() {
+    if [[ "$2" != *"$3"* ]]; then ok "$1"; else no "$1" "unexpected '$3' in '$2'"; fi
+}
+leg_resume_run() {
+    rm -f "$leg_record"
+    local rc=0
+    PATH="$leg_resume_dir:$PATH" LEG_RECORD="$leg_record" \
+        CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" \
+        "$leg_sh" --harness claude --model sonnet --clone "$leg_clone" \
+        -- --settings /s.json --resume 0123abcd <<<'resume prompt' \
+        2> "$leg_resume_dir/stderr" || rc=$?
+    echo "$rc"
+}
+leg_rc="$(LEG_RESUME_RC=1 LEG_RESUME_ERR='No conversation found with session ID: 0123abcd' \
+    leg_resume_run)"
+check "leg wrapper (claude --resume, no transcript): reruns fresh and exits with its rc" \
+    "0" "$leg_rc"
+check "leg wrapper (claude --resume, no transcript): two invocations" \
+    "2" "$(wc -l < "$leg_record")"
+leg_contains "leg wrapper (claude --resume, no transcript): first try resumes" \
+    "$(sed -n 1p "$leg_record")" "--settings /s.json --resume 0123abcd|stdin:resume prompt"
+leg_retry_line="$(sed -n 2p "$leg_record")"
+leg_contains "leg wrapper (claude --resume, no transcript): retry keeps args and prompt" \
+    "$leg_retry_line" "--settings /s.json|stdin:resume prompt"
+leg_lacks "leg wrapper (claude --resume, no transcript): retry drops --resume" \
+    "$leg_retry_line" "--resume"
+leg_contains "leg wrapper (claude --resume, no transcript): the failed resume's stderr passes through" \
+    "$(cat "$leg_resume_dir/stderr")" "No conversation found"
+leg_rc="$(LEG_RESUME_RC=7 LEG_RESUME_ERR='model overloaded' leg_resume_run)"
+check "leg wrapper (claude --resume, other failure): exit code is the harness's own" \
+    "7" "$leg_rc"
+check "leg wrapper (claude --resume, other failure): no fresh rerun" \
+    "1" "$(wc -l < "$leg_record")"
+leg_rc="$(LEG_RESUME_RC=0 leg_resume_run)"
+check "leg wrapper (claude --resume, success): exits 0 after one invocation" \
+    "0 1" "$leg_rc $(wc -l < "$leg_record")"
+
 # pi leg -- fixed flags/order, no model map file present (no rewrite).
 CLAUDE_PROXY_BASE_URL="" FORK_SANDBOX_K8S_PI_MODEL_MAP=/nonexistent-map.json \
     leg_run "$leg_sh" --harness pi --model z-ai/glm-4.6 --clone "$leg_clone" \
