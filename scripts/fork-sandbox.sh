@@ -3542,10 +3542,10 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
         exit 1
     fi
     # The transcript store wires into the pipeline's own first code step's
-    # seat -- that step's "s<K>_sandbox_cmd" (and a "s<K>cont_sandbox_cmd"
-    # for its --refresh-at continuations), built below the same way
-    # impl_sandbox_cmd/cont_sandbox_cmd are for a legacy-shaped run -- never
-    # into any other step's seat, so this is never the seat's model and
+    # seat -- that step's "s<K>resume_sandbox_cmd" (pass 1) and
+    # "s<K>cont_sandbox_cmd" (its --refresh-at continuations), built below
+    # the same way impl_sandbox_cmd/cont_sandbox_cmd are for a legacy-shaped
+    # run -- never into any other step's seat, so this is never the seat's model and
     # arguments going missing, the way patching a bare --model/--harness
     # into the wrong seat would be. Only a claude seat can hold a store
     # today (claude-sandboxed's own --session-state bind, and this pod
@@ -8501,13 +8501,17 @@ fi
 # "none" default for every step but one: with --session-state given (only
 # possible when preset_session_step_idx names a claude seat -- the
 # composed refusal above refuses every other case), the pipeline's own
-# first code step gets "resume" instead, the same way impl_sandbox_cmd does
-# for a legacy-shaped run, and a second array, "s<K>cont_sandbox_cmd", is
-# built in "state" mode for that step's --refresh-at continuations -- see
-# fork-sandbox-runner.sh's own composed-aliasing block for how run_step_kind
-# 1's s<K>_sandbox_cmd/s<K>cont_sandbox_cmd become impl_sandbox_cmd/
-# cont_sandbox_cmd there. Every other step, review/maintain/fix/plan/tidy
-# legs and fix seats included, stays "none".
+# first code step ALSO gets two extra arrays -- "s<K>resume_sandbox_cmd"
+# ("resume" mode, pass 1 only) and "s<K>cont_sandbox_cmd" ("state" mode,
+# its --refresh-at continuations) -- the same way impl_sandbox_cmd/
+# cont_sandbox_cmd do for a legacy-shaped run. "s<K>_sandbox_cmd" itself
+# stays plain for every step, this one included, so a repeat pass of the
+# session step (run through run_leg, not the pass-1 aliasing) never
+# touches the store either -- see fork-sandbox-runner.sh's own composed-
+# aliasing block for how run_step_kind 1's s<K>resume_sandbox_cmd/
+# s<K>cont_sandbox_cmd become impl_sandbox_cmd/cont_sandbox_cmd there.
+# Every other step, review/maintain/fix/plan/tidy legs and fix seats
+# included, stays "none".
 if [[ "$preset_is_legacy_shaped" != true ]]; then
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         # Review-kit binds are added by fs_build_sandbox_cmd, while pi needs
@@ -8542,11 +8546,19 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                 unset -n kit_k_fix_cmd
             fi
         done
+        # "s<K>_sandbox_cmd" itself is ALWAYS the plain build, with no store
+        # flags at all -- run_leg reads it for every repeat pass of this
+        # step (kind "code", pass 2+) exactly as it reads the legacy
+        # sandbox_cmd for those, so a repeat pass is the fresh conversation
+        # run_leg's own comment promises, never a resume of the caller's
+        # old one. The session step gets two EXTRA arrays the plain one
+        # never touches: "s<K>resume_sandbox_cmd" (pass 1 only, read by the
+        # runner's own step-1-style aliasing below) and
+        # "s<K>cont_sandbox_cmd" (its --refresh-at continuations).
+        fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
         if [[ -n "$session_state" && "$preset_k" == "$preset_session_step_idx" ]]; then
-            fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd" resume
+            fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}resume_sandbox_cmd" resume
             fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}cont_sandbox_cmd" state
-        else
-            fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
         fi
         if [[ "${preset_step_action[$preset_k]}" != code \
             && "${preset_step_action[$preset_k]}" != plan \
@@ -9336,11 +9348,16 @@ fs_emit_run_sh_preamble() {
             printf 's%d_sandbox_cmd=(' "$preset_k"
             printf '%q ' "${preset_k_cmd_ref[@]}"
             printf ')\n'
-            # Only the pipeline's own first code step gets one, and only on
-            # a --session-state run -- see the "s<K>_*"/fs_build_sandbox_cmd
-            # loop above, where this array is built in "state" mode. Every
-            # other step never has a same-named array to read here.
+            # Only the pipeline's own first code step gets these, and only
+            # on a --session-state run -- see the "s<K>_*"/
+            # fs_build_sandbox_cmd loop above, where they are built in
+            # "resume"/"state" mode. Every other step never has same-named
+            # arrays to read here.
             if [[ -n "$session_state" && "$preset_k" == "$preset_session_step_idx" ]]; then
+                declare -n preset_k_cmd_ref="s${preset_k}resume_sandbox_cmd"
+                printf 's%dresume_sandbox_cmd=(' "$preset_k"
+                printf '%q ' "${preset_k_cmd_ref[@]}"
+                printf ')\n'
                 declare -n preset_k_cmd_ref="s${preset_k}cont_sandbox_cmd"
                 printf 's%dcont_sandbox_cmd=(' "$preset_k"
                 printf '%q ' "${preset_k_cmd_ref[@]}"

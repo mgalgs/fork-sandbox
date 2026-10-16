@@ -615,14 +615,27 @@ fs_leg_retry_suffix() {
 if [[ "${composed_pipeline:-0}" == 1 ]]; then
     for (( _fs_step = 1; _fs_step <= run_step_count; _fs_step++ )); do
         if [[ "${run_step_kind[$_fs_step]}" == code ]]; then
+            # "s<K>_sandbox_cmd" is always the plain build (see
+            # fs_build_sandbox_cmd's composed build loop) -- read it for
+            # sandbox_cmd, the fallback run_leg itself falls through to for
+            # a repeat pass of this very step, so a repeat pass never
+            # inherits a resumed conversation it was never meant to see.
             declare -n _fs_first_cmd="${run_step_idx[$_fs_step]}_sandbox_cmd"
-            impl_sandbox_cmd=("${_fs_first_cmd[@]}")
             sandbox_cmd=("${_fs_first_cmd[@]}")
+            impl_sandbox_cmd=("${_fs_first_cmd[@]}")
             unset -n _fs_first_cmd
-            # The launcher only emits "s<K>cont_sandbox_cmd" for this same
-            # step when --session-state was given (see fs_build_sandbox_cmd's
-            # composed build loop); every other run has no such array to
-            # read, so check for it rather than reading it unconditionally.
+            # The launcher only emits "s<K>resume_sandbox_cmd"/
+            # "s<K>cont_sandbox_cmd" for this same step when --session-state
+            # was given (see fs_build_sandbox_cmd's composed build loop);
+            # every other run has no such arrays to read, so check for them
+            # rather than reading them unconditionally.
+            _fs_first_resume_var="${run_step_idx[$_fs_step]}resume_sandbox_cmd"
+            if declare -p "$_fs_first_resume_var" &>/dev/null; then
+                declare -n _fs_first_resume_cmd="$_fs_first_resume_var"
+                impl_sandbox_cmd=("${_fs_first_resume_cmd[@]}")
+                unset -n _fs_first_resume_cmd
+            fi
+            unset _fs_first_resume_var
             _fs_first_cont_var="${run_step_idx[$_fs_step]}cont_sandbox_cmd"
             if declare -p "$_fs_first_cont_var" &>/dev/null; then
                 declare -n _fs_first_cont_cmd="$_fs_first_cont_var"

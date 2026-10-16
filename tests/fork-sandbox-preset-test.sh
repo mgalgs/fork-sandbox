@@ -3483,6 +3483,53 @@ else
     no "composed-session (no --session-state) walk launch succeeds"
 fi
 
+# A repeat pass of the SAME first code step must be its own fresh
+# conversation too -- not just a LATER code step (above). Reproduces the
+# review finding: with the code step itself capped at 2 passes, pass 2 ran
+# through run_leg, which (before the fix) read the resume-mode array built
+# for pass 1 and re-resumed the caller's old session on every repeat pass.
+cat > "$real_presets/composed-session-repeat.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+    repeat: 2
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+composed_session_repeat_sid=0123abcd-4567-89ab-cdef-0123456789ab
+composed_session_repeat_state="$(mktemp -d /var/tmp/claude-scratch/fs-preset-session-repeat.XXXXXX)"
+tmpdirs+=("$composed_session_repeat_state")
+prep_stub $'commit\ncommit\napproved'
+if rd_session_repeat="$(run_stubbed --preset composed-session-repeat \
+    --session-state "$composed_session_repeat_state" --resume-session "$composed_session_repeat_sid" \
+    --branch "sandbox-test-composed-session-repeat-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_session_repeat")
+    check "the composed-session-repeat walk runs exactly 3 legs" "3" "$(cat "$count")"
+    repeat_leg1_argv="$(sed -n 1p "$argv_log")"
+    repeat_leg2_argv="$(sed -n 2p "$argv_log")"
+    repeat_leg3_argv="$(sed -n 3p "$argv_log")"
+    contains "the code step's pass 1 carries --session-state" \
+        "$repeat_leg1_argv" "--session-state $composed_session_repeat_state"
+    contains "the code step's pass 1 carries --resume-session" \
+        "$repeat_leg1_argv" "--resume-session $composed_session_repeat_sid"
+    lacks "the code step's pass 2 (a repeat, not a continuation) carries no --session-state" \
+        "$repeat_leg2_argv" "--session-state"
+    lacks "the code step's pass 2 (a repeat, not a continuation) carries no --resume-session" \
+        "$repeat_leg2_argv" "--resume-session"
+    lacks "the review leg carries no --session-state" "$repeat_leg3_argv" "--session-state"
+    lacks "the review leg carries no --resume-session" "$repeat_leg3_argv" "--resume-session"
+else
+    no "composed-session-repeat walk launch succeeds"
+fi
+
 printf '\n== the engine: a plan stage (--foreground, stubs) ==\n'
 
 cat > "$real_presets/plan-code-review.yaml" <<'EOF'
