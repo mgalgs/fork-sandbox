@@ -235,6 +235,18 @@ Do these in order.
   `pm drain done busy=<n>` line with `n` above 0 means the timeout cut
   something off.
 
+  This is the postmaster adopting its own restarted wake wrapper
+  (`fork-sandbox-k8s-wake.sh --adopt`, which calls `fork-sandbox-k8s.sh
+  resume` under the hood) -- a narrower case than the general-purpose
+  `fork-sandbox adopt <run-dir>` verb: the postmaster already knows which
+  wake directories are its own and adopts automatically, on its own
+  restart, with no caller involved. A `--k8s` run submitted OUTSIDE the
+  postmaster (a workstation's own `fork-sandbox run --k8s`, or any other
+  caller holding a run directory) has no such automatic restart story --
+  that is what `fork-sandbox adopt` is for, called by whatever the
+  consumer's own re-adoption logic is. See "Re-adopting a run whose
+  host-side driver died" in [kubernetes-runs.md](kubernetes-runs.md).
+
 ## The mail API
 
 The mail API is a small HTTP server that runs the `mail` and `postmaster`

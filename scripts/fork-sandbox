@@ -5,6 +5,7 @@
 #        fork-sandbox status [options] <run-dir>
 #        fork-sandbox say <run-dir> <message>
 #        fork-sandbox stop [--timeout SECS] <run-dir>
+#        fork-sandbox adopt <run-dir>
 #        fork-sandbox k8s <sub-verb> [options]
 #        fork-sandbox log <sub-verb> [options]
 #        fork-sandbox configure [options]
@@ -23,6 +24,7 @@
 #   say        fork-sandbox-say.sh
 #   stop       fork-sandbox-stop.sh
 #   k8s        fork-sandbox-k8s.sh
+#   adopt      fork-sandbox-k8s.sh adopt --run-dir
 #   log        sandbox-run-log.py
 #   configure  fork-sandbox.sh configure
 #   validate-services  fork-sandbox-k8s-services-parse.py
@@ -35,6 +37,14 @@
 # The dispatcher parses nothing of its own beyond a leading -h/--help, so a
 # --help after a verb reaches that verb's script and the sub-verbs of k8s
 # and log pass straight through.
+#
+# adopt <run-dir> is the one verb this dispatcher rewrites, the same way it
+# rewrites `configure`: it is `fork-sandbox-k8s.sh adopt --run-dir
+# <run-dir>` under a short, positional-argument name, for a caller
+# re-adopting a --k8s run whose own host-side driver died (a restart, an
+# evicted client) while its pod kept working. See `fork-sandbox-k8s.sh
+# adopt`'s own header and "Re-adopting a run whose host-side driver died" in
+# docs/kubernetes-runs.md for what it actually does.
 
 set -euo pipefail
 
@@ -70,6 +80,21 @@ case "$verb" in
     stop)
         target='fork-sandbox-stop.sh'
         ;;
+    adopt)
+        target='fork-sandbox-k8s.sh'
+        # A plain `-h`/`--help` right after the verb must reach cmd_adopt's
+        # own help text, not get swallowed as --run-dir's value (which a
+        # blind `set -- adopt --run-dir "$@"` would do here, turning
+        # `fork-sandbox adopt --help` into a doomed lookup for a run
+        # directory literally named "--help"). A caller with no argument at
+        # all still rewrites to `adopt --run-dir` with nothing after it --
+        # cmd_adopt's own arg parser reports that cleanly.
+        if [[ "${1-}" == '-h' || "${1-}" == '--help' ]]; then
+            set -- adopt --help
+        else
+            set -- adopt --run-dir "$@"
+        fi
+        ;;
     configure)
         target='fork-sandbox.sh'
         set -- configure "$@"
@@ -100,7 +125,7 @@ case "$verb" in
         ;;
     *)
         printf "fork-sandbox: unknown verb '%s'\n" "$verb" >&2
-        printf '%s\n' 'Verbs: run status say stop configure k8s log validate-services mail mail-api mail-forward fleet postmaster' >&2
+        printf '%s\n' 'Verbs: run status say stop adopt configure k8s log validate-services mail mail-api mail-forward fleet postmaster' >&2
         printf '%s\n' "Try 'fork-sandbox --help'." >&2
         exit 2
         ;;

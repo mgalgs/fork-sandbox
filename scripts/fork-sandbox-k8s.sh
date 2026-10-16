@@ -40,6 +40,7 @@
 #                            [--outbox-max SIZE] [--review-loop N]
 #                            [--keep] [--run-dir DIR] <project-path>
 #        fork-sandbox-k8s.sh resume --run-dir DIR [--timeout SECONDS]
+#        fork-sandbox-k8s.sh adopt --run-dir DIR
 #        fork-sandbox-k8s.sh fetch --branch NAME
 #                            [--upstream REF | --upstream-none REASON]
 #                            <project-path>
@@ -168,15 +169,40 @@
 # (exit 1). Exit codes are run's own: the agent's, or the wait's nonzero
 # rc (2 for a dead pod, after writing the run-log row; 1 for a timeout).
 #
-# resume is also the adopt path, so it refuses a run whose submit never
-# finished pushing the run's inputs into the pod (the pod gives up on its
-# own, so there is nothing to adopt). submit writes INPUTS_PUSH_EXPECTED=true
-# at run.env's first write and INPUTS_PUSH_COMPLETE=true the moment the pod
-# is told its inputs are complete; a run.env with the first and not the
-# second is refused with exit 2 (the code a missing pod gets), after
-# deleting the run's cluster objects by branch label as submit's failure
-# trap does. A run.env with neither key (an older submit) is adopted as
-# before.
+# resume is also the adopt path for a restarted cluster postmaster's own
+# wake wrapper (see docs/cluster-postmaster.md), so it refuses a run whose
+# submit never finished pushing the run's inputs into the pod (the pod
+# gives up on its own, so there is nothing to adopt). submit writes
+# INPUTS_PUSH_EXPECTED=true at run.env's first write and
+# INPUTS_PUSH_COMPLETE=true the moment the pod is told its inputs are
+# complete; a run.env with the first and not the second is refused with
+# exit 2 (the code a missing pod gets), after deleting the run's cluster
+# objects by branch label as submit's failure trap does. A run.env with
+# neither key (an older submit) is adopted as before.
+#
+# adopt --run-dir DIR is the general-purpose version of the same idea, for
+# ANY --k8s run whose own host-side driver died while its pod kept working
+# -- not only the postmaster's wake wrapper, and not only right after a
+# failed push. It is a thin wrapper around resume (above): past its own
+# checks, it IS resume, so it reuses every setting resume already reads
+# back from DIR/run.env and works for a single-leg or a composed
+# (--pipeline/--preset) run alike. What it adds: a no-op exit 0 on a run
+# DIR/exit-code already answers for (some earlier wait or collect already
+# reached a terminal outcome -- calling adopt again must never re-run
+# collect against an already-reaped pod); a refusal, exit 1, while another
+# driver holds DIR/.driver.lock (every run, resume and adopt holds it for
+# its whole life) or the run's recorded driver pid is still alive (never
+# two drivers on one run -- two processes racing wait/collect against the
+# same pod is the exact hazard this rules out); and a refusal, exit 1,
+# outright on a run.env that is not network=cluster at all (not a --k8s
+# run). Past those checks its exit
+# codes are resume's own. See "Re-adopting a run whose host-side driver died"
+# in docs/kubernetes-runs.md for the incident this exists for, and note
+# its one real constraint: adoption only works while the pod is still
+# alive, so it must be called again soon after whatever restarted the
+# driver, not whenever it is next convenient -- `fork-sandbox-status.sh`
+# reports a run in this state as "orphaned", not "failed", specifically so
+# a caller polling status knows there is still something to adopt.
 #
 # fetch runs `git fetch` against the pod's clone, the same channel in
 # reverse, landing the branch in your real repo. It also signals the pod
@@ -1132,7 +1158,9 @@ claude_env="$config_dir/claude.env"
 # Reads one NAME=VALUE line from an env file, first match wins. Never
 # `source`d: these files are read by a script that goes on to build
 # commands from other things too, and a config file is not the place to
-# accept arbitrary shell.
+# accept arbitrary shell. Identical in behavior to fs_read_env_value
+# (fork-sandbox-lib.sh); kept as its own binding here since every call site
+# below already uses this name.
 read_env_value() {
     local file="$1" key="$2" line
     [[ -f "$file" ]] || return 1
@@ -1413,6 +1441,11 @@ RUN_LABEL_VALUES=()
 # until submit finishes. Declared empty here so it is safe to read under
 # `set -u` even on a verb that never calls cmd_submit.
 K8S_LAST_SUBMIT_RUN_DIR=""
+
+# Set by cmd_run only: cmd_submit then records the driver (pid and lock)
+# before marking the push complete. A bare `submit` has no wait or collect
+# to follow, so it must not claim to drive the run.
+K8S_SUBMIT_RECORDS_DRIVER=false
 
 # Quantity -> a comparable integer: millicores for cpu, bytes for memory.
 # Prints nothing for a value that is not a (positive) quantity of that kind.
@@ -1925,37 +1958,9 @@ k8s_extract_nginx_conf() {
     '
 }
 
-# A hex sha256 of stdin, for the proxy config-change annotation below.
-# sha256sum and openssl are not both guaranteed on every machine this might
-# run on (sha256sum is missing without GNU coreutils, openssl is missing on
-# a minimal install) -- try the GNU tool, then two portable fallbacks,
-# before giving up.
-k8s_sha256_stdin() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum | cut -d' ' -f1
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 | cut -d' ' -f1
-    elif command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 | sed 's/^.* //'
-    else
-        echo "Error: none of sha256sum, shasum or openssl found. One is" >&2
-        echo "needed to hash the proxy ConfigMap's content, so a config" >&2
-        echo "change can roll the proxy Deployment -- see" >&2
-        echo "docs/kubernetes-runs.md." >&2
-        return 1
-    fi
-}
-
-# The sanitising half of k8s_safe_name below, factored out so a filesystem
-# path (which has no 63-char Kubernetes object-name limit) can reuse it
-# without the truncation that would otherwise chop it.
-k8s_safe_name_component() {
-    local branch="$1" safe
-    safe="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
-    safe="${safe##-}"
-    safe="${safe%%-}"
-    printf '%s' "$safe"
-}
+# k8s_sha256_stdin and k8s_safe_name_component (the sanitising half of
+# k8s_safe_name below) are shared with fork-sandbox-status.sh's pod-liveness
+# probe and live in fork-sandbox-lib.sh.
 
 # Resolves the fork-sandbox/owner label value: an explicit K8S_RUN_OWNER
 # (already validated above, used as-is -- an operator-typed value is
@@ -2298,41 +2303,11 @@ resolve_run_image() {
     return 0
 }
 
-# A Kubernetes object name: lowercase RFC 1123, <=63 chars. Branch names are
-# freeform, so this derives a safe name rather than requiring the caller to
-# pick one that already qualifies. Capped at 50, not 63: this name is also
-# used as the base of the per-run claude-proxy Service, with a
-# "-claude-proxy" suffix appended (13 chars), and a Service name is itself
-# capped at 63 -- so the base must leave room for that suffix or a long
-# branch renders a Service name the API server rejects, aborting submit
-# after the Secret, ConfigMap and Pod for that run already exist.
-# A normalized branch gets a digest too, even when it fits: otherwise refs
-# such as feature/foo and feature-foo (or Feature/foo and feature-foo) share
-# one set of Kubernetes objects.
-k8s_safe_name() {
-    local prefix="$1" branch="$2" component candidate digest base
-    component="$(k8s_safe_name_component "$branch")"
-    candidate="$prefix-$component"
-    if [[ "$component" == "$branch" ]] && (( ${#candidate} <= 50 )); then
-        printf '%s' "$candidate"
-        return
-    fi
-    digest="$(printf '%s' "$branch" | k8s_sha256_stdin | cut -c1-8)"
-    base="${candidate:0:41}"
-    base="${base%-}"
-    printf '%s-%s' "$base" "$digest"
-}
-
-# The object-name derivation used before k8s_safe_name added digests. Keep it
-# for management commands so runs submitted by that version remain fetchable,
-# sayable, and removable after this script is updated. Submit must continue to
-# use k8s_safe_name: unlike this legacy form, it distinguishes names that
-# sanitize to the same component.
-k8s_legacy_safe_name() {
-    local prefix="$1" branch="$2"
-    printf '%s-%s' "$prefix" "$(k8s_safe_name_component "$branch")" \
-        | cut -c1-50 | sed 's/-$//'
-}
+# k8s_safe_name and k8s_legacy_safe_name (the object-name derivation used
+# before k8s_safe_name added digests, kept for management commands so runs
+# submitted by an older version remain fetchable, sayable, and removable)
+# are shared with fork-sandbox-status.sh's pod-liveness probe and live in
+# fork-sandbox-lib.sh.
 
 # Prefer the current name, then look for an object created with the legacy
 # name. The fallback is intentionally limited to management commands; a
@@ -8679,6 +8654,11 @@ EOF
         rm -f -- "$run_dir_tar"
     fi
 
+    # Before the push is marked complete: a pushed run with no driver
+    # recorded reads as orphaned, and adopt would take it over.
+    if [[ "$K8S_SUBMIT_RECORDS_DRIVER" == true ]]; then
+        k8s_record_client_pid "$run_dir"
+    fi
     kubectl exec -c agent "$pod_name" -- sh -c 'touch /work/.inputs-complete'
     # The pod has been told its inputs are complete: see
     # INPUTS_PUSH_EXPECTED above and cmd_resume's check of the pair.
@@ -9367,6 +9347,7 @@ k8s_claude_keeper_start() {
     local parent_pid=$BASHPID
     (
         exec >/dev/null
+        [[ -z "$K8S_DRIVER_LOCK_FD" ]] || exec {K8S_DRIVER_LOCK_FD}>&-
         cred_dir="$(dirname -- "$cred_file")"
         sync_lock1="$cred_dir/.oauth_refresh.lock"
         sync_lock2="$("$FS_REALPATH" -m "$cred_dir").lock"
@@ -9500,6 +9481,7 @@ k8s_codex_keeper_start() {
     local auth_path="$1" safe_name="$2" parent_pid=$BASHPID
     (
         exec >/dev/null
+        [[ -z "$K8S_DRIVER_LOCK_FD" ]] || exec {K8S_DRIVER_LOCK_FD}>&-
         last_hash=""
         while kill -0 "$parent_pid" 2>/dev/null; do
             if ! python3 "$script_dir/fork-sandbox-codex-refresh.py" "$auth_path"; then
@@ -11375,6 +11357,45 @@ cmd_collect() {
     trap - ERR
 }
 
+# DIR/.driver.lock, held exclusively by whichever process drives a run
+# (run, resume or adopt) until it exits. This, not k8s_client_pid, is what
+# keeps two drivers off one run when they live in different pid namespaces
+# sharing the run dir's volume (an old and a new consumer pod overlapping
+# in a rollout): a pid means nothing across namespaces, a held flock does.
+# fork-sandbox-status.sh probes the same file. Background children must
+# close K8S_DRIVER_LOCK_FD, or they keep a dead driver's lock held.
+K8S_DRIVER_LOCK_FD=""
+K8S_DRIVER_LOCK_WAIT=5
+
+# Returns 1 when another live process holds the lock, 0 once this process
+# holds it -- or, with a warning, when the filesystem cannot flock at all,
+# so a run there still proceeds on the pid check alone. With $2 = strict
+# (adopt), that last case returns 2 instead. The short wait, not -n, rides
+# out status's own momentary shared-lock probe.
+k8s_take_driver_lock() {
+    local run_dir="$1" strict="${2-}" fd rc=0
+    [[ -z "$K8S_DRIVER_LOCK_FD" ]] || return 0
+    if ! { exec {fd}>>"$run_dir/.driver.lock"; } 2>/dev/null; then
+        [[ "$strict" != strict ]] || return 2
+        echo "fork-sandbox-k8s: warning: cannot open $run_dir/.driver.lock;" \
+            "only the recorded pid guards this run against a second driver." >&2
+        return 0
+    fi
+    # -E 3: flock(1) exits 1 on some plain errors too, so give "held by
+    # someone else" a code of its own.
+    flock -E 3 -w "$K8S_DRIVER_LOCK_WAIT" -x "$fd" || rc=$?
+    if (( rc == 0 )); then
+        K8S_DRIVER_LOCK_FD="$fd"
+        return 0
+    fi
+    exec {fd}>&-
+    (( rc == 3 )) && return 1
+    [[ "$strict" != strict ]] || return 2
+    echo "fork-sandbox-k8s: warning: cannot flock $run_dir/.driver.lock (flock" \
+        "exit $rc); only the recorded pid guards this run against a second driver." >&2
+    return 0
+}
+
 # Records this process as the one watching $1 (a run dir) through to
 # collect. fork-sandbox-status.sh's run_state() already treats
 # k8s_client_pid, under network=cluster, as a liveness signal (never a
@@ -11385,20 +11406,36 @@ cmd_collect() {
 # alive from here through collect -- but cmd_submit's own run.env writer
 # never prints this key, because a bare `submit` alone has no wait/collect
 # to follow and must not claim this pid speaks for the whole run. Called
-# only from cmd_run and cmd_resume, the two callers that DO commit to
-# seeing a run through, right before each hands off to k8s_run_tail below
+# only for cmd_run (from inside cmd_submit, before INPUTS_PUSH_COMPLETE is
+# written, so status never sees a pushed run with no driver recorded) and
+# cmd_resume, the two callers that DO commit to seeing a run through
 # -- without it, run_state() reads every plain --k8s run as "abandoned"
 # for its entire active life (no local pid file, network=cluster, and no
 # k8s_client_pid key at all), long before any Job failure actually
 # happened. Rewrites the key in place (the cost=/model=/outbox_bytes=
 # quartet's own idiom) rather than appending, so a resume by a new process
 # after an old one died replaces the stale pid instead of leaving it as
-# the first, authoritative match.
+# the first, authoritative match. k8s_client_pid_start -- $$'s own
+# fs_proc_start_time, recorded in the same rewrite -- is what lets a later
+# reader (run_state(), run_finalizer_alive(), cmd_adopt's own driver-alive
+# check, all via fs_k8s_driver_alive) tell this pid apart from an unrelated
+# process that reuses it later; see that function's own comment for why a
+# bare pid is not enough once the reader runs in a different pid namespace
+# from the one that recorded it. It also takes DIR/.driver.lock (see
+# k8s_take_driver_lock) and exits 1 when another live driver holds it.
 k8s_record_client_pid() {
-    local run_dir="$1"
+    local run_dir="$1" start
     [[ -n "$run_dir" && -f "$run_dir/run.env" ]] || return 0
-    if grep -v '^k8s_client_pid=' "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
+    if ! k8s_take_driver_lock "$run_dir"; then
+        echo "Error: another driver (a run, resume or adopt) holds" >&2
+        echo "$run_dir/.driver.lock; refusing to drive the same run twice." >&2
+        exit 1
+    fi
+    start="$(fs_proc_start_time "$$")"
+    if grep -v -e '^k8s_client_pid=' -e '^k8s_client_pid_start=' \
+        "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
         printf 'k8s_client_pid=%s\n' "$$" >> "$run_dir/run.env.part"
+        [[ -n "$start" ]] && printf 'k8s_client_pid_start=%s\n' "$start" >> "$run_dir/run.env.part"
         mv -f "$run_dir/run.env.part" "$run_dir/run.env"
     else
         rm -f "$run_dir/run.env.part"
@@ -11555,6 +11592,245 @@ cmd_resume() {
     k8s_record_client_pid "$run_dir"
     k8s_run_tail "$run_dir" "$branch" "$timeout" "$project" \
         "$outbox_dir" "$outbox_max_bytes" "$review_loop" "$keep"
+}
+
+# Bounded request timeout for adopt's own one-shot "is this run truly
+# unrecoverable" probe below -- same order of magnitude as
+# K8S_PEEK_REQUEST_TIMEOUT above, since both are a single read-only
+# kubectl call a caller is waiting on synchronously.
+K8S_ADOPT_PROBE_TIMEOUT=10
+
+# adopt's own read-only, bounded probe of whether an orphaned-looking run
+# (dead driver, no exit code, push already complete) is still worth
+# adopting at all, or whether the pod already ran to completion or
+# vanished with nobody ever collecting it. Mirrors fork-sandbox-status.sh's
+# own k8s_orphan_probe/json_reason pair (see "Re-adopting a run whose
+# host-side driver died" in docs/kubernetes-runs.md) so a caller sees the
+# same wording from either tool, but reuses this script's own kubectl
+# wrapper and k8s_probe_find_pod instead of re-deriving K8S_CONTEXT/
+# K8S_NAMESPACE from k8s.env the way status.sh's standalone probe must.
+#
+# Prints the --json reason text and returns 0 when the pod has already
+# exited (Succeeded/Failed) or is gone outright: there is truly nothing
+# left to collect, and the caller must not fall through into resume's own
+# wait/collect, which would otherwise re-run the cluster wait and append a
+# fresh run_end row to the durable run log on every blind retry (the
+# "call adopt on every startup" consumer this verb exists for). Prints
+# nothing and returns 1 when the pod is still alive -- the ordinary
+# orphaned case, where resume proceeds exactly as it does today -- or when
+# the cluster could not be asked at all: "unknown" must never be read as
+# "unrecoverable", the same "don't guess" rule status.sh's own probe
+# follows.
+k8s_adopt_unrecoverable_reason() {
+    local branch="$1" req_timeout="$K8S_ADOPT_PROBE_TIMEOUT"
+    local safe_name legacy_name pod_name phase
+    safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
+    legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
+    pod_name="$(k8s_probe_find_pod "$safe_name" "$legacy_name" "$req_timeout")" || return 1
+    if [[ -z "$pod_name" ]]; then
+        printf 'the pod vanished before anything collected it'
+        return 0
+    fi
+    phase="$(kubectl get pod "$pod_name" --request-timeout="${req_timeout}s" \
+        -o jsonpath='{.status.phase}' 2>/dev/null)" || return 1
+    case "$phase" in
+        Succeeded|Failed)
+            printf 'the pod finished before anything collected it'
+            return 0 ;;
+    esac
+    return 1
+}
+
+# adopt's no-op: exit 0 when DIR/exit-code already answers for the run.
+adopt_exit_if_finished() {
+    local run_dir="$1"
+    [[ -f "$run_dir/exit-code" ]] || return 0
+    echo "fork-sandbox-k8s: adopt: $run_dir already finished (exit" \
+        "$(tr -dc '0-9-' < "$run_dir/exit-code" 2>/dev/null)); nothing to do." >&2
+    exit 0
+}
+
+# adopt: re-adopt a --k8s run whose own host-side driver (the
+# submitting `run`, or an earlier `resume`/`adopt`) died while its pod kept
+# working -- see "Re-adopting a run whose host-side driver died" in
+# docs/kubernetes-runs.md for the incident this exists for (a consumer's
+# own driver process dying mid-run on a host restart, with the pod left
+# idling for up to K8S_RUN_TTL with nobody coming to collect it).
+#
+# This is deliberately a thin wrapper around resume, which already does
+# everything a dead driver's own continuation would have done (wait,
+# collect, the run-log row, the reap) for single-leg and composed runs
+# alike, reading every setting back from DIR/run.env rather than asking the
+# caller to repeat them. What adopt adds on top, so that a caller can call
+# it blindly on every run it still has a directory for:
+#
+#   - refuses outright on a run.env whose network is not "cluster" (not a
+#     --k8s run at all -- there is no pod to re-adopt);
+#   - is a no-op, exit 0, on a run DIR/exit-code already answers for (some
+#     wait or collect already reached a terminal outcome, adopted or not --
+#     calling adopt again must never re-run collect against a pod that is
+#     already gone because a prior collect already reaped it);
+#   - takes DIR/.driver.lock (k8s_take_driver_lock, the lock every driver
+#     holds) before any of the checks below, so they are all read under it;
+#     while another driver holds it, adopt exits 1. This is what rules out
+#     two drivers across pid namespaces, where the pid check below cannot;
+#   - refuses, exit 1, while a submit for this run is still pushing its
+#     inputs (run.env has INPUTS_PUSH_EXPECTED=true but not yet
+#     INPUTS_PUSH_COMPLETE=true): that window can have no recorded pid yet,
+#     and resume's own push-incomplete branch would delete the live
+#     submit's cluster objects;
+#   - refuses, exit 1, while the run's recorded driver
+#     (k8s_client_pid, paired with k8s_client_pid_start, read the same way
+#     fork-sandbox-status.sh's run_state() does) is still alive: two drivers
+#     racing wait/collect against the same pod is exactly the hazard this
+#     check exists to rule out, and "is it alive" is read with
+#     fs_k8s_driver_alive, which requires BOTH the pid to answer (via
+#     fs_status_pid_alive, the same zombie-aware check status.sh uses, not
+#     bare kill -0) AND, when a start time was recorded for it, the start
+#     time to still match. The pid alone is not enough: this check can run
+#     in a different pid namespace from the one that recorded it (a
+#     consumer that runs its --k8s driver from inside its own pod, re-run
+#     from a FRESH pod after a rollout), where a low, reused pid can land on
+#     a live, unrelated process. Requiring the start time too closes that --
+#     a colliding pid in a new namespace was started at a different,
+#     unrelated time, so the match fails and the driver reads as gone;
+#   - exits non-zero, with the pod-vanished/pod-finished reason status
+#     --json already carries for this case (see k8s_adopt_unrecoverable_
+#     reason above), on an unrecoverable run, WITHOUT falling into
+#     resume's own wait/collect: resume's cmd_wait would reach the same
+#     non-zero exit on a dead or gone pod, but by its own wording, not
+#     this reason, and only after re-running the cluster wait and
+#     appending another run_end row to the durable run log -- a real cost
+#     for the "call adopt on every startup for every in-flight run"
+#     consumer this verb exists for, since none of that is a no-op the way
+#     the already-finished check above is.
+#
+# Everything past those checks is resume's own body, so adopt's exit codes
+# past this point are resume's: the agent's own exit code on an ordinary
+# finish, or wait's nonzero rc (2 for a pod that has already exited or
+# vanished -- there is nothing left to recover, the pod held the only copy
+# of the run's clone -- 1 for a timeout).
+cmd_adopt() {
+    local run_dir=""
+    while (( $# )); do
+        case "$1" in
+            -h|--help)
+                cat <<'EOF'
+Usage: fork-sandbox adopt <run-dir>
+       fork-sandbox-k8s.sh adopt --run-dir <run-dir>
+
+Re-adopt a --k8s run whose own host-side driver died while its pod kept
+working, doing from that point on exactly what the dead driver would have:
+wait for the agent, collect (evidence, outbox, the branch fetch, and
+session state for a --resume run), record the exit code, summary.json and
+the run-log line, and reap.
+
+Safe to call blindly, on every startup, for every in-flight run: a no-op,
+exit 0, on a run that already finished; a refusal, exit 1, on a run that
+is not a --k8s run, is still starting, or whose driver is still alive; a
+non-zero exit, with the reason, on a run that can no longer be recovered.
+See "Re-adopting a run whose host-side driver died" in
+docs/kubernetes-runs.md.
+EOF
+                exit 0
+                ;;
+            --run-dir)
+                [[ $# -ge 2 ]] || { echo "Error: --run-dir requires a directory." >&2; exit 1; }
+                run_dir="$2"
+                shift 2
+                ;;
+            *) echo "Error: unknown argument '$1' for adopt." >&2; exit 1 ;;
+        esac
+    done
+    [[ -n "$run_dir" ]] || { echo "Error: adopt requires --run-dir." >&2; exit 1; }
+    [[ -d "$run_dir" ]] || { echo "Error: adopt: no such run directory: $run_dir" >&2; exit 1; }
+    local env_file="$run_dir/run.env"
+    [[ -f "$env_file" ]] || {
+        echo "Error: adopt: $run_dir has no run.env; nothing to adopt." >&2
+        exit 1
+    }
+
+    if [[ "$(read_env_value "$env_file" network || true)" != cluster ]]; then
+        echo "Error: adopt: $run_dir is not a --k8s run (its run.env has no" >&2
+        echo "network=cluster); there is no pod to re-adopt." >&2
+        exit 1
+    fi
+
+    adopt_exit_if_finished "$run_dir"
+
+    # The same lock every driver holds (k8s_take_driver_lock), taken before
+    # any other check so each one below is read under it: a driver that
+    # finishes between an unlocked check and the lock cannot be re-run.
+    local lock_rc=0
+    k8s_take_driver_lock "$run_dir" strict || lock_rc=$?
+    case "$lock_rc" in
+        0) ;;
+        1)
+            echo "Error: adopt: another driver (the original run, a resume or" >&2
+            echo "another adopt) holds $run_dir/.driver.lock." >&2
+            exit 1 ;;
+        *)
+            echo "Error: adopt: cannot lock $run_dir/.driver.lock, so a second" >&2
+            echo "driver cannot be ruled out; refusing to adopt." >&2
+            exit 1 ;;
+    esac
+    adopt_exit_if_finished "$run_dir"
+
+    # A plain run records its driver (pid and lock) only at the very end of
+    # the push, after the Job apply, the pod-ready wait and the context
+    # push. So a submit still pushing has INPUTS_PUSH_EXPECTED=true, no
+    # INPUTS_PUSH_COMPLETE yet, and no k8s_client_pid at all: the driver_pid
+    # check just below would read that as "driver gone" and fall into
+    # resume's own push-incomplete branch, which deletes this live submit's
+    # cluster objects. run_state() calls this exact shape "starting", never
+    # "orphaned" (see its own INPUTS_PUSH_EXPECTED branch) -- hold adopt to
+    # the same line and refuse here, before the pid check ever runs.
+    if [[ "$(read_env_value "$env_file" INPUTS_PUSH_EXPECTED || true)" == true \
+        && "$(read_env_value "$env_file" INPUTS_PUSH_COMPLETE || true)" != true ]]; then
+        echo "Error: adopt: $run_dir's submit is still pushing its inputs" >&2
+        echo "(INPUTS_PUSH_EXPECTED is set but INPUTS_PUSH_COMPLETE is not) --" >&2
+        echo "its driver has not finished starting yet, even though no" >&2
+        echo "k8s_client_pid has been recorded for it. Refusing to adopt a" >&2
+        echo "run that is still starting; try again shortly." >&2
+        exit 1
+    fi
+
+    local driver_pid driver_pid_start
+    driver_pid="$(read_env_value "$env_file" k8s_client_pid || true)"
+    driver_pid="${driver_pid//[^0-9]/}"
+    driver_pid_start="$(read_env_value "$env_file" k8s_client_pid_start || true)"
+    if [[ -n "$driver_pid" ]] && fs_k8s_driver_alive "$driver_pid" "$driver_pid_start"; then
+        echo "Error: adopt: $run_dir's driver (pid $driver_pid) is still alive." >&2
+        echo "Refusing to adopt a run with a live driver -- two processes" >&2
+        echo "waiting on and collecting the same pod is exactly what this" >&2
+        echo "check exists to rule out." >&2
+        exit 1
+    fi
+
+    # Unrecoverable (pod already exited or gone): say so with the same
+    # reason status --json already carries for this case, and stop here --
+    # never fall into resume's own wait/collect, which would re-run the
+    # cluster wait and append a fresh run_end row to the durable run log on
+    # every blind retry. A run.env with no BRANCH at all (resume's own
+    # check refuses that, but resume has not run yet at this point) or a
+    # probe that could not ask the cluster leaves unrecoverable_reason
+    # empty either way, and this falls through to resume exactly as
+    # before, which still refuses a branch-less run.env on its own.
+    local branch_for_probe unrecoverable_reason=""
+    branch_for_probe="$(read_env_value "$env_file" BRANCH || true)"
+    if [[ -n "$branch_for_probe" ]]; then
+        unrecoverable_reason="$(k8s_adopt_unrecoverable_reason "$branch_for_probe" 2>/dev/null)" \
+            || unrecoverable_reason=""
+    fi
+    if [[ -n "$unrecoverable_reason" ]]; then
+        echo "Error: adopt: $run_dir cannot be recovered: $unrecoverable_reason." >&2
+        echo "The pod held the only copy of this run's clone, so there is" >&2
+        echo "nothing left to re-adopt." >&2
+        exit 1
+    fi
+
+    echo "fork-sandbox-k8s: adopt: $run_dir's driver is gone; re-adopting." >&2
+    cmd_resume --run-dir "$run_dir"
 }
 
 # submit, then wait, then collect -- see the header comment above for why.
@@ -11791,6 +12067,7 @@ cmd_run() {
         cmd_submit --dry-run "${submit_argv[@]}"
         exit 0
     fi
+    K8S_SUBMIT_RECORDS_DRIVER=true
     cmd_submit "${submit_argv[@]}"
 
     # cmd_submit is a plain bash function call, never a subprocess, so its
@@ -11804,7 +12081,6 @@ cmd_run() {
     # docs/kubernetes-runs.md.
     local run_dir="$K8S_LAST_SUBMIT_RUN_DIR"
 
-    k8s_record_client_pid "$run_dir"
     k8s_run_tail "$run_dir" "$branch" "$timeout" "$project_path" \
         "$outbox_dir" "$outbox_max_bytes" "$review_loop_cap" "$keep"
 }
@@ -11819,6 +12095,7 @@ case "$verb" in
     submit) cmd_submit "$@"; k8s_note_standalone_submit_keeper ;;
     run) cmd_run "$@" ;;
     resume) cmd_resume "$@" ;;
+    adopt) cmd_adopt "$@" ;;
     wait) cmd_wait "$@" ;;
     collect) cmd_collect "$@" ;;
     fetch) cmd_fetch "$@" ;;
@@ -11827,7 +12104,7 @@ case "$verb" in
     rm) cmd_rm "$@" ;;
     check-grant) cmd_check_grant "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, upgrade-postmaster, submit, run, resume, wait, collect, fetch, say, peek, rm or check-grant." >&2
+        echo "Error: unknown command '$verb'. Use install, upgrade-postmaster, submit, run, resume, adopt, wait, collect, fetch, say, peek, rm or check-grant." >&2
         exit 1
         ;;
 esac

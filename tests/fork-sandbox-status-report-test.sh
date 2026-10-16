@@ -3,8 +3,18 @@ set -uo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 status="$repo_dir/scripts/fork-sandbox-status.sh"
+lib_sh="$repo_dir/scripts/fork-sandbox-lib.sh"
 rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status.XXXXXX)"
-trap 'rm -rf -- "$rd"' EXIT
+# Isolated and empty on purpose: a dead-driver --k8s run dir's state now
+# depends on k8s_orphan_probe finding (or not finding) a real k8s.env here
+# -- see "31"-"34" below. Pointing this at a fresh, k8s.env-less directory
+# for the whole suite keeps every OTHER test (which never means to probe a
+# cluster at all) from depending on whatever happens to be configured on
+# the machine running this suite, and keeps this suite from ever shelling
+# out to a real kubectl even if one is on PATH.
+config_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status-config.XXXXXX)"
+export FORK_SANDBOX_CONFIG_DIR="$config_dir"
+trap 'rm -rf -- "$rd" "$config_dir"' EXIT
 cat > "$rd/run.env" <<EOF
 version=1
 branch=test
@@ -76,7 +86,7 @@ fi
 # that has exited plays an abandoned run. Each case runs in a fresh dir and
 # the watch loop either exits on its own (terminal state) or is stopped by
 # timeout (a run that stays running).
-run_dirs=("$rd")
+run_dirs=("$rd" "$config_dir")
 new_run_dir() {
     rd_new="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status.XXXXXX)"
     run_dirs+=("$rd_new")
@@ -1203,6 +1213,51 @@ out="$(timeout 5 "$status" --monitor-terminal "$rd_new" 2>&1)"
 [[ "$out" != *"never started"* ]] \
     || { echo "monitor-terminal falsely reported a live composed k8s run as never started: $out"; exit 1; }
 
+# 7a. The same live pid, but paired with its own correctly-recorded start
+# time: still "running". The pairing must not break the ordinary,
+# non-colliding case.
+own_start="$(bash -c 'source "$1"; fs_proc_start_time "$2"' _ "$lib_sh" "$$")"
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-live-start
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$$
+k8s_client_pid_start=$own_start
+EOF
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    running"* ]] \
+    || { echo "a live composed k8s run with a matching recorded start time was not read as running: $out"; exit 1; }
+
+# 7a2. The same live pid, but with a start time that does NOT match --
+# the pid-collision case this pairing exists to catch: a consumer that
+# runs its --k8s driver from inside its own pod, polling status from a
+# FRESH pod after a rollout whose pid namespace reused this pid for an
+# unrelated, still-running process. Without pairing a start time, this
+# pid alone reads as "the old driver is alive" forever; with it, the
+# mismatch reads the driver as gone, falling back to today's answer
+# (no k8s.env configured in this suite, so the probe cannot ask the
+# cluster and keeps "abandoned" rather than guessing "orphaned").
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-pid-collide
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$$
+k8s_client_pid_start=not-a-real-start-time
+EOF
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" != "state:    running"* ]] \
+    || { echo "a live pid with a mismatched recorded start time was still read as running: $out"; exit 1; }
+[[ "$out" == "state:    abandoned"* ]] \
+    || { echo "a live pid with a mismatched recorded start time was not read as abandoned: $out"; exit 1; }
+
 # 7b. The same shape, once the host-side client is gone: "abandoned", not
 # stuck as "starting" forever, and the abandoned message names the k8s
 # remedies (fork-sandbox-k8s.sh collect/rm) rather than the tmux/clone
@@ -1322,4 +1377,188 @@ json="$("$status" --json "$rd_new")"
 [[ "$(printf '%s' "$json" | jq -r .state)" == "working" ]] \
     || { echo "cluster run finished before its live collector: $json"; exit 1; }
 
-echo "92 passed, 0 failed"
+# 31. k8s_orphan_probe: a dead --k8s driver with a confirmed-live pod reads
+# "orphaned", not "abandoned" -- the one condition under which this script
+# ever shells out to kubectl at all. A dedicated, scoped k8s.env plus a
+# stub kubectl on PATH, local to these invocations only: every test above
+# and below this section still runs against the suite-wide, k8s.env-less
+# $FORK_SANDBOX_CONFIG_DIR and never touches kubectl.
+k8s_probe_config_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status-k8scfg.XXXXXX)"
+k8s_probe_stub_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status-k8sstub.XXXXXX)"
+run_dirs+=("$k8s_probe_config_dir" "$k8s_probe_stub_dir")
+cat > "$k8s_probe_config_dir/k8s.env" <<'EOF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox
+EOF
+cat > "$k8s_probe_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" get pod -l job-name="*)
+        if [[ -n "${K8S_PROBE_STUB_POD_JSON:-}" ]]; then
+            printf '%s\n' "$K8S_PROBE_STUB_POD_JSON"
+        else
+            printf '{"items":[]}\n'
+        fi
+        ;;
+    *)
+        echo "k8s_orphan_probe test stub: unexpected kubectl call: $*" >&2
+        exit 1
+        ;;
+esac
+STUB
+chmod +x "$k8s_probe_stub_dir/kubectl"
+
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-orphaned
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$dead_pid
+EOF
+out="$(K8S_PROBE_STUB_POD_JSON='{"items":[{"status":{"phase":"Running"}}]}' \
+    FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_stub_dir:$PATH" \
+    "$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    orphaned"* ]] \
+    || { echo "a live pod behind a dead k8s driver was not read as orphaned: $out"; exit 1; }
+[[ "$out" == *"fork-sandbox adopt $rd_new"* ]] \
+    || { echo "orphaned status did not name the adopt remedy: $out"; exit 1; }
+json="$(K8S_PROBE_STUB_POD_JSON='{"items":[{"status":{"phase":"Running"}}]}' \
+    FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_stub_dir:$PATH" \
+    "$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "orphaned" ]] \
+    || { echo "json state wrong for an orphaned run: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r 'has("reason")')" == "false" ]] \
+    || { echo "an orphaned run's json carried a reason it should not: $json"; exit 1; }
+
+# --monitor-terminal ends at once on orphaned rather than waiting on a
+# summary that will never arrive -- nothing left running will ever write
+# one -- and names the same remedy.
+out="$(K8S_PROBE_STUB_POD_JSON='{"items":[{"status":{"phase":"Running"}}]}' \
+    FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_stub_dir:$PATH" \
+    timeout 10 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$out" == *"orphaned: the host-side k8s client is gone"* ]] \
+    || { echo "monitor-terminal did not report the orphaned run: $out"; exit 1; }
+[[ "$out" == *"fork-sandbox adopt $rd_new"* ]] \
+    || { echo "monitor-terminal's orphaned block did not name the adopt remedy: $out"; exit 1; }
+
+# 32. The same dead driver, but the probe finds the pod already exited:
+# state stays "failed" (unchanged from today, no exit-code was ever
+# written so there is nothing else this could be), and --json now adds a
+# reason distinguishing "nobody collected it" from an ordinary agent
+# failure. Succeeded and Failed are both unrecoverable the same way.
+for phase in Succeeded Failed; do
+    out="$(K8S_PROBE_STUB_POD_JSON="{\"items\":[{\"status\":{\"phase\":\"$phase\"}}]}" \
+        FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_stub_dir:$PATH" \
+        "$status" "$rd_new" 2>&1)"
+    [[ "$out" == "state:    abandoned"* ]] \
+        || { echo "an exited ($phase) pod behind a dead k8s driver was not abandoned: $out"; exit 1; }
+    json="$(K8S_PROBE_STUB_POD_JSON="{\"items\":[{\"status\":{\"phase\":\"$phase\"}}]}" \
+        FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_stub_dir:$PATH" \
+        "$status" --json "$rd_new")"
+    [[ "$(printf '%s' "$json" | jq -r .state)" == "failed" ]] \
+        || { echo "json state wrong for an exited ($phase) orphan: $json"; exit 1; }
+    [[ "$(printf '%s' "$json" | jq -r .reason)" == "the pod finished before anything collected it" ]] \
+        || { echo "json reason wrong for an exited ($phase) orphan: $json"; exit 1; }
+done
+
+# 33. The same dead driver, but no pod answers to this run's label at all
+# (already collected and removed, or never scheduled): also unrecoverable,
+# with its own, distinct reason text.
+json="$(K8S_PROBE_STUB_POD_JSON='{"items":[]}' \
+    FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_stub_dir:$PATH" \
+    "$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "failed" ]] \
+    || { echo "json state wrong for a gone orphan: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .reason)" == "the pod vanished before anything collected it" ]] \
+    || { echo "json reason wrong for a gone orphan: $json"; exit 1; }
+
+# 34. Cannot ask at all (no K8S_CONTEXT in this run's k8s.env): keep
+# today's answer rather than guess. This reuses the suite-wide,
+# k8s.env-less FORK_SANDBOX_CONFIG_DIR (no override here) -- the actual
+# reason kubectl is never reached is k8s_orphan_probe's own "no k8s.env"
+# early return (it checks that before it ever checks for kubectl on
+# PATH), not PATH itself, which this case leaves untouched. A hostile
+# kubectl stub, placed on PATH only for these two calls, proves the point
+# directly rather than by absence: it fails loudly if invoked at all.
+k8s_probe_hostile_stub_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status-k8shostile.XXXXXX)"
+run_dirs+=("$k8s_probe_hostile_stub_dir")
+cat > "$k8s_probe_hostile_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+echo "k8s_orphan_probe test stub: kubectl must not run when the cluster cannot be asked: $*" >&2
+exit 1
+STUB
+chmod +x "$k8s_probe_hostile_stub_dir/kubectl"
+out="$(PATH="$k8s_probe_hostile_stub_dir:$PATH" "$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    abandoned"* ]] \
+    || { echo "an unaskable cluster did not keep today's abandoned answer: $out"; exit 1; }
+json="$(PATH="$k8s_probe_hostile_stub_dir:$PATH" "$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "failed" ]] \
+    || { echo "json state wrong when the cluster cannot be asked: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r 'has("reason")')" == "false" ]] \
+    || { echo "an unaskable cluster's json guessed a reason: $json"; exit 1; }
+
+# 35. k8s_orphan_probe's single kubectl call is bounded: it must carry
+# --request-timeout, so a hung API server cannot turn one status call
+# into a hang. A stub that refuses any pod lookup missing the flag proves
+# it is actually there, not merely accepted if present.
+k8s_probe_timeout_stub_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status-k8stimeout.XXXXXX)"
+run_dirs+=("$k8s_probe_timeout_stub_dir")
+cat > "$k8s_probe_timeout_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" get pod -l job-name="*)
+        case " $* " in
+            *" --request-timeout="*) ;;
+            *) echo "k8s_orphan_probe test stub: no --request-timeout: $*" >&2; exit 1 ;;
+        esac
+        printf '{"items":[{"status":{"phase":"Running"}}]}\n'
+        ;;
+    *)
+        echo "k8s_orphan_probe test stub: unexpected kubectl call: $*" >&2
+        exit 1
+        ;;
+esac
+STUB
+chmod +x "$k8s_probe_timeout_stub_dir/kubectl"
+out="$(FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_timeout_stub_dir:$PATH" \
+    "$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    orphaned"* ]] \
+    || { echo "probe did not pass --request-timeout: $out"; exit 1; }
+
+
+# 36. A live driver whose pid this reader cannot see (another pid namespace
+# sharing the run dir's volume, e.g. an old consumer pod mid-rollout) holds
+# the run's .driver.lock: the run reads "running", never "orphaned", and
+# the cluster is never asked. Once the lock is released, the same run dir
+# reads "orphaned" again.
+k8s_lock_stub_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.status-k8slock.XXXXXX)"
+run_dirs+=("$k8s_lock_stub_dir")
+cat > "$k8s_lock_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+echo "driver-lock test stub: kubectl must not run while the driver lock is held: $*" >&2
+exit 1
+STUB
+chmod +x "$k8s_lock_stub_dir/kubectl"
+: > "$rd_new/.driver.lock"
+(
+    exec {lock_fd}>>"$rd_new/.driver.lock"
+    flock "$lock_fd"
+    exec sleep 30
+) &
+lock_holder=$!
+sleep 0.5
+json="$(FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_lock_stub_dir:$PATH" \
+    "$status" --json "$rd_new" 2>&1)"
+kill "$lock_holder" 2>/dev/null; wait "$lock_holder" 2>/dev/null || true
+[[ "$(printf '%s' "$json" | jq -r .state)" == "working" ]] \
+    || { echo "a held driver lock behind a dead pid did not read as working: $json"; exit 1; }
+out="$(K8S_PROBE_STUB_POD_JSON='{"items":[{"status":{"phase":"Running"}}]}' \
+    FORK_SANDBOX_CONFIG_DIR="$k8s_probe_config_dir" PATH="$k8s_probe_stub_dir:$PATH" \
+    "$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    orphaned"* ]] \
+    || { echo "a released driver lock did not fall back to the orphan probe: $out"; exit 1; }
+
+echo "112 passed, 0 failed"

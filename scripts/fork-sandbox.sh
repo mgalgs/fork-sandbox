@@ -8678,8 +8678,18 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     # process has no SIGTERM-reachable local work to tear down -- killing
     # it would abandon the pod in the cluster while reporting success.
     # run_state() instead treats this key as a liveness signal without
-    # ever handing it to a kill path.
-    [[ "$k8s_runner_mode" != true ]] || printf 'k8s_client_pid=%s\n' "$$"
+    # ever handing it to a kill path. k8s_client_pid_start pairs $$'s own
+    # fs_proc_start_time with it, taken here, before the exec below, so it
+    # is this process's start time, not the replaced image's -- exec keeps
+    # the same pid but not a new start time. Readers (fs_k8s_driver_alive)
+    # need this to tell a live driver from an unrelated process that later
+    # reuses the same pid number in a different pid namespace; see that
+    # function's own comment.
+    if [[ "$k8s_runner_mode" == true ]]; then
+        printf 'k8s_client_pid=%s\n' "$$"
+        k8s_client_pid_start="$(fs_proc_start_time "$$")"
+        [[ -n "$k8s_client_pid_start" ]] && printf 'k8s_client_pid_start=%s\n' "$k8s_client_pid_start"
+    fi
     printf 'model=%s\n' "$record_model"
     printf 'review_model=%s\n' "$review_model"
     printf 'review_harness=%s\n' "$review_harness"

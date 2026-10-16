@@ -573,6 +573,7 @@ What it cannot do yet, and why saying so matters: a flag this path cannot honor 
 - **`--pi-args` is refused by `fork-sandbox run --k8s` by name, but the capability exists**: `fork-sandbox-k8s.sh submit` and `run` both accept it and carry the extra arguments into the pod's pi invocation — use `fork-sandbox-k8s.sh` directly for it. **`--prompts-dir` is refused as not-yet-built**, not as permanently unsupported — it names a real capability the cluster path has not been wired up to carry yet.
 - **`--context-ro <dir>` IS built**: `--k8s` forwards it into the pod — `dir` must be under `/var/tmp/claude-scratch/forks/`, contain no symlinks or hard links, and is capped at 256 MiB. Unlike a local run's real `--bind-ro`, the pod has no way to bind a subdirectory of its emptyDir read-only: read-only there is by convention (the agent is told not to write there), not enforced by the filesystem.
 - **`--context-secret <name>` is `--k8s`-only**: the pod mounts that Kubernetes Secret read-only at `/work/context`, one file per key, for a credential the task needs. The Secret must carry the label `fork-sandbox/context=true` and must not carry `fork-sandbox/branch`. Names starting `fork-sandbox-` or ending `-claude-token` are refused. It cannot be combined with `--context-ro`, which uses the same path. The site creates and labels the Secret; see "Getting a Secret in" in `docs/kubernetes-runs.md`.
+- **If the host-side driver dies, re-adopt it rather than re-launching.** The process behind `fork-sandbox run --k8s` is the only thing waiting on the pod and collecting it when it finishes; if that process itself dies (a host restart, a closed terminal), `fork-sandbox status <run-dir>`/`--json` reports `orphaned` instead of `failed` for as long as the pod is still alive. `fork-sandbox adopt <run-dir>` picks the run back up from exactly where the dead driver left off — wait, collect, record, reap — rather than losing whatever the pod already did. It refuses while the original driver is still alive and is safe to call more than once (a no-op on a run that already finished). Do this soon: once the pod idles past `K8S_RUN_TTL` and exits, the state becomes an unrecoverable `failed` instead, and nothing can get the work back. See "Re-adopting a run whose host-side driver died" in `docs/kubernetes-runs.md`.
 
 ### Composed presets on the cluster
 
@@ -863,6 +864,9 @@ up there. Everything it printed is in the run directory.
   `fork-sandbox stop <run-dir>` closes this after the fact — it fetches the
   branch back and records the run's end, same as it does when you use it to
   abandon a run in the first place instead of killing the session by hand.
+- **`orphaned`.** A `--k8s`-only state: the host-side driver is gone, but the
+  pod is still alive. `fork-sandbox adopt <run-dir>` picks the run back up
+  from where the driver left off; see "Kubernetes runs" above.
 - **Non-zero exit.** `--log <run-dir>` carries the sandbox wrapper's own
   errors — an expired access token is the common one.
 - **An addendum was never acted on.** Check the count in the status block

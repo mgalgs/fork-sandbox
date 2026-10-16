@@ -106,6 +106,21 @@ run_case 'validate-services passes the file through' \
     validate-services .agents/sandbox-services/services.yaml
 run_case 'configure prepends configure' $'fork-sandbox.sh\nconfigure\n--dry-run' \
     configure --dry-run
+run_case 'adopt rewrites to k8s adopt --run-dir' \
+    $'fork-sandbox-k8s.sh\nadopt\n--run-dir\n/run/dir' \
+    adopt /run/dir
+# --help/-h right after the verb must reach cmd_adopt's own help text, not
+# get swallowed as --run-dir's value: a blind rewrite would otherwise turn
+# `fork-sandbox adopt --help` into a lookup for a run directory literally
+# named "--help". The no-argument case (`adopt` alone, which still rewrites
+# to `adopt --run-dir` with nothing after it) is cmd_adopt's own problem to
+# report cleanly, not the dispatcher's -- covered in fork-sandbox-k8s-test.sh.
+run_case 'adopt --help passes through as --help, not a run-dir value' \
+    $'fork-sandbox-k8s.sh\nadopt\n--help' \
+    adopt --help
+run_case 'adopt -h passes through as --help too' \
+    $'fork-sandbox-k8s.sh\nadopt\n--help' \
+    adopt -h
 run_case 'mail passes arguments' $'fork-sandbox-mail.sh\nlist' mail list
 run_case 'mail-api passes arguments' \
     $'fork-sandbox-mail-api.py\nserve\n--tokens\nt' mail-api serve --tokens t
@@ -117,7 +132,7 @@ run_case 'help after verb reaches target' $'fork-sandbox.sh\n--help' run --help
 
 help="$("$tmp"/fork-sandbox --help)"
 if [[ "$help" == *'run'* && "$help" == *'status'* && "$help" == *'say'* &&
-    "$help" == *'stop'* &&
+    "$help" == *'stop'* && "$help" == *'adopt'* &&
     "$help" == *'configure'* && "$help" == *'k8s'* && "$help" == *'log'* &&
     "$help" == *'validate-services'* && "$help" == *'mail'* && "$help" == *'fleet'* &&
     "$help" == *'postmaster'* &&
@@ -153,7 +168,7 @@ if grep -Fq "unknown verb 'frobnicate'" "$tmp/unknown-err"; then
 else
     no 'unknown verb names offender' "$(cat "$tmp/unknown-err")"
 fi
-if grep -qF 'Verbs: run status say stop configure k8s log validate-services mail mail-api mail-forward fleet postmaster' \
+if grep -qF 'Verbs: run status say stop adopt configure k8s log validate-services mail mail-api mail-forward fleet postmaster' \
         "$tmp/unknown-err"; then
     ok 'unknown verb lists every verb'
 else

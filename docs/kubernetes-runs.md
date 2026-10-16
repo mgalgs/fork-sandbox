@@ -768,6 +768,169 @@ later attaches a verdict to (`sandbox-run-log.py verdict <run-id>`), and
 it is what `collect`'s own `record` call reads. It is removed by the
 orchestrator after review, exactly like a local run's own run directory.
 
+## Re-adopting a run whose host-side driver died
+
+`fork-sandbox run --k8s ...` is one host process start to finish: it
+`exec`s into `fork-sandbox-k8s.sh run`, which is `submit`, then `wait`,
+then `collect` -- the same single process throughout (see "The durable
+run log" above for how `k8s_client_pid` records it). If that process dies
+mid-run -- the machine or container hosting it restarts, the operator's
+terminal closes, a consumer's own pod gets rolled -- the agent pod keeps
+working, but nothing is left waiting on it or watching for it to finish.
+Left alone, the pod idles out its `K8S_RUN_TTL` and exits, and whatever it
+produced is gone: nobody ever reads the sentinel at `/work/.run-complete`,
+pulls the evidence or the outbox back, or fetches the branch.
+
+A real consumer hits this: an app that runs notes as `--k8s` runs from
+inside its own pod, keeping each run's directory on a persistent volume
+and polling `fork-sandbox-status.sh --json` for it. Rolling out a new
+image for that app kills the driver of whatever run was in flight. Before
+the change described here, `status` read that run as `abandoned` --
+mapped to `state: "failed"` in `--json` -- indistinguishable from the
+agent itself having failed, while the pod worked on for up to
+`K8S_RUN_TTL` more minutes with nobody coming to collect it.
+
+**`orphaned`: a new state for exactly this gap.** When a `--k8s` run's
+driver is dead (`k8s_client_pid` in `run.env`, paired with
+`k8s_client_pid_start`, fails `fs_k8s_driver_alive` -- see `adopt`'s own
+"refuses while the run's own recorded driver is still alive" below for why
+a bare pid check is not enough) and no process holds its `.driver.lock`,
+no exit code was ever recorded, and the
+run's submit already finished pushing its inputs
+(so this is not the separate, pre-existing "the submitter died before the
+pod got its inputs" case -- see "The durable run log" above),
+`fork-sandbox-status.sh` now asks the cluster, once, bounded: a single
+`kubectl get pod` carrying `--request-timeout`, read-only, never writing
+or executing anything it gets back. If the pod still exists and has not
+exited, both plain `status` and `--json` report `orphaned` instead of
+`abandoned`/`failed`. If the cluster cannot be asked at all -- no
+`k8s.env`, no `K8S_CONTEXT` in it, no `kubectl` on `PATH`, or the call
+itself fails -- this keeps today's answer (`abandoned`) rather than guess
+either way. An ordinary run, whose driver is alive, never reaches this
+probe at all, so it costs nothing for the common case.
+
+**`failed`, with a reason, when there is truly nothing left.** When the
+same dead-driver probe instead finds the pod has already exited
+(`Succeeded` or `Failed`) or is gone outright (no pod answers to this
+run's label), the state stays `failed` -- unchanged, and correctly so:
+the pod held the only copy of the run's clone, so once it is gone there
+is nothing to re-adopt, the same "impossible" case the top of this
+project's own design already calls out. What is new is that `--json` now
+adds a `reason` key (`"the pod finished before anything collected it"` or
+`"the pod vanished before anything collected it"`) so a polling consumer
+can tell that apart from an ordinary agent failure -- "the agent failed"
+from "nobody collected it" -- without guessing from the absence of a
+`summary.json` alone.
+
+**`fork-sandbox adopt <run-dir>`** does, from an orphaned run's directory,
+exactly what the dead driver would have done from that point on: wait for
+the agent, collect (evidence, outbox, the branch fetch, and session state
+for a `--resume-session` run -- `cmd_collect`'s own pull-backs, unchanged),
+record the exit code, `summary.json` and the run-log line, and reap. It
+lives in `fork-sandbox-k8s.sh` (`adopt --run-dir DIR`) and is also reachable
+through the short, positional top-level form `fork-sandbox adopt <run-dir>`.
+It is deliberately a thin wrapper around the pre-existing `resume` verb
+(the one a restarted cluster postmaster's own wake wrapper already calls to
+adopt a wake it inherited -- see "The push-complete marker" in "The durable
+run log" above, and `fork-sandbox-k8s-wake.sh --adopt`): past its own
+checks, `adopt` *is* `resume`, so it reuses every setting `resume` already
+reads back from `DIR/run.env` rather than asking the caller to repeat them,
+and it works for a single-leg run and a composed (`--pipeline`/`--preset`)
+run alike for the same reason `resume` already does -- `cmd_wait` and
+`cmd_collect` read the run directory's own `RUNNER` marker, not anything
+`adopt` or `resume` branches on.
+
+What `adopt` adds on top of `resume`, so a caller can call it blindly on
+every in-flight run it knows about, on every startup, with no
+per-run-shape knowledge of its own:
+
+- **Refuses outright on a run that is not `--k8s` at all** (no
+  `network=cluster` in `run.env`) -- there is no pod to re-adopt.
+- **Is a no-op, exit 0, on a run whose directory already answers for
+  itself** (`DIR/exit-code` exists -- some earlier `wait` or `collect`
+  already reached a terminal outcome, adopted or not). Calling `adopt`
+  again on a run already collected must never re-run `collect` against a
+  pod that collect itself already reaped.
+- **Takes the run's driver lock first, and refuses, exit 1, while another
+  process holds it.** Every driver -- `run`, `resume` and `adopt` -- holds
+  an exclusive `flock` on `DIR/.driver.lock` for its whole life; `run`
+  takes it just before it marks the push complete. `adopt` takes the same
+  lock (waiting up to 5 seconds) before any of the checks below, so each of
+  them is read under it, and a driver that finishes while `adopt` waits
+  leaves `adopt` a no-op. This, not the pid, is what keeps two drivers off
+  one run when they live in different pid namespaces that share the run
+  directory's volume: during a Deployment rollout the old and new pods
+  overlap, and the old pod's still-live driver has a pid the new pod cannot
+  see. Two concurrent `adopt` calls collide on the same lock. The lock is
+  released the moment its holder exits, on any path. A filesystem that
+  cannot `flock` makes `adopt` refuse (a second driver cannot be ruled
+  out), while `run` and `resume` warn and carry on, guarded by the pid
+  alone. `status` probes the same lock, read-only: a held lock reads as
+  `running`, never `orphaned`.
+- **Refuses, exit 1, while a submit for this run is still pushing its
+  inputs** (`run.env` has `INPUTS_PUSH_EXPECTED=true` but not yet
+  `INPUTS_PUSH_COMPLETE=true`). That window can have no driver pid or lock
+  recorded yet, and `resume`'s own push-incomplete cleanup would delete the
+  live submit's cluster objects. `status` calls this run `starting`, not
+  `orphaned`, for the same reason.
+- **Refuses, exit 1, while the run's own recorded driver is still
+  alive** (`k8s_client_pid`, paired with `k8s_client_pid_start` and read
+  the same way `status`'s own `run_state()` does) -- *never two drivers on
+  one run*. Two processes racing `wait`/`collect` against the same pod is
+  exactly the hazard this rules out. The pid alone is not enough to decide
+  that: `adopt` can run in a different pid namespace from the one that
+  recorded `k8s_client_pid` (a consumer that runs its `--k8s` driver from
+  inside its own pod, calling `adopt` again from a FRESH pod after a
+  rollout, whose pid namespace resets and hands out small numbers its own
+  threaded server occupies by the dozen). A stale, recorded pid can then
+  land on a live, unrelated process, and a bare "is this pid alive" check
+  would read that collision as "the driver is still alive" forever --
+  refusing `adopt` on every call until the pod idles out its `K8S_RUN_TTL`,
+  losing exactly the work this verb exists to save. `k8s_client_pid_start`
+  -- the pid's own start time (`/proc/<pid>/stat`'s `starttime`, or `ps -o
+  lstart` where that is unavailable), recorded alongside it by the same
+  writer -- closes this: a colliding pid in a new namespace was started at
+  a different, unrelated time, so requiring both to match reads it as dead
+  instead. A run.env written before this field existed has no start time to
+  compare and falls back to the bare pid check alone.
+- **Exits non-zero on an unrecoverable run**, with the same reason
+  `status --json` now reports (above), and touches the durable run log
+  not at all. `resume`'s own `cmd_wait` does tell a gone or
+  already-exited pod apart from a live one and exits non-zero on either
+  -- but with its own wording, not this reason, and only after re-running
+  the cluster wait and appending another `run_end` row to the log, every
+  time. Neither is acceptable for the "call `adopt` on every startup for
+  every in-flight run it knows" consumer this verb exists for, so `adopt`
+  runs this same bounded, read-only probe itself, before it ever reaches
+  `resume`: on an unrecoverable run it reports the reason and stops;
+  on a live pod it falls through into `resume` exactly as before.
+
+**The timing caveat.** Adoption is possible only while the pod is still
+alive -- `K8S_RUN_TTL` keeps ticking the whole time nobody is watching, and
+once it idles out, the container exits and `kubectl exec` can no longer
+reach it, the same unrecoverable state a too-late `wait`/`fetch`/`collect`
+already hits (see "Getting the work back without a credential" above).
+Call `adopt` again soon after whatever restarted the driver, not whenever
+it is next convenient; `status`'s own `orphaned` state exists specifically
+so a caller polling it knows there is still something worth adopting,
+before that window closes.
+
+**`--monitor-terminal` on an orphaned run is terminal, not a wait.**
+Nothing a monitor is watching will ever turn an orphaned run into `done`
+or `failed` on its own: the driver that would have called `wait` and
+`collect` is gone for good, and only `adopt` -- called from wherever still
+has cluster access, which may not be the machine running the monitor --
+can ever finish it. Looping here would be waiting on nothing, forever,
+which is exactly the silent-hang `--monitor-terminal` exists to avoid on
+every other terminal state; `orphaned` ends the watch at once instead, with
+a line naming the `adopt` command to run.
+
+What this does not do, by design: it does not make the driver itself
+survive a restart (a daemon, a controller, an in-cluster collector would
+be the way to do that, and none is built here), and it cannot recover a
+run whose pod has already exited -- the clone that held the work lived
+only in that pod, and nothing outside it ever had a copy.
+
 ## Getting the repository in: by push, not by clone
 
 **This is the biggest change from the original design, and it replaces two

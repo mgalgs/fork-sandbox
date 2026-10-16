@@ -5000,3 +5000,127 @@ fs_apply_upstream() {
     fi
     return 0
 }
+
+# A hex sha256 of stdin, for the proxy config-change annotation
+# (fork-sandbox-k8s.sh) and the pod-name digest below. sha256sum and
+# openssl are not both guaranteed on every machine this might run on
+# (sha256sum is missing without GNU coreutils, openssl is missing on a
+# minimal install) -- try the GNU tool, then two portable fallbacks,
+# before giving up.
+k8s_sha256_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 | sed 's/^.* //'
+    else
+        echo "Error: none of sha256sum, shasum or openssl found. One is" >&2
+        echo "needed to hash the proxy ConfigMap's content, so a config" >&2
+        echo "change can roll the proxy Deployment -- see" >&2
+        echo "docs/kubernetes-runs.md." >&2
+        return 1
+    fi
+}
+
+# The sanitising half of k8s_safe_name below, factored out so a filesystem
+# path (which has no 63-char Kubernetes object-name limit) can reuse it
+# without the truncation that would otherwise chop it.
+k8s_safe_name_component() {
+    local branch="$1" safe
+    safe="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
+    safe="${safe##-}"
+    safe="${safe%%-}"
+    printf '%s' "$safe"
+}
+
+# A Kubernetes object name: lowercase RFC 1123, <=63 chars. Branch names are
+# freeform, so this derives a safe name rather than requiring the caller to
+# pick one that already qualifies. Capped at 50, not 63: this name is also
+# used as the base of the per-run claude-proxy Service, with a
+# "-claude-proxy" suffix appended (13 chars), and a Service name is itself
+# capped at 63 -- so the base must leave room for that suffix or a long
+# branch renders a Service name the API server rejects, aborting submit
+# after the Secret, ConfigMap and Pod for that run already exist.
+# A normalized branch gets a digest too, even when it fits: otherwise refs
+# such as feature/foo and feature-foo (or Feature/foo and feature-foo) share
+# one set of Kubernetes objects.
+k8s_safe_name() {
+    local prefix="$1" branch="$2" component candidate digest base
+    component="$(k8s_safe_name_component "$branch")"
+    candidate="$prefix-$component"
+    if [[ "$component" == "$branch" ]] && (( ${#candidate} <= 50 )); then
+        printf '%s' "$candidate"
+        return
+    fi
+    digest="$(printf '%s' "$branch" | k8s_sha256_stdin | cut -c1-8)"
+    base="${candidate:0:41}"
+    base="${base%-}"
+    printf '%s-%s' "$base" "$digest"
+}
+
+# The object-name derivation used before k8s_safe_name added digests. Keep it
+# for management commands so runs submitted by that version remain fetchable,
+# sayable, and removable after this script is updated. Submit must continue to
+# use k8s_safe_name: unlike this legacy form, it distinguishes names that
+# sanitize to the same component.
+k8s_legacy_safe_name() {
+    local prefix="$1" branch="$2"
+    printf '%s-%s' "$prefix" "$(k8s_safe_name_component "$branch")" \
+        | cut -c1-50 | sed 's/-$//'
+}
+
+# `kill -0` alone cannot tell a running process from a zombie one: POSIX
+# leaves a zombie's pid allocated, not yet reaped by its parent, precisely
+# so its exit status stays collectible -- so signal 0 against it still
+# succeeds. fork-sandbox-status.sh's --resume contract rules that answer out
+# explicitly: polling must not depend on a watched pid being alive in the
+# zombie sense, because the parent that would reap it may not. On Linux,
+# /proc/<pid>/stat's third field is the single-letter process state, and 'Z'
+# names exactly this case; comm (field 2) is parenthesized and can itself
+# contain ") ", so the split anchors on the LAST ") " the same way
+# fs_proc_start_time's own /proc/<pid>/stat read does. Without /proc (no
+# Linux procfs), this can only fall back to kill -0's own answer. Shared by
+# fork-sandbox-status.sh's run_state()/run_finalizer_alive() and
+# fork-sandbox-k8s.sh's adopt (never two drivers on one run).
+fs_status_pid_alive() {
+    local pid="$1" stat_line rest state
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [[ -r "/proc/$pid/stat" ]] && stat_line="$(cat -- "/proc/$pid/stat" 2>/dev/null)" \
+        && [[ -n "$stat_line" ]]; then
+        rest="${stat_line##*) }"
+        state="${rest%% *}"
+        [[ "$state" == "Z" ]] && return 1
+    fi
+    return 0
+}
+
+# Whether $1, a --k8s run's recorded driver pid, still names the SAME
+# process that recorded it, given $2, the k8s_client_pid_start recorded
+# beside it (fs_proc_start_time's own output at record time; empty for a
+# run.env written before that key existed). fs_status_pid_alive alone
+# answers "is pid $1 alive" in the CALLER's own pid namespace, which is not
+# always the one that recorded it: the one deployment this check exists for
+# is a consumer that runs --k8s drivers from inside its own pod and re-execs
+# this check from a FRESH pod after a rollout, with a fresh pid namespace
+# that hands out small numbers its own threaded server occupies by the
+# dozen. A stale low pid then lands on a live, unrelated process, and a bare
+# "is $1 alive" reads that collision as "the driver is still alive" --
+# exactly backwards. Requiring the start time to match too (the same
+# wraps-around hazard fs_tidy_leg_live_pgid's own comment names, and the
+# same fix: fs_proc_start_time, not a flock, because the driver that would
+# hold one is gone) closes that: a colliding pid in a new namespace started
+# at a different, unrelated time, so the comparison reads it as dead. A run
+# with no recorded start (an old run.env, or the rare write that could not
+# read one back) falls back to the bare pid check alone -- there is nothing
+# to compare against, and a false "dead" here is worse than the collision
+# this guards against, for a run that predates this field.
+fs_k8s_driver_alive() {
+    local pid="$1" recorded_start="${2-}" now_start
+    [[ -n "$pid" ]] && fs_status_pid_alive "$pid" || return 1
+    if [[ -n "$recorded_start" ]]; then
+        now_start="$(fs_proc_start_time "$pid")"
+        [[ -n "$now_start" && "$now_start" == "$recorded_start" ]] || return 1
+    fi
+    return 0
+}

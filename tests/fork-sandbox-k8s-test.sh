@@ -7509,7 +7509,12 @@ case " $* " in
         # submit had spooled before this call) already exists.
         exit "${K8S_STUB_APPLY_RC:-0}" ;;
     *" wait "*) exit 0 ;;
-    *" get pod -l job-name="*) printf 'stub-pod\n' ;;
+    *" get pod -l job-name="*)
+        # Overridable so a test can simulate adopt's own unrecoverable-run
+        # probe (k8s_adopt_unrecoverable_reason) finding no pod at all --
+        # the "gone" case, distinct from the Succeeded/Failed "exited"
+        # case K8S_STUB_POD_PHASE below covers.
+        [[ "${K8S_STUB_POD_MISSING:-}" == 1 ]] || printf 'stub-pod\n' ;;
     *" -o jsonpath={.status.phase} "*)
         # cmd_wait's per-poll liveness check. Defaults to Running (never
         # Failed/Succeeded, so the poll loop falls through to the sentinel
@@ -8085,6 +8090,350 @@ else
     no "submit records a relative --outbox-dir absolute, resolved against its own cwd" \
         "rc=$rc run.env=$(cat "$resume_reldir_rd/run.env" 2>/dev/null)"
 fi
+
+# 1e. `adopt`: re-adopt a run whose own host-side driver died. A thin
+# wrapper around resume (above) adding four checks of its own: not-k8s is
+# refused outright, an already-finished run is a no-op, a live driver is
+# refused, and a lock rules out two concurrent adopt calls. Composed
+# (RUNNER=1) support falls out of the same code with no change, for the
+# same reason resume's own RUNNER=1 pull-back is not re-tested under
+# `resume` either (see the comment on that, below, under "uncommitted.patch
+# applies cleanly"): adopt calls cmd_resume verbatim once its own checks
+# clear, which calls k8s_run_tail, which always calls cmd_collect with the
+# SAME --run-dir regardless of which verb reached it.
+#
+# A guaranteed-dead pid for "the driver is gone": spawned, never reaped, so
+# fs_status_pid_alive's zombie check (not a bare kill -0, which a zombie
+# still answers) is what has to call it dead -- the same check both
+# fork-sandbox-status.sh's run_state() and cmd_adopt itself use.
+sleep 0.2 & adopt_dead_pid=$!
+sleep 0.3
+
+# -h/--help must print usage and exit 0 -- not be read as a run directory.
+# The front-end dispatcher (fork-sandbox) rewrites `adopt --help` to this
+# exact `adopt --help` form (see fork-sandbox-dispatcher-test.sh); it is
+# cmd_adopt's own job to then recognize it instead of handing it to
+# --run-dir as a value.
+adopt_help_out="$(newdir)/adopt-help.out"; tmpdirs+=("$(dirname "$adopt_help_out")")
+rc=0
+runstub_verb "$(newdir)/kubectl.log" "$adopt_help_out" adopt --help || rc=$?
+if (( rc == 0 )) && grep -q '^Usage: fork-sandbox adopt <run-dir>' "$adopt_help_out"; then
+    ok "adopt --help prints usage and exits 0"
+else
+    no "adopt --help prints usage and exits 0" "rc=$rc out=$(cat "$adopt_help_out")"
+fi
+
+# A missing --run-dir value (what the dispatcher's own no-argument rewrite
+# produces: `adopt --run-dir` with nothing after it) must report cleanly,
+# not crash on a raw bash parameter-expansion error.
+adopt_missing_out="$(newdir)/adopt-missing.out"; tmpdirs+=("$(dirname "$adopt_missing_out")")
+rc=0
+runstub_verb "$(newdir)/kubectl.log" "$adopt_missing_out" adopt --run-dir || rc=$?
+if (( rc == 1 )) && grep -qF 'Error: --run-dir requires a directory.' "$adopt_missing_out" \
+    && ! grep -q 'line [0-9]*:' "$adopt_missing_out"; then
+    ok "adopt with a missing --run-dir value reports cleanly instead of a raw bash error"
+else
+    no "adopt with a missing --run-dir value reports cleanly instead of a raw bash error" \
+        "rc=$rc out=$(cat "$adopt_missing_out")"
+fi
+
+adopt_rd_nk8s="$(newdir)"; tmpdirs+=("$adopt_rd_nk8s")
+cat > "$adopt_rd_nk8s/run.env" <<'EOF'
+version=1
+network=local
+EOF
+rc=0
+runstub_verb "$(newdir)/kubectl.log" "$adopt_rd_nk8s/adopt.out" adopt --run-dir "$adopt_rd_nk8s" || rc=$?
+if (( rc == 1 )) && grep -q 'is not a --k8s run' "$adopt_rd_nk8s/adopt.out"; then
+    ok "adopt refuses a run.env that is not network=cluster"
+else
+    no "adopt refuses a run.env that is not network=cluster" \
+        "rc=$rc out=$(cat "$adopt_rd_nk8s/adopt.out")"
+fi
+
+# resume_rd_a (above) already finished -- its exit-code is on disk from the
+# "resume on a completed run collects" case. adopt on it a second time
+# must do nothing: no wait, no collect, no cluster object touched at all.
+adopt_noop_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_noop_log")")
+rc=0
+runstub_verb "$adopt_noop_log" "$resume_rd_a/adopt.out" adopt --run-dir "$resume_rd_a" || rc=$?
+if (( rc == 0 )) && grep -q 'already finished' "$resume_rd_a/adopt.out" && [[ ! -s "$adopt_noop_log" ]]; then
+    ok "adopt is a no-op, exit 0, on a run DIR/exit-code already answers for, touching no cluster object"
+else
+    no "adopt is a no-op, exit 0, on a run DIR/exit-code already answers for, touching no cluster object" \
+        "rc=$rc out=$(cat "$resume_rd_a/adopt.out") log=$(cat "$adopt_noop_log")"
+fi
+
+# Never two drivers: a live k8s_client_pid (this very test process, very
+# much alive for the duration of this check) refuses adopt outright,
+# before it ever asks the cluster anything.
+adopt_rd_alive="$(resume_submit fs-k8s-test-adopt-alive)"
+printf 'k8s_client_pid=%s\n' "$$" >> "$adopt_rd_alive/run.env"
+adopt_log_alive="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_alive")")
+rc=0
+runstub_verb "$adopt_log_alive" "$adopt_rd_alive/adopt.out" adopt --run-dir "$adopt_rd_alive" || rc=$?
+if (( rc == 1 )) && grep -q "driver (pid $$) is still alive" "$adopt_rd_alive/adopt.out" \
+    && [[ ! -s "$adopt_log_alive" ]]; then
+    ok "adopt refuses while the run's recorded driver is still alive, touching no cluster object"
+else
+    no "adopt refuses while the run's recorded driver is still alive, touching no cluster object" \
+        "rc=$rc out=$(cat "$adopt_rd_alive/adopt.out") log=$(cat "$adopt_log_alive")"
+fi
+
+# The same live pid, but PAIRED with its own, correctly-recorded start
+# time (k8s_record_client_pid's own writer, exercised directly via
+# fs_proc_start_time rather than a real submit): still reads "alive" and
+# still refuses. This is the ordinary, non-colliding case the pid+start
+# pairing must not break.
+adopt_rd_alive_start="$(resume_submit fs-k8s-test-adopt-alive-start)"
+printf 'k8s_client_pid=%s\n' "$$" >> "$adopt_rd_alive_start/run.env"
+printf 'k8s_client_pid_start=%s\n' "$(fs_proc_start_time "$$")" >> "$adopt_rd_alive_start/run.env"
+adopt_log_alive_start="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_alive_start")")
+rc=0
+runstub_verb "$adopt_log_alive_start" "$adopt_rd_alive_start/adopt.out" \
+    adopt --run-dir "$adopt_rd_alive_start" || rc=$?
+if (( rc == 1 )) && grep -q "driver (pid $$) is still alive" "$adopt_rd_alive_start/adopt.out" \
+    && [[ ! -s "$adopt_log_alive_start" ]]; then
+    ok "adopt refuses while the run's recorded driver is alive with a matching start time"
+else
+    no "adopt refuses while the run's recorded driver is alive with a matching start time" \
+        "rc=$rc out=$(cat "$adopt_rd_alive_start/adopt.out") log=$(cat "$adopt_log_alive_start")"
+fi
+
+# A live pid whose recorded start time does NOT match: the pid-collision
+# case this pairing exists to catch -- a consumer that runs its --k8s
+# driver from inside its own pod, re-reading run.env from a FRESH pod
+# after a rollout whose pid namespace reused this test's own pid for an
+# unrelated, still-running process. Without the start-time check, this
+# would read "driver (pid $$) is still alive" forever, exactly the "adopt
+# refuses on every startup until the pod idles out its TTL, losing the
+# work this verb exists to save" failure mode. With it, the mismatched
+# start time means the recorded driver reads as gone, and adopt falls
+# through to the ordinary dead-driver path -- reaching the lock and the
+# unrecoverable-run probe below, not the "still alive" refusal.
+adopt_rd_collide="$(resume_submit fs-k8s-test-adopt-pid-collide)"
+printf 'k8s_client_pid=%s\n' "$$" >> "$adopt_rd_collide/run.env"
+printf 'k8s_client_pid_start=not-a-real-start-time\n' >> "$adopt_rd_collide/run.env"
+adopt_log_collide="$(newdir)/kubectl.log"; adopt_out_collide="$(dirname "$adopt_log_collide")/out.txt"
+tmpdirs+=("$(dirname "$adopt_log_collide")")
+rc=0
+K8S_STUB_POD_MISSING=1 runstub_verb "$adopt_log_collide" "$adopt_out_collide" \
+    adopt --run-dir "$adopt_rd_collide" || rc=$?
+if (( rc != 0 )) && ! grep -q 'is still alive' "$adopt_out_collide" \
+    && grep -q 'the pod vanished before anything collected it' "$adopt_out_collide"; then
+    ok "adopt treats a live pid with a mismatched start time as the driver being gone, not alive"
+else
+    no "adopt treats a live pid with a mismatched start time as the driver being gone, not alive" \
+        "rc=$rc out=$(cat "$adopt_out_collide")"
+fi
+
+# Never two drivers, across pid namespaces too: every run, resume and adopt
+# holds DIR/.driver.lock for its whole life, so a driver whose pid this
+# reader cannot see (an old consumer pod still running during a rollout)
+# still blocks adopt. Here the holder stands in for that driver, with a dead
+# pid recorded. adopt waits K8S_DRIVER_LOCK_WAIT (5 s), then refuses
+# without touching the cluster. Concurrent adopts collide on the same lock.
+adopt_rd_lock="$(resume_submit fs-k8s-test-adopt-lock)"
+printf 'k8s_client_pid=%s\n' "$adopt_dead_pid" >> "$adopt_rd_lock/run.env"
+(
+    exec {adopt_lock_fd}>>"$adopt_rd_lock/.driver.lock"
+    flock "$adopt_lock_fd"
+    exec sleep 30
+) &
+adopt_lock_holder=$!
+sleep 0.5
+adopt_log_lock="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_lock")")
+rc=0
+runstub_verb "$adopt_log_lock" "$adopt_rd_lock/adopt.out" adopt --run-dir "$adopt_rd_lock" || rc=$?
+if (( rc == 1 )) && grep -q 'another driver (the original run, a resume or' "$adopt_rd_lock/adopt.out" \
+    && [[ ! -s "$adopt_log_lock" ]]; then
+    ok "adopt refuses while another process holds the run's driver lock, touching no cluster object"
+else
+    no "adopt refuses while another process holds the run's driver lock, touching no cluster object" \
+        "rc=$rc out=$(cat "$adopt_rd_lock/adopt.out") log=$(cat "$adopt_log_lock")"
+fi
+# resume takes the same lock before it drives anything.
+adopt_log_lock_r="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_lock_r")")
+rc=0
+runstub_verb "$adopt_log_lock_r" "$adopt_rd_lock/resume.out" resume --run-dir "$adopt_rd_lock" || rc=$?
+kill "$adopt_lock_holder" 2>/dev/null; wait "$adopt_lock_holder" 2>/dev/null
+if (( rc == 1 )) && grep -q 'refusing to drive the same run twice' "$adopt_rd_lock/resume.out" \
+    && [[ ! -s "$adopt_log_lock_r" ]]; then
+    ok "resume refuses while another process holds the run's driver lock, touching no cluster object"
+else
+    no "resume refuses while another process holds the run's driver lock, touching no cluster object" \
+        "rc=$rc out=$(cat "$adopt_rd_lock/resume.out") log=$(cat "$adopt_log_lock_r")"
+fi
+# The refusal must not be mistaken for the lock itself being gone: once the
+# holder above is killed, the exact same run dir adopts cleanly.
+adopt_log_lock2="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_lock2")")
+rc=0
+K8S_STUB_RUN_COMPLETE_VALUE=0 K8S_STUB_OUTBOX_RC=0 \
+    runstub_verb "$adopt_log_lock2" "$adopt_rd_lock/adopt2.out" adopt --run-dir "$adopt_rd_lock" || rc=$?
+if (( rc == 0 )) && grep -q 'run complete. branch=fs-k8s-test-adopt-lock agent_exit=0' "$adopt_rd_lock/adopt2.out"; then
+    ok "adopt proceeds once an earlier lock holder is gone"
+else
+    no "adopt proceeds once an earlier lock holder is gone" "rc=$rc out=$(cat "$adopt_rd_lock/adopt2.out")"
+fi
+
+# Every check is read under the lock: a driver that finishes (writes
+# exit-code) while adopt waits for its lock leaves adopt a no-op, not a
+# second collect of an already-reaped run.
+adopt_rd_race="$(resume_submit fs-k8s-test-adopt-race)"
+printf 'k8s_client_pid=%s\n' "$adopt_dead_pid" >> "$adopt_rd_race/run.env"
+(
+    exec {adopt_race_fd}>>"$adopt_rd_race/.driver.lock"
+    flock "$adopt_race_fd"
+    sleep 1.5
+    printf '0\n' > "$adopt_rd_race/exit-code"
+) &
+adopt_race_holder=$!
+sleep 0.5
+adopt_log_race="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_race")")
+rc=0
+runstub_verb "$adopt_log_race" "$adopt_rd_race/adopt.out" adopt --run-dir "$adopt_rd_race" || rc=$?
+wait "$adopt_race_holder" 2>/dev/null
+if (( rc == 0 )) && grep -q 'already finished' "$adopt_rd_race/adopt.out" \
+    && [[ ! -s "$adopt_log_race" ]]; then
+    ok "adopt re-reads exit-code under the driver lock, so a driver finishing meanwhile leaves it a no-op"
+else
+    no "adopt re-reads exit-code under the driver lock, so a driver finishing meanwhile leaves it a no-op" \
+        "rc=$rc out=$(cat "$adopt_rd_race/adopt.out") log=$(cat "$adopt_log_race")"
+fi
+
+# run records its driver (pid, and the lock) before it marks the push
+# complete, so status never sees a pushed run with no driver -- which it
+# would read as orphaned, and adopt would take over. A bare submit records
+# none: it has no wait or collect to follow.
+adopt_log_order="$(newdir)/kubectl.log"; adopt_out_order="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$adopt_log_order")" "$(dirname "$adopt_out_order")")
+rc=0
+K8S_STUB_RUN_COMPLETE_VALUE=0 K8S_STUB_OUTBOX_RC=0 \
+    runstub_run "$adopt_log_order" "$adopt_out_order" \
+    --branch fs-k8s-test-run-driver-order --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || rc=$?
+adopt_rd_order="$(sed -n 's/^  run dir:  *//p' "$adopt_out_order" | head -1)"
+adopt_pid_line="$(grep -n '^k8s_client_pid=' "$adopt_rd_order/run.env" 2>/dev/null | cut -d: -f1)"
+adopt_push_line="$(grep -n '^INPUTS_PUSH_COMPLETE=true' "$adopt_rd_order/run.env" 2>/dev/null | cut -d: -f1)"
+if (( rc == 0 )) && [[ -n "$adopt_pid_line" && -n "$adopt_push_line" ]] \
+    && (( adopt_pid_line < adopt_push_line )) && [[ -f "$adopt_rd_order/.driver.lock" ]]; then
+    ok "run records its driver pid and lock before INPUTS_PUSH_COMPLETE"
+else
+    no "run records its driver pid and lock before INPUTS_PUSH_COMPLETE" \
+        "rc=$rc pid_line=$adopt_pid_line push_line=$adopt_push_line env=$(cat "$adopt_rd_order/run.env" 2>/dev/null)"
+fi
+adopt_rd_bare="$(resume_submit fs-k8s-test-bare-submit-no-driver)"
+if ! grep -q '^k8s_client_pid=' "$adopt_rd_bare/run.env" && [[ ! -e "$adopt_rd_bare/.driver.lock" ]]; then
+    ok "a bare submit records no driver"
+else
+    no "a bare submit records no driver" "$(cat "$adopt_rd_bare/run.env")"
+fi
+
+# The ordinary path: driver confirmed dead, adopt re-attaches exactly as
+# resume does (same wait, collect, run-log row), and records ITSELF as
+# this run's driver going forward -- the stale dead pid is gone from
+# run.env, replaced with a single, fresh k8s_client_pid line.
+adopt_rd_ok="$(resume_submit fs-k8s-test-adopt-ok --timeout 900)"
+printf 'k8s_client_pid=%s\n' "$adopt_dead_pid" >> "$adopt_rd_ok/run.env"
+adopt_log_ok="$(newdir)/kubectl.log"; adopt_out_ok="$(dirname "$adopt_log_ok")/out.txt"
+tmpdirs+=("$(dirname "$adopt_log_ok")")
+rc=0
+K8S_STUB_RUN_COMPLETE_VALUE=0 K8S_STUB_OUTBOX_RC=0 \
+    runstub_verb "$adopt_log_ok" "$adopt_out_ok" adopt --run-dir "$adopt_rd_ok" || rc=$?
+adopt_pid_lines="$(grep -c '^k8s_client_pid=' "$adopt_rd_ok/run.env")"
+if (( rc == 0 )) && grep -q 'run complete. branch=fs-k8s-test-adopt-ok agent_exit=0' "$adopt_out_ok" \
+    && [[ -f "$adopt_rd_ok/summary.json" ]] \
+    && [[ "$adopt_pid_lines" == 1 ]] \
+    && ! grep -qx "k8s_client_pid=$adopt_dead_pid" "$adopt_rd_ok/run.env"; then
+    ok "adopt re-attaches a run whose driver is confirmed dead, and records itself as the new driver"
+else
+    no "adopt re-attaches a run whose driver is confirmed dead, and records itself as the new driver" \
+        "rc=$rc pid_lines=$adopt_pid_lines out=$(cat "$adopt_out_ok") env=$(cat "$adopt_rd_ok/run.env")"
+fi
+
+# A plain submit still pushing its inputs: INPUTS_PUSH_EXPECTED=true, no
+# INPUTS_PUSH_COMPLETE yet, and (since k8s_record_client_pid does not run
+# until cmd_submit has already returned, well after the push) no
+# k8s_client_pid either. The driver-alive check above would read that
+# empty pid as "driver gone" and fall through into resume's own
+# push-incomplete branch, which deletes a LIVE submit's cluster objects --
+# status would not call this run "orphaned" either (run_state()'s own
+# INPUTS_PUSH_EXPECTED branch calls it "starting"), so adopt must refuse
+# here, before ever touching the cluster.
+adopt_rd_pushing="$(resume_submit fs-k8s-test-adopt-pushing)"
+sed -i '/^INPUTS_PUSH_COMPLETE=/d' "$adopt_rd_pushing/run.env"
+adopt_log_pushing="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_pushing")")
+rc=0
+runstub_verb "$adopt_log_pushing" "$adopt_rd_pushing/adopt.out" adopt --run-dir "$adopt_rd_pushing" || rc=$?
+if (( rc == 1 )) && grep -q 'still pushing its inputs' "$adopt_rd_pushing/adopt.out" \
+    && [[ ! -s "$adopt_log_pushing" ]]; then
+    ok "adopt refuses a run.env with INPUTS_PUSH_EXPECTED set but no INPUTS_PUSH_COMPLETE and no k8s_client_pid, touching no cluster object"
+else
+    no "adopt refuses a run.env with INPUTS_PUSH_EXPECTED set but no INPUTS_PUSH_COMPLETE and no k8s_client_pid, touching no cluster object" \
+        "rc=$rc out=$(cat "$adopt_rd_pushing/adopt.out") log=$(cat "$adopt_log_pushing")"
+fi
+
+# Unrecoverable: the dead-driver probe finds no pod at all behind this
+# run's label (already collected and removed, or never scheduled). adopt
+# must say so with the same reason status --json already carries, exit
+# non-zero, and never fall into resume's own wait/collect -- no exit-code
+# is written, and the durable run log gets no new row, so the "call adopt
+# on every startup for every in-flight run" consumer does not accumulate a
+# duplicate run_end row on every blind retry of a run that can never be
+# recovered.
+adopt_rd_gone="$(resume_submit fs-k8s-test-adopt-gone)"
+printf 'k8s_client_pid=%s\n' "$adopt_dead_pid" >> "$adopt_rd_gone/run.env"
+adopt_gone_home="$(newdir)"; tmpdirs+=("$adopt_gone_home")
+adopt_log_gone="$(newdir)/kubectl.log"; adopt_out_gone="$(dirname "$adopt_log_gone")/out.txt"
+tmpdirs+=("$(dirname "$adopt_log_gone")")
+rc=0
+HOME="$adopt_gone_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$adopt_log_gone" \
+    K8S_STUB_POD_MISSING=1 FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" adopt --run-dir "$adopt_rd_gone" > "$adopt_out_gone" 2>&1 || rc=$?
+if (( rc != 0 )) && grep -q 'the pod vanished before anything collected it' "$adopt_out_gone" \
+    && [[ ! -f "$adopt_rd_gone/exit-code" ]] \
+    && [[ ! -f "$adopt_gone_home/.claude/sandbox-runs.jsonl" ]]; then
+    ok "adopt on an unrecoverable (gone-pod) run exits non-zero with the status --json reason, recording nothing"
+else
+    no "adopt on an unrecoverable (gone-pod) run exits non-zero with the status --json reason, recording nothing" \
+        "rc=$rc out=$(cat "$adopt_out_gone") exit_code=$([[ -f "$adopt_rd_gone/exit-code" ]] && cat "$adopt_rd_gone/exit-code")"
+fi
+# Idempotent: a second blind call -- exactly the "call it on every
+# startup" pattern the handoff names -- gives the same answer, not a
+# crash and not a second run-log row.
+adopt_log_gone2="$(newdir)/kubectl.log"; adopt_out_gone2="$(dirname "$adopt_log_gone2")/out2.txt"
+tmpdirs+=("$(dirname "$adopt_log_gone2")")
+rc=0
+HOME="$adopt_gone_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$adopt_log_gone2" \
+    K8S_STUB_POD_MISSING=1 FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" adopt --run-dir "$adopt_rd_gone" > "$adopt_out_gone2" 2>&1 || rc=$?
+if (( rc != 0 )) && grep -q 'the pod vanished before anything collected it' "$adopt_out_gone2" \
+    && [[ ! -f "$adopt_gone_home/.claude/sandbox-runs.jsonl" ]]; then
+    ok "adopt on an unrecoverable run is idempotent across repeated blind calls, still recording nothing"
+else
+    no "adopt on an unrecoverable run is idempotent across repeated blind calls, still recording nothing" \
+        "rc=$rc out=$(cat "$adopt_out_gone2")"
+fi
+
+# The exited-pod flavor of the same unrecoverable case: Succeeded and
+# Failed are both unrecoverable, with the "finished" wording instead of
+# "vanished".
+for adopt_exited_phase in Succeeded Failed; do
+    adopt_rd_exited="$(resume_submit "fs-k8s-test-adopt-exited-$adopt_exited_phase")"
+    printf 'k8s_client_pid=%s\n' "$adopt_dead_pid" >> "$adopt_rd_exited/run.env"
+    adopt_log_exited="$(newdir)/kubectl.log"; adopt_out_exited="$(dirname "$adopt_log_exited")/out.txt"
+    tmpdirs+=("$(dirname "$adopt_log_exited")")
+    rc=0
+    K8S_STUB_POD_PHASE="$adopt_exited_phase" \
+        runstub_verb "$adopt_log_exited" "$adopt_out_exited" adopt --run-dir "$adopt_rd_exited" || rc=$?
+    if (( rc != 0 )) && grep -q 'the pod finished before anything collected it' "$adopt_out_exited" \
+        && [[ ! -f "$adopt_rd_exited/exit-code" ]]; then
+        ok "adopt on an unrecoverable ($adopt_exited_phase-pod) run exits non-zero with the status --json reason"
+    else
+        no "adopt on an unrecoverable ($adopt_exited_phase-pod) run exits non-zero with the status --json reason" \
+            "rc=$rc out=$(cat "$adopt_out_exited")"
+    fi
+done
 
 # 2. A failed read with NOTHING on stderr is reported as silent, not as an
 # empty block: the explicit "wrote nothing" line, and not the heading the

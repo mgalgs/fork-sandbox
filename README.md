@@ -559,13 +559,23 @@ on its own; if continuing one branch is ever blocked by something real,
 the run fails rather than silently forking a new name.
 
 **Polling.** `fork-sandbox status --json <run-dir>` carries at least
-`state` (`queued` | `working` | `replied` | `failed`), `branch` (fetched
-into the project repo before `state` becomes `replied`), and `reply_file`
+`state` (`queued` | `working` | `replied` | `failed`, plus `orphaned` --
+see below -- for a `--k8s` run specifically), `branch` (fetched into the
+project repo before `state` becomes `replied`), and `reply_file`
 (`<run-dir>/outbox/reply.md` — the agent's own reply when it wrote one,
 otherwise the rendered session result, readable once `state` is
 `replied`). Every key `status --json` already had stays exactly as it
 was; these are additive, and present whether or not the run was started
 by hand or through `--resume`.
+
+A `--k8s` run's own host-side driver can die while its pod keeps working
+(a host restart, an evicted client). `state` then reads `orphaned`
+instead of `failed` as long as the pod is still alive, and `failed`
+(unchanged) with an added `reason` key once there is truly nothing left
+to recover (the pod already exited or is gone). `fork-sandbox adopt
+<run-dir>` re-adopts an orphaned run from exactly where its driver left
+off; see "Re-adopting a run whose host-side driver died" in
+docs/kubernetes-runs.md.
 
 The fetch-back into the project repo is not forced, and git refuses to
 update a branch that is checked out in that repo or any of its

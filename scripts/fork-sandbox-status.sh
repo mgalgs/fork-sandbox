@@ -85,13 +85,26 @@
 #               session (no index directory at all) prints nothing and
 #               exits 0. Reads no git, like every other mode here.
 #
-# Why this is safe to blanket-approve. It reads and never writes, it runs no
-# git and no other program except fork-sandbox-format.sh, and it accepts only
-# a directory under /var/tmp/claude-scratch/forks/claude-fork-sandbox.* (or the
-# legacy /var/tmp/claude-fork-sandbox.*), resolved first, holding a run.env.
-# Inside that directory it opens a fixed list of file names (including the
-# review and maintainer loop records and the review and maintainer verdicts)
-# and
+# A --k8s run's state (plain and --json) can also read "orphaned": its
+# host-side driver (the `fork-sandbox-k8s.sh run`/`resume` process) is dead,
+# but the pod it was watching is still alive, so the run is not actually
+# over -- see k8s_orphan_probe and run_state() below, and "Re-adopt a run
+# whose host-side driver died" in docs/kubernetes-runs.md. Re-adopt it with
+# `fork-sandbox adopt <run-dir>`. When the probe instead finds the pod has
+# already exited or is gone, the state stays "failed" (there is nothing left
+# to adopt -- the pod held the only copy of the run's work), but --json adds
+# a `reason` key saying so, so a polling consumer can tell that apart from an
+# ordinary agent failure. --monitor-terminal treats orphaned as terminal: a
+# dead driver never comes back, and only `adopt`, called from wherever still
+# has cluster access, can ever finish the run, so waiting on it here would
+# be waiting on nothing, forever.
+#
+# Why this is safe to blanket-approve. It reads and never writes, and it
+# accepts only a directory under
+# /var/tmp/claude-scratch/forks/claude-fork-sandbox.* (or the legacy
+# /var/tmp/claude-fork-sandbox.*), resolved first, holding a run.env. Inside
+# that directory it opens a fixed list of file names (including the review
+# and maintainer loop records and the review and maintainer verdicts) and
 # refuses a symlink, so it cannot be turned into a way to read an arbitrary
 # file. It never reads stdin. --session --progress reads a by-session
 # symlink instead of a <run-dir> argument, but print_progress_view holds
@@ -101,6 +114,19 @@
 # single-path-component shape before touching the by-session root at all --
 # so neither an adversarial link nor a "--session ../x" can point it
 # anywhere this boundary would otherwise exclude.
+#
+# It runs no git and no other program except fork-sandbox-format.sh, flock
+# (a shared, non-blocking probe of a --k8s run's .driver.lock, on a
+# read-only fd) and, narrowly, kubectl: a --k8s run whose driver is
+# confirmed dead (see above)
+# gets exactly one bounded, read-only `kubectl get pod`, every call carrying
+# --request-timeout, to tell "orphaned" apart from "failed" -- see
+# k8s_orphan_probe's own header for the full exit-vocabulary and the bound.
+# This never reaches further than that one read: nothing it returns is ever
+# written anywhere or executed, only matched against Succeeded/Failed/empty
+# to pick one of four words, and a run whose driver is alive (every run this
+# tool is normally pointed at) never reaches this code path at all, so it
+# costs that run nothing.
 #
 # It deliberately does not inspect the clone. The clone's git config is
 # writable by the sandbox, and a key such as core.fsmonitor makes any git
@@ -409,7 +435,7 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|tidy.json|pipeline.json) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|tidy.json|.driver.lock|pipeline.json) ;;
         step-[0-9]*-loop.json)
             [[ "$name" =~ ^step-[0-9]+-loop\.json$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         # One file per leg, named by the runner. The leg kinds are
@@ -861,31 +887,75 @@ elapsed_human() {
     human_duration "$(elapsed_seconds)"
 }
 
-# `kill -0` alone cannot tell a running process from a zombie one: POSIX
-# leaves a zombie's pid allocated, not yet reaped by its parent, precisely
-# so its exit status stays collectible -- so signal 0 against it still
-# succeeds. The --resume contract rules that answer out explicitly:
-# polling must not depend on the submitter's pid being alive, because the
-# client's own PID 1 may not reap, and a finished submitter can linger as
-# a zombie indefinitely. On Linux, /proc/<pid>/stat's third field is the
-# single-letter process state, and 'Z' names exactly this case; comm
-# (field 2) is parenthesized and can itself contain ") ", so the split
-# anchors on the LAST ") " the same way fs_proc_start_time's own
-# /proc/<pid>/stat read does. Without /proc (no Linux procfs), this can
-# only fall back to kill -0's own answer.
-fs_status_pid_alive() {
-    local pid="$1" stat_line rest state
-    kill -0 "$pid" 2>/dev/null || return 1
-    if [[ -r "/proc/$pid/stat" ]] && stat_line="$(cat -- "/proc/$pid/stat" 2>/dev/null)" \
-        && [[ -n "$stat_line" ]]; then
-        rest="${stat_line##*) }"
-        state="${rest%% *}"
-        [[ "$state" == "Z" ]] && return 1
+# fs_status_pid_alive (the --resume contract's zombie-aware `kill -0`
+# wrapper) is shared with fork-sandbox-k8s.sh's adopt (never two drivers on
+# one run) and lives in fork-sandbox-lib.sh.
+
+# The one kubectl call this otherwise file-only, git-only script ever makes
+# (see the header's "safe to blanket-approve" note) -- and only on the one
+# path that needs it: a --k8s run whose driver is confirmed dead and whose
+# submit already completed, where "abandoned" used to be the only answer
+# even while the pod was still working, idling, or holding a finished
+# sentinel nobody had collected yet (see the real incident this exists
+# for: an editor app's own pod restarting out from under an in-flight
+# run -- "Re-adopting a run whose host-side driver died").
+#
+# Prints exactly one of:
+#   alive         -- the pod exists and has not exited; still adoptable
+#                    with `fork-sandbox adopt <run-dir>`.
+#   exited:PHASE  -- the pod ran to completion (Succeeded or Failed) and
+#                    nothing ever collected it. Unrecoverable: the clone
+#                    that held the work lived only in that pod.
+#   gone          -- no pod answers to this run's label at all (already
+#                    collected and removed, or never scheduled). Also
+#                    unrecoverable.
+#   unknown       -- the cluster could not be asked at all (no k8s.env, no
+#                    K8S_CONTEXT in it, no kubectl on PATH, or the call
+#                    itself failed/timed out) -- callers must keep
+#                    today's answer rather than guess at either of the
+#                    above.
+# Every kubectl call carries --request-timeout, so a hung API server
+# delays this one status call by at most a couple of seconds -- it never
+# hangs, and a run whose driver is still alive never reaches this function
+# at all (see run_state()'s own guard below), so an ordinary run's status
+# call never pays for it.
+k8s_orphan_probe() {
+    local cfg="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/k8s.env"
+    local ctx ns safe legacy timeout="${FS_STATUS_K8S_PROBE_TIMEOUT:-3}"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=3
+    [[ -n "$branch" ]] || { printf 'unknown'; return; }
+    [[ -f "$cfg" ]] || { printf 'unknown'; return; }
+    ctx="$(fs_read_env_value "$cfg" K8S_CONTEXT 2>/dev/null)" || ctx=""
+    [[ -n "$ctx" ]] || { printf 'unknown'; return; }
+    ns="$(fs_read_env_value "$cfg" K8S_NAMESPACE 2>/dev/null)"
+    ns="${ns:-fork-sandbox}"
+    command -v kubectl >/dev/null 2>&1 || { printf 'unknown'; return; }
+    safe="$(k8s_safe_name fork-sandbox-agent "$branch")"
+    legacy="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
+
+    local pod_json count phase
+    pod_json="$(kubectl --context="$ctx" -n "$ns" get pod -l "job-name=$safe" \
+        --request-timeout="${timeout}s" -o json 2>/dev/null)" || { printf 'unknown'; return; }
+    count="$(jq -r '.items | length' <<< "$pod_json" 2>/dev/null)" || count=""
+    [[ "$count" =~ ^[0-9]+$ ]] || { printf 'unknown'; return; }
+    if [[ "$count" == 0 && "$legacy" != "$safe" ]]; then
+        pod_json="$(kubectl --context="$ctx" -n "$ns" get pod -l "job-name=$legacy" \
+            --request-timeout="${timeout}s" -o json 2>/dev/null)" || { printf 'unknown'; return; }
+        count="$(jq -r '.items | length' <<< "$pod_json" 2>/dev/null)" || count=""
+        [[ "$count" =~ ^[0-9]+$ ]] || { printf 'unknown'; return; }
     fi
-    return 0
+    if [[ "$count" == 0 ]]; then
+        printf 'gone'
+        return
+    fi
+    phase="$(jq -r '.items[0].status.phase // empty' <<< "$pod_json" 2>/dev/null)"
+    case "$phase" in
+        Succeeded|Failed) printf 'exited:%s' "$phase" ;;
+        *) printf 'alive' ;;
+    esac
 }
 
-# starting | running | abandoned | done | failed
+# starting | running | abandoned | orphaned | done | failed
 run_state() {
     local rc pid
     if rc="$(run_file_read exit-code 2>/dev/null)"; then
@@ -912,17 +982,21 @@ run_state() {
         # a version=, and the only writers of version= that ever omit a
         # pid file are these.
         if [[ "$network" == "cluster" ]]; then
-            local k8s_pid
+            local k8s_pid k8s_pid_start
             k8s_pid="$(run_env_get k8s_client_pid)"
             k8s_pid="${k8s_pid//[^0-9]/}"
-            if [[ -n "$k8s_pid" ]] && fs_status_pid_alive "$k8s_pid"; then
+            k8s_pid_start="$(run_env_get k8s_client_pid_start)"
+            if [[ -n "$k8s_pid" ]] && fs_k8s_driver_alive "$k8s_pid" "$k8s_pid_start"; then
+                printf 'running'
+            elif driver_lock_held; then
+                # A live driver whose pid this reader cannot see: another
+                # pid namespace sharing the run dir's volume.
                 printf 'running'
             elif [[ "$(run_env_get INPUTS_PUSH_EXPECTED)" == true \
                 && "$(run_env_get INPUTS_PUSH_COMPLETE)" != true ]]; then
-                # k8s_record_client_pid only runs once cmd_submit has
-                # returned to cmd_run/cmd_resume, which is after
-                # INPUTS_PUSH_COMPLETE is already written (see that
-                # writer's own comment in fork-sandbox-k8s.sh) -- so a
+                # k8s_record_client_pid only runs at the very end of the
+                # push, just before INPUTS_PUSH_COMPLETE is written (see
+                # that writer's own comment in fork-sandbox-k8s.sh) -- so a
                 # submit still pushing the pod's inputs has no
                 # k8s_client_pid yet even though it is very much alive, so
                 # it reads "starting" (-> queued), not "abandoned", until
@@ -936,7 +1010,21 @@ run_state() {
                     printf 'starting'
                 fi
             else
-                printf 'abandoned'
+                # The driver is confirmed dead and the push already
+                # completed: today's only answer was "abandoned", even
+                # while the pod was still working or idling with a
+                # finished sentinel nobody had collected -- ask the
+                # cluster, bounded, before settling for that. "exited"/
+                # "gone"/"unknown" all keep today's answer: the first two
+                # because the state stays correctly "failed" either way
+                # (see fork-sandbox-k8s.sh's adopt for why there is
+                # nothing left to recover), the third because the cluster
+                # could not be asked and this must never guess.
+                if [[ "$(k8s_orphan_probe)" == alive ]]; then
+                    printf 'orphaned'
+                else
+                    printf 'abandoned'
+                fi
             fi
             return
         fi
@@ -957,13 +1045,19 @@ exit_code() {
     printf '%s' "${rc//[^0-9-]/}"
 }
 
-# The --resume contract's own state vocabulary (queued|working|replied|failed),
-# a mapping from run_state()'s starting|running|abandoned|done|failed, not a
-# replacement for it: that vocabulary is this script's human-readable prose,
-# this one is what a program polling --json compares against. abandoned has
-# no good home in four states and is reported as failed -- the run never will
-# reply, which is the fact a poller needs, not the distinction between "died"
-# and "never going to finish" that abandoned draws for a human reader.
+# The --resume contract's own state vocabulary
+# (queued|working|replied|failed|orphaned), a mapping from run_state()'s
+# starting|running|abandoned|orphaned|done|failed, not a replacement for
+# it: that vocabulary is this script's human-readable prose, this one is
+# what a program polling --json compares against. abandoned has no good
+# home in these states and is reported as failed -- the run never will
+# reply, which is the fact a poller needs, not the distinction between
+# "died" and "never going to finish" that abandoned draws for a human
+# reader. orphaned gets its own word, unlike abandoned: unlike a dead
+# run, it may still become "replied" or "failed" on its own, through
+# `fork-sandbox adopt <run-dir>` -- collapsing it into "failed" would
+# tell a polling consumer to give up on exactly the run most worth
+# re-adopting.
 contract_state() {
     case "$(run_state)" in
         starting) printf 'queued' ;;
@@ -974,20 +1068,41 @@ contract_state() {
             if run_finalizer_alive; then printf 'working'; else printf 'replied'; fi
             ;;
         abandoned|failed) printf 'failed' ;;
+        orphaned) printf 'orphaned' ;;
     esac
 }
 
 # The runner (local) or the k8s client (network=cluster): whichever process
 # finishes the run after its exit-code is written.
 run_finalizer_alive() {
-    local p
+    local p p_start=""
     p="$(run_file_read pid 2>/dev/null)" || p=""
     p="${p//[^0-9]/}"
     if [[ -z "$p" && "$network" == "cluster" ]]; then
         p="$(run_env_get k8s_client_pid)"
         p="${p//[^0-9]/}"
+        p_start="$(run_env_get k8s_client_pid_start)"
     fi
-    [[ -n "$p" ]] && fs_status_pid_alive "$p"
+    if [[ -n "$p" ]] && fs_k8s_driver_alive "$p" "$p_start"; then
+        return 0
+    fi
+    [[ "$network" == "cluster" ]] && driver_lock_held
+}
+
+# Whether a live process holds DIR/.driver.lock, the lock every --k8s
+# driver (run, resume, adopt) holds for its whole life; see
+# k8s_take_driver_lock in fork-sandbox-k8s.sh. A shared, non-blocking probe
+# on a read-only fd: it writes nothing and never creates the file. Anything
+# short of a clear "held" (no file, no flock, an unsupported filesystem)
+# reads as not held, leaving the pid check the only answer.
+driver_lock_held() {
+    local fd rc=0
+    resolve_run_file .driver.lock || return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    { exec {fd}<"$RUN_FILE_PATH"; } 2>/dev/null || return 1
+    flock -E 3 -n -s "$fd" || rc=$?
+    exec {fd}<&-
+    (( rc == 3 ))
 }
 
 # end_reason: absent on every ordinary run (it ended on its own).
@@ -1182,6 +1297,11 @@ print_status_block() {
             printf '\nThe runner process is gone and it never wrote an exit code.\n'
             printf 'The tmux session was probably killed. Nothing was fetched.\n'
         fi
+    elif [[ "$state" == "orphaned" ]]; then
+        printf '\nThe host-side k8s client is gone, but the pod is still running (or\n'
+        printf 'idling with a finished sentinel nobody has collected yet). Re-adopt\n'
+        printf 'it to finish what the dead driver would have done:\n'
+        printf '  fork-sandbox adopt %s\n' "$run_dir"
     fi
 }
 
@@ -1316,9 +1436,32 @@ case "$mode" in
                               else "failed" end),
                       reply_file: $reply_file}'
         else
-            jq -n --arg state "$(contract_state)" --arg branch "$branch" \
-                --arg reply_file "$reply_file_path" \
-                '{state: $state, branch: $branch, reply_file: $reply_file}'
+            json_state="$(contract_state)"
+            # A consumer polling this needs to tell "the agent failed" apart
+            # from "nobody collected it": both land here as state=failed (no
+            # exit-code was ever written, so there is nothing else this could
+            # be -- see run_state()'s own abandoned branch), but only the
+            # latter is this specific, nameable cause. Re-probe rather than
+            # thread run_state()'s own probe result out of it: this is the
+            # one caller that needs the reason text, it is already on the
+            # rare dead-driver path, and the probe is bounded the same way
+            # either call.
+            json_reason=""
+            if [[ "$json_state" == failed && "$network" == cluster ]] \
+                && ! resolve_run_file exit-code 2>/dev/null \
+                && { [[ "$(run_env_get INPUTS_PUSH_EXPECTED)" != true ]] \
+                    || [[ "$(run_env_get INPUTS_PUSH_COMPLETE)" == true ]]; }; then
+                case "$(k8s_orphan_probe)" in
+                    gone)
+                        json_reason="the pod vanished before anything collected it" ;;
+                    exited:*)
+                        json_reason="the pod finished before anything collected it" ;;
+                esac
+            fi
+            jq -n --arg state "$json_state" --arg branch "$branch" \
+                --arg reply_file "$reply_file_path" --arg reason "$json_reason" \
+                '{state: $state, branch: $branch, reply_file: $reply_file}
+                 + (if $reason == "" then {} else {reason: $reason} end)'
         fi
         ;;
 
@@ -1385,7 +1528,7 @@ case "$mode" in
                 fi
             fi
         fi
-        if [[ "$state" == "failed" || "$state" == "abandoned" ]]; then
+        if [[ "$state" == "failed" || "$state" == "abandoned" || "$state" == "orphaned" ]]; then
             print_tail_of_log
         fi
         ;;
@@ -1491,6 +1634,29 @@ case "$mode" in
                         else
                             printf 'Nothing was fetched. The clone is still at %s\n' "$clone_dir"
                         fi
+                        print_tail_of_log
+                    )"
+                    printf '%s\n' "$block"
+                    exit 0
+                    ;;
+                orphaned)
+                    # Terminal here, deliberately, even though an orphaned
+                    # run is not actually dead: nothing this monitor is
+                    # watching will ever turn it into "done" or "failed" on
+                    # its own -- the driver that would have called wait and
+                    # collect is gone for good, and only a human or
+                    # orchestrator calling `fork-sandbox adopt <run-dir>`
+                    # (from wherever still has cluster access) can finish
+                    # it. Looping here would be waiting on nothing, forever
+                    # -- the opposite of the "must end, or say what it's
+                    # waiting for" rule every other terminal case follows.
+                    count_event_files
+                    block="$(
+                        flush_result_if_terminal_only "$EVENT_FILE_COUNT"
+                        printf 'orphaned: the host-side k8s client is gone, but the pod is still\n'
+                        printf 'running (or idling with a finished sentinel nobody has collected\n'
+                        printf 'yet), after %s. Re-adopt it with:\n' "$(elapsed_human)"
+                        printf '  fork-sandbox adopt %s\n' "$run_dir"
                         print_tail_of_log
                     )"
                     printf '%s\n' "$block"
