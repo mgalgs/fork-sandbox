@@ -503,7 +503,8 @@ discover_model_facts() {
         local model="$1" len why kind
         FACTS_SRC=reported
         len="$(jq -r --arg m "$model" \
-            'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
+            'first(.data[] | select(.id == $m)
+                | .max_model_len // .context_length // empty) // empty' \
             <<<"$body" 2>/dev/null || true)"
         if [[ ! "$len" =~ ^[0-9]+$ ]]; then
             # Guess low: too small wastes context, while too large means a
@@ -1359,7 +1360,8 @@ discover_pipeline_pi_facts() {
                 '. + {($from): $to}' <<< "$PIPELINE_PI_REWRITE")"
         fi
         len="$(jq -r --arg m "$id" \
-            'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
+            'first(.data[] | select(.id == $m)
+                | .max_model_len // .context_length // empty) // empty' \
             <<<"$body" 2>/dev/null || true)"
         if [[ ! "$len" =~ ^[0-9]+$ ]]; then
             len=32768

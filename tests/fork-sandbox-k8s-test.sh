@@ -14648,6 +14648,16 @@ else
         "rc=$discover_rc: $discover_out"
 fi
 
+# OpenRouter's listing names the window context_length, not max_model_len.
+discover_run '{"data":[{"id":"or/m","context_length":1000000}]}' ""
+if (( discover_rc == 0 )) \
+    && [[ "$discover_out" == *"CTX=1000000 MAX_TOKENS=32768 MODEL_CTX_SOURCE=reported"* ]]; then
+    ok "discovery: context_length stands in when max_model_len is absent"
+else
+    no "discovery: context_length stands in when max_model_len is absent" \
+        "rc=$discover_rc: $discover_out"
+fi
+
 # A listed id with no usable max_model_len reaches the guess through
 # the third path to it: the default is to refuse, and
 # ALLOW_UNLISTED_MODEL=1 permits the launch with a warning that names
