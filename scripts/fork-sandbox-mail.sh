@@ -860,12 +860,14 @@ mail_sha256_file() {
 # Validates each --attach file for a LANE-MAIL-BUNDLE (see mail_emit_bundle)
 # without touching the store: basename shape (mail_validate_attach_basename),
 # existence, the size cap, and the same within-invocation collision/dedup
-# rules as mail_stage_attachments, minus the against-the-store check (a
-# bundle is built before anything is written anywhere). Enforces the
-# MAIL_ATTACH_MAX_COUNT cap here too, on the sending side, before ssh ever
-# runs. Prints one "<basename>\t<file>" line per distinct staged attachment,
+# rules as mail_stage_attachments. $1 is the sender's own thread dir for a
+# reply ("" for a send): the sender's local copy of the bundle is ingested
+# only after every remote host accepted it, so a collision there must be
+# caught now, before ssh runs. Enforces the MAIL_ATTACH_MAX_COUNT cap here
+# too. Prints one "<basename>\t<file>" line per distinct staged attachment,
 # in --attach order.
 mail_emit_validate_attach() {
+    local thread_dir="$1"; shift
     local -a seen_bases=() seen_files=() out=()
     local f base size i dup
     if (( $# > MAIL_ATTACH_MAX_COUNT )); then
@@ -880,6 +882,13 @@ mail_emit_validate_attach() {
         if (( size > MAIL_ATTACH_MAX_BYTES )); then
             echo "Error: --attach file '$f' is $size bytes, over the" >&2
             echo "$MAIL_ATTACH_MAX_BYTES byte (4 MiB) cap." >&2
+            return 1
+        fi
+        if [[ -n "$thread_dir" && -e "$thread_dir/attachments/$base" ]] \
+            && ! cmp -s -- "$f" "$thread_dir/attachments/$base"; then
+            echo "Error: --attach '$f' would overwrite attachments/$base," >&2
+            echo "which already holds different content staged by an earlier" >&2
+            echo "message in this thread. Rename the file and retry." >&2
             return 1
         fi
         dup=0
@@ -1176,7 +1185,7 @@ cmd_send() {
     if (( ${#attach_files[@]} > 0 )); then
         if (( emit )); then
             local pairs_out base f
-            pairs_out="$(mail_emit_validate_attach "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
+            pairs_out="$(mail_emit_validate_attach "" "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
             local -a attach_bases=()
             while IFS=$'\t' read -r base f; do
                 [[ -n "$base" ]] || continue
@@ -1403,7 +1412,7 @@ cmd_reply() {
     if (( ${#attach_files[@]} > 0 )); then
         if (( emit )); then
             local pairs_out base f
-            pairs_out="$(mail_emit_validate_attach "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
+            pairs_out="$(mail_emit_validate_attach "$thread_dir" "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
             local -a attach_bases=()
             while IFS=$'\t' read -r base f; do
                 [[ -n "$base" ]] || continue
@@ -1905,28 +1914,29 @@ cmd_ingest() {
         mail_ingest_fail "--peer '$peer' is not a valid peer name."
         return 1
     fi
-    local workdir rc=0 size raw
+    local workdir rc=0 size raw marker=$'LANE-MAIL-BUNDLE 1\n' cap is_bundle=0
     workdir="$(mktemp -d "$MAIL_ROOT/.mail.ingest.XXXXXX")"
     raw="$workdir/raw"
-    # Bounded to the worst case of a bundle (see MAIL_BUNDLE_MAX_BYTES):
-    # a sender that never stops sending still can't make this read an
-    # unbounded amount, whichever form the stream turns out to be.
-    head -c $(( MAIL_BUNDLE_MAX_BYTES + 1 )) > "$raw" || true
+    # Read just the marker's length first, so only a bundle gets the bundle
+    # cap and a plain message is still read no further than 1 MiB. GNU head
+    # -c reads exactly N bytes from a pipe; the second head continues there.
+    head -c "${#marker}" > "$raw" || true
+    printf '%s' "$marker" | cmp -s - "$raw" && is_bundle=1
+    cap=$MAIL_INGEST_MAX_BYTES
+    (( is_bundle )) && cap=$MAIL_BUNDLE_MAX_BYTES
     size="$(wc -c < "$raw" | tr -d '[:space:]')"
-    if (( size > MAIL_BUNDLE_MAX_BYTES )); then
-        mail_ingest_fail "message stream is over the maximum bundle size." || rc=1
+    head -c $(( cap + 1 - size )) >> "$raw" || true
+    size="$(wc -c < "$raw" | tr -d '[:space:]')"
+    if (( is_bundle && size > cap )); then
+        mail_ingest_fail "bundle is over the $cap byte cap." || rc=1
+    elif (( size > cap )); then
+        mail_ingest_fail "message is over the $MAIL_INGEST_MAX_BYTES byte cap." || rc=1
+    elif (( is_bundle )); then
+        mail_ingest_bundle "$peer" "$raw" "$workdir" || rc=$?
     else
-        local firstline=""
-        IFS= read -r firstline < "$raw" || true
-        if [[ "$firstline" == "LANE-MAIL-BUNDLE 1" ]]; then
-            mail_ingest_bundle "$peer" "$raw" "$workdir" || rc=$?
-        elif (( size > MAIL_INGEST_MAX_BYTES )); then
-            mail_ingest_fail "message is over the $MAIL_INGEST_MAX_BYTES byte cap." || rc=1
-        else
-            # shellcheck disable=SC2034  # read via the namerefs in mail_ingest_message
-            local -a no_bases=() no_files=()
-            mail_ingest_message "$peer" "$raw" "$workdir/body" no_bases no_files || rc=$?
-        fi
+        # shellcheck disable=SC2034  # read via the namerefs in mail_ingest_message
+        local -a no_bases=() no_files=()
+        mail_ingest_message "$peer" "$raw" "$workdir/body" no_bases no_files || rc=$?
     fi
     rm -rf -- "$workdir"
     return "$rc"

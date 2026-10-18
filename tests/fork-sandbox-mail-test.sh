@@ -1612,6 +1612,19 @@ before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
 mb ingest --peer alpha < "$bx_trailing" >/dev/null 2>"$work/bx-trailing.err"; rc=$?
 check "ingest refuses trailing bytes after 'end'" "1 $before_m" "$rc $(find "$hx_root_b" -name '*.msg' | wc -l)"
 
+# Only a stream that opens with the bundle marker gets the bundle cap; a
+# plain message over 1 MiB keeps today's refusal, even when it would fit
+# under the bundle cap.
+bx_cap=$(( 1024 * 1024 + 8 * 4 * 1024 * 1024 + 8192 ))
+{ printf 'LANE-MAIL-BUNDLE 1\n'; head -c $(( bx_cap + 1 )) /dev/zero; } \
+    | mb ingest --peer alpha >/dev/null 2>"$work/bx-overcap.err"; rc=$?
+check "ingest refuses a bundle stream over the whole-bundle cap" \
+    "1 yes" "$rc $(grep -q "bundle is over the $bx_cap byte cap" "$work/bx-overcap.err" && echo yes || echo no)"
+{ printf 'Message-ID: x\n'; head -c $(( 2 * 1024 * 1024 )) /dev/zero | tr '\0' x; } \
+    | mb ingest --peer alpha >/dev/null 2>"$work/bx-plaincap.err"; rc=$?
+check "a plain message over 1 MiB keeps the plain-message cap refusal" \
+    "1 yes" "$rc $(grep -q 'message is over the 1048576 byte cap' "$work/bx-plaincap.err" && echo yes || echo no)"
+
 echo "== cross-host bundles: collisions, reuse and symlinks =="
 
 bx_diff_dir="$work/bx-diff-dir"; mkdir -p "$bx_diff_dir"
@@ -1636,6 +1649,22 @@ check "the attachment file itself is untouched by the reuse" "0" \
     "$(cmp -s "$bx_att" "$hx_root_b/threads/$bx_id/attachments/bx-att.txt"; echo $?)"
 check "the thread's tree shows both messages, both marked with the paperclip" "2" \
     "$(mb tree "$bx_id" 2>/dev/null | grep -c '📎')"
+
+# The sender's own copy is ingested only after every remote host took the
+# bundle, so a reply --emit must refuse a collision in the sender's own
+# thread up front, before anything is sent.
+bx_own_dir="$work/bx-own"; mkdir -p "$bx_own_dir/v1" "$bx_own_dir/v2"
+printf 'own v1\n' > "$bx_own_dir/v1/own.txt"
+printf 'own v2\n' > "$bx_own_dir/v2/own.txt"
+bx_own_id="$(printf 'own\n' | ma send --from @fe --to @x --subject own --body - --attach "$bx_own_dir/v1/own.txt" 2>diag.txt)"
+bx_own_out="$(printf 'r\n' | ma reply --emit --from @fe --reply-to "$bx_own_id" --body - \
+    --attach "$bx_own_dir/v2/own.txt" 2>"$work/bx-own.err")"; rc=$?
+check "reply --emit refuses an attachment that collides in the sender's own thread" \
+    "1 0 yes" "$rc ${#bx_own_out} $(grep -q 'would overwrite attachments/own.txt' "$work/bx-own.err" && echo yes || echo no)"
+cp "$bx_own_dir/v1/own.txt" "$bx_own_dir/v2/own.txt"
+printf 'r\n' | ma reply --emit --from @fe --reply-to "$bx_own_id" --body - \
+    --attach "$bx_own_dir/v2/own.txt" >/dev/null 2>diag.txt; rc=$?
+check "reply --emit accepts identical content already in the sender's thread" "0" "$rc"
 
 # A thread that has never had an attachment has no attachments/ dir yet.
 # Two frames in one bundle sharing a basename with different content are
