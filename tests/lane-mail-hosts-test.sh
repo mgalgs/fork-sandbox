@@ -85,17 +85,40 @@ mk_host() {
 mk_host alpha
 mk_host beta
 mk_host gamma
+mk_host delta
 
-# Peers files: alpha reaches beta, gamma and a dead peer; beta and gamma reach
-# alpha. Each table is what the target's authorized_keys would pin: the
-# forced --peer is the SENDER's name.
-printf '# peers\nbeta beta-dest\ngamma gamma-dest\ngone dead\nmallory mallory-dest\n' > "$scratch/alpha/cfg/lane-mail-peers"
+# Peers files: alpha reaches beta, gamma, delta and a dead peer; beta and
+# gamma reach alpha. Each table is what the target's authorized_keys would
+# pin: the forced --peer is the SENDER's name.
+printf '# peers\nbeta beta-dest\ngamma gamma-dest\ngone dead\nmallory mallory-dest\ndelta delta-dest\n' > "$scratch/alpha/cfg/lane-mail-peers"
 printf 'alpha alpha-dest\n' > "$scratch/beta/cfg/lane-mail-peers"
 printf 'alpha alpha-dest\nbeta beta-dest\n' > "$scratch/gamma/cfg/lane-mail-peers"
-printf 'beta-dest\t%s\talpha\ngamma-dest\t%s\talpha\nmallory-dest\t%s\tmallory\n' \
-    "$scratch/beta" "$scratch/gamma" "$scratch/beta" > "$scratch/table-alpha"
+printf 'beta-dest\t%s\talpha\ngamma-dest\t%s\talpha\nmallory-dest\t%s\tmallory\ndelta-dest\t%s\talpha\n' \
+    "$scratch/beta" "$scratch/gamma" "$scratch/beta" "$scratch/delta" > "$scratch/table-alpha"
 printf 'alpha-dest\t%s\tbeta\n' "$scratch/alpha" > "$scratch/table-beta"
 printf 'alpha-dest\t%s\tgamma\nbeta-dest\t%s\tgamma\n' "$scratch/alpha" "$scratch/beta" > "$scratch/table-gamma"
+
+# delta plays a fork-sandbox that predates bundle support: for a plain
+# message it behaves exactly like the real lane-mail-serve (full
+# passthrough), but for a LANE-MAIL-BUNDLE it reproduces precisely the
+# error an old `ingest` gives -- the bundle's first line has no colon, so
+# an old header-block parser sees it as a malformed header line. This
+# tests that lane-mail.sh recognizes that specific refusal and reports
+# the upgrade it actually needs, rather than the generic delivery error.
+mv "$scratch/delta/bin/lane-mail-serve" "$scratch/delta/bin/lane-mail-serve.real"
+cat > "$scratch/delta/bin/lane-mail-serve" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+tmp="\$(mktemp)"
+trap 'rm -f "\$tmp"' EXIT
+cat > "\$tmp"
+if head -c 32 "\$tmp" | grep -q '^LANE-MAIL-BUNDLE 1'; then
+    printf "lane-mail-serve: malformed header line 'LANE-MAIL-BUNDLE 1'.\\n" >&2
+    exit 1
+fi
+exec "$scratch/delta/bin/lane-mail-serve.real" "\$@" < "\$tmp"
+STUB
+chmod +x "$scratch/delta/bin/lane-mail-serve"
 
 # ha/hb/hg: run lane-mail.sh as that host.
 host_run() {
@@ -207,9 +230,43 @@ err="$(printf 'x\n' | ha send --from @fe:beta --to @x:beta --subject s --body - 
 check "--from must be a lane on this host" "1" "$rc"
 contains "it says so" "$err" "--from must be a lane on this host"
 
+echo "== cross-host attachments =="
 printf 'attach\n' > "$scratch/att.txt"
-err="$(printf 'x\n' | ha send --from @fe --to @x:beta --subject s --body - --attach "$scratch/att.txt" 2>&1)"; rc=$?
-check "a cross-host message refuses an attachment" "1 $before_b $before_a" "$rc $(msgs beta) $(msgs alpha)"
+out="$(printf 'see attached\n' | ha send --from @fe --to @x:beta --subject 'with attach' --body - --attach "$scratch/att.txt" 2>"$scratch/err")"; rc=$?
+att_id="$out"
+check "a cross-host message with an attachment succeeds" "0" "$rc"
+check "the attachment is delivered to the receiving host" "1" \
+    "$(find "$scratch/beta/root/threads/$att_id/attachments" -name att.txt 2>/dev/null | wc -l)"
+check "the delivered attachment is byte-identical" "0" \
+    "$(cmp -s "$scratch/att.txt" "$scratch/beta/root/threads/$att_id/attachments/att.txt"; echo $?)"
+check "the sender's own store also has the attachment" "1" \
+    "$(find "$scratch/alpha/root/threads/$att_id/attachments" -name att.txt 2>/dev/null | wc -l)"
+contains "the receiving side's tree shows the paperclip" "$(hb tree "$att_id")" "📎"
+contains "the sending side's tree shows the paperclip too" "$(ha tree "$att_id")" "📎"
+
+printf 'reply attach\n' > "$scratch/reply-att.txt"
+out="$(printf 'reply with attach\n' | hb reply --from @x --reply-to "$att_id" --body - --attach "$scratch/reply-att.txt" 2>"$scratch/err")"; rc=$?
+check "a cross-host reply with an attachment succeeds" "0" "$rc"
+check "the reply's attachment reaches the original sender's store" "1" \
+    "$(find "$scratch/alpha/root/threads/$att_id/attachments" -name reply-att.txt 2>/dev/null | wc -l)"
+check "the reply's attachment is byte-identical on the original sender's side" "0" \
+    "$(cmp -s "$scratch/reply-att.txt" "$scratch/alpha/root/threads/$att_id/attachments/reply-att.txt"; echo $?)"
+check "the replier's own store keeps the reply's attachment too" "1" \
+    "$(find "$scratch/beta/root/threads/$att_id/attachments" -name reply-att.txt 2>/dev/null | wc -l)"
+check "tree shows both messages on the original sender's side, both marked with the paperclip" "2" \
+    "$(ha tree "$att_id" | grep -c '📎')"
+before_b="$(msgs beta)"
+
+echo "== a receiving fork-sandbox that predates bundle support =="
+before_a_delta="$(msgs alpha)"
+err="$(printf 'x\n' | ha send --from @fe --to @x:delta --subject s --body - --attach "$scratch/att.txt" 2>&1)"; rc=$?
+check "delivery of an attachment to a pre-bundle receiver fails" "1" "$rc"
+contains "it names the upgrade the far host needs" "$err" "predates attachment support and must be upgraded"
+check "nothing is stored, on either side" "0 $before_a_delta" \
+    "$(find "$scratch/delta/root" -name '*.msg' 2>/dev/null | wc -l) $(msgs alpha)"
+out="$(printf 'plain\n' | ha send --from @fe --to @x:delta --subject plain --body - 2>"$scratch/err")"; rc=$?
+check "a plain cross-host message to the same pre-bundle receiver still succeeds" "0" "$rc"
+check "it is stored on the pre-bundle receiver" "1" "$(msgs delta)"
 
 mv "$scratch/alpha/cfg/lane-mail.env" "$scratch/alpha/cfg/lane-mail.env.save"
 printf 'LANE_MAIL_PEER_NAME=Bad_Name\nLANE_MAIL_SSH=%s\n' "$scratch/ssh-stub" > "$scratch/alpha/cfg/lane-mail.env"

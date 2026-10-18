@@ -486,8 +486,50 @@ path; everything else is unchanged.
 A failure — an unreachable peer, an ssh error, the far side refusing —
 exits non-zero with the reason and writes nothing locally; with several
 hosts, hosts delivered before the failure are named. There is no retry queue:
-re-send. A cross-host message carries no attachments, grants or review target,
-and `--from` must be a lane on this host.
+re-send. A cross-host message carries no grants or review target (refused);
+`--from` must be a lane on this host. It does carry `--attach` — see
+"Attachments" below.
+
+**Attachments.** `send`/`reply --attach` works cross-host too, carried as a
+bundle on the same stdin stream `deliver` already reads — no second ssh
+connection, no new forced-command verb. `--emit` with no `--attach` prints
+exactly what it always printed, byte for byte; with one or more, it prints
+a `LANE-MAIL-BUNDLE 1` instead:
+
+```
+LANE-MAIL-BUNDLE 1
+message <N>
+<N bytes: the plain message, exactly as --emit prints it with no attachments>
+attachment <basename> <size> <sha256-hex>
+<size bytes: the attachment, verbatim>
+... one attachment frame per X-Attachment header, in header order ...
+end
+```
+
+Every frame line ends with `\n`; every payload (the message, each
+attachment) is followed by exactly one `\n` before the next frame line.
+`ingest` reads this strictly: a declared size must be met exactly, the
+sha256 must match, at most 8 attachments and at least one (a
+zero-attachment bundle is refused — send a plain message instead), `end`
+with nothing after it. A basename must be non-empty, at most 255 bytes, not
+`.` or `..`, hold no `/` or control character, and not start with `-` — the
+sender checks this too, so a bad basename fails before ssh runs rather than
+at the far side. The message's `X-Attachment` headers must match the
+bundle's attachment frames exactly: same basenames, same order, same count.
+Collisions follow the same rule as a local `--attach`: a basename already
+staged with different content refuses the whole message; identical content
+is accepted and reused; two frames in one bundle sharing a basename follow
+the same rule against each other. Everything is staged in a scratch
+location on the receiving store's own filesystem and moved into place only
+after every frame validates, with the message written last — a reader who
+sees the message already sees its attachments, and a refused bundle leaves
+the store exactly as it was, including no thread dir left behind for a
+message that would have opened a new thread.
+
+A receiver whose fork-sandbox predates bundle support refuses it with its
+ordinary "malformed header line" error (the bundle's first line has no
+colon); `lane-mail.sh` turns that specific refusal into an error naming the
+upgrade the far host needs, and stores nothing locally either way.
 
 **What `add` does, by hand.** For each direction, from the sending host `S`
 to the receiving host `R`:
@@ -539,8 +581,10 @@ unless `--one-way`.
   name that host (a bare `From` is qualified with it, anything else is
   refused) and bare `To`/`Cc` addresses are qualified with it too. A sender
   picks its lane name but can never speak for another host.
-- The reserved headers (`X-Attachment`, `X-Upstream-*`, `X-Review-Target*`,
-  `X-Version`) never cross.
+- The reserved headers `X-Upstream-*`, `X-Review-Target*` and `X-Version`
+  never cross. `X-Attachment` crosses only as part of a bundle, and only
+  when it matches the bundle's attachment frames exactly (see
+  "Attachments" above); a plain message still refuses it outright.
 
 A peer holding a key can fill the receiver's lane-mail store with mail under
 its own host name; the forced command bounds that to the lane-mail root, and

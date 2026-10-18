@@ -1293,8 +1293,12 @@ contains "--emit qualifies a bare From with this host" "$hx_emit" $'\nFrom: @fe:
 contains "--emit qualifies bare To addresses, keeps others" "$hx_emit" $'\nTo: @x:beta, @y:alpha\n'
 contains "--emit qualifies Cc" "$hx_emit" $'\nCc: @w:alpha\n'
 check "--emit stores nothing" "1" "$(find "$hx_root_a/threads" -name '*.msg' | wc -l | tr -d ' ')"
-hx_emit_attach() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --attach /etc/hostname; }
-refuses "--emit refuses an attachment" hx_emit_attach
+hx_emit_bundle="$(printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --attach /etc/hostname 2>diag.txt)"; rc=$?
+check "--emit with an attachment now succeeds" "0" "$rc"
+check "--emit with an attachment prints a bundle" "LANE-MAIL-BUNDLE 1" "$(head -n1 <<<"$hx_emit_bundle")"
+check "--emit with no attachment still prints a plain message, not a bundle" "1" \
+    "$([[ "$(head -n1 <<<"$hx_emit")" == Message-ID:* ]] && echo 1 || echo 0)"
+check "--emit with an attachment stores nothing" "1" "$(find "$hx_root_a/threads" -name '*.msg' | wc -l | tr -d ' ')"
 hx_emit_budget() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --budget 4; }
 refuses "--emit refuses --budget" hx_emit_budget
 hx_emit_no_grant() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --no-grant; }
@@ -1392,6 +1396,226 @@ sed 's/^From: .*/From: @fe/;s/^To: .*/To: @x:beta, @q/;s/^Message-ID: .*/Message
 hx_bare_msg="$(mb show 11111111-1111-4111-8111-111111111111)"
 contains "ingest --peer qualifies a bare From with the peer" "$hx_bare_msg" $'\nFrom: @fe:alpha\n'
 contains "ingest --peer qualifies a bare To with the peer" "$hx_bare_msg" $'\nTo: @x, @q:alpha\n'
+
+echo "== cross-host bundles: --emit with --attach, and ingest =="
+
+bx_att="$work/bx-att.txt"
+printf 'bundle attachment content\n' > "$bx_att"
+bx_att_sha="$(sha256sum "$bx_att" | cut -d' ' -f1)"
+bx_att_size="$(wc -c < "$bx_att" | tr -d ' ')"
+
+bx_good="$work/bx-good.bundle"
+printf 'bundled body\n' | ma send --emit --from @fe --to @x:beta --subject 'with attach' --body - --attach "$bx_att" > "$bx_good" 2>diag.txt
+check "building the fixture bundle succeeds" "0" "$?"
+bx_id="$(sed -n 's/^Message-ID: //p' "$bx_good" | head -1)"
+check "the fixture bundle starts with the marker line" "LANE-MAIL-BUNDLE 1" "$(head -1 "$bx_good")"
+check "the fixture bundle ends with 'end'" "end" "$(tail -1 "$bx_good")"
+contains "the fixture bundle carries the attachment frame" "$(cat "$bx_good")" "attachment bx-att.txt $bx_att_size $bx_att_sha"
+
+bx_got="$(mb ingest --peer alpha < "$bx_good" 2>diag.txt)"; rc=$?
+check "ingest accepts a bundle and prints the message id" "0 $bx_id" "$rc $bx_got"
+bx_stored="$(mb show "$bx_id")"
+contains "the stored message keeps X-Attachment" "$bx_stored" "X-Attachment: attachments/bx-att.txt"
+check "the attachment is staged under the thread" "1" \
+    "$(find "$hx_root_b/threads/$bx_id/attachments" -name bx-att.txt 2>/dev/null | wc -l)"
+check "the staged attachment is byte-identical" "0" \
+    "$(cmp -s "$bx_att" "$hx_root_b/threads/$bx_id/attachments/bx-att.txt"; echo $?)"
+contains "tree marks the bundled attachment with the paperclip" "$(mb tree "$bx_id")" "📎"
+
+ma_got="$(ma ingest < "$bx_good" 2>diag.txt)"; rc=$?
+check "a local ingest of the same bundle (the sender's own copy) succeeds" "0 $bx_id" "$rc $ma_got"
+check "the sender's own store also has the attachment" "1" \
+    "$(find "$hx_root_a/threads/$bx_id/attachments" -name bx-att.txt 2>/dev/null | wc -l)"
+contains "tree marks the bundled attachment on the sender's side too" "$(ma tree "$bx_id")" "📎"
+
+echo "== cross-host bundles: sending side =="
+
+bx_dash="$work/-dash.txt"
+printf 'x\n' > "$bx_dash"
+bx_emit_dash() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --attach "$bx_dash"; }
+refuses "--emit refuses an attachment basename starting with '-'" bx_emit_dash
+contains "it says so" "$(bx_emit_dash 2>&1)" "must not start with '-'"
+
+bx_many_dir="$work/bx-many"; mkdir -p "$bx_many_dir"
+bx_many_args=()
+for i in 1 2 3 4 5 6 7 8 9; do
+    printf 'f%s\n' "$i" > "$bx_many_dir/f$i.txt"
+    bx_many_args+=(--attach "$bx_many_dir/f$i.txt")
+done
+bx_emit_many() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - "${bx_many_args[@]}"; }
+refuses "--emit refuses more than 8 attachments" bx_emit_many
+contains "it names the cap" "$(bx_emit_many 2>&1)" "at most 8 attachments"
+
+echo "== cross-host bundles: ingest refusals leave the store unchanged =="
+
+# extract_msg_part <bundle-file> <out-file>: pulls the embedded plain
+# message out of a bundle, so adversarial frames can be built around a
+# genuine, correctly-headed message part (produced by the real --emit).
+extract_msg_part() {
+    local bundle="$1" out="$2" n prefix_bytes
+    n="$(sed -n '2p' "$bundle" | sed 's/^message //')"
+    prefix_bytes="$(head -n2 "$bundle" | wc -c)"
+    tail -c "+$(( prefix_bytes + 1 ))" "$bundle" | head -c "$n" > "$out"
+}
+# make_bundle <out-file> <msg-part-file> <basename:content-file[:size][:sha]>...
+# Builds a LANE-MAIL-BUNDLE 1 stream by hand, independent of
+# mail_emit_bundle, so ingest's own frame parsing can be exercised with
+# deliberately wrong sizes, hashes, counts or basenames -- what an
+# adversarial or buggy peer might send.
+make_bundle() {
+    local out="$1" msgfile="$2"; shift 2
+    local msg_n; msg_n="$(wc -c < "$msgfile" | tr -d ' ')"
+    { printf 'LANE-MAIL-BUNDLE 1\n'; printf 'message %s\n' "$msg_n"; cat "$msgfile"; printf '\n'; } > "$out"
+    local spec base content size sha
+    for spec in "$@"; do
+        IFS=':' read -r base content size sha <<< "$spec"
+        [[ -n "$size" ]] || size="$(wc -c < "$content" | tr -d ' ')"
+        [[ -n "$sha" ]] || sha="$(sha256sum "$content" | cut -d' ' -f1)"
+        { printf 'attachment %s %s %s\n' "$base" "$size" "$sha"; cat "$content"; printf '\n'; } >> "$out"
+    done
+    printf 'end\n' >> "$out"
+}
+
+bx_msgpart="$work/bx-msgpart.msg"
+extract_msg_part "$bx_good" "$bx_msgpart"
+bx_fresh_id() { cat /proc/sys/kernel/random/uuid; }
+
+# bx_try <label> <msgpart-file> <attach-spec...> -- stamps a fresh
+# Message-ID/Thread-ID into a copy of <msgpart-file> (same length, so the
+# bundle's own declared message size stays correct), builds a bundle
+# around it with make_bundle, and feeds it to ingest. A case passes only
+# if ingest refuses AND the store gained no message and no attachment
+# file.
+bx_try() {
+    local label="$1" msgpart_src="$2"; shift 2
+    local fresh msgpart out before_m before_a after_m after_a rc
+    fresh="$(bx_fresh_id)"
+    msgpart="$work/bx-try-msg.tmp"
+    sed "s/^Message-ID: .*/Message-ID: $fresh/;s/^Thread-ID: .*/Thread-ID: $fresh/" "$msgpart_src" > "$msgpart"
+    out="$work/bx-try.bundle"
+    make_bundle "$out" "$msgpart" "$@"
+    before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+    before_a="$(find "$hx_root_b" -path '*/attachments/*' -type f | wc -l)"
+    mb ingest --peer alpha < "$out" >/dev/null 2>"$work/bx-try.err"; rc=$?
+    after_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+    after_a="$(find "$hx_root_b" -path '*/attachments/*' -type f | wc -l)"
+    rm -f -- "$msgpart"
+    if (( rc != 0 )) && [[ "$before_m" == "$after_m" && "$before_a" == "$after_a" ]]; then
+        ok "$label"
+    else
+        no "$label" "rc=$rc before=$before_m/$before_a after=$after_m/$after_a $(cat "$work/bx-try.err")"
+    fi
+}
+
+bx_try "ingest refuses an attachment frame basename starting with '-'" "$bx_msgpart" "-dash.txt:$bx_att"
+bx_try "ingest refuses an attachment frame basename of '.'" "$bx_msgpart" ".:$bx_att"
+bx_try "ingest refuses an attachment frame basename of '..'" "$bx_msgpart" "..:$bx_att"
+bx_try "ingest refuses an attachment frame basename containing '/'" "$bx_msgpart" "a/b:$bx_att"
+bx_long_base="$(printf 'a%.0s' $(seq 1 300))"
+bx_try "ingest refuses an attachment frame basename over 255 bytes" "$bx_msgpart" "$bx_long_base:$bx_att"
+bx_try "ingest refuses an attachment frame declaring over the 4 MiB cap" "$bx_msgpart" \
+    "bx-att.txt:$bx_att:$(( 4 * 1024 * 1024 + 1 ))"
+
+bx9_dir="$work/bx-nine"; mkdir -p "$bx9_dir"
+bx9_specs=()
+for i in 1 2 3 4 5 6 7 8 9; do
+    printf 'f%s\n' "$i" > "$bx9_dir/f$i.txt"
+    bx9_specs+=("f$i.txt:$bx9_dir/f$i.txt")
+done
+bx_try "ingest refuses a bundle with more than 8 attachment frames" "$bx_msgpart" "${bx9_specs[@]}"
+
+bx_try "ingest refuses an attachment frame whose declared size the stream falls short of" "$bx_msgpart" \
+    "bx-att.txt:$bx_att:$(( bx_att_size + 50 ))"
+bx_try "ingest refuses an attachment frame whose declared size the stream overruns" "$bx_msgpart" \
+    "bx-att.txt:$bx_att:$(( bx_att_size - 2 ))"
+bx_bad_sha="$(printf '0%.0s' $(seq 1 64))"
+bx_try "ingest refuses an attachment frame whose sha256 does not match" "$bx_msgpart" \
+    "bx-att.txt:$bx_att:$bx_att_size:$bx_bad_sha"
+
+bx_extra="$work/bx-extra.txt"; printf 'extra\n' > "$bx_extra"
+bx_try "ingest refuses more attachment frames than X-Attachment headers" "$bx_msgpart" \
+    "bx-att.txt:$bx_att" "extra.txt:$bx_extra"
+
+bx_good2="$work/bx-good2.bundle"
+printf 'two\n' | ma send --emit --from @fe --to @x:beta --subject 'two attach' --body - \
+    --attach "$bx_att" --attach "$bx_extra" > "$bx_good2" 2>diag.txt
+bx_msgpart2="$work/bx-msgpart2.msg"
+extract_msg_part "$bx_good2" "$bx_msgpart2"
+bx_try "ingest refuses fewer attachment frames than X-Attachment headers" "$bx_msgpart2" "bx-att.txt:$bx_att"
+
+bx_zero_msgpart="$work/bx-zero-msg.msg"
+sed '/^X-Attachment:/d' "$bx_msgpart" > "$bx_zero_msgpart"
+bx_try "ingest refuses a bundle with no attachment frames at all" "$bx_zero_msgpart"
+
+bx_trailing_fresh="$(bx_fresh_id)"
+bx_trailing_msgpart="$work/bx-trailing-msg.msg"
+sed "s/^Message-ID: .*/Message-ID: $bx_trailing_fresh/;s/^Thread-ID: .*/Thread-ID: $bx_trailing_fresh/" "$bx_msgpart" > "$bx_trailing_msgpart"
+bx_trailing="$work/bx-trailing.bundle"
+make_bundle "$bx_trailing" "$bx_trailing_msgpart" "bx-att.txt:$bx_att"
+printf 'garbage\n' >> "$bx_trailing"
+before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+mb ingest --peer alpha < "$bx_trailing" >/dev/null 2>"$work/bx-trailing.err"; rc=$?
+check "ingest refuses trailing bytes after 'end'" "1 $before_m" "$rc $(find "$hx_root_b" -name '*.msg' | wc -l)"
+
+echo "== cross-host bundles: collisions, reuse and symlinks =="
+
+bx_diff_dir="$work/bx-diff-dir"; mkdir -p "$bx_diff_dir"
+printf 'different content\n' > "$bx_diff_dir/bx-att.txt"
+bx_reply_diff="$work/bx-reply-diff.bundle"
+printf 'reply body\n' | ma reply --emit --from @fe --reply-to "$bx_id" --body - --attach "$bx_diff_dir/bx-att.txt" > "$bx_reply_diff" 2>diag.txt
+before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+mb ingest --peer alpha < "$bx_reply_diff" >/dev/null 2>"$work/bx-diff.err"; rc=$?
+check "ingest refuses a same-basename attachment with different content" "1 $before_m" "$rc $(find "$hx_root_b" -name '*.msg' | wc -l)"
+check "the already-staged attachment keeps its original content" "0" \
+    "$(cmp -s "$bx_att" "$hx_root_b/threads/$bx_id/attachments/bx-att.txt"; echo $?)"
+
+bx_same_dir="$work/bx-same-dir"; mkdir -p "$bx_same_dir"
+cp "$bx_att" "$bx_same_dir/bx-att.txt"
+bx_reply_same="$work/bx-reply-same.bundle"
+printf 'reply body 2\n' | ma reply --emit --from @fe --reply-to "$bx_id" --body - --attach "$bx_same_dir/bx-att.txt" > "$bx_reply_same" 2>diag.txt
+before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+mb ingest --peer alpha < "$bx_reply_same" >diag.txt 2>&1; rc=$?
+check "identical-content reuse across messages in a thread is accepted" "0" "$rc"
+check "it is stored as a new message in the thread" "$(( before_m + 1 ))" "$(find "$hx_root_b" -name '*.msg' | wc -l)"
+check "the attachment file itself is untouched by the reuse" "0" \
+    "$(cmp -s "$bx_att" "$hx_root_b/threads/$bx_id/attachments/bx-att.txt"; echo $?)"
+check "the thread's tree shows both messages, both marked with the paperclip" "2" \
+    "$(mb tree "$bx_id" 2>/dev/null | grep -c '📎')"
+
+bx_sym_att="$work/bx-sym-att.txt"; printf 'sym\n' > "$bx_sym_att"
+bx_sym_bundle="$work/bx-sym.bundle"
+printf 'sym body\n' | ma send --emit --from @fe --to @x:beta --subject 'sym test' --body - --attach "$bx_sym_att" > "$bx_sym_bundle" 2>diag.txt
+bx_sym_id="$(sed -n 's/^Message-ID: //p' "$bx_sym_bundle" | head -1)"
+mb ingest --peer alpha < "$bx_sym_bundle" >/dev/null 2>diag.txt
+bx_sym_target="$work/elsewhere.txt"; printf 'elsewhere\n' > "$bx_sym_target"
+rm -f "$hx_root_b/threads/$bx_sym_id/attachments/bx-sym-att.txt"
+ln -s "$bx_sym_target" "$hx_root_b/threads/$bx_sym_id/attachments/bx-sym-att.txt"
+bx_sym_dir2="$work/bx-sym-dir2"; mkdir -p "$bx_sym_dir2"
+cp "$bx_sym_att" "$bx_sym_dir2/bx-sym-att.txt"
+bx_sym_reply="$work/bx-sym-reply.bundle"
+printf 'reply\n' | ma reply --emit --from @fe --reply-to "$bx_sym_id" --body - --attach "$bx_sym_dir2/bx-sym-att.txt" > "$bx_sym_reply" 2>diag.txt
+before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+mb ingest --peer alpha < "$bx_sym_reply" >/dev/null 2>"$work/bx-sym.err"; rc=$?
+check "ingest refuses a symlinked attachment entry" "1 $before_m" "$rc $(find "$hx_root_b" -name '*.msg' | wc -l)"
+check "the symlinked entry is left exactly as it was" "1" \
+    "$([[ -L "$hx_root_b/threads/$bx_sym_id/attachments/bx-sym-att.txt" ]] && echo 1 || echo 0)"
+
+bx_symdir_att="$work/bx-symdir-att.txt"; printf 'symdir\n' > "$bx_symdir_att"
+bx_symdir_bundle="$work/bx-symdir.bundle"
+printf 'symdir body\n' | ma send --emit --from @fe --to @x:beta --subject 'symdir test' --body - --attach "$bx_symdir_att" > "$bx_symdir_bundle" 2>diag.txt
+bx_symdir_id="$(sed -n 's/^Message-ID: //p' "$bx_symdir_bundle" | head -1)"
+mb ingest --peer alpha < "$bx_symdir_bundle" >/dev/null 2>diag.txt
+mv "$hx_root_b/threads/$bx_symdir_id/attachments" "$work/elsewhere-dir"
+ln -s "$work/elsewhere-dir" "$hx_root_b/threads/$bx_symdir_id/attachments"
+bx_symdir_dir2="$work/bx-symdir-dir2"; mkdir -p "$bx_symdir_dir2"
+cp "$bx_symdir_att" "$bx_symdir_dir2/bx-symdir-att.txt"
+bx_symdir_reply="$work/bx-symdir-reply.bundle"
+printf 'reply\n' | ma reply --emit --from @fe --reply-to "$bx_symdir_id" --body - --attach "$bx_symdir_dir2/bx-symdir-att.txt" > "$bx_symdir_reply" 2>diag.txt
+before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+mb ingest --peer alpha < "$bx_symdir_reply" >/dev/null 2>"$work/bx-symdir.err"; rc=$?
+check "ingest refuses a symlinked attachments directory" "1 $before_m" "$rc $(find "$hx_root_b" -name '*.msg' | wc -l)"
+check "the symlinked attachments directory is left exactly as it was" "1" \
+    "$([[ -L "$hx_root_b/threads/$bx_symdir_id/attachments" ]] && echo 1 || echo 0)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

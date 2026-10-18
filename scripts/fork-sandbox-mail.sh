@@ -42,18 +42,39 @@
 # but print it (headers, blank line, body) on stdout instead of storing it,
 # and write nothing to the store. The printed form is PORTABLE: every bare
 # address is qualified with this host's peer name, so it means the same on
-# any host. --emit does not carry attachments, grants, --review-target,
-# --budget, --no-grant or the upstream flags (refused). It exists so lane-mail.sh can deliver a
-# message to another host before anything is written here.
+# any host. --emit does not carry grants, --review-target, --budget,
+# --no-grant or the upstream flags (refused). It exists so lane-mail.sh can
+# deliver a message to another host before anything is written here.
 #
-# `ingest [--peer <name>]` reads one complete message from stdin (as --emit
-# prints it) and stores it keeping its Message-ID, Thread-ID and all other
-# headers, normalising addresses that name this host to the bare form. It
-# refuses (one-line error, exit 1): a message over 1 MiB, a malformed or
-# duplicated core header, a missing core header (Message-ID, Thread-ID, Date,
-# From, To, Subject, X-Hops), an id that is not a store-shaped id, the
-# reserved headers X-Attachment, X-Upstream-*, X-Review-Target*, X-Version,
-# X-Thread-Budget and X-Grant, an invalid address, an empty body, and a Message-ID already in the store.
+# --emit WITH one or more --attach prints a LANE-MAIL-BUNDLE instead of the
+# plain message: the plain message framed with its byte count, then one
+# "attachment <basename> <size> <sha256>" frame per distinct attachment (in
+# --attach order), each immediately followed by that many raw bytes and a
+# single newline, then a final "end" line. At most
+# MAIL_ATTACH_MAX_COUNT (8) attachments, each under MAIL_ATTACH_MAX_BYTES (4
+# MiB); over either is refused here, before anything is sent. See
+# docs/agent-mail.md, "Lane mail between hosts", for the exact framing
+# grammar and the trust rules `ingest` applies to it.
+#
+# `ingest [--peer <name>]` reads one complete message OR one LANE-MAIL-BUNDLE
+# from stdin (as --emit prints either) and stores it keeping its Message-ID,
+# Thread-ID and all other headers, normalising addresses that name this host
+# to the bare form. For a plain message it refuses (one-line error, exit 1):
+# a message over 1 MiB, a malformed or duplicated core header, a missing core
+# header (Message-ID, Thread-ID, Date, From, To, Subject, X-Hops), an id that
+# is not a store-shaped id, the reserved headers X-Attachment, X-Upstream-*,
+# X-Review-Target*, X-Version, X-Thread-Budget and X-Grant, an invalid
+# address, an empty body, and a Message-ID already in the store. For a
+# bundle, the message part goes through the same checks except that
+# X-Attachment headers are required and must match the bundle's attachment
+# frames exactly (same basenames, same order, same count); each attachment
+# frame is validated (basename shape, size cap, declared size and sha256
+# against the bytes actually sent) and staged atomically into
+# threads/<tid>/attachments/ before the message is written -- see
+# docs/agent-mail.md for the full grammar, caps and collision rules. A
+# receiver that predates bundle support refuses it with its ordinary
+# "malformed header line" error, since the bundle's first line has no colon;
+# lane-mail.sh turns that into a specific upgrade error.
 # With --peer the message is treated as received from that peer: From must
 # name that host (a bare From is qualified with it; any other host is
 # refused) and bare To/Cc addresses, which are in the sender's frame, are
@@ -260,6 +281,15 @@
 # refused too: the staged basename list is '/'-joined and split back
 # apart with `read -ra`, which stops at the first newline and would
 # silently truncate the list.
+#
+# A cross-host bundle (--emit with --attach; see "Lane mail between hosts"
+# in docs/agent-mail.md) applies a stricter basename rule on both ends,
+# since the receiving `ingest` trusts a peer less than a local caller:
+# non-empty, at most 255 bytes, not "." or "..", no "/", no control
+# character (a newline included), and no leading "-". The same collision
+# and dedup rules apply, plus one more: two attachment frames in one
+# bundle sharing a basename are refused unless byte-identical, same as two
+# --attach arguments sharing a basename locally.
 
 set -euo pipefail
 
@@ -270,6 +300,15 @@ MAIL_ATTACH_MAX_BYTES=$(( 4 * 1024 * 1024 ))
 # LANE_MAIL_LANE_RE / LANE_MAIL_HOST_RE in lane-mail-lib.sh.
 MAIL_ADDR_RE='^@[a-z0-9][a-z0-9-]*(:[a-z0-9][a-z0-9.-]*)?$'
 MAIL_INGEST_MAX_BYTES=$(( 1024 * 1024 ))
+# A LANE-MAIL-BUNDLE carries at most this many attachments (sender and
+# receiver both enforce it; see docs/agent-mail.md, "Lane mail between
+# hosts"). MAIL_BUNDLE_MAX_BYTES bounds the whole wire stream `ingest` will
+# ever read for one delivery -- the message cap, plus the worst case of
+# attachments at the count and size caps, plus generous slack for frame
+# lines -- so a sender that never stops sending can't make `ingest` read an
+# unbounded amount.
+MAIL_ATTACH_MAX_COUNT=8
+MAIL_BUNDLE_MAX_BYTES=$(( MAIL_INGEST_MAX_BYTES + MAIL_ATTACH_MAX_COUNT * MAIL_ATTACH_MAX_BYTES + 8192 ))
 # Same hex-id shape as fork-sandbox.sh's own session-id check: no slashes,
 # no dots, no leading hyphen. mail_new_uuid never generates anything else,
 # so a caller-supplied id failing this shape is not a thread id this store
@@ -764,6 +803,101 @@ mail_stage_attachments() {
     (IFS='/'; printf '%s' "${names[*]:-}")
 }
 
+# The basename rule a cross-host bundle attachment holds both ends to (see
+# "Lane mail between hosts" in docs/agent-mail.md): non-empty, at most 255
+# bytes, not "." or "..", no "/", no control character (a newline
+# included), and no leading "-" (which a tool reading the staged file by
+# name alone could otherwise read as an option). $2, if given, names the
+# thing being validated for the error text (default "attachment").
+mail_validate_attach_basename() {
+    local base="$1" what="${2:-attachment}"
+    if [[ -z "$base" ]]; then
+        echo "Error: $what basename must not be empty." >&2
+        return 1
+    elif (( ${#base} > 255 )); then
+        echo "Error: $what basename '${base:0:60}...' is over 255 bytes." >&2
+        return 1
+    elif [[ "$base" == "." || "$base" == ".." ]]; then
+        echo "Error: $what basename must not be '.' or '..'." >&2
+        return 1
+    elif [[ "$base" == */* ]]; then
+        echo "Error: $what basename '$base' must not contain '/'." >&2
+        return 1
+    elif [[ "$base" == -* ]]; then
+        echo "Error: $what basename '$base' must not start with '-'." >&2
+        return 1
+    elif [[ "$base" =~ [[:cntrl:]] ]]; then
+        echo "Error: $what basename must not contain a newline or control character." >&2
+        return 1
+    fi
+    return 0
+}
+
+# A hex sha256 of file $1, portable across the GNU/BSD/minimal split (same
+# fallback chain as fork-sandbox-lib.sh's k8s_sha256_stdin, but over a file
+# rather than stdin, since a cross-host attachment is hashed twice: once
+# while building the bundle, once while verifying it on ingest).
+mail_sha256_file() {
+    local f="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$f" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "$f" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 -- "$f" | sed 's/^.* //'
+    else
+        echo "Error: none of sha256sum, shasum or openssl found; one is needed" >&2
+        echo "to checksum a cross-host mail attachment." >&2
+        return 1
+    fi
+}
+
+# Validates each --attach file for a LANE-MAIL-BUNDLE (see mail_emit_bundle)
+# without touching the store: basename shape (mail_validate_attach_basename),
+# existence, the size cap, and the same within-invocation collision/dedup
+# rules as mail_stage_attachments, minus the against-the-store check (a
+# bundle is built before anything is written anywhere). Enforces the
+# MAIL_ATTACH_MAX_COUNT cap here too, on the sending side, before ssh ever
+# runs. Prints one "<basename>\t<file>" line per distinct staged attachment,
+# in --attach order.
+mail_emit_validate_attach() {
+    local -a seen_bases=() seen_files=() out=()
+    local f base size i dup
+    if (( $# > MAIL_ATTACH_MAX_COUNT )); then
+        echo "Error: --emit: a message may carry at most $MAIL_ATTACH_MAX_COUNT attachments." >&2
+        return 1
+    fi
+    for f in "$@"; do
+        base="$(basename -- "$f")"
+        mail_validate_attach_basename "$base" "--attach basename" || return 1
+        [[ -f "$f" ]] || { echo "Error: --attach file '$f' not found." >&2; return 1; }
+        size="$(wc -c < "$f" | tr -d '[:space:]')"
+        if (( size > MAIL_ATTACH_MAX_BYTES )); then
+            echo "Error: --attach file '$f' is $size bytes, over the" >&2
+            echo "$MAIL_ATTACH_MAX_BYTES byte (4 MiB) cap." >&2
+            return 1
+        fi
+        dup=0
+        for ((i = 0; i < ${#seen_bases[@]}; i++)); do
+            [[ "${seen_bases[i]}" == "$base" ]] || continue
+            if ! cmp -s -- "$f" "${seen_files[i]}"; then
+                echo "Error: --attach '$f' and '${seen_files[i]}' both map to" >&2
+                echo "attachments/$base but have different content; they were" >&2
+                echo "given together in this command. Rename one and retry." >&2
+                return 1
+            fi
+            dup=1
+            break
+        done
+        if (( ! dup )); then
+            seen_bases+=("$base")
+            seen_files+=("$f")
+            out+=("$base"$'\t'"$f")
+        fi
+    done
+    printf '%s\n' "${out[@]}"
+}
+
 # Writes headers + a blank line + the body (from $2, a file, copied
 # verbatim) to a fresh temp file, then claims a NNN via the mkdir-lock
 # scheme documented above and renames the temp file into place under $3
@@ -827,15 +961,15 @@ mail_body_is_empty() {
 
 # --emit builds a message exactly as send/reply would but prints it instead
 # of storing it, so a caller can ship it elsewhere before anything is
-# written here. It carries only what a plain message carries: attachments,
-# grants, a review target and the upstream flags stay in the local store.
-# Args: verb, attach count, grant-ns count, reach-probe count, and the
-# concatenation of the single-valued flags that --emit cannot carry.
+# written here. Attachments travel (as a LANE-MAIL-BUNDLE; see
+# mail_emit_bundle); grants, a review target and the upstream flags stay in
+# the local store regardless. Args: verb, grant-ns count, reach-probe count,
+# and the concatenation of the single-valued flags that --emit cannot carry.
 mail_emit_check() {
-    local verb="$1" n_attach="$2" n_ns="$3" n_probe="$4" other="$5"
-    if (( n_attach > 0 )) || (( n_ns > 0 )) || (( n_probe > 0 )) || [[ -n "$other" ]]; then
-        echo "Error: $verb: --emit does not carry attachments, grants, a review" >&2
-        echo "target, a thread budget, --no-grant or upstream flags." >&2
+    local verb="$1" n_ns="$2" n_probe="$3" other="$4"
+    if (( n_ns > 0 )) || (( n_probe > 0 )) || [[ -n "$other" ]]; then
+        echo "Error: $verb: --emit does not carry grants, a review target, a" >&2
+        echo "thread budget, --no-grant or upstream flags." >&2
         return 1
     fi
 }
@@ -861,6 +995,38 @@ mail_emit_message() {
     printf '%s\n\n' "$1"
     cat -- "$2"
     rm -f -- "$2"
+}
+
+# Prints a LANE-MAIL-BUNDLE 1 (see docs/agent-mail.md, "Lane mail between
+# hosts", for the exact grammar `ingest` holds a sender to): the plain
+# message ($1 headers, $2 body file, removed after) framed with its byte
+# count, then one "attachment <basename> <size> <sha256>" frame per
+# "<basename>\t<file>" pair in $3..., each immediately followed by that
+# many raw bytes and a single newline, then a final "end" line. Every
+# frame line ends with "\n"; every payload is followed by exactly one
+# "\n" before the next frame line -- the receiver reads both strictly.
+mail_emit_bundle() {
+    local headers="$1" body_file="$2"; shift 2
+    local msg; msg="$(mktemp "$MAIL_ROOT/.mail.emit.XXXXXX")"
+    { printf '%s\n\n' "$headers"; cat -- "$body_file"; } > "$msg"
+    rm -f -- "$body_file"
+    local msg_size; msg_size="$(wc -c < "$msg" | tr -d '[:space:]')"
+    printf 'LANE-MAIL-BUNDLE 1\n'
+    printf 'message %s\n' "$msg_size"
+    cat -- "$msg"
+    rm -f -- "$msg"
+    printf '\n'
+    local entry base f size sha
+    for entry in "$@"; do
+        base="${entry%%$'\t'*}"
+        f="${entry#*$'\t'}"
+        size="$(wc -c < "$f" | tr -d '[:space:]')"
+        sha="$(mail_sha256_file "$f")" || return 1
+        printf 'attachment %s %s %s\n' "$base" "$size" "$sha"
+        cat -- "$f"
+        printf '\n'
+    done
+    printf 'end\n'
 }
 
 cmd_send() {
@@ -934,7 +1100,7 @@ cmd_send() {
     if (( emit )); then
         local no_grant_mark=""
         (( no_grant )) && no_grant_mark="no-grant"
-        mail_emit_check send "${#attach_files[@]}" "${#grant_allow_ns[@]}" "${#grant_reach_probe[@]}" \
+        mail_emit_check send "${#grant_allow_ns[@]}" "${#grant_reach_probe[@]}" \
             "$grant_context_ro$grant_context_secret$review_target_arg$budget$no_grant_mark" || return 1
     fi
 
@@ -1001,13 +1167,26 @@ cmd_send() {
     fi
 
     local attach_csv=""
+    local -a attach_pairs=()
     if (( ${#attach_files[@]} > 0 )); then
-        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || {
-            (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
-            (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
-            rm -f -- "$body_file"
-            return 1
-        }
+        if (( emit )); then
+            local pairs_out base f
+            pairs_out="$(mail_emit_validate_attach "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
+            local -a attach_bases=()
+            while IFS=$'\t' read -r base f; do
+                [[ -n "$base" ]] || continue
+                attach_bases+=("$base")
+                attach_pairs+=("$base"$'\t'"$f")
+            done <<< "$pairs_out"
+            attach_csv="$(IFS='/'; printf '%s' "${attach_bases[*]}")"
+        else
+            attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || {
+                (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
+                (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
+                rm -f -- "$body_file"
+                return 1
+            }
+        fi
     fi
 
     local from_hdr="$from" to_hdr="$to_norm" cc_hdr="$cc_norm"
@@ -1048,7 +1227,11 @@ cmd_send() {
     local headers; headers="$(printf '%s\n' "${hlines[@]}")"
 
     if (( emit )); then
-        mail_emit_message "$headers" "$body_file"
+        if (( ${#attach_pairs[@]} > 0 )); then
+            mail_emit_bundle "$headers" "$body_file" "${attach_pairs[@]}" || return 1
+        else
+            mail_emit_message "$headers" "$body_file"
+        fi
         return 0
     fi
 
@@ -1136,7 +1319,7 @@ cmd_reply() {
     [[ -n "$to" ]] && { to_norm="$(mail_validate_addr_list "$to")" || return 1; }
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
     if (( emit )); then
-        mail_emit_check reply "${#attach_files[@]}" 0 0 "$upstream_head_arg$upstream_state_arg" || return 1
+        mail_emit_check reply 0 0 "$upstream_head_arg$upstream_state_arg" || return 1
     fi
 
     local parent_file
@@ -1211,8 +1394,21 @@ cmd_reply() {
 
     local thread_dir; thread_dir="$(mail_thread_dir "$p_thread_id")"
     local attach_csv=""
+    local -a attach_pairs=()
     if (( ${#attach_files[@]} > 0 )); then
-        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
+        if (( emit )); then
+            local pairs_out base f
+            pairs_out="$(mail_emit_validate_attach "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
+            local -a attach_bases=()
+            while IFS=$'\t' read -r base f; do
+                [[ -n "$base" ]] || continue
+                attach_bases+=("$base")
+                attach_pairs+=("$base"$'\t'"$f")
+            done <<< "$pairs_out"
+            attach_csv="$(IFS='/'; printf '%s' "${attach_bases[*]}")"
+        else
+            attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
+        fi
     fi
 
     local uuid; uuid="$(mail_new_uuid)"
@@ -1248,7 +1444,11 @@ cmd_reply() {
     local headers; headers="$(printf '%s\n' "${hlines[@]}")"
 
     if (( emit )); then
-        mail_emit_message "$headers" "$body_file"
+        if (( ${#attach_pairs[@]} > 0 )); then
+            mail_emit_bundle "$headers" "$body_file" "${attach_pairs[@]}" || return 1
+        else
+            mail_emit_message "$headers" "$body_file"
+        fi
         return 0
     fi
 
@@ -1271,9 +1471,15 @@ mail_ingest_fail() {
 # Validates the message in $2 (read bounded from stdin by cmd_ingest) and,
 # if it is sound, places it in the store keeping its ids and headers. $1 is
 # the peer name to stamp it as received from, or empty. $3 is a scratch file
-# for the body. Prints the message id.
+# for the body. $4 and $5 name arrays (possibly empty): the attachment
+# basenames a bundle's frames declared, in frame order, and the temp file
+# holding each frame's already-size/sha-verified payload, same order. With
+# both empty (the plain-message case, including every cross-host delivery
+# before bundles existed) X-Attachment stays reserved and refused, exactly
+# as before. Prints the message id.
 mail_ingest_message() {
     local peer="$1" raw="$2" body_file="$3"
+    local -n exp_bases_ref="$4" attach_srcs_ref="$5"
     local -a hdrs=()
     local line n=0 found_blank=0
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -1292,6 +1498,7 @@ mail_ingest_message() {
     fi
 
     local -A hv=() hcount=()
+    local -a seen_attach=()
     local name val k
     for line in "${hdrs[@]}"; do
         if [[ "$line" == *$'\r'* ]]; then
@@ -1304,8 +1511,12 @@ mail_ingest_message() {
         fi
         name="${BASH_REMATCH[1]}"
         val="${BASH_REMATCH[3]}"
+        if [[ "${name^^}" == "X-ATTACHMENT" ]]; then
+            seen_attach+=("$val")
+            continue
+        fi
         case "${name^^}" in
-            X-ATTACHMENT|X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-REVIEW-TARGET|X-REVIEW-TARGET-SET|X-VERSION|X-THREAD-BUDGET|X-GRANT)
+            X-UPSTREAM-HEAD|X-UPSTREAM-STATE|X-REVIEW-TARGET|X-REVIEW-TARGET-SET|X-VERSION|X-THREAD-BUDGET|X-GRANT)
                 mail_ingest_fail "header '$name' is reserved and does not travel."
                 return 1
                 ;;
@@ -1330,6 +1541,31 @@ mail_ingest_message() {
             return 1
         fi
     done
+
+    # X-Attachment either stays fully reserved (a plain message, or ingest
+    # called with no bundle) or must match the bundle's attachment frames
+    # exactly: same basenames, same order, same count -- the frames are
+    # already size- and sha256-verified, but the headers are the sender's
+    # own claim about what it attached, and the two must agree.
+    if (( ${#exp_bases_ref[@]} == 0 )); then
+        if (( ${#seen_attach[@]} > 0 )); then
+            mail_ingest_fail "header 'X-Attachment' is reserved and does not travel."
+            return 1
+        fi
+    else
+        if (( ${#seen_attach[@]} != ${#exp_bases_ref[@]} )); then
+            mail_ingest_fail "message carries ${#seen_attach[@]} X-Attachment header(s) but the bundle has ${#exp_bases_ref[@]} attachment frame(s)."
+            return 1
+        fi
+        local idx want
+        for idx in "${!exp_bases_ref[@]}"; do
+            want="attachments/${exp_bases_ref[$idx]}"
+            if [[ "${seen_attach[$idx]}" != "$want" ]]; then
+                mail_ingest_fail "X-Attachment header '${seen_attach[$idx]}' does not match the bundle's attachment frame '$want' (same order required)."
+                return 1
+            fi
+        done
+    fi
 
     local mid="${hv[Message-ID]}" tid="${hv[Thread-ID]}"
     for k in Message-ID Thread-ID In-Reply-To; do
@@ -1398,6 +1634,64 @@ mail_ingest_message() {
     thread_dir="$(mail_thread_dir "$tid")"
     [[ -d "$thread_dir" ]] || created=1
     mkdir -p -- "$thread_dir"
+
+    # A bundle's attachments are staged (and, where needed, moved into
+    # place) before the message is ever written, so a reader who sees the
+    # message already sees its attachments, and a refusal here leaves the
+    # thread exactly as it was (no thread dir left behind for a brand-new
+    # thread). Nothing is moved until every frame has been validated.
+    if (( ${#exp_bases_ref[@]} > 0 )); then
+        local attach_dir="$thread_dir/attachments"
+        if [[ -L "$attach_dir" ]]; then
+            mail_ingest_fail "attachments is a symlink in this thread; refusing."
+            (( created )) && rmdir -- "$thread_dir" 2>/dev/null
+            return 1
+        elif [[ -e "$attach_dir" && ! -d "$attach_dir" ]]; then
+            mail_ingest_fail "attachments is not a directory in this thread; refusing."
+            (( created )) && rmdir -- "$thread_dir" 2>/dev/null
+            return 1
+        fi
+        mkdir -p -- "$attach_dir"
+
+        local -A within_src=()
+        local i base src dest
+        for i in "${!exp_bases_ref[@]}"; do
+            base="${exp_bases_ref[$i]}"; src="${attach_srcs_ref[$i]}"
+            if [[ -n "${within_src[$base]:-}" ]]; then
+                if ! cmp -s -- "$src" "${within_src[$base]}"; then
+                    mail_ingest_fail "two attachment frames named '$base' in this bundle have different content."
+                    (( created )) && { rmdir -- "$attach_dir" 2>/dev/null; rmdir -- "$thread_dir" 2>/dev/null; }
+                    return 1
+                fi
+                continue
+            fi
+            within_src[$base]="$src"
+            dest="$attach_dir/$base"
+            if [[ -e "$dest" || -L "$dest" ]]; then
+                if [[ -L "$dest" || ! -f "$dest" ]]; then
+                    mail_ingest_fail "attachments/$base exists and is not a plain file; refusing."
+                    (( created )) && { rmdir -- "$attach_dir" 2>/dev/null; rmdir -- "$thread_dir" 2>/dev/null; }
+                    return 1
+                fi
+                if ! cmp -s -- "$src" "$dest"; then
+                    mail_ingest_fail "attachments/$base already holds different content."
+                    (( created )) && { rmdir -- "$attach_dir" 2>/dev/null; rmdir -- "$thread_dir" 2>/dev/null; }
+                    return 1
+                fi
+            fi
+        done
+
+        local -A moved=()
+        for i in "${!exp_bases_ref[@]}"; do
+            base="${exp_bases_ref[$i]}"; src="${attach_srcs_ref[$i]}"
+            [[ -n "${moved[$base]:-}" ]] && continue
+            moved[$base]=1
+            dest="$attach_dir/$base"
+            [[ -e "$dest" ]] && continue
+            mv -- "$src" "$dest"
+        done
+    fi
+
     if ! mail_place_message "$headers" "$body_file" "$thread_dir" "$mid" >/dev/null; then
         (( created )) && rmdir -- "$thread_dir" 2>/dev/null
         return 1
@@ -1405,11 +1699,143 @@ mail_ingest_message() {
     printf '%s\n' "$mid"
 }
 
+# Reads exactly one byte from stdin and succeeds only if it was a newline
+# -- the "exactly one \n before the next frame line" rule a bundle's
+# payloads are held to. EOF, or any other byte, is a failure (truncated or
+# malformed framing, told apart by the caller's own EOF handling).
+mail_ingest_bundle_sep() {
+    local sep rc=0
+    IFS= read -r -n 1 sep || rc=$?
+    [[ "$rc" -eq 0 && -z "$sep" ]]
+}
+
+# Parses a LANE-MAIL-BUNDLE 1 stream already fully captured, bounded, in
+# file $2 (the marker line itself included) -- see docs/agent-mail.md,
+# "Lane mail between hosts", for the exact grammar this enforces strictly:
+# the message frame's declared byte count must be met exactly, each
+# payload followed by exactly one newline, at most MAIL_ATTACH_MAX_COUNT
+# attachment frames, at least one (a zero-attachment bundle is refused --
+# send a plain message instead), "end" with nothing after it. $3 is a
+# scratch dir, on the store's filesystem, for the message and attachment
+# payloads (the caller owns it and cleans it up). On success, hands off to
+# mail_ingest_message, which validates the rest and stages the
+# attachments atomically.
+mail_ingest_bundle() {
+    local peer="$1" raw="$2" workdir="$3"
+    exec 3< "$raw"
+    local line
+    if ! IFS= read -r line <&3 || [[ "$line" != "LANE-MAIL-BUNDLE 1" ]]; then
+        exec 3<&-
+        mail_ingest_fail "malformed bundle header line."
+        return 1
+    fi
+    if ! IFS= read -r line <&3; then
+        exec 3<&-
+        mail_ingest_fail "truncated bundle: missing message frame."
+        return 1
+    fi
+    if [[ ! "$line" =~ ^message\ ([0-9]+)$ ]]; then
+        exec 3<&-
+        mail_ingest_fail "malformed message frame line."
+        return 1
+    fi
+    local msg_n="${BASH_REMATCH[1]}"
+    if (( msg_n > MAIL_INGEST_MAX_BYTES )); then
+        exec 3<&-
+        mail_ingest_fail "bundle message frame is over the $MAIL_INGEST_MAX_BYTES byte cap."
+        return 1
+    fi
+    local msg_file="$workdir/message"
+    head -c "$msg_n" <&3 > "$msg_file"
+    if [[ "$(wc -c < "$msg_file" | tr -d '[:space:]')" != "$msg_n" ]]; then
+        exec 3<&-
+        mail_ingest_fail "bundle message frame declared $msg_n bytes but the stream had fewer."
+        return 1
+    fi
+    if ! mail_ingest_bundle_sep <&3; then
+        exec 3<&-
+        mail_ingest_fail "the message frame is not followed by exactly one newline."
+        return 1
+    fi
+
+    local -a exp_bases=() attach_srcs=()
+    local saw_end=0 n_attach=0 base fsize fsha att_file actual_sha
+    while IFS= read -r line <&3; do
+        if [[ "$line" == "end" ]]; then
+            saw_end=1
+            break
+        fi
+        if (( n_attach >= MAIL_ATTACH_MAX_COUNT )); then
+            exec 3<&-
+            mail_ingest_fail "bundle carries more than $MAIL_ATTACH_MAX_COUNT attachments."
+            return 1
+        fi
+        if [[ ! "$line" =~ ^attachment\ (.+)\ ([0-9]+)\ ([0-9a-f]{64})$ ]]; then
+            exec 3<&-
+            mail_ingest_fail "malformed attachment frame line."
+            return 1
+        fi
+        base="${BASH_REMATCH[1]}"; fsize="${BASH_REMATCH[2]}"; fsha="${BASH_REMATCH[3]}"
+        if ! mail_validate_attach_basename "$base" "attachment frame"; then
+            exec 3<&-
+            return 1
+        fi
+        if (( fsize > MAIL_ATTACH_MAX_BYTES )); then
+            exec 3<&-
+            mail_ingest_fail "attachment '$base' is $fsize bytes, over the $MAIL_ATTACH_MAX_BYTES byte (4 MiB) cap."
+            return 1
+        fi
+        n_attach=$(( n_attach + 1 ))
+        att_file="$workdir/att.$n_attach"
+        head -c "$fsize" <&3 > "$att_file"
+        if [[ "$(wc -c < "$att_file" | tr -d '[:space:]')" != "$fsize" ]]; then
+            exec 3<&-
+            mail_ingest_fail "attachment '$base' declared $fsize bytes but the stream had fewer."
+            return 1
+        fi
+        actual_sha="$(mail_sha256_file "$att_file")" || { exec 3<&-; return 1; }
+        if [[ "$actual_sha" != "$fsha" ]]; then
+            exec 3<&-
+            mail_ingest_fail "attachment '$base': sha256 mismatch."
+            return 1
+        fi
+        if ! mail_ingest_bundle_sep <&3; then
+            exec 3<&-
+            mail_ingest_fail "attachment '$base' is not followed by exactly one newline."
+            return 1
+        fi
+        exp_bases+=("$base")
+        attach_srcs+=("$att_file")
+    done
+    if (( ! saw_end )); then
+        exec 3<&-
+        mail_ingest_fail "truncated bundle: missing 'end'."
+        return 1
+    fi
+    if (( n_attach == 0 )); then
+        exec 3<&-
+        mail_ingest_fail "a bundle must carry at least one attachment; send a plain message instead."
+        return 1
+    fi
+    local trailing
+    # shellcheck disable=SC2034  # only its presence (any byte read) matters
+    if IFS= read -r -n 1 trailing <&3; then
+        exec 3<&-
+        mail_ingest_fail "trailing bytes after 'end'."
+        return 1
+    fi
+    exec 3<&-
+
+    local body_file="$workdir/body"
+    mail_ingest_message "$peer" "$msg_file" "$body_file" exp_bases attach_srcs
+}
+
 # ingest --peer: the receiving end of a cross-host delivery. Writes one
-# complete message (as `send --emit` prints it) from stdin into this store,
-# keeping its Message-ID, Thread-ID and every other header, normalising
-# addresses that name this host to the bare form. Without --peer it is a
-# local write (the sender's own copy of a message it just delivered).
+# complete message or one LANE-MAIL-BUNDLE (as `send --emit` prints either)
+# from stdin into this store, keeping its Message-ID, Thread-ID and every
+# other header, normalising addresses that name this host to the bare
+# form. Without --peer it is a local write (the sender's own copy of a
+# message, or bundle, it just delivered).
 cmd_ingest() {
     local peer=""
     while [[ $# -gt 0 ]]; do
@@ -1423,17 +1849,30 @@ cmd_ingest() {
         mail_ingest_fail "--peer '$peer' is not a valid peer name."
         return 1
     fi
-    local raw body_file rc=0 size
-    raw="$(mktemp "$MAIL_ROOT/.mail.ingest.XXXXXX")"
-    body_file="$(mktemp "$MAIL_ROOT/.mail.body.XXXXXX")"
-    head -c $(( MAIL_INGEST_MAX_BYTES + 1 )) > "$raw" || true
+    local workdir rc=0 size raw
+    workdir="$(mktemp -d "$MAIL_ROOT/.mail.ingest.XXXXXX")"
+    raw="$workdir/raw"
+    # Bounded to the worst case of a bundle (see MAIL_BUNDLE_MAX_BYTES):
+    # a sender that never stops sending still can't make this read an
+    # unbounded amount, whichever form the stream turns out to be.
+    head -c $(( MAIL_BUNDLE_MAX_BYTES + 1 )) > "$raw" || true
     size="$(wc -c < "$raw" | tr -d '[:space:]')"
-    if (( size > MAIL_INGEST_MAX_BYTES )); then
-        mail_ingest_fail "message is over the $MAIL_INGEST_MAX_BYTES byte cap." || rc=1
+    if (( size > MAIL_BUNDLE_MAX_BYTES )); then
+        mail_ingest_fail "message stream is over the maximum bundle size." || rc=1
     else
-        mail_ingest_message "$peer" "$raw" "$body_file" || rc=$?
+        local firstline=""
+        IFS= read -r firstline < "$raw" || true
+        if [[ "$firstline" == "LANE-MAIL-BUNDLE 1" ]]; then
+            mail_ingest_bundle "$peer" "$raw" "$workdir" || rc=$?
+        elif (( size > MAIL_INGEST_MAX_BYTES )); then
+            mail_ingest_fail "message is over the $MAIL_INGEST_MAX_BYTES byte cap." || rc=1
+        else
+            # shellcheck disable=SC2034  # read via the namerefs in mail_ingest_message
+            local -a no_bases=() no_files=()
+            mail_ingest_message "$peer" "$raw" "$workdir/body" no_bases no_files || rc=$?
+        fi
     fi
-    rm -f -- "$raw" "$body_file"
+    rm -rf -- "$workdir"
     return "$rc"
 }
 

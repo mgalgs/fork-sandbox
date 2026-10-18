@@ -21,10 +21,20 @@
 # are accepted (each spelled bare or as `lane-mail-serve <verb>`, nothing
 # after it):
 #
-#   deliver   reads ONE message on stdin and stores it in the fixed lane-mail
-#             root (/var/tmp/claude-scratch/lane-mail, from lane-mail-lib.sh
-#             -- never an argument, never from the environment of the
-#             caller).
+#   deliver   reads ONE message, or ONE LANE-MAIL-BUNDLE carrying a message
+#             plus its attachments, on stdin, and stores it in the fixed
+#             lane-mail root (/var/tmp/claude-scratch/lane-mail, from
+#             lane-mail-lib.sh -- never an argument, never from the
+#             environment of the caller). Which it got is read off the
+#             stream itself, not a separate verb: it is still exactly
+#             "deliver" over ssh. The message is capped at 1 MiB, a bundle
+#             at that plus its attachments (fork-sandbox-mail.sh's
+#             MAIL_ATTACH_MAX_COUNT and MAIL_ATTACH_MAX_BYTES); see
+#             docs/agent-mail.md, "Lane mail between hosts", for the exact
+#             grammar and caps and the trust rules applied to a bundle's
+#             attachment frames -- this script does none of that parsing
+#             itself, it hands the stream straight to `fork-sandbox-mail.sh
+#             ingest --peer`.
 #   ping      reads nothing, writes nothing, and prints `pong <this host's
 #             peer name>`. `lane-mail-peer add` uses it to prove a wired
 #             direction works end to end.
@@ -42,8 +52,10 @@
 # picks its lane name freely and can never speak for another host. A missing
 # or malformed --peer is refused: without a forced command there is no
 # identity, so an unpinned key cannot deliver. All of that is
-# `fork-sandbox-mail.sh ingest --peer`, which also bounds the message to
-# 1 MiB, validates headers and ids, and refuses duplicates.
+# `fork-sandbox-mail.sh ingest --peer`, which also bounds the stream (a
+# message to 1 MiB, a bundle to that plus its attachments), validates
+# headers, ids and -- for a bundle -- every attachment frame, and refuses
+# duplicates.
 #
 # On success it prints `ok <message-id>` on stdout and exits 0; on refusal or
 # failure it prints one line `lane-mail-serve: <reason>` on stderr and exits

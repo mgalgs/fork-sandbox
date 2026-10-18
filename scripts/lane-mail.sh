@@ -58,11 +58,17 @@
 # If any step fails the command exits non-zero with the reason (for ssh, its
 # own stderr) and writes nothing here; hosts delivered before a failure are
 # named in the error. There is no retry queue -- re-send. A message to several
-# hosts is delivered to each, in order. A cross-host message carries no
-# attachments, grants or review target (refused). `--from` must be a lane on
-# this host. Waking is unchanged: the receiving host's watcher and unread-mail
-# hook see the message in that host's own store. `inbox` and `seen` are always
-# this host's; nothing reads a remote inbox.
+# hosts is delivered to each, in order. A cross-host message carries
+# --attach (fork-sandbox-mail.sh's --emit frames it as a LANE-MAIL-BUNDLE on
+# the same stdin stream -- no second connection, no new ssh verb; see
+# docs/agent-mail.md, "Lane mail between hosts", for the wire format, the
+# caps, and the trust rules the receiving `ingest` applies to it) but no
+# grants or review target (refused). A receiving fork-sandbox that predates
+# bundle support refuses the whole delivery with an error naming the
+# upgrade it needs; nothing is stored, here or there. `--from` must be a
+# lane on this host. Waking is unchanged: the receiving host's watcher and
+# unread-mail hook see the message in that host's own store. `inbox` and
+# `seen` are always this host's; nothing reads a remote inbox.
 #
 # `register` maps the calling Claude Code session to its lane mailbox in
 # /tmp/claude-$UID/lane-mail-lanes/<session-id>; the unread-mail hooks
@@ -179,6 +185,8 @@ cross_host() {
     local msg="$work/msg" rc=0
     "$mail_bin" "$verb" --emit "${args[@]}" > "$msg" || rc=$?
     (( rc == 0 )) || exit "$rc"
+    local is_bundle=0
+    [[ "$(head -n1 -- "$msg")" == "LANE-MAIL-BUNDLE 1" ]] && is_bundle=1
 
     local mid from from_host
     mid="$(msg_header "$msg" Message-ID)"
@@ -217,6 +225,9 @@ cross_host() {
             local why
             why="$(tr '\n' ' ' < "$work/err")"
             [[ -n "$why" ]] || why="unexpected reply '${resp:0:80}'"
+            if (( is_bundle )) && [[ "$why" == *"malformed header line"* ]]; then
+                die "delivery to '$host' failed: the far host's fork-sandbox predates attachment support and must be upgraded; nothing was stored locally${delivered:+; already delivered to:$delivered}"
+            fi
             die "delivery to '$host' failed (exit $rc): ${why% }; nothing was stored locally${delivered:+; already delivered to:$delivered}"
         fi
         delivered+=" $host"
