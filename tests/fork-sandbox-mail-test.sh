@@ -1507,14 +1507,69 @@ bx_try() {
     fi
 }
 
-bx_try "ingest refuses an attachment frame basename starting with '-'" "$bx_msgpart" "-dash.txt:$bx_att"
-bx_try "ingest refuses an attachment frame basename of '.'" "$bx_msgpart" ".:$bx_att"
-bx_try "ingest refuses an attachment frame basename of '..'" "$bx_msgpart" "..:$bx_att"
-bx_try "ingest refuses an attachment frame basename containing '/'" "$bx_msgpart" "a/b:$bx_att"
+# bx_msgpart_named <out-file> <basename> -- a copy of the fixture message
+# part whose lone X-Attachment header names <basename> instead of
+# bx-att.txt. Without this, a frame built with a different (bad) basename
+# would be refused by the header/frame mismatch check regardless of
+# whether the basename-shape or size-cap guard under test even ran --
+# giving the same "ingest refuses" outcome for the wrong reason. Matching
+# the header to the frame's name isolates the guard under test.
+bx_msgpart_named() {
+    local out="$1" base="$2"
+    sed "s#^X-Attachment: attachments/bx-att.txt#X-Attachment: attachments/$base#" "$bx_msgpart" > "$out"
+}
+
+bx_named_dash="$work/bx-named-dash.msg"; bx_msgpart_named "$bx_named_dash" "-dash.txt"
+bx_try "ingest refuses an attachment frame basename starting with '-'" "$bx_named_dash" "-dash.txt:$bx_att"
+contains "the refusal is the basename-shape guard" "$(cat "$work/bx-try.err")" "must not start with '-'"
+
+bx_named_dot="$work/bx-named-dot.msg"; bx_msgpart_named "$bx_named_dot" "."
+bx_try "ingest refuses an attachment frame basename of '.'" "$bx_named_dot" ".:$bx_att"
+contains "the refusal is the basename-shape guard" "$(cat "$work/bx-try.err")" "must not be '.' or '..'"
+
+bx_named_dotdot="$work/bx-named-dotdot.msg"; bx_msgpart_named "$bx_named_dotdot" ".."
+bx_try "ingest refuses an attachment frame basename of '..'" "$bx_named_dotdot" "..:$bx_att"
+contains "the refusal is the basename-shape guard" "$(cat "$work/bx-try.err")" "must not be '.' or '..'"
+
+bx_named_slash="$work/bx-named-slash.msg"; bx_msgpart_named "$bx_named_slash" "a/b"
+bx_try "ingest refuses an attachment frame basename containing '/'" "$bx_named_slash" "a/b:$bx_att"
+contains "the refusal is the basename-shape guard" "$(cat "$work/bx-try.err")" "must not contain '/'"
+
 bx_long_base="$(printf 'a%.0s' $(seq 1 300))"
-bx_try "ingest refuses an attachment frame basename over 255 bytes" "$bx_msgpart" "$bx_long_base:$bx_att"
-bx_try "ingest refuses an attachment frame declaring over the 4 MiB cap" "$bx_msgpart" \
-    "bx-att.txt:$bx_att:$(( 4 * 1024 * 1024 + 1 ))"
+bx_named_long="$work/bx-named-long.msg"; bx_msgpart_named "$bx_named_long" "$bx_long_base"
+bx_try "ingest refuses an attachment frame basename over 255 bytes" "$bx_named_long" "$bx_long_base:$bx_att"
+contains "the refusal is the basename-shape guard" "$(cat "$work/bx-try.err")" "is over 255 bytes"
+
+# 200 of a two-byte UTF-8 character: 255 characters but 400 bytes. In a
+# UTF-8 locale (the one an ssh session typically hands down), bash's
+# ${#base} counts characters, not bytes -- if the basename guard measured
+# length that way, this would slip past it and reach `mv`, which fails on
+# the over-length path component but (see mail_ingest_message) runs
+# inside a call chain whose caller tests its exit status in an `||`,
+# suspending `set -e` for the whole chain, so the failure would go
+# unnoticed and the message would be stored missing its attachment.
+bx_mb_base="$(printf 'é%.0s' $(seq 1 200))"
+bx_named_mb="$work/bx-named-mb.msg"; bx_msgpart_named "$bx_named_mb" "$bx_mb_base"
+LC_ALL=en_US.UTF-8 bx_try "ingest refuses a multibyte attachment frame basename over 255 bytes" \
+    "$bx_named_mb" "$bx_mb_base:$bx_att"
+contains "the refusal is measured in bytes, not characters" "$(cat "$work/bx-try.err")" "is over 255 bytes"
+
+# A real 4 MiB+1 payload (matching its own declared size and sha256
+# exactly), so the only guard that can refuse it is the explicit size-cap
+# check -- which runs before the payload is read at all -- and not the
+# short/long-read check that a mismatched declared size would trigger
+# instead.
+bx_toobig="$work/bx-toobig.bin"
+head -c $(( 4 * 1024 * 1024 + 1 )) /dev/zero > "$bx_toobig"
+bx_try "ingest refuses an attachment frame declaring over the 4 MiB cap" "$bx_msgpart" "bx-att.txt:$bx_toobig"
+contains "the cap refusal is specific, not a short/long read" "$(cat "$work/bx-try.err")" "byte (4 MiB) cap"
+
+# The bundle-message-frame cap (separate from the plain-message cap it
+# shares a limit with): a message part padded past MAIL_INGEST_MAX_BYTES.
+bx_oversize_msgpart="$work/bx-oversize-msg.msg"
+{ cat "$bx_msgpart"; head -c 1100000 /dev/zero | tr '\0' x; } > "$bx_oversize_msgpart"
+bx_try "ingest refuses a bundle message frame over the size cap" "$bx_oversize_msgpart" "bx-att.txt:$bx_att"
+contains "the oversize message-frame refusal names the frame" "$(cat "$work/bx-try.err")" "bundle message frame is over"
 
 bx9_dir="$work/bx-nine"; mkdir -p "$bx9_dir"
 bx9_specs=()
@@ -1581,6 +1636,30 @@ check "the attachment file itself is untouched by the reuse" "0" \
     "$(cmp -s "$bx_att" "$hx_root_b/threads/$bx_id/attachments/bx-att.txt"; echo $?)"
 check "the thread's tree shows both messages, both marked with the paperclip" "2" \
     "$(mb tree "$bx_id" 2>/dev/null | grep -c '📎')"
+
+# A thread that has never had an attachment has no attachments/ dir yet.
+# Two frames in one bundle sharing a basename with different content are
+# refused before anything is moved into place (mail_ingest_message), but
+# the refusal must not leave an empty attachments/ dir behind for this
+# thread -- it had none before, and the bundle gained nothing.
+bx_leak_tid="33333333-3333-4333-8333-333333333333"
+bx_leak_mid="$(bx_fresh_id)"
+bx_leak_tmp="$work/bx-leak-tmp.msg"
+bx_leak_msgpart="$work/bx-leak-msg.msg"
+sed "s/^Message-ID: .*/Message-ID: $bx_leak_mid/;s/^Thread-ID: .*/Thread-ID: $bx_leak_tid/;s/^Subject: .*/&\nIn-Reply-To: $bx_leak_tid/" \
+    "$bx_msgpart" > "$bx_leak_tmp"
+sed "s#^X-Attachment: attachments/bx-att.txt#X-Attachment: attachments/dup.txt\nX-Attachment: attachments/dup.txt#" \
+    "$bx_leak_tmp" > "$bx_leak_msgpart"
+bx_dup_a="$work/bx-dup-a.txt"; printf 'dup A\n' > "$bx_dup_a"
+bx_dup_b="$work/bx-dup-b.txt"; printf 'dup B\n' > "$bx_dup_b"
+bx_leak_bundle="$work/bx-leak.bundle"
+make_bundle "$bx_leak_bundle" "$bx_leak_msgpart" "dup.txt:$bx_dup_a" "dup.txt:$bx_dup_b"
+before_m="$(find "$hx_root_b" -name '*.msg' | wc -l)"
+mb ingest --peer alpha < "$bx_leak_bundle" >/dev/null 2>"$work/bx-leak.err"; rc=$?
+check "ingest refuses two bundle frames sharing a basename with different content" "1 $before_m" \
+    "$rc $(find "$hx_root_b" -name '*.msg' | wc -l)"
+check "the refusal leaves no attachments dir behind in a thread that had none" "0" \
+    "$([[ -e "$hx_root_b/threads/$bx_leak_tid/attachments" ]] && echo 1 || echo 0)"
 
 bx_sym_att="$work/bx-sym-att.txt"; printf 'sym\n' > "$bx_sym_att"
 bx_sym_bundle="$work/bx-sym.bundle"

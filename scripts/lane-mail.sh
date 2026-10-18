@@ -225,7 +225,16 @@ cross_host() {
             local why
             why="$(tr '\n' ' ' < "$work/err")"
             [[ -n "$why" ]] || why="unexpected reply '${resp:0:80}'"
-            if (( is_bundle )) && [[ "$why" == *"malformed header line"* ]]; then
+            # An old ingest refuses a bundle one of two ways, depending on
+            # size: it checks the raw byte count before it ever parses
+            # headers, so a bundle over the 1 MiB plain-message cap (the
+            # common case once an attachment is involved) gets the generic
+            # "over the byte cap" refusal; a bundle at or under that size
+            # reaches header parsing, where the unparseable marker line
+            # gets "malformed header line". Either way it is this host's
+            # own old age, not a problem with the bundle, so both map to
+            # the same upgrade-needed error.
+            if (( is_bundle )) && { [[ "$why" == *"malformed header line"* ]] || [[ "$why" == *"message is over the "*" byte cap."* ]]; }; then
                 die "delivery to '$host' failed: the far host's fork-sandbox predates attachment support and must be upgraded; nothing was stored locally${delivered:+; already delivered to:$delivered}"
             fi
             die "delivery to '$host' failed (exit $rc): ${why% }; nothing was stored locally${delivered:+; already delivered to:$delivered}"

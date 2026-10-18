@@ -100,11 +100,17 @@ printf 'alpha-dest\t%s\tgamma\nbeta-dest\t%s\tgamma\n' "$scratch/alpha" "$scratc
 
 # delta plays a fork-sandbox that predates bundle support: for a plain
 # message it behaves exactly like the real lane-mail-serve (full
-# passthrough), but for a LANE-MAIL-BUNDLE it reproduces precisely the
-# error an old `ingest` gives -- the bundle's first line has no colon, so
-# an old header-block parser sees it as a malformed header line. This
-# tests that lane-mail.sh recognizes that specific refusal and reports
-# the upgrade it actually needs, rather than the generic delivery error.
+# passthrough). For a LANE-MAIL-BUNDLE it reproduces precisely what an old
+# `ingest` gives, which depends on size, since the old `cmd_ingest` checks
+# the raw byte count before it ever parses headers: a bundle at or under
+# the 1 MiB plain-message cap reaches header parsing, where the marker
+# line's missing colon makes an old header-block parser call it a
+# malformed header line; a bundle over that cap (the common case once an
+# attachment is involved) never gets that far and is refused with the
+# generic over-the-cap error instead. This tests that lane-mail.sh
+# recognizes both of those specific refusals and reports the upgrade it
+# actually needs, rather than the generic delivery error, whichever size
+# of bundle triggered it.
 mv "$scratch/delta/bin/lane-mail-serve" "$scratch/delta/bin/lane-mail-serve.real"
 cat > "$scratch/delta/bin/lane-mail-serve" <<STUB
 #!/usr/bin/env bash
@@ -112,6 +118,11 @@ set -uo pipefail
 tmp="\$(mktemp)"
 trap 'rm -f "\$tmp"' EXIT
 cat > "\$tmp"
+size="\$(wc -c < "\$tmp" | tr -d ' ')"
+if (( size > 1048576 )); then
+    printf "lane-mail-serve: ingest: message is over the 1048576 byte cap.\\n" >&2
+    exit 1
+fi
 if head -c 32 "\$tmp" | grep -q '^LANE-MAIL-BUNDLE 1'; then
     printf "lane-mail-serve: malformed header line 'LANE-MAIL-BUNDLE 1'.\\n" >&2
     exit 1
@@ -267,6 +278,21 @@ check "nothing is stored, on either side" "0 $before_a_delta" \
 out="$(printf 'plain\n' | ha send --from @fe --to @x:delta --subject plain --body - 2>"$scratch/err")"; rc=$?
 check "a plain cross-host message to the same pre-bundle receiver still succeeds" "0" "$rc"
 check "it is stored on the pre-bundle receiver" "1" "$(msgs delta)"
+
+# A bundle whose attachment pushes it past the 1 MiB plain-message cap
+# never reaches an old receiver's header parsing at all -- its cmd_ingest
+# checks the raw byte count first, so the journal-sized case that
+# motivated this feature gets the generic over-the-cap refusal, not
+# "malformed header line". lane-mail.sh has to recognize that one too.
+before_a_delta2="$(msgs alpha)"
+before_delta2="$(find "$scratch/delta/root" -name '*.msg' 2>/dev/null | wc -l)"
+big_att="$scratch/big-att.bin"
+dd if=/dev/zero of="$big_att" bs=1M count=2 >/dev/null 2>&1
+err="$(printf 'x\n' | ha send --from @fe --to @x:delta --subject s --body - --attach "$big_att" 2>&1)"; rc=$?
+check "delivery of a bundle over 1 MiB to a pre-bundle receiver fails" "1" "$rc"
+contains "it names the upgrade the far host needs for an over-cap bundle too" "$err" "predates attachment support and must be upgraded"
+check "nothing new is stored, on either side" "$before_delta2 $before_a_delta2" \
+    "$(find "$scratch/delta/root" -name '*.msg' 2>/dev/null | wc -l) $(msgs alpha)"
 
 mv "$scratch/alpha/cfg/lane-mail.env" "$scratch/alpha/cfg/lane-mail.env.save"
 printf 'LANE_MAIL_PEER_NAME=Bad_Name\nLANE_MAIL_SSH=%s\n' "$scratch/ssh-stub" > "$scratch/alpha/cfg/lane-mail.env"

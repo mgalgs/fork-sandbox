@@ -526,10 +526,15 @@ sees the message already sees its attachments, and a refused bundle leaves
 the store exactly as it was, including no thread dir left behind for a
 message that would have opened a new thread.
 
-A receiver whose fork-sandbox predates bundle support refuses it with its
-ordinary "malformed header line" error (the bundle's first line has no
-colon); `lane-mail.sh` turns that specific refusal into an error naming the
-upgrade the far host needs, and stores nothing locally either way.
+A receiver whose fork-sandbox predates bundle support refuses it one of two
+ways, depending on size: its `ingest` checks the raw byte count before it
+ever parses headers, so a bundle over the 1 MiB plain-message cap (the
+common case once an attachment is involved) gets the generic "message is
+over the ... byte cap" refusal; a bundle at or under that size reaches
+header parsing, where the bundle's first line (no colon) gets the ordinary
+"malformed header line" error instead. `lane-mail.sh` recognizes both and
+turns either into an error naming the upgrade the far host needs, and
+stores nothing locally either way.
 
 **What `add` does, by hand.** For each direction, from the sending host `S`
 to the receiving host `R`:

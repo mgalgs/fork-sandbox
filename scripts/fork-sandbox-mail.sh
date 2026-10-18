@@ -71,10 +71,9 @@
 # frame is validated (basename shape, size cap, declared size and sha256
 # against the bytes actually sent) and staged atomically into
 # threads/<tid>/attachments/ before the message is written -- see
-# docs/agent-mail.md for the full grammar, caps and collision rules. A
-# receiver that predates bundle support refuses it with its ordinary
-# "malformed header line" error, since the bundle's first line has no colon;
-# lane-mail.sh turns that into a specific upgrade error.
+# docs/agent-mail.md for the full grammar, caps and collision rules,
+# including what a receiver that predates bundle support does with one
+# (lane-mail.sh turns that into a specific upgrade error).
 # With --peer the message is treated as received from that peer: From must
 # name that host (a bare From is qualified with it; any other host is
 # refused) and bare To/Cc addresses, which are in the sender's frame, are
@@ -808,13 +807,19 @@ mail_stage_attachments() {
 # bytes, not "." or "..", no "/", no control character (a newline
 # included), and no leading "-" (which a tool reading the staged file by
 # name alone could otherwise read as an option). $2, if given, names the
-# thing being validated for the error text (default "attachment").
+# thing being validated for the error text (default "attachment"). The
+# 255-byte limit is measured with `wc -c`, not bash's `${#base}`: the
+# latter counts characters, and this script runs in whatever locale the
+# caller (or, cross-host, the ssh session) has -- a multibyte basename
+# could otherwise pass here and still be too long for the filesystem.
 mail_validate_attach_basename() {
-    local base="$1" what="${2:-attachment}"
+    local base="$1" what="${2:-attachment}" blen
     if [[ -z "$base" ]]; then
         echo "Error: $what basename must not be empty." >&2
         return 1
-    elif (( ${#base} > 255 )); then
+    fi
+    blen="$(printf '%s' "$base" | wc -c)"
+    if (( blen > 255 )); then
         echo "Error: $what basename '${base:0:60}...' is over 255 bytes." >&2
         return 1
     elif [[ "$base" == "." || "$base" == ".." ]]; then
@@ -1468,6 +1473,28 @@ mail_ingest_fail() {
     return 1
 }
 
+# Undoes a partial attachment placement from mail_ingest_message: removes
+# the basenames named in nameref array $5 from directory $1, removes $1
+# itself if $2 says this call created it, and removes thread dir $3 if $4
+# says this call created that. Needed because mail_ingest_message runs
+# inside callers that test its exit status in an `||` (cmd_ingest's
+# `mail_ingest_bundle ... || rc=$?`, mail_ingest_bundle's own hand-off) --
+# bash suspends `set -e` for the whole call chain while that test is live,
+# so a late failure (another frame's mv, or mail_place_message) does not
+# stop the shell on its own, and the "writes nothing visible until
+# everything is validated" contract has to be enforced explicitly here.
+mail_ingest_rollback_attachments() {
+    local attach_dir="$1" attach_dir_created="$2" thread_dir="$3" thread_created="$4"
+    local -n placed_ref="$5"
+    local base
+    for base in "${placed_ref[@]}"; do
+        rm -f -- "$attach_dir/$base"
+    done
+    (( attach_dir_created )) && rmdir -- "$attach_dir" 2>/dev/null
+    (( thread_created )) && rmdir -- "$thread_dir" 2>/dev/null
+    return 0
+}
+
 # Validates the message in $2 (read bounded from stdin by cmd_ingest) and,
 # if it is sound, places it in the store keeping its ids and headers. $1 is
 # the peer name to stamp it as received from, or empty. $3 is a scratch file
@@ -1638,10 +1665,18 @@ mail_ingest_message() {
     # A bundle's attachments are staged (and, where needed, moved into
     # place) before the message is ever written, so a reader who sees the
     # message already sees its attachments, and a refusal here leaves the
-    # thread exactly as it was (no thread dir left behind for a brand-new
-    # thread). Nothing is moved until every frame has been validated.
+    # thread exactly as it was: no thread dir left behind for a brand-new
+    # thread, and no empty attachments dir left behind for an existing
+    # thread that had none yet. To get that, attach_dir is created only
+    # once every frame has passed validation -- not up front -- and
+    # anything moved into it before a later failure (another frame's mv,
+    # or mail_place_message) is rolled back explicitly, since this
+    # function cannot rely on `set -e` to stop it (see
+    # mail_ingest_rollback_attachments).
+    local attach_dir="" attach_dir_created=0
+    local -a placed=()
     if (( ${#exp_bases_ref[@]} > 0 )); then
-        local attach_dir="$thread_dir/attachments"
+        attach_dir="$thread_dir/attachments"
         if [[ -L "$attach_dir" ]]; then
             mail_ingest_fail "attachments is a symlink in this thread; refusing."
             (( created )) && rmdir -- "$thread_dir" 2>/dev/null
@@ -1651,7 +1686,6 @@ mail_ingest_message() {
             (( created )) && rmdir -- "$thread_dir" 2>/dev/null
             return 1
         fi
-        mkdir -p -- "$attach_dir"
 
         local -A within_src=()
         local i base src dest
@@ -1660,7 +1694,7 @@ mail_ingest_message() {
             if [[ -n "${within_src[$base]:-}" ]]; then
                 if ! cmp -s -- "$src" "${within_src[$base]}"; then
                     mail_ingest_fail "two attachment frames named '$base' in this bundle have different content."
-                    (( created )) && { rmdir -- "$attach_dir" 2>/dev/null; rmdir -- "$thread_dir" 2>/dev/null; }
+                    (( created )) && rmdir -- "$thread_dir" 2>/dev/null
                     return 1
                 fi
                 continue
@@ -1670,16 +1704,19 @@ mail_ingest_message() {
             if [[ -e "$dest" || -L "$dest" ]]; then
                 if [[ -L "$dest" || ! -f "$dest" ]]; then
                     mail_ingest_fail "attachments/$base exists and is not a plain file; refusing."
-                    (( created )) && { rmdir -- "$attach_dir" 2>/dev/null; rmdir -- "$thread_dir" 2>/dev/null; }
+                    (( created )) && rmdir -- "$thread_dir" 2>/dev/null
                     return 1
                 fi
                 if ! cmp -s -- "$src" "$dest"; then
                     mail_ingest_fail "attachments/$base already holds different content."
-                    (( created )) && { rmdir -- "$attach_dir" 2>/dev/null; rmdir -- "$thread_dir" 2>/dev/null; }
+                    (( created )) && rmdir -- "$thread_dir" 2>/dev/null
                     return 1
                 fi
             fi
         done
+
+        [[ -d "$attach_dir" ]] || attach_dir_created=1
+        mkdir -p -- "$attach_dir"
 
         local -A moved=()
         for i in "${!exp_bases_ref[@]}"; do
@@ -1688,12 +1725,31 @@ mail_ingest_message() {
             moved[$base]=1
             dest="$attach_dir/$base"
             [[ -e "$dest" ]] && continue
-            mv -- "$src" "$dest"
+            # -n (no-clobber): if a concurrent delivery placed attachments/
+            # $base between the check above and this mv, mv leaves our copy
+            # at $src untouched instead of overwriting -- closing the race
+            # a plain `mv` would lose (last writer wins, silently).
+            if ! mv -n -- "$src" "$dest"; then
+                mail_ingest_fail "failed to place attachments/$base."
+                mail_ingest_rollback_attachments "$attach_dir" "$attach_dir_created" "$thread_dir" "$created" placed
+                return 1
+            fi
+            if [[ -e "$src" ]]; then
+                if ! cmp -s -- "$src" "$dest"; then
+                    rm -f -- "$src"
+                    mail_ingest_fail "attachments/$base already holds different content."
+                    mail_ingest_rollback_attachments "$attach_dir" "$attach_dir_created" "$thread_dir" "$created" placed
+                    return 1
+                fi
+                rm -f -- "$src"
+            else
+                placed+=("$base")
+            fi
         done
     fi
 
     if ! mail_place_message "$headers" "$body_file" "$thread_dir" "$mid" >/dev/null; then
-        (( created )) && rmdir -- "$thread_dir" 2>/dev/null
+        mail_ingest_rollback_attachments "$attach_dir" "$attach_dir_created" "$thread_dir" "$created" placed
         return 1
     fi
     printf '%s\n' "$mid"
