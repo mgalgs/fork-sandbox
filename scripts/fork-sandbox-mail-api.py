@@ -94,9 +94,9 @@ is the next argv element. A lone '-' is a positional; any other token that
 starts with '-' is a flag, so a positional that starts with '-' is refused.
 mail:
     send    0; --from --to* --cc* --subject --body --attach* --hops --header*
-            --allow-namespace* --reach-probe* --context-secret
+            --allow-namespace* --reach-probe* --host-alias* --context-secret
             --review-target --budget --no-grant; --from in the token's
-            identities (the three grant flags and --no-grant also need cap
+            identities (the four grant flags and --no-grant also need cap
             grant, --review-target needs cap target; --budget needs no cap,
             it only lowers spend)
     reply   0; --from --reply-to --body --to* --cc* --subject --attach* --hops
@@ -106,8 +106,8 @@ mail:
     show tree export inbox: read (export needs --json; inbox takes --all)
     list    0; --json --header*; read
     seen    1+; the first positional in the identities, and cap seen
-    grant   1; --allow-namespace* --reach-probe* --context-secret --clear
-            --show --json;
+    grant   1; --allow-namespace* --reach-probe* --host-alias* --context-secret
+            --clear --show --json;
             --show needs read, anything else needs grant
 postmaster:
     status  0; --thread --json; read
@@ -189,6 +189,7 @@ SPEC = {
             "--subject": VALUE, "--body": VALUE, "--attach": MULTI,
             "--hops": VALUE, "--header": MULTI,
             "--allow-namespace": MULTI, "--reach-probe": MULTI,
+            "--host-alias": MULTI,
             "--context-secret": VALUE, "--review-target": VALUE,
             "--budget": VALUE, "--no-grant": BOOL}),
         "reply": (0, 0, {
@@ -204,6 +205,7 @@ SPEC = {
         "seen": (1, None, {}),
         "grant": (1, 1, {
             "--allow-namespace": MULTI, "--reach-probe": MULTI,
+            "--host-alias": MULTI,
             "--context-secret": VALUE,
             "--clear": BOOL, "--show": BOOL, "--json": BOOL}),
     },
@@ -280,8 +282,8 @@ OPERATOR_ONLY = {("postmaster", "flag"), ("postmaster", "unflag")}
 MUTATING = {("mail", "send"), ("mail", "reply"), ("mail", "seen"),
             ("mail", "grant"), ("postmaster", "flag"),
             ("postmaster", "unflag")}
-GRANT_FLAGS = ("--allow-namespace", "--reach-probe", "--context-secret",
-               "--no-grant")
+GRANT_FLAGS = ("--allow-namespace", "--reach-probe", "--host-alias",
+               "--context-secret", "--no-grant")
 
 
 class ConfigError(Exception):

@@ -19,6 +19,7 @@
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
+#                            [--host-alias IP=HOST[,HOST...]]...
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
@@ -34,6 +35,7 @@
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
+#                            [--host-alias IP=HOST[,HOST...]]...
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
 #                            [--run-dir DIR]
@@ -52,6 +54,7 @@
 #        fork-sandbox-k8s.sh rm --branch NAME
 #        fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
 #                            [--reach-probe HOST:PORT]...
+#                            [--host-alias IP=HOST[,HOST...]]...
 #                            [--context-ro DIR | --context-secret NAME]
 #
 # --model MODEL is REQUIRED on a K8S_PROXY_UPSTREAM (legacy) install. On a
@@ -303,15 +306,17 @@
 #
 # rm deletes the run's Job, its pod, and its ConfigMap.
 #
-# check-grant validates a --allow-namespace/--reach-probe/--context-ro/
-# --context-secret grant with NO kubectl and NO cluster -- it runs exactly
-# the same checks submit runs on those flags (the pairing rule, the
-# per-probe HOST:PORT/DNS shape/grant-match checks, --context-ro's
-# forks/-only + no-links checks, and --context-secret's name checks),
+# check-grant validates a --allow-namespace/--reach-probe/--host-alias/
+# --context-ro/--context-secret grant with NO kubectl and NO cluster -- it
+# runs exactly the same checks submit runs on those flags (the pairing rule,
+# the per-probe HOST:PORT/DNS shape/grant-match checks, --host-alias's IP and
+# DNS-name checks, --context-ro's forks/-only + no-links checks, and
+# --context-secret's name checks),
 # sharing the same functions, so a grant check-grant accepts is one
 # submit will also accept later, for the identical reason. It needs no
 # k8s.env either. Exit 0 and, on stdout only, one line per flag in the order
-# given (ALLOW_NAMESPACE=..., REACH_PROBE=..., then CONTEXT_RO=<realpath of
+# given (ALLOW_NAMESPACE=..., REACH_PROBE=..., HOST_ALIAS=..., then
+# CONTEXT_RO=<realpath of
 # DIR> when --context-ro was given, then CONTEXT_SECRET=<name> when
 # --context-secret was given, always last) -- this is the grant file format the
 # postmaster's per-thread grant store (fork-sandbox-mail.sh's `grant` verb)
@@ -621,6 +626,12 @@
 # or <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN, and <ns> must be one of this run's
 # --allow-namespace values -- a grant the gate never exercises is not
 # verified. See "Per-run namespace grants" in docs/kubernetes-runs.md.
+#
+# --host-alias IP=HOST[,HOST...] (submit, run), repeatable: one entry in the
+# agent pod's spec.hostAliases, so each HOST resolves to IP inside the pod
+# (/etc/hosts). IP must be an IPv4 or IPv6 literal and each HOST a DNS name.
+# Nothing checks that IP is reachable: egress is still bounded by
+# --allow-namespace, so an alias pointing anywhere else fails to connect.
 #
 # --run-dir DIR (collect): finalize the run directory submit created --
 # writing summary.json and calling sandbox-run-log.py record -- rather than
@@ -5697,6 +5708,102 @@ validate_context_secret_name() {
     fi
 }
 
+# An IPv4 or IPv6 literal, as the API server accepts for hostAliases[].ip.
+# IPv4 octets refuse leading zeros: some resolvers read them as octal.
+k8s_valid_ip_literal() {
+    local ip="$1" o rest groups
+    local -a octets
+    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        IFS=. read -r -a octets <<< "$ip"
+        for o in "${octets[@]}"; do
+            [[ "$o" == 0 || "$o" != 0* ]] || return 1
+            (( 10#$o <= 255 )) || return 1
+        done
+        return 0
+    fi
+    [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ && ${#ip} -le 39 ]] || return 1
+    [[ "$ip" != *:::* ]] || return 1
+    rest="${ip/::/}"
+    [[ "$rest" != *::* ]] || return 1
+    [[ "$ip" == ::* || "$ip" != :* ]] || return 1
+    [[ "$ip" == *:: || "$ip" != *: ]] || return 1
+    groups="${ip//[^:]/}"
+    if [[ "$ip" == *::* ]]; then
+        (( ${#groups} <= 7 )) || return 1
+    else
+        (( ${#groups} == 7 )) || return 1
+    fi
+    [[ ! "$ip" =~ [0-9a-fA-F]{5} ]]
+}
+
+# A DNS-1123 subdomain whose labels are each at most 63 characters, the
+# shape the API server requires of every hostAliases[].hostnames entry.
+k8s_valid_dns_subdomain() {
+    local name="$1" label
+    local -a labels
+    (( ${#name} >= 1 && ${#name} <= 253 )) || return 1
+    [[ "$name" != *. && "$name" != .* && "$name" != *..* ]] || return 1
+    IFS=. read -r -a labels <<< "$name"
+    for label in "${labels[@]}"; do
+        (( ${#label} <= 63 )) || return 1
+        [[ "$label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || return 1
+    done
+}
+
+# --host-alias IP=HOST[,HOST...] validate, shared by check-grant and submit:
+# each value becomes one spec.hostAliases entry, so a value the API server
+# would refuse is refused here, before any cluster object exists. exit 1 on
+# refusal, like the validators above. Same fs_reject_unsafe_chars boundary
+# too: a value is printed back verbatim as check-grant's HOST_ALIAS= line.
+validate_host_aliases() {
+    local spec ip hosts h
+    local -a host_list
+    (( $# )) || return 0
+    fs_reject_unsafe_chars "$@" || exit 1
+    for spec in "$@"; do
+        ip="${spec%%=*}"
+        hosts="${spec#*=}"
+        if [[ "$spec" != *=* || -z "$ip" || -z "$hosts" ]]; then
+            echo "Error: --host-alias '$spec' must be IP=HOST[,HOST...]." >&2
+            exit 1
+        fi
+        if ! k8s_valid_ip_literal "$ip"; then
+            echo "Error: --host-alias '$spec' names '$ip', which is not an IPv4" >&2
+            echo "or IPv6 literal." >&2
+            exit 1
+        fi
+        if [[ "$hosts" == ,* || "$hosts" == *, || "$hosts" == *,,* ]]; then
+            echo "Error: --host-alias '$spec' has an empty host name." >&2
+            exit 1
+        fi
+        IFS=, read -r -a host_list <<< "$hosts"
+        for h in "${host_list[@]}"; do
+            if ! k8s_valid_dns_subdomain "$h"; then
+                echo "Error: --host-alias '$spec' names host '$h', which is not a" >&2
+                echo "valid DNS name (lowercase letters, digits, '-' and '.', each" >&2
+                echo "label at most 63 characters, starting and ending alphanumeric)." >&2
+                exit 1
+            fi
+        done
+    done
+}
+
+# The pod spec's hostAliases: block for validated --host-alias values (leading
+# newline included, so it appends to the line before it), or nothing.
+k8s_host_aliases_yaml() {
+    local spec h
+    local -a host_list
+    (( $# )) || return 0
+    printf '\n      hostAliases:'
+    for spec in "$@"; do
+        printf '\n        - ip: "%s"\n          hostnames:' "${spec%%=*}"
+        IFS=, read -r -a host_list <<< "${spec#*=}"
+        for h in "${host_list[@]}"; do
+            printf '\n            - "%s"' "$h"
+        done
+    done
+}
+
 # --context-secret and --context-ro both populate /work/context.
 refuse_context_secret_with_ro() {
     echo "Error: --context-secret and --context-ro cannot be combined: both" >&2
@@ -5710,29 +5817,28 @@ refuse_context_secret_with_ro() {
 # on: a grant accepted here is one submit will also accept later, and a
 # grant refused here is refused for the identical reason. See
 # docs/kubernetes-runs.md.
+check_grant_usage() {
+    echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
+    echo "                            [--reach-probe HOST:PORT]..." >&2
+    echo "                            [--host-alias IP=HOST[,HOST...]]..." >&2
+    echo "                            [--context-ro DIR | --context-secret NAME]" >&2
+    exit 1
+}
+
 cmd_check_grant() {
-    local -a allow_ns_raw=() reach_probe_raw=()
+    local -a allow_ns_raw=() reach_probe_raw=() host_alias_raw=()
     local context_ro="" context_secret="" saw_any=false
     while (( $# )); do
         case "$1" in
             --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); saw_any=true; shift 2 ;;
             --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); saw_any=true; shift 2 ;;
+            --host-alias) host_alias_raw+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); saw_any=true; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; saw_any=true; shift 2 ;;
             --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; saw_any=true; shift 2 ;;
-            *)
-                echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
-                echo "                            [--reach-probe HOST:PORT]..." >&2
-                echo "                            [--context-ro DIR | --context-secret NAME]" >&2
-                exit 1
-                ;;
+            *) check_grant_usage ;;
         esac
     done
-    if [[ "$saw_any" != true ]]; then
-        echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
-        echo "                            [--reach-probe HOST:PORT]..." >&2
-        echo "                            [--context-ro DIR | --context-secret NAME]" >&2
-        exit 1
-    fi
+    [[ "$saw_any" == true ]] || check_grant_usage
 
     # Run in a subshell so the extracted validators' own "exit 1 on
     # refusal" (unchanged, so submit's behaviour above stays identical)
@@ -5744,6 +5850,7 @@ cmd_check_grant() {
         validate_run_allow_ns run_allow_ns_namespaces run_allow_ns_ports "${allow_ns_raw[@]}"
         validate_run_reach_probes run_reach_probes run_allow_ns_namespaces run_allow_ns_ports \
             "${#allow_ns_raw[@]}" "${reach_probe_raw[@]}"
+        validate_host_aliases "${host_alias_raw[@]}"
         local context_ro_real=""
         if [[ -n "$context_ro" ]]; then
             context_ro_real="$(validate_context_ro_dir "$context_ro")" || exit 1
@@ -5758,6 +5865,9 @@ cmd_check_grant() {
         done
         for v in "${reach_probe_raw[@]}"; do
             printf 'REACH_PROBE=%s\n' "$v"
+        done
+        for v in "${host_alias_raw[@]}"; do
+            printf 'HOST_ALIAS=%s\n' "$v"
         done
         if [[ -n "$context_ro" ]]; then
             printf 'CONTEXT_RO=%s\n' "$context_ro_real"
@@ -6110,6 +6220,7 @@ cmd_submit() {
     local refresh_at="" refresh_enabled=0 refresh_max="" refresh_context_window=""
     local refresh_threshold_tokens="" refresh_ceiling_tokens=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
+    local -a host_alias_raw=()
     # Internal: set only by fork-sandbox.sh's own --resume orchestration,
     # which is the one caller that deliberately targets a branch it
     # expects to already exist (the moving draft a prior run in the same
@@ -6150,6 +6261,7 @@ cmd_submit() {
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
             --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
             --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
+            --host-alias) host_alias_raw+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -7055,6 +7167,7 @@ cmd_submit() {
     local -a run_reach_probes=()
     validate_run_reach_probes run_reach_probes run_allow_ns_namespaces run_allow_ns_ports \
         "${#allow_ns_raw[@]}" "${reach_probe_raw[@]}"
+    validate_host_aliases "${host_alias_raw[@]}"
 
     resolve_platform || exit 1
     local icmp_check=0
@@ -7178,6 +7291,8 @@ cmd_submit() {
     # component the agent Job and its ConfigMap use.
     local priority_class_line=""
     [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && priority_class_line=$'\n'"      priorityClassName: \"$K8S_AGENT_PRIORITY_CLASS\""
+    local host_aliases_yaml
+    host_aliases_yaml="$(k8s_host_aliases_yaml "${host_alias_raw[@]}")"
     local claude_proxy_rendered=""
     if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
         local claude_proxy_template
@@ -7974,7 +8089,7 @@ spec:
         app: fork-sandbox-agent
         fork-sandbox/branch: $safe_name${extra_labels_8}
     spec:
-      restartPolicy: Never${priority_class_line}${services_grace_env}
+      restartPolicy: Never${priority_class_line}${host_aliases_yaml}${services_grace_env}
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -11938,6 +12053,7 @@ cmd_run() {
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
     local allow_existing_branch=false
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
+    local -a host_alias_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -11973,6 +12089,7 @@ cmd_run() {
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
             --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
             --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
+            --host-alias) host_alias_raw+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -12144,6 +12261,7 @@ cmd_run() {
     for l in "${labels_raw[@]}"; do submit_argv+=(--label "$l"); done
     for l in "${allow_ns_raw[@]}"; do submit_argv+=(--allow-namespace "$l"); done
     for l in "${reach_probe_raw[@]}"; do submit_argv+=(--reach-probe "$l"); done
+    for l in "${host_alias_raw[@]}"; do submit_argv+=(--host-alias "$l"); done
     for l in "${extra_refs_raw[@]}"; do submit_argv+=(--extra-ref "$l"); done
     submit_argv+=("$project_path" "$handoff_file")
 

@@ -4242,7 +4242,8 @@ pm_spawn_wake() {
         spawn_args+=(--outbox-dir "$wake_dir/outbox")
 
         # Grant flags, forwarded in file order: every ALLOW_NAMESPACE line,
-        # then every REACH_PROBE line (both repeatable, so fs_pm_env_get's
+        # then every REACH_PROBE line, then every HOST_ALIAS line (all
+        # repeatable, so fs_pm_env_get's
         # last-match-wins read is the wrong tool -- read every line), then
         # the single optional CONTEXT_RO and CONTEXT_SECRET lines. Forwarded
         # for ANY k8s seat that has a grant file, `grant: required` or not
@@ -4260,6 +4261,9 @@ pm_spawn_wake() {
             while IFS= read -r g_line; do
                 spawn_args+=(--reach-probe "$g_line")
             done < <(sed -n 's/^REACH_PROBE=//p' "$grant_file")
+            while IFS= read -r g_line; do
+                spawn_args+=(--host-alias "$g_line")
+            done < <(sed -n 's/^HOST_ALIAS=//p' "$grant_file")
             local context_ro
             context_ro="$(fs_pm_env_get "$grant_file" CONTEXT_RO)"
             [[ -n "$context_ro" ]] && spawn_args+=(--context-ro "$context_ro")

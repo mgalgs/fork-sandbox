@@ -205,7 +205,7 @@ flag and refused, since there is no way to tell it from one.
 
 | verb | positionals | flags | auth |
 |---|---|---|---|
-| send | 0 | `--from --to* --cc* --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --context-secret --review-target --budget --no-grant` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--context-secret`/`--no-grant` also need cap `grant`; `--review-target` also needs cap `target`; `--budget` needs no cap (it only lowers spend) |
+| send | 0 | `--from --to* --cc* --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --host-alias* --context-secret --review-target --budget --no-grant` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--host-alias`/`--context-secret`/`--no-grant` also need cap `grant`; `--review-target` also needs cap `target`; `--budget` needs no cap (it only lowers spend) |
 | reply | 0 | `--from --reply-to --body --to* --cc* --subject --attach* --hops --header* --upstream-head --upstream-state` | `--from` in the token's identities; `--upstream-head` and `--upstream-state` also need cap `upstream` |
 | show | 1 | | `read` |
 | tree | 1 | | `read` |
@@ -213,7 +213,7 @@ flag and refused, since there is no way to tell it from one.
 | inbox | 1 | `--all` | `read` |
 | export | 1 | `--json` | `read` |
 | seen | 1+ | | the first positional in the token's identities, and cap `seen` |
-| grant | 1 | `--allow-namespace* --reach-probe* --context-secret --clear --show --json` | `--show` alone needs `read`; anything else needs `grant` |
+| grant | 1 | `--allow-namespace* --reach-probe* --host-alias* --context-secret --clear --show --json` | `--show` alone needs `read`; anything else needs `grant` |
 
 (`*` marks a repeatable flag.)
 

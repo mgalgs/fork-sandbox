@@ -407,6 +407,13 @@ check "read only: send with a grant flag is 403 (needs grant)" "403" \
 check "grant cap: send with a grant flag is 200" "200" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject s --body - --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80)"
 check "grant cap: that send ran: rc 0" "0" "$(rjson rc)"
+check "read only: send with --host-alias is 403 (needs grant)" "403" \
+    "$(xr "$tok/reader" --tool mail --stdin hi -- send --from @reader --to @x --subject s --body - --host-alias 192.0.2.1=a.example.com)"
+check "grant cap: repeated grant --host-alias: rc 0" "0" \
+    "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --host-alias 192.0.2.1=a.example.com --host-alias 192.0.2.2=b.example.com >/dev/null; rjson rc)"
+check "grant cap: the grant file carries both HOST_ALIAS= lines" \
+    "$(printf 'HOST_ALIAS=192.0.2.1=a.example.com\nHOST_ALIAS=192.0.2.2=b.example.com')" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$seed.env" 2>/dev/null)"
 check "grant cap: grant --context-secret: rc 0" "0" \
     "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --context-secret preview-ctx >/dev/null; rjson rc)"
 check "grant cap: the grant file carries CONTEXT_SECRET=preview-ctx" "CONTEXT_SECRET=preview-ctx" \

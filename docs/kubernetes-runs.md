@@ -1917,12 +1917,34 @@ submit's own failure trap.
 On the local (non-`--k8s`) path, both flags are refused with a message that
 they are `--k8s`-only: a local sandbox has no cluster namespaces to grant.
 
+### Pod host aliases: `--host-alias`
+
+`--host-alias IP=HOST[,HOST...]` (submit, run, and `fork-sandbox.sh --k8s`),
+repeatable, adds one entry to the agent pod's `spec.hostAliases`, so inside
+the pod each HOST resolves to IP (kubelet writes it into `/etc/hosts`). Use it
+when the agent must reach a granted Service under a public name — a TLS
+certificate's name, say — that cluster DNS does not serve:
+
+```
+--allow-namespace preview-pr-7:443 --reach-probe gateway.preview-pr-7:443 \
+--host-alias 192.0.2.20=pr-7.example.com,pr-7-api.example.com
+```
+
+IP must be an IPv4 or IPv6 literal (an IPv4 octet with a leading zero is
+refused), and each HOST a DNS name: lowercase letters, digits, `-` and `.`,
+each label at most 63 characters. Anything else is refused before any cluster
+object exists. Nothing checks that IP belongs to a granted namespace: the
+pod's egress is still bounded by `--allow-namespace`, so an alias pointing
+anywhere else just fails to connect. Refused without `--k8s`.
+
 ### Checking a grant ahead of time: `check-grant`
 
 `fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
-[--reach-probe HOST:PORT]... [--context-ro DIR | --context-secret NAME]` runs
+[--reach-probe HOST:PORT]... [--host-alias IP=HOST[,HOST...]]...
+[--context-ro DIR | --context-secret NAME]` runs
 the grant-time half of the checks `submit` runs on these flags — the pairing
 rule, the per-probe HOST:PORT/DNS-shape/grant-match checks above,
+`--host-alias`'s IP and DNS-name checks,
 `--context-ro`'s forks/-only-and-no-links checks, and `--context-secret`'s
 name checks (see "Getting a Secret in: --context-secret") — sharing the exact
 same functions, so a
@@ -1935,7 +1957,8 @@ a Job is ever submitted for it.
 Exit codes: **0** on success, printing to stdout only — nothing else — one
 line per flag in the order given: `ALLOW_NAMESPACE=<value>` (one per
 `--allow-namespace`, value exactly as given, not normalized), then
-`REACH_PROBE=<value>` (same, per `--reach-probe`), then, only when
+`REACH_PROBE=<value>` (same, per `--reach-probe`), then `HOST_ALIAS=<value>`
+(same, per `--host-alias`), then, only when
 `--context-ro` was given, `CONTEXT_RO=<realpath of DIR>`, then, only when
 `--context-secret` was given, `CONTEXT_SECRET=<name>` as the last line.
 `--context-ro` and `--context-secret` together are refused. **1** for no flags

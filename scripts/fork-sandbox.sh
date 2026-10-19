@@ -577,6 +577,10 @@
 #                        must confirm is reachable before the run starts.
 #                        Repeatable, required whenever --allow-namespace is
 #                        given, refused without it. Refused without --k8s.
+# --host-alias <ip>=<host>[,<host>...]:
+#                        with --k8s, one entry in the agent pod's
+#                        spec.hostAliases, so each host resolves to <ip>
+#                        inside the pod. Repeatable. Refused without --k8s.
 # --extra-ref <name>=<sha>:
 #                        with --k8s, push one more commit into the pod as a
 #                        branch named <name> beside the run's own branch, in
@@ -1887,6 +1891,7 @@ k8s_endpoint_given=false
 k8s_image=""
 k8s_allow_ns_raw=()
 k8s_reach_probe_raw=()
+k8s_host_alias_raw=()
 k8s_extra_refs_raw=()
 outbox_max_arg=""
 network_arg="pinned"
@@ -2122,6 +2127,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --reach-probe)
             k8s_reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}")
+            shift 2
+            ;;
+        --host-alias)
+            k8s_host_alias_raw+=("${2:?--host-alias requires IP=HOST[,HOST...]}")
             shift 2
             ;;
         --extra-ref)
@@ -4042,6 +4051,7 @@ if [[ "$k8s_mode" == true ]]; then
     # like every other k8s-only flag this dispatch defers to it.
     for k8s_grant_fwd in "${k8s_allow_ns_raw[@]}"; do k8s_argv+=(--allow-namespace "$k8s_grant_fwd"); done
     for k8s_grant_fwd in "${k8s_reach_probe_raw[@]}"; do k8s_argv+=(--reach-probe "$k8s_grant_fwd"); done
+    for k8s_grant_fwd in "${k8s_host_alias_raw[@]}"; do k8s_argv+=(--host-alias "$k8s_grant_fwd"); done
     # Forwarded raw, like the grant flags: cmd_submit checks the name and the
     # sha before anything is created.
     for k8s_grant_fwd in "${k8s_extra_refs_raw[@]}"; do k8s_argv+=(--extra-ref "$k8s_grant_fwd"); done
@@ -4068,9 +4078,9 @@ fi
 if [[ "$k8s_runner_mode" != true ]] && [[ -n "$k8s_timeout" || "$k8s_keep" == true \
     || -n "$k8s_outbox_dir" || -n "$k8s_endpoint" || -n "$k8s_image" \
     || ${#k8s_allow_ns_raw[@]} -gt 0 || ${#k8s_reach_probe_raw[@]} -gt 0 \
-    || -n "$context_secret" ]]; then
+    || ${#k8s_host_alias_raw[@]} -gt 0 || -n "$context_secret" ]]; then
     echo "Error: --timeout, --keep, --outbox-dir, --endpoint, --image," >&2
-    echo "--allow-namespace, --reach-probe and --context-secret" >&2
+    echo "--allow-namespace, --reach-probe, --host-alias and --context-secret" >&2
     echo "only apply with --k8s," >&2
     echo "which passes them on to fork-sandbox-k8s.sh run. Add --k8s, or drop" >&2
     echo "the flag. A local sandbox has no namespaces to grant and no Secrets" >&2
@@ -9535,6 +9545,7 @@ if [[ "$k8s_runner_mode" == true ]]; then
     export FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1
     for k8s_grant_fwd in "${k8s_allow_ns_raw[@]}"; do k8s_argv+=(--allow-namespace "$k8s_grant_fwd"); done
     for k8s_grant_fwd in "${k8s_reach_probe_raw[@]}"; do k8s_argv+=(--reach-probe "$k8s_grant_fwd"); done
+    for k8s_grant_fwd in "${k8s_host_alias_raw[@]}"; do k8s_argv+=(--host-alias "$k8s_grant_fwd"); done
     for k8s_grant_fwd in "${k8s_extra_refs_raw[@]}"; do k8s_argv+=(--extra-ref "$k8s_grant_fwd"); done
     # Step 1's own seat: --harness/--model mean the legacy single-leg
     # shape in runner mode, same as the legacy --k8s dispatch's own

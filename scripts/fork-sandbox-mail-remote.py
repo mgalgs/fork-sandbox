@@ -87,7 +87,8 @@ RETRY_KEYS = ("FORK_SANDBOX_MAIL_API_RETRY_SECONDS",
 # "--body" is never taken for the flag.
 VALUE_FLAGS = {
     "--from", "--to", "--cc", "--subject", "--body", "--attach", "--hops",
-    "--header", "--allow-namespace", "--reach-probe", "--context-ro",
+    "--header", "--allow-namespace", "--reach-probe", "--host-alias",
+    "--context-ro",
     "--context-secret", "--reply-to", "--budget",
 }
 

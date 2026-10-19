@@ -7,7 +7,8 @@
 #                              [--attach <file>]... [--hops <n>]
 #                              [--header 'X-Name: value']...
 #                              [--allow-namespace NS[:PORT]]...
-#                              [--reach-probe HOST:PORT]... [--context-ro DIR]
+#                              [--reach-probe HOST:PORT]...
+#                              [--host-alias IP=HOST[,HOST...]]... [--context-ro DIR]
 #                              [--context-secret NAME]
 #                              [--review-target <branch>:<sha>] [--budget <n>]
 #                              [--no-grant]
@@ -26,7 +27,8 @@
 #        fork-sandbox-mail.sh inbox <name> [--all]
 #        fork-sandbox-mail.sh seen <name> <message-id>...
 #        fork-sandbox-mail.sh grant <thread-id> [--allow-namespace NS[:PORT]]...
-#                              [--reach-probe HOST:PORT]... [--context-ro DIR]
+#                              [--reach-probe HOST:PORT]...
+#                              [--host-alias IP=HOST[,HOST...]]... [--context-ro DIR]
 #                              [--context-secret NAME]
 #        fork-sandbox-mail.sh grant <thread-id> --clear
 #        fork-sandbox-mail.sh grant <thread-id> --show [--json]
@@ -721,19 +723,21 @@ mail_grant_print_json() {
         printf 'null\n'
         return 0
     fi
-    local -a ns=() probe=()
+    local -a ns=() probe=() host_aliases=()
     local ctx="null" ctx_secret="null" line
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         case "$line" in
             ALLOW_NAMESPACE=*) ns+=("$(mail_json_escape "${line#ALLOW_NAMESPACE=}")") ;;
             REACH_PROBE=*) probe+=("$(mail_json_escape "${line#REACH_PROBE=}")") ;;
+            HOST_ALIAS=*) host_aliases+=("$(mail_json_escape "${line#HOST_ALIAS=}")") ;;
             CONTEXT_RO=*) ctx="\"$(mail_json_escape "${line#CONTEXT_RO=}")\"" ;;
             CONTEXT_SECRET=*) ctx_secret="\"$(mail_json_escape "${line#CONTEXT_SECRET=}")\"" ;;
         esac
     done < "$grant_file"
-    printf '{"thread": "%s", "allow_namespace": %s, "reach_probe": %s, "context_ro": %s, "context_secret": %s}\n' \
-        "$(mail_json_escape "$tid")" "$(mail_json_string_array ns)" "$(mail_json_string_array probe)" "$ctx" "$ctx_secret"
+    printf '{"thread": "%s", "allow_namespace": %s, "reach_probe": %s, "host_alias": %s, "context_ro": %s, "context_secret": %s}\n' \
+        "$(mail_json_escape "$tid")" "$(mail_json_string_array ns)" "$(mail_json_string_array probe)" \
+        "$(mail_json_string_array host_aliases)" "$ctx" "$ctx_secret"
 }
 
 # Validates and copies each --attach file into <thread-dir>/attachments/,
@@ -977,11 +981,12 @@ mail_body_is_empty() {
 # of storing it, so a caller can ship it elsewhere before anything is
 # written here. Attachments travel (as a LANE-MAIL-BUNDLE; see
 # mail_emit_bundle); grants, a review target and the upstream flags stay in
-# the local store regardless. Args: verb, grant-ns count, reach-probe count,
-# and the concatenation of the single-valued flags that --emit cannot carry.
+# the local store regardless. Args: verb, the number of repeatable grant
+# values given (every flag), and the concatenation of the single-valued
+# flags that --emit cannot carry.
 mail_emit_check() {
-    local verb="$1" n_ns="$2" n_probe="$3" other="$4"
-    if (( n_ns > 0 )) || (( n_probe > 0 )) || [[ -n "$other" ]]; then
+    local verb="$1" n_multi="$2" other="$3"
+    if (( n_multi > 0 )) || [[ -n "$other" ]]; then
         echo "Error: $verb: --emit does not carry grants, a review target, a" >&2
         echo "thread budget, --no-grant or upstream flags." >&2
         return 1
@@ -1046,7 +1051,7 @@ mail_emit_bundle() {
 cmd_send() {
     local from="" to="" cc="" subject="" body_arg="" hops=8
     local -a attach_files=() extra_headers=()
-    local -a grant_allow_ns=() grant_reach_probe=()
+    local -a grant_allow_ns=() grant_reach_probe=() grant_host_alias=()
     local grant_context_ro="" grant_context_secret="" review_target_arg="" emit=0
     local budget="" no_grant=0
     while [[ $# -gt 0 ]]; do
@@ -1064,6 +1069,7 @@ cmd_send() {
             --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
             --allow-namespace) grant_allow_ns+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
             --reach-probe) grant_reach_probe+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
+            --host-alias) grant_host_alias+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); shift 2 ;;
             --context-ro) grant_context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             --context-secret) grant_context_secret="${2:?--context-secret requires a Secret name}"; shift 2 ;;
             --review-target) review_target_arg="${2:?--review-target requires <branch>:<sha>}"; shift 2 ;;
@@ -1091,9 +1097,10 @@ cmd_send() {
         return 1
     fi
     if (( no_grant )) && { (( ${#grant_allow_ns[@]} > 0 )) || (( ${#grant_reach_probe[@]} > 0 )) \
+            || (( ${#grant_host_alias[@]} > 0 )) \
             || [[ -n "$grant_context_ro$grant_context_secret" ]]; }; then
         echo "Error: send: --no-grant opens a thread with no environment and cannot be combined with" >&2
-        echo "--allow-namespace, --reach-probe, --context-ro or --context-secret." >&2
+        echo "--allow-namespace, --reach-probe, --host-alias, --context-ro or --context-secret." >&2
         return 1
     fi
     mail_validate_no_newline "$subject" "--subject" || return 1
@@ -1114,7 +1121,8 @@ cmd_send() {
     if (( emit )); then
         local no_grant_mark=""
         (( no_grant )) && no_grant_mark="no-grant"
-        mail_emit_check send "${#grant_allow_ns[@]}" "${#grant_reach_probe[@]}" \
+        mail_emit_check send \
+            "$(( ${#grant_allow_ns[@]} + ${#grant_reach_probe[@]} + ${#grant_host_alias[@]} ))" \
             "$grant_context_ro$grant_context_secret$review_target_arg$budget$no_grant_mark" || return 1
     fi
 
@@ -1128,6 +1136,7 @@ cmd_send() {
     local gv
     for gv in "${grant_allow_ns[@]:-}"; do [[ -n "$gv" ]] && grant_args+=(--allow-namespace "$gv"); done
     for gv in "${grant_reach_probe[@]:-}"; do [[ -n "$gv" ]] && grant_args+=(--reach-probe "$gv"); done
+    for gv in "${grant_host_alias[@]:-}"; do [[ -n "$gv" ]] && grant_args+=(--host-alias "$gv"); done
     [[ -n "$grant_context_ro" ]] && grant_args+=(--context-ro "$grant_context_ro")
     [[ -n "$grant_context_secret" ]] && grant_args+=(--context-secret "$grant_context_secret")
     local saw_grant=0
@@ -1278,7 +1287,7 @@ cmd_reply() {
             --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
             --upstream-head) upstream_head_arg="${2:?--upstream-head requires <branch>:<sha>}"; shift 2 ;;
             --upstream-state) upstream_state_arg="${2:?--upstream-state requires closed or open}"; shift 2 ;;
-            --allow-namespace|--reach-probe|--context-ro|--context-secret)
+            --allow-namespace|--reach-probe|--host-alias|--context-ro|--context-secret)
                 echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
                 echo "fork-sandbox mail grant <thread-id> ..." >&2
                 return 1
@@ -1333,7 +1342,7 @@ cmd_reply() {
     [[ -n "$to" ]] && { to_norm="$(mail_validate_addr_list "$to")" || return 1; }
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
     if (( emit )); then
-        mail_emit_check reply 0 0 "$upstream_head_arg$upstream_state_arg" || return 1
+        mail_emit_check reply 0 "$upstream_head_arg$upstream_state_arg" || return 1
     fi
 
     local parent_file
@@ -2111,12 +2120,13 @@ cmd_inbox() {
 cmd_grant() {
     local tid="${1:?Usage: fork-sandbox-mail.sh grant <thread-id> [options]}"
     shift
-    local -a allow_ns=() reach_probe=()
+    local -a allow_ns=() reach_probe=() host_alias=()
     local context_ro="" context_secret="" clear=0 show=0 json=0 saw_value=0
     while (( $# )); do
         case "$1" in
             --allow-namespace) allow_ns+=("${2:?--allow-namespace requires NS[:PORT]}"); saw_value=1; shift 2 ;;
             --reach-probe) reach_probe+=("${2:?--reach-probe requires HOST:PORT}"); saw_value=1; shift 2 ;;
+            --host-alias) host_alias+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); saw_value=1; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; saw_value=1; shift 2 ;;
             --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; saw_value=1; shift 2 ;;
             --clear) clear=1; shift ;;
@@ -2140,7 +2150,8 @@ cmd_grant() {
         return 1
     fi
     if (( ! clear && ! show && ! saw_value )); then
-        echo "Error: grant: give --allow-namespace/--reach-probe/--context-ro/--context-secret, --clear or --show." >&2
+        echo "Error: grant: give --allow-namespace/--reach-probe/--host-alias/--context-ro/--context-secret," >&2
+        echo "--clear or --show." >&2
         return 1
     fi
 
@@ -2173,6 +2184,7 @@ cmd_grant() {
     local v
     for v in "${allow_ns[@]}"; do args+=(--allow-namespace "$v"); done
     for v in "${reach_probe[@]}"; do args+=(--reach-probe "$v"); done
+    for v in "${host_alias[@]}"; do args+=(--host-alias "$v"); done
     [[ -n "$context_ro" ]] && args+=(--context-ro "$context_ro")
     [[ -n "$context_secret" ]] && args+=(--context-secret "$context_secret")
 

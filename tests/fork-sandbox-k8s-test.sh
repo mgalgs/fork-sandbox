@@ -1651,6 +1651,52 @@ else
         "$both_submit_ns_out"
 fi
 
+printf '\n== submit/run: --host-alias renders the pod spec hostAliases ==\n'
+ha_job() { yq -c "select(.kind == \"Job\") | .spec.template.spec.hostAliases" <<< "$1"; }
+ha_out="$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ha --model moonshotai/kimi-k3 \
+    --host-alias "192.0.2.10=pr-1.example.com,pr-1-mcp.example.com" \
+    --host-alias "2001:db8::5=other.example.com" \
+    "$proj_dir" "$handoff_file")"
+check "submit --host-alias: each flag is one hostAliases entry, hosts in order" \
+    '[{"ip":"192.0.2.10","hostnames":["pr-1.example.com","pr-1-mcp.example.com"]},{"ip":"2001:db8::5","hostnames":["other.example.com"]}]' \
+    "$(ha_job "$ha_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint -c "$repo_dir/.yamllint" - <<< "$ha_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: submit --host-alias output"; else no "yamllint: submit --host-alias output" "$out"; fi
+fi
+check "submit without --host-alias renders no hostAliases" "null" \
+    "$(ha_job "$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-ha --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file")")"
+check "run --host-alias forwards to submit's render" \
+    '[{"ip":"192.0.2.10","hostnames":["pr-1.example.com"]}]' \
+    "$(ha_job "$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+        --branch fs-k8s-test-ha --model moonshotai/kimi-k3 \
+        --host-alias "192.0.2.10=pr-1.example.com" "$proj_dir" "$handoff_file")")"
+for ha_bad in "192.0.2=a.example.com" "192.0.2.010=a.example.com" "192.0.2.256=a.example.com" \
+        "1::2::3=a.example.com" "fd00::1:=a.example.com" "host.example.com=a.example.com"; do
+    refuses "submit --host-alias '$ha_bad' (not an IP literal) is refused" \
+        "is not an IPv4" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-ha --model moonshotai/kimi-k3 \
+        --host-alias "$ha_bad" "$proj_dir" "$handoff_file"
+done
+for ha_bad in "192.0.2.10=Upper.example.com" "192.0.2.10=-a.example.com" \
+        "192.0.2.10=a..example.com" "192.0.2.10=a_b.example.com"; do
+    refuses "submit --host-alias '$ha_bad' (not a DNS name) is refused" \
+        "is not a" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-ha --model moonshotai/kimi-k3 \
+        --host-alias "$ha_bad" "$proj_dir" "$handoff_file"
+done
+for ha_bad in "192.0.2.10" "192.0.2.10=" "=a.example.com" "192.0.2.10=a.example.com,"; do
+    refuses "submit --host-alias '$ha_bad' (malformed) is refused" \
+        "--host-alias '$ha_bad'" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-ha --model moonshotai/kimi-k3 \
+        --host-alias "$ha_bad" "$proj_dir" "$handoff_file"
+done
+
 printf '\n== submit: per-run grant apply (render-grant, stale-grant refusal, capability gate) ==\n'
 # --dry-run renders the grant NetworkPolicy, named <safe_name>-agent-grant,
 # ahead of the Job -- the apply order submit itself uses.
@@ -12319,6 +12365,12 @@ else
         "$(cat /tmp/fs-k8s-flag-test-default-harness.err)"
 fi
 rm -f /tmp/fs-k8s-flag-test-default-harness.err
+check "--k8s --host-alias reaches the rendered pod spec on the legacy path" \
+    '[{"ip":"192.0.2.1","hostnames":["a.example.com"]}]' \
+    "$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+        --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-host-alias \
+        --host-alias 192.0.2.1=a.example.com "$k8s_flag_proj" "$k8s_flag_handoff" 2>/dev/null \
+        | yq -c 'select(.kind == "Job") | .spec.template.spec.hostAliases')"
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness claude --model claude-sonnet-5 \
     --branch fs-k8s-flag-test-claude-harness \
@@ -12733,6 +12785,10 @@ refuses "--image without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
     --image registry.example/you/fork-sandbox:latest unused-project unused-handoff
+refuses "--host-alias without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --host-alias 192.0.2.1=a.example.com unused-project unused-handoff
 refuses "--endpoint with a bad name shape is refused" \
     "takes a name matching" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
@@ -18235,6 +18291,22 @@ check "reserved -claude-token suffix names the rule" "yes" \
 cg_run --context-secret preview.ctx-2 >/dev/null 2>&1
 check "a dotted DNS-1123 subdomain name is accepted" "0" "$?"
 
+printf '\n== check-grant --host-alias ==\n'
+cg_out="$(cg_run --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 \
+    --host-alias 192.0.2.10=pr-7.example.com,pr-7-mcp.example.com \
+    --host-alias 2001:db8::7=b.example.com --context-secret preview-ctx 2>/dev/null)"
+check "host-alias grant: HOST_ALIAS= lines after REACH_PROBE=, before CONTEXT_SECRET=" \
+    "$(printf 'ALLOW_NAMESPACE=preview-pr-7\nREACH_PROBE=svc.preview-pr-7:80\nHOST_ALIAS=192.0.2.10=pr-7.example.com,pr-7-mcp.example.com\nHOST_ALIAS=2001:db8::7=b.example.com\nCONTEXT_SECRET=preview-ctx')" \
+    "$cg_out"
+cg_out="$(cg_run --host-alias 192.0.2.10=pr-7.example.com 2>/dev/null)"
+check "host-alias alone is a grant: exit 0" "0" "$?"
+check "host-alias alone: only the HOST_ALIAS= line" "HOST_ALIAS=192.0.2.10=pr-7.example.com" "$cg_out"
+for ha_bad in "192.0.2.300=a.example.com" "192.0.2.10=Bad.example.com" "192.0.2.10" \
+        "$(printf '192.0.2.10=a.example.com\nCONTEXT_RO=/var/tmp/claude-scratch/forks/x')"; do
+    cg_run --host-alias "$ha_bad" >/dev/null 2>&1
+    check "host-alias '${ha_bad:0:30}' refused: exit 2" "2" "$?"
+done
+
 cs_submit_out="$(newdir)/cs-submit.yaml"; tmpdirs+=("$(dirname "$cs_submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-cs-branch --model moonshotai/kimi-k3 --context-secret preview-ctx \
@@ -22203,7 +22275,8 @@ walk_dispatch() {
 # Same as walk_dispatch, but forwards every extra arg straight through to
 # the launcher after --branch, ahead of the project/handoff positionals --
 # for proving the cluster-only flags (--timeout, --keep, --outbox-dir,
-# --endpoint, --image, --allow-namespace, --reach-probe, --context-secret)
+# --endpoint, --image, --allow-namespace, --reach-probe, --host-alias,
+# --context-secret)
 # reach the stub k8s.sh on a COMPOSED --k8s dispatch exactly as they do on
 # a legacy one, rather than being refused by the launcher's own "only apply
 # with --k8s" gate before ever getting there (the bug this round fixes --
@@ -22227,13 +22300,14 @@ if walk_dispatch_flags "$walk_flags_pod_work" "$walk_flags_branch" \
     --timeout 111 --keep --outbox-dir "$walk_flags_outbox_dir" \
     --endpoint llm --image registry.example/you/fork-sandbox:latest \
     --allow-namespace preview:8080 --reach-probe preview.svc.cluster.local:8080 \
+    --host-alias 192.0.2.1=a.example.com \
     --context-secret preview-ctx; then
     ok "a composed --k8s dispatch accepts every cluster-only flag at once"
 else
     no "a composed --k8s dispatch accepts every cluster-only flag at once" \
         "$(cat "$WALK_STAGE_OUT")"
 fi
-if [[ "$(cat "$WALK_STAGE_OUT")" == *"run --run-dir "*" --timeout 111"*" --keep"*" --endpoint llm"*" --image registry.example/you/fork-sandbox:latest"*" --outbox-dir $walk_flags_outbox_dir"*" --context-secret preview-ctx"*" --allow-namespace preview:8080"*" --reach-probe preview.svc.cluster.local:8080"* ]]; then
+if [[ "$(cat "$WALK_STAGE_OUT")" == *"run --run-dir "*" --timeout 111"*" --keep"*" --endpoint llm"*" --image registry.example/you/fork-sandbox:latest"*" --outbox-dir $walk_flags_outbox_dir"*" --context-secret preview-ctx"*" --allow-namespace preview:8080"*" --reach-probe preview.svc.cluster.local:8080"*" --host-alias 192.0.2.1=a.example.com"* ]]; then
     ok "every cluster-only flag reaches the stub k8s.sh's argv on the composed path"
 else
     no "every cluster-only flag reaches the stub k8s.sh's argv on the composed path" \
