@@ -88,7 +88,7 @@ RETRY_KEYS = ("FORK_SANDBOX_MAIL_API_RETRY_SECONDS",
 VALUE_FLAGS = {
     "--from", "--to", "--cc", "--subject", "--body", "--attach", "--hops",
     "--header", "--allow-namespace", "--reach-probe", "--host-alias",
-    "--context-ro",
+    "--seat-resources", "--context-ro",
     "--context-secret", "--reply-to", "--budget",
 }
 

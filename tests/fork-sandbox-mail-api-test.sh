@@ -414,6 +414,15 @@ check "grant cap: repeated grant --host-alias: rc 0" "0" \
 check "grant cap: the grant file carries both HOST_ALIAS= lines" \
     "$(printf 'HOST_ALIAS=192.0.2.1=a.example.com\nHOST_ALIAS=192.0.2.2=b.example.com')" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$seed.env" 2>/dev/null)"
+check "read only: send with --seat-resources is 403 (needs grant)" "403" \
+    "$(xr "$tok/reader" --tool mail --stdin hi -- send --from @reader --to @x --subject s --body - --seat-resources core=cpu=1)"
+check "read only: grant --seat-resources is 403 (needs grant)" "403" \
+    "$(xr "$tok/reader" --tool mail -- grant "$seed" --seat-resources core=cpu=1)"
+check "grant cap: repeated grant --seat-resources: rc 0" "0" \
+    "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --seat-resources core=cpu=2,memory=4Gi --seat-resources review=memory=6Gi >/dev/null; rjson rc)"
+check "grant cap: the grant file carries both SEAT_RESOURCES= lines" \
+    "$(printf 'SEAT_RESOURCES=core=cpu=2,memory=4Gi\nSEAT_RESOURCES=review=memory=6Gi')" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$seed.env" 2>/dev/null)"
 check "grant cap: grant --context-secret: rc 0" "0" \
     "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --context-secret preview-ctx >/dev/null; rjson rc)"
 check "grant cap: the grant file carries CONTEXT_SECRET=preview-ctx" "CONTEXT_SECRET=preview-ctx" \

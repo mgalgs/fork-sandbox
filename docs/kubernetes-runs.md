@@ -1937,14 +1937,46 @@ object exists. Nothing checks that IP belongs to a granted namespace: the
 pod's egress is still bounded by `--allow-namespace`, so an alias pointing
 anywhere else just fails to connect. Refused without `--k8s`.
 
+### One seat's cpu and memory: `--agent-resources` and `--seat-resources`
+
+`--agent-resources cpu=QTY[,memory=QTY]` (submit, run, and
+`fork-sandbox.sh --k8s`), at most once per run, sets this run's cpu and/or
+memory on the container that runs the legs (see "The agent's container
+resources"). Each value given is BOTH the request and the limit, so a heavy
+seat — one driving a browser, say — never overcommits its node. It overrides
+`K8S_AGENT_{REQUESTS,LIMITS}_{CPU,MEMORY}` for this run only; a key not given
+keeps `k8s.env`'s values, and ephemeral storage is untouched. Keys are `cpu`
+and `memory`, at least one, each at most once, in either order. Each value
+must be a Kubernetes quantity (`2`, `0.5`, `500m`; `4Gi`, `6G`) no larger than
+the namespace `LimitRange` max; anything else is refused before any cluster
+object exists. Refused without `--k8s`.
+
+A mail thread sets it per seat at grant time instead:
+`--seat-resources SEAT=cpu=QTY[,memory=QTY]` on `mail send`, `mail grant` and
+`check-grant`, repeatable, one flag per seat (a seat named twice is refused).
+The postmaster forwards the part after `SEAT=` as `--agent-resources` to that
+seat's k8s wakes only; every other seat on the thread keeps the defaults. The
+split exists because nothing below the postmaster knows which seat a run is:
+the run-level flag needs no seat, and the grant-level one carries it.
+`check-grant` runs the identical quantity and `LimitRange`-max checks, so an
+oversized value is refused at kickoff, not when the pod is created:
+
+```
+fork-sandbox mail send --from @ci --to @core --subject ... --body - \
+    --seat-resources core=cpu=2,memory=4Gi
+```
+
 ### Checking a grant ahead of time: `check-grant`
 
 `fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
 [--reach-probe HOST:PORT]... [--host-alias IP=HOST[,HOST...]]...
+[--seat-resources SEAT=cpu=QTY[,memory=QTY]]...
 [--context-ro DIR | --context-secret NAME]` runs
 the grant-time half of the checks `submit` runs on these flags — the pairing
 rule, the per-probe HOST:PORT/DNS-shape/grant-match checks above,
-`--host-alias`'s IP and DNS-name checks,
+`--host-alias`'s IP and DNS-name checks, `--seat-resources`' seat-name,
+quantity and `LimitRange`-max checks (the ones `submit` runs on
+`--agent-resources`),
 `--context-ro`'s forks/-only-and-no-links checks, and `--context-secret`'s
 name checks (see "Getting a Secret in: --context-secret") — sharing the exact
 same functions, so a
@@ -1958,7 +1990,8 @@ Exit codes: **0** on success, printing to stdout only — nothing else — one
 line per flag in the order given: `ALLOW_NAMESPACE=<value>` (one per
 `--allow-namespace`, value exactly as given, not normalized), then
 `REACH_PROBE=<value>` (same, per `--reach-probe`), then `HOST_ALIAS=<value>`
-(same, per `--host-alias`), then, only when
+(same, per `--host-alias`), then `SEAT_RESOURCES=<value>` (same, per
+`--seat-resources`), then, only when
 `--context-ro` was given, `CONTEXT_RO=<realpath of DIR>`, then, only when
 `--context-secret` was given, `CONTEXT_SECRET=<name>` as the last line.
 `--context-ro` and `--context-secret` together are refused. **1** for no flags
@@ -3390,6 +3423,9 @@ request, and Kubernetes then makes the admitted request equal to that
 limit, so the default can never exceed an explicit limit. An explicit
 positive request can be paired with a limit but cannot exceed it. The
 namespace quota and LimitRange have no ephemeral-storage constraints.
+
+To size one run or one mail seat instead, see "One seat's cpu and memory:
+`--agent-resources` and `--seat-resources`".
 
 Because the keys live in `k8s.env`, they apply to every pod `submit`
 creates — including the seats the in-cluster postmaster launches, whose pod carries the same `k8s.env` (re-run

@@ -20,6 +20,7 @@
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
 #                            [--host-alias IP=HOST[,HOST...]]...
+#                            [--agent-resources cpu=QTY[,memory=QTY]]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
@@ -36,6 +37,7 @@
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
 #                            [--host-alias IP=HOST[,HOST...]]...
+#                            [--agent-resources cpu=QTY[,memory=QTY]]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
 #                            [--run-dir DIR]
@@ -55,6 +57,7 @@
 #        fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
 #                            [--reach-probe HOST:PORT]...
 #                            [--host-alias IP=HOST[,HOST...]]...
+#                            [--seat-resources SEAT=cpu=QTY[,memory=QTY]]...
 #                            [--context-ro DIR | --context-secret NAME]
 #
 # --model MODEL is REQUIRED on a K8S_PROXY_UPSTREAM (legacy) install. On a
@@ -307,16 +310,18 @@
 # rm deletes the run's Job, its pod, and its ConfigMap.
 #
 # check-grant validates a --allow-namespace/--reach-probe/--host-alias/
-# --context-ro/--context-secret grant with NO kubectl and NO cluster -- it
-# runs exactly the same checks submit runs on those flags (the pairing rule,
-# the per-probe HOST:PORT/DNS shape/grant-match checks, --host-alias's IP and
-# DNS-name checks, --context-ro's forks/-only + no-links checks, and
-# --context-secret's name checks),
+# --seat-resources/--context-ro/--context-secret grant with NO kubectl and NO
+# cluster -- it runs exactly the same checks submit runs on those flags (the
+# pairing rule, the per-probe HOST:PORT/DNS shape/grant-match checks,
+# --host-alias's IP and DNS-name checks, --seat-resources' quantity and
+# LimitRange-max checks (the ones submit runs on --agent-resources),
+# --context-ro's forks/-only + no-links checks, and --context-secret's name
+# checks),
 # sharing the same functions, so a grant check-grant accepts is one
 # submit will also accept later, for the identical reason. It needs no
 # k8s.env either. Exit 0 and, on stdout only, one line per flag in the order
-# given (ALLOW_NAMESPACE=..., REACH_PROBE=..., HOST_ALIAS=..., then
-# CONTEXT_RO=<realpath of
+# given (ALLOW_NAMESPACE=..., REACH_PROBE=..., HOST_ALIAS=...,
+# SEAT_RESOURCES=..., then CONTEXT_RO=<realpath of
 # DIR> when --context-ro was given, then CONTEXT_SECRET=<name> when
 # --context-secret was given, always last) -- this is the grant file format the
 # postmaster's per-thread grant store (fork-sandbox-mail.sh's `grant` verb)
@@ -632,6 +637,16 @@
 # (/etc/hosts). IP must be an IPv4 or IPv6 literal and each HOST a DNS name.
 # Nothing checks that IP is reachable: egress is still bounded by
 # --allow-namespace, so an alias pointing anywhere else fails to connect.
+#
+# --agent-resources cpu=QTY[,memory=QTY] (submit, run), at most once: this
+# run's cpu and/or memory for the container that runs the legs, each value
+# set as BOTH the request and the limit (so a heavy seat never overcommits a
+# node), overriding K8S_AGENT_{REQUESTS,LIMITS}_{CPU,MEMORY} for this run
+# only; a key not given keeps k8s.env's values. Each QTY must be a
+# Kubernetes quantity no larger than the namespace LimitRange max. The
+# postmaster passes it to one seat's wakes from that seat's
+# --seat-resources SEAT=... grant line (check-grant's own flag, which runs
+# the identical checks); ephemeral storage is untouched.
 #
 # --run-dir DIR (collect): finalize the run directory submit created --
 # writing summary.json and calling sandbox-run-log.py record -- rather than
@@ -5804,6 +5819,98 @@ k8s_host_aliases_yaml() {
     done
 }
 
+# The cpu=QTY[,memory=QTY] part of --agent-resources and --seat-resources,
+# shared by submit and check-grant so a value refused at kickoff is refused
+# for the same reason it would be at submit. $1 names the flag and $2 is its
+# whole value, both for messages only; $3 is the part to parse. Sets
+# PARSED_RESOURCES_CPU and PARSED_RESOURCES_MEMORY (empty for a key not
+# given) -- the module-global out-param idiom PARSED_LABEL_KEY uses. exit 1
+# on refusal, like the validators above. The caller has already run
+# fs_reject_unsafe_chars on the raw value.
+k8s_parse_resources_spec() {
+    local flag="$1" whole="$2" spec="$3" entry key val max_val
+    local -a entries
+    PARSED_RESOURCES_CPU="" PARSED_RESOURCES_MEMORY=""
+    if [[ -z "$spec" || "$spec" == ,* || "$spec" == *, || "$spec" == *,,* ]]; then
+        echo "Error: $flag '$whole' has an empty entry; give cpu=QTY[,memory=QTY]." >&2
+        exit 1
+    fi
+    IFS=, read -r -a entries <<< "$spec"
+    for entry in "${entries[@]}"; do
+        key="${entry%%=*}"
+        val="${entry#*=}"
+        if [[ "$entry" != *=* || -z "$val" ]]; then
+            echo "Error: $flag '$whole': '$entry' must be cpu=QTY or memory=QTY." >&2
+            exit 1
+        fi
+        case "$key" in
+            cpu) max_val="$K8S_LIMITRANGE_MAX_CPU" ;;
+            memory) max_val="$K8S_LIMITRANGE_MAX_MEMORY" ;;
+            *)
+                echo "Error: $flag '$whole' sets '$key'; only cpu and memory can be set." >&2
+                exit 1
+                ;;
+        esac
+        local out_var="PARSED_RESOURCES_${key^^}"
+        if [[ -n "${!out_var}" ]]; then
+            echo "Error: $flag '$whole' sets $key twice." >&2
+            exit 1
+        fi
+        local val_n
+        val_n="$(k8s_quantity_value "$key" "$val")"
+        if [[ -z "$val_n" ]]; then
+            if [[ "$key" == cpu ]]; then
+                echo "Error: $flag '$whole': cpu '$val' is not a Kubernetes cpu quantity (2, 0.5 or 500m) above zero." >&2
+            else
+                echo "Error: $flag '$whole': memory '$val' is not a Kubernetes memory quantity (512Mi, 6Gi, 6G) above zero." >&2
+            fi
+            exit 1
+        fi
+        if (( val_n > $(k8s_quantity_value "$key" "$max_val") )); then
+            echo "Error: $flag '$whole': $key $val is above the namespace LimitRange max of $max_val" >&2
+            echo "(manifests/k8s/00-namespace.yaml); the pod would be rejected at admission." >&2
+            exit 1
+        fi
+        printf -v "$out_var" '%s' "$val"
+    done
+}
+
+# --seat-resources SEAT=cpu=QTY[,memory=QTY] validate, for check-grant: the
+# seat shape (a mail lane name), one flag per seat, and the shared
+# k8s_parse_resources_spec checks on the rest -- the same ones submit runs on
+# the --agent-resources value the postmaster forwards from it. Same
+# fs_reject_unsafe_chars boundary as validate_host_aliases: each value is
+# printed back verbatim as check-grant's SEAT_RESOURCES= line, so a newline
+# would forge grant lines.
+validate_seat_resources() {
+    local spec seat
+    local -A seen=()
+    (( $# )) || return 0
+    fs_reject_unsafe_chars "$@" || exit 1
+    for spec in "$@"; do
+        seat="${spec%%=*}"
+        if [[ "$spec" != *=* || ! "$seat" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "Error: --seat-resources '$spec' must be SEAT=cpu=QTY[,memory=QTY], SEAT a" >&2
+            echo "seat name (lowercase letters, digits and '-')." >&2
+            exit 1
+        fi
+        if [[ -n "${seen[$seat]-}" ]]; then
+            echo "Error: --seat-resources names seat '$seat' twice; give one flag per seat." >&2
+            exit 1
+        fi
+        seen[$seat]=1
+        k8s_parse_resources_spec --seat-resources "$spec" "${spec#*=}"
+    done
+}
+
+# --agent-resources is not repeatable: one run is one seat, and a second
+# flag would silently shadow the first.
+refuse_second_agent_resources() {
+    echo "Error: --agent-resources given twice; give it once, with every key" >&2
+    echo "(cpu=QTY[,memory=QTY])." >&2
+    exit 1
+}
+
 # --context-secret and --context-ro both populate /work/context.
 refuse_context_secret_with_ro() {
     echo "Error: --context-secret and --context-ro cannot be combined: both" >&2
@@ -5821,18 +5928,20 @@ check_grant_usage() {
     echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
     echo "                            [--reach-probe HOST:PORT]..." >&2
     echo "                            [--host-alias IP=HOST[,HOST...]]..." >&2
+    echo "                            [--seat-resources SEAT=cpu=QTY[,memory=QTY]]..." >&2
     echo "                            [--context-ro DIR | --context-secret NAME]" >&2
     exit 1
 }
 
 cmd_check_grant() {
-    local -a allow_ns_raw=() reach_probe_raw=() host_alias_raw=()
+    local -a allow_ns_raw=() reach_probe_raw=() host_alias_raw=() seat_resources_raw=()
     local context_ro="" context_secret="" saw_any=false
     while (( $# )); do
         case "$1" in
             --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); saw_any=true; shift 2 ;;
             --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); saw_any=true; shift 2 ;;
             --host-alias) host_alias_raw+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); saw_any=true; shift 2 ;;
+            --seat-resources) seat_resources_raw+=("${2:?--seat-resources requires SEAT=cpu=QTY[,memory=QTY]}"); saw_any=true; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; saw_any=true; shift 2 ;;
             --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; saw_any=true; shift 2 ;;
             *) check_grant_usage ;;
@@ -5851,6 +5960,7 @@ cmd_check_grant() {
         validate_run_reach_probes run_reach_probes run_allow_ns_namespaces run_allow_ns_ports \
             "${#allow_ns_raw[@]}" "${reach_probe_raw[@]}"
         validate_host_aliases "${host_alias_raw[@]}"
+        validate_seat_resources "${seat_resources_raw[@]}"
         local context_ro_real=""
         if [[ -n "$context_ro" ]]; then
             context_ro_real="$(validate_context_ro_dir "$context_ro")" || exit 1
@@ -5868,6 +5978,9 @@ cmd_check_grant() {
         done
         for v in "${host_alias_raw[@]}"; do
             printf 'HOST_ALIAS=%s\n' "$v"
+        done
+        for v in "${seat_resources_raw[@]}"; do
+            printf 'SEAT_RESOURCES=%s\n' "$v"
         done
         if [[ -n "$context_ro" ]]; then
             printf 'CONTEXT_RO=%s\n' "$context_ro_real"
@@ -6221,6 +6334,7 @@ cmd_submit() {
     local refresh_threshold_tokens="" refresh_ceiling_tokens=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
     local -a host_alias_raw=()
+    local agent_resources="" agent_resources_given=false
     # Internal: set only by fork-sandbox.sh's own --resume orchestration,
     # which is the one caller that deliberately targets a branch it
     # expects to already exist (the moving draft a prior run in the same
@@ -6262,6 +6376,10 @@ cmd_submit() {
             --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
             --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
             --host-alias) host_alias_raw+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); shift 2 ;;
+            --agent-resources)
+                [[ "$agent_resources_given" == true ]] && refuse_second_agent_resources
+                agent_resources="${2:?--agent-resources requires cpu=QTY[,memory=QTY]}"
+                agent_resources_given=true; shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -7168,6 +7286,25 @@ cmd_submit() {
     validate_run_reach_probes run_reach_probes run_allow_ns_namespaces run_allow_ns_ports \
         "${#allow_ns_raw[@]}" "${reach_probe_raw[@]}"
     validate_host_aliases "${host_alias_raw[@]}"
+
+    # This run's --agent-resources: each key given becomes both the request
+    # and the limit, over k8s.env's values for this run only, for
+    # k8s_agent_resources_yaml to render. The top-level
+    # k8s_validate_agent_resources pass is not re-run: a key set here has
+    # request = limit <= the LimitRange max (k8s_parse_resources_spec), and
+    # a key not given keeps the k8s.env pair that pass already checked.
+    if [[ "$agent_resources_given" == true ]]; then
+        fs_reject_unsafe_chars "$agent_resources" || exit 1
+        k8s_parse_resources_spec --agent-resources "$agent_resources" "$agent_resources"
+        if [[ -n "$PARSED_RESOURCES_CPU" ]]; then
+            K8S_AGENT_REQUESTS_CPU="$PARSED_RESOURCES_CPU"
+            K8S_AGENT_LIMITS_CPU="$PARSED_RESOURCES_CPU"
+        fi
+        if [[ -n "$PARSED_RESOURCES_MEMORY" ]]; then
+            K8S_AGENT_REQUESTS_MEMORY="$PARSED_RESOURCES_MEMORY"
+            K8S_AGENT_LIMITS_MEMORY="$PARSED_RESOURCES_MEMORY"
+        fi
+    fi
 
     resolve_platform || exit 1
     local icmp_check=0
@@ -12054,6 +12191,7 @@ cmd_run() {
     local allow_existing_branch=false
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
     local -a host_alias_raw=()
+    local agent_resources="" agent_resources_given=false
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -12090,6 +12228,10 @@ cmd_run() {
             --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
             --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
             --host-alias) host_alias_raw+=("${2:?--host-alias requires IP=HOST[,HOST...]}"); shift 2 ;;
+            --agent-resources)
+                [[ "$agent_resources_given" == true ]] && refuse_second_agent_resources
+                agent_resources="${2:?--agent-resources requires cpu=QTY[,memory=QTY]}"
+                agent_resources_given=true; shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -12262,6 +12404,7 @@ cmd_run() {
     for l in "${allow_ns_raw[@]}"; do submit_argv+=(--allow-namespace "$l"); done
     for l in "${reach_probe_raw[@]}"; do submit_argv+=(--reach-probe "$l"); done
     for l in "${host_alias_raw[@]}"; do submit_argv+=(--host-alias "$l"); done
+    [[ "$agent_resources_given" == true ]] && submit_argv+=(--agent-resources "$agent_resources")
     for l in "${extra_refs_raw[@]}"; do submit_argv+=(--extra-ref "$l"); done
     submit_argv+=("$project_path" "$handoff_file")
 

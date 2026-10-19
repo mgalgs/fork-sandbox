@@ -70,6 +70,43 @@ check "k8s case3b: --context-secret forwarded with the grant's Secret name" prev
 check "k8s case3b: the k8s seat also carries --k8s" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 check "k8s case3b: no --context-ro is forwarded" 0 "$(grep -c -- '^--context-ro$' "$STUB_ARGV_LOG")"
 
+# ---- case 3c: SEAT_RESOURCES= reaches only the seat it names ----
+# The grant names two k8s seats (karen, kara). Karen's wake gets karen's
+# cpu/memory, alone, as --agent-resources; kim, a k8s seat the grant does
+# not name, woken on a thread carrying the same two lines, gets none.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+"$MAIL" send --from '@carol' --to '@karen' --subject 'seat resources topic' \
+    --body "$work/body.tmp" --hops 8 --host-alias 192.0.2.1=a.example.com \
+    --seat-resources kara=cpu=500m --seat-resources karen=cpu=2,memory=4Gi >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case3c: the named seat gets exactly one --agent-resources" 1 \
+    "$(grep -c -- '^--agent-resources$' "$STUB_ARGV_LOG")"
+check "k8s case3c: the named seat's --agent-resources is its own cpu/memory, seat stripped" \
+    cpu=2,memory=4Gi "$(argv_after --agent-resources "$STUB_ARGV_LOG")"
+check "k8s case3c: the thread's other grant flags still reach the named seat" \
+    192.0.2.1=a.example.com "$(argv_after --host-alias "$STUB_ARGV_LOG")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+"$MAIL" send --from '@carol' --to '@kim' --subject 'other seat resources topic' \
+    --body "$work/body.tmp" --hops 8 --host-alias 192.0.2.1=a.example.com \
+    --seat-resources kara=cpu=500m --seat-resources karen=cpu=2,memory=4Gi >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case3c: a k8s seat the grant does not name is still woken on k8s" 1 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s case3c: a k8s seat the grant does not name gets no --agent-resources" 0 \
+    "$(grep -c -- '^--agent-resources$' "$STUB_ARGV_LOG")"
+check "k8s case3c: the unnamed seat still gets the thread-wide --host-alias" \
+    192.0.2.1=a.example.com "$(argv_after --host-alias "$STUB_ARGV_LOG")"
+
 # ---- case 4: endpoint -> --endpoint; a pi seat's thinking -> --pi-args ----
 
 # Fresh root: case3's own grant-topic reply (no explicit To:, so

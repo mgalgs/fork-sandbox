@@ -705,6 +705,51 @@ out="$("$mail" reply --from @bob --reply-to "$grant_tid" --body - \
 check "reply with --host-alias exits 1" "1" "$?"
 contains "reply's --host-alias refusal names send" "$out" "grant flags apply to a new thread only"
 
+printf '\n== grant / send: --seat-resources ==\n'
+
+"$mail" grant "$grant_tid" --host-alias 192.0.2.10=pr-7.example.com \
+    --seat-resources core=cpu=2,memory=4Gi --seat-resources review=memory=6Gi
+check "grant with --seat-resources exits 0" "0" "$?"
+check "grant file holds SEAT_RESOURCES= lines after HOST_ALIAS=, in flag order" \
+    "$(printf 'HOST_ALIAS=192.0.2.10=pr-7.example.com\nSEAT_RESOURCES=core=cpu=2,memory=4Gi\nSEAT_RESOURCES=review=memory=6Gi')" \
+    "$(cat -- "$grant_file")"
+contains "--show --json carries seat_resources" "$("$mail" grant "$grant_tid" --show --json)" \
+    '"seat_resources": ["core=cpu=2,memory=4Gi", "review=memory=6Gi"]'
+"$mail" grant "$grant_tid" --clear
+contains "--show --json with no seat resources carries seat_resources []" \
+    "$("$mail" grant "$grant_tid" --host-alias 192.0.2.10=pr-7.example.com \
+        && "$mail" grant "$grant_tid" --show --json)" '"seat_resources": []'
+"$mail" grant "$grant_tid" --clear
+
+grants_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+out="$("$mail" grant "$grant_tid" --seat-resources core=cpu=8 2>&1)"
+check "grant with a --seat-resources cpu above the LimitRange max exits 2" "2" "$?"
+contains "the over-max refusal is an Error: naming the max" "$out" "Error: --seat-resources 'core=cpu=8': cpu 8 is above the namespace LimitRange max"
+"$mail" grant "$grant_tid" --seat-resources core=memory=1.5Gi >/dev/null 2>&1
+check "grant with a non-quantity --seat-resources memory exits 2" "2" "$?"
+"$mail" grant "$grant_tid" --seat-resources core=cpu=1 --seat-resources core=memory=2Gi >/dev/null 2>&1
+check "grant naming one seat in two --seat-resources exits 2" "2" "$?"
+check "a refused --seat-resources writes no grant file" "$grants_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+
+send_out="$("$mail" send --from @alice --to @bob --subject "Send with seat resources" --body - \
+    --seat-resources core=cpu=2,memory=4Gi <<< "hi" 2>diag.txt)"
+check "send with --seat-resources exits 0" "0" "$?"
+check "send with --seat-resources writes the SEAT_RESOURCES= grant line" "SEAT_RESOURCES=core=cpu=2,memory=4Gi" \
+    "$(cat -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$send_out.env")"
+sr_threads="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+out="$("$mail" send --from @alice --to @bob --subject "Send over max" --body - \
+    --seat-resources core=memory=9Gi <<< "hi" 2>&1)"
+check "send with a --seat-resources memory above the max exits 2" "2" "$?"
+contains "send's over-max refusal is check-grant's Error:" "$out" "above the namespace LimitRange max"
+check "a refused send --seat-resources creates no thread" "$sr_threads" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+
+out="$("$mail" reply --from @bob --reply-to "$grant_tid" --body - \
+    --seat-resources core=cpu=1 <<< "x" 2>&1)"
+check "reply with --seat-resources exits 1" "1" "$?"
+contains "reply's --seat-resources refusal names send" "$out" "grant flags apply to a new thread only"
+
 printf '\n== grant / send: --context-secret ==\n'
 
 "$mail" grant "$grant_tid" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 --context-secret preview-ctx
@@ -894,7 +939,7 @@ check "a plain send carries no X-Grant" "0" "$("$mail" show "$bd_plain" | grep -
 ng_threads="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
 ng_grants="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
 for ng_flag in "--allow-namespace ns-x" "--reach-probe svc.ns-x:80" "--host-alias 192.0.2.1=a.example.com" \
-        "--context-ro /tmp" "--context-secret ctx"; do
+        "--seat-resources core=cpu=1" "--context-ro /tmp" "--context-secret ctx"; do
     # shellcheck disable=SC2086  # the flag and its value are two words
     ng_out="$("$mail" send --from @alice --to @bob --subject "Conflict" --body - --no-grant $ng_flag <<< "x" 2>&1)"; rc=$?
     check "--no-grant with ${ng_flag%% *} exits 1" "1" "$rc"
@@ -1341,6 +1386,10 @@ hx_emit_no_grant() { printf 'b\n' | ma send --emit --from @fe --to @x --subject 
 refuses "--emit refuses --no-grant" hx_emit_no_grant
 hx_emit_host_alias() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --host-alias 192.0.2.1=a.example.com; }
 refuses "--emit refuses --host-alias" hx_emit_host_alias
+hx_emit_seat_resources() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --seat-resources core=cpu=1; }
+refuses "--emit refuses --seat-resources" hx_emit_seat_resources
+contains "--emit's --seat-resources refusal says it carries no grants" \
+    "$(hx_emit_seat_resources 2>&1)" "--emit does not carry grants"
 contains "--emit's --host-alias refusal says it carries no grants" \
     "$(hx_emit_host_alias 2>&1)" "--emit does not carry grants"
 printf 'LANE_MAIL_PEER_NAME=Bad_Name\n' > "$hx_cfg_a/lane-mail.env"

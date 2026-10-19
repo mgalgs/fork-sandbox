@@ -4245,6 +4245,7 @@ pm_spawn_wake() {
         # then every REACH_PROBE line, then every HOST_ALIAS line (all
         # repeatable, so fs_pm_env_get's
         # last-match-wins read is the wrong tool -- read every line), then
+        # the SEAT_RESOURCES line naming THIS seat, if any, then
         # the single optional CONTEXT_RO and CONTEXT_SECRET lines. Forwarded
         # for ANY k8s seat that has a grant file, `grant: required` or not
         # -- an optional grant still shapes network/context access when
@@ -4264,6 +4265,16 @@ pm_spawn_wake() {
             while IFS= read -r g_line; do
                 spawn_args+=(--host-alias "$g_line")
             done < <(sed -n 's/^HOST_ALIAS=//p' "$grant_file")
+            # SEAT_RESOURCES=<seat>=cpu=..,memory=.. is per seat, and nothing
+            # below this point knows the seat's name: only the named seat's
+            # wake gets the cpu/memory part, as --agent-resources; every
+            # other seat keeps the namespace default. check-grant refuses a
+            # seat named twice.
+            while IFS= read -r g_line; do
+                if [[ "${g_line%%=*}" == "$agent" ]]; then
+                    spawn_args+=(--agent-resources "${g_line#*=}")
+                fi
+            done < <(sed -n 's/^SEAT_RESOURCES=//p' "$grant_file")
             local context_ro
             context_ro="$(fs_pm_env_get "$grant_file" CONTEXT_RO)"
             [[ -n "$context_ro" ]] && spawn_args+=(--context-ro "$context_ro")

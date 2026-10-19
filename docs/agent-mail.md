@@ -224,7 +224,8 @@ authority is written down.
   set it, and needs no cap: it can only lower spend).
 - **`X-Grant`**: root only; store-written by `mail send --no-grant` (the
   literal `none`; refused together with `--allow-namespace`,
-  `--reach-probe`, `--host-alias`, `--context-ro` and `--context-secret`). It says the
+  `--reach-probe`, `--host-alias`, `--seat-resources`, `--context-ro` and
+  `--context-secret`). It says the
   thread was opened with **no environment**: a `backend: k8s`,
   `grant: required` seat on it spawns at once with no grant flags instead
   of holding, and `mail grant <tid> <values>` refuses it. ABSENT means "a
@@ -847,8 +848,9 @@ since it may arrive from repo persona frontmatter the machine cannot unset.
 ```bash
 fork-sandbox-mail.sh grant <thread-id> [--allow-namespace NS[:PORT]]...
                               [--reach-probe HOST:PORT]...
-                              [--host-alias IP=HOST[,HOST...]]... [--context-ro DIR]
-                              [--context-secret NAME]
+                              [--host-alias IP=HOST[,HOST...]]...
+                              [--seat-resources SEAT=cpu=QTY[,memory=QTY]]...
+                              [--context-ro DIR] [--context-secret NAME]
 fork-sandbox-mail.sh grant <thread-id> --clear
 fork-sandbox-mail.sh grant <thread-id> --show [--json]
 ```
@@ -875,15 +877,23 @@ granted Service by a public name. See "Pod host aliases: --host-alias" in
 docs/kubernetes-runs.md. `grant --show --json` reports the values as
 `host_alias`, `[]` when absent.
 
-`mail send` accepts the same five flags to grant a brand-new thread at
+`--seat-resources SEAT=cpu=QTY[,memory=QTY]`, repeatable, one flag per seat,
+sets the cpu and/or memory of the k8s wakes of the one seat it names, each
+value as both request and limit; every other seat keeps the namespace
+default. A quantity above the namespace `LimitRange` max is refused here,
+not at pod creation. See "One seat's cpu and memory" in
+docs/kubernetes-runs.md. `grant --show --json` reports the values as
+`seat_resources`, `[]` when absent.
+
+`mail send` accepts the same six flags to grant a brand-new thread at
 creation time; the check runs before the thread is created, so a refused
-value leaves nothing behind. `mail reply` refuses all five — a grant
+value leaves nothing behind. `mail reply` refuses all six — a grant
 applies only at thread creation, never on an existing thread (use the
 `grant` verb for that instead).
 
 `mail send --no-grant` is the opposite choice at creation time: it stamps
 `X-Grant: none` on the root (see the header contract) and means the thread
-has no environment at all. It is refused together with any of the five
+has no environment at all. It is refused together with any of the six
 grant flags. `grant <thread-id> <values>` then refuses that thread (exit 2,
 saying it was opened with `--no-grant`); `--show` and `--clear` keep
 working. If a grant file nonetheless exists for such a thread (placed by
@@ -895,12 +905,15 @@ forwarded — and emits `grant-ignored thread=<8>` on each k8s wake.
 Path: `$MAIL_ROOT/.postmaster/grants/<thread-id>.env`. Written atomically
 (mktemp in the same directory, then `mv`), so a reader never observes a
 partial file. The body is `check-grant`'s stdout verbatim: repeatable
-`ALLOW_NAMESPACE=<value>`, `REACH_PROBE=<value>` and `HOST_ALIAS=<value>`
-lines, one per flag, in that order and in the order given, values exactly as given (not normalized), plus a trailing
+`ALLOW_NAMESPACE=<value>`, `REACH_PROBE=<value>`, `HOST_ALIAS=<value>` and
+`SEAT_RESOURCES=<value>` lines, one per flag, in that order and in the order given, values exactly as given (not normalized), plus a trailing
 `CONTEXT_RO=<realpath>` line only when `--context-ro` was given, then a
 trailing `CONTEXT_SECRET=<name>` line only when `--context-secret` was
 given (always the last line). The postmaster forwards it to a k8s seat as
 `--context-secret <name>`.
+A `SEAT_RESOURCES=<seat>=<cpu/memory>` line is the one per-seat line: the
+postmaster forwards its part after `<seat>=` as `--agent-resources` only to
+the wakes of the seat it names, and to no other seat.
 
 This file applies only to `backend: k8s` seats; a local seat on the same
 thread has nothing that reads it and ignores it by construction.
@@ -947,8 +960,8 @@ already ran), only that one seat waits, flagged once with reason
 `no grant for k8s seat <agent>: <message-id>` (keyword `no-grant`), unless
 the thread's root carries `X-Grant: none` (`mail send --no-grant`): that
 thread has no environment to wait for, so the seat spawns at once with no
-`--allow-namespace`, `--reach-probe`, `--host-alias`, `--context-ro` or `--context-secret`
-flags. A thread without that header always holds. Run
+`--allow-namespace`, `--reach-probe`, `--host-alias`, `--agent-resources`,
+`--context-ro` or `--context-secret` flags. A thread without that header always holds. Run
 `fork-sandbox-mail.sh grant <thread-id> ...` (above) to release it — the
 next `deliver` pass picks the grant up and dispatches the held trigger. See
 "The held state file is a read contract" below for the on-disk record, and

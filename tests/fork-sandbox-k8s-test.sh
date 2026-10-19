@@ -1697,6 +1697,94 @@ for ha_bad in "192.0.2.10" "192.0.2.10=" "=a.example.com" "192.0.2.10=a.example.
         --host-alias "$ha_bad" "$proj_dir" "$handoff_file"
 done
 
+printf '\n== submit/run: --agent-resources sets this run'"'"'s cpu/memory, request = limit ==\n'
+ar_job() { yq -c 'select(.kind == "Job") | .spec.template.spec.containers[] | select(.name == "agent") | .resources' <<< "$1"; }
+ar_submit() {
+    # ar_submit CONFIG_DIR ARG... -> the submit --dry-run render on stdout
+    local cfg="$1"; shift
+    FORK_SANDBOX_CONFIG_DIR="$cfg" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-ar --model moonshotai/kimi-k3 "$@" "$proj_dir" "$handoff_file"
+}
+ar_out="$(ar_submit "$config_dir" --agent-resources cpu=2,memory=4Gi 2>/dev/null)"
+check "submit --agent-resources cpu+memory: each is both request and limit" \
+    '{"requests":{"cpu":"2","memory":"4Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"2","memory":"4Gi"}}' \
+    "$(ar_job "$ar_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint -c "$repo_dir/.yamllint" - <<< "$ar_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: submit --agent-resources output"; else no "yamllint: submit --agent-resources output" "$out"; fi
+fi
+check "submit --agent-resources: keys in either order, millicores accepted" \
+    '{"requests":{"cpu":"500m","memory":"1Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"500m","memory":"1Gi"}}' \
+    "$(ar_job "$(ar_submit "$config_dir" --agent-resources memory=1Gi,cpu=500m 2>/dev/null)")"
+check "submit --agent-resources cpu only: memory keeps the namespace default (no field)" \
+    '{"requests":{"cpu":"2","ephemeral-storage":"1Gi"},"limits":{"cpu":"2"}}' \
+    "$(ar_job "$(ar_submit "$config_dir" --agent-resources cpu=2 2>/dev/null)")"
+check "submit --agent-resources at the LimitRange max is accepted" \
+    '{"requests":{"cpu":"4","memory":"8Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"4","memory":"8Gi"}}' \
+    "$(ar_job "$(ar_submit "$config_dir" --agent-resources cpu=4,memory=8Gi 2>/dev/null)")"
+ar_cfg="$(agent_res_cfg K8S_AGENT_REQUESTS_CPU=500m K8S_AGENT_LIMITS_CPU=2 \
+    K8S_AGENT_REQUESTS_MEMORY=1Gi K8S_AGENT_LIMITS_MEMORY=6Gi)"
+check "submit --agent-resources memory over k8s.env: memory is the flag's, cpu keeps k8s.env's" \
+    '{"requests":{"cpu":"500m","memory":"3Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"2","memory":"3Gi"}}' \
+    "$(ar_job "$(ar_submit "$ar_cfg" --agent-resources memory=3Gi 2>/dev/null)")"
+ar_cfg="$(agent_res_cfg K8S_AGENT_REQUESTS_MEMORY=6Gi K8S_AGENT_LIMITS_MEMORY=6Gi)"
+check "submit --agent-resources below a k8s.env request sets both: no request above its limit" \
+    '{"requests":{"memory":"4Gi","ephemeral-storage":"1Gi"},"limits":{"memory":"4Gi"}}' \
+    "$(ar_job "$(ar_submit "$ar_cfg" --agent-resources memory=4Gi 2>/dev/null)")"
+check "submit without --agent-resources keeps the base render" \
+    '{"requests":{"ephemeral-storage":"1Gi"}}' "$(ar_job "$(ar_submit "$config_dir" 2>/dev/null)")"
+check "run --agent-resources forwards to submit's render" \
+    '{"requests":{"cpu":"1500m","memory":"3Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"1500m","memory":"3Gi"}}' \
+    "$(ar_job "$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+        --branch fs-k8s-test-ar --model moonshotai/kimi-k3 \
+        --agent-resources cpu=1500m,memory=3Gi "$proj_dir" "$handoff_file" 2>/dev/null)")"
+for ar_bad in \
+    'cpu=abc|is not a Kubernetes cpu quantity' \
+    'cpu=2Gi|is not a Kubernetes cpu quantity' \
+    'cpu=0|is not a Kubernetes cpu quantity' \
+    'cpu=-1|is not a Kubernetes cpu quantity' \
+    'memory=1.5Gi|is not a Kubernetes memory quantity' \
+    'memory=6GB|is not a Kubernetes memory quantity' \
+    'memory=1: 2|is not a Kubernetes memory quantity' \
+    'cpu=5|cpu 5 is above the namespace LimitRange max' \
+    'cpu=4001m|cpu 4001m is above the namespace LimitRange max' \
+    'memory=9Gi|memory 9Gi is above the namespace LimitRange max' \
+    'cpu=1,memory=9G|memory 9G is above the namespace LimitRange max' \
+    'gpu=1|only cpu and memory can be set' \
+    'ephemeral-storage=1Gi|only cpu and memory can be set' \
+    'cpu=1,cpu=2|sets cpu twice' \
+    'memory=1Gi,cpu=1,memory=2Gi|sets memory twice' \
+    ',|has an empty entry' \
+    'cpu=1,|has an empty entry' \
+    ',cpu=1|has an empty entry' \
+    'cpu=1,,memory=1Gi|has an empty entry' \
+    'cpu=|must be cpu=QTY or memory=QTY' \
+    'cpu|must be cpu=QTY or memory=QTY'; do
+    IFS='|' read -r ar_bad_val ar_bad_what <<< "$ar_bad"
+    refuses "submit --agent-resources '$ar_bad_val' is refused ($ar_bad_what)" \
+        "Error: --agent-resources '$ar_bad_val'" \
+        ar_submit "$config_dir" --agent-resources "$ar_bad_val"
+    refuses "submit --agent-resources '$ar_bad_val': the error says why" \
+        "$ar_bad_what" ar_submit "$config_dir" --agent-resources "$ar_bad_val"
+done
+refuses "submit --agent-resources '' (empty) is refused" \
+    "--agent-resources requires" ar_submit "$config_dir" --agent-resources ""
+refuses "submit --agent-resources given twice is refused" \
+    "--agent-resources given twice" \
+    ar_submit "$config_dir" --agent-resources cpu=1 --agent-resources memory=1Gi
+refuses "run --agent-resources given twice is refused" \
+    "--agent-resources given twice" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-ar --model moonshotai/kimi-k3 \
+    --agent-resources cpu=1 --agent-resources cpu=2 "$proj_dir" "$handoff_file"
+refuses "submit --agent-resources with a newline is refused" \
+    "contains a newline" \
+    ar_submit "$config_dir" --agent-resources "$(printf 'cpu=1\nmemory=1Gi')"
+ar_cfg="$(agent_res_cfg K8S_AGENT_REQUESTS_MEMORY=4Gi)"
+refuses "submit --agent-resources cpu only keeps the k8s.env memory-request-above-default check" \
+    "is above the LimitRange default limit" \
+    ar_submit "$ar_cfg" --agent-resources cpu=2
+
 printf '\n== submit: per-run grant apply (render-grant, stale-grant refusal, capability gate) ==\n'
 # --dry-run renders the grant NetworkPolicy, named <safe_name>-agent-grant,
 # ahead of the Job -- the apply order submit itself uses.
@@ -12371,6 +12459,17 @@ check "--k8s --host-alias reaches the rendered pod spec on the legacy path" \
         --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-host-alias \
         --host-alias 192.0.2.1=a.example.com "$k8s_flag_proj" "$k8s_flag_handoff" 2>/dev/null \
         | yq -c 'select(.kind == "Job") | .spec.template.spec.hostAliases')"
+check "--k8s --agent-resources reaches the rendered agent container on the legacy path" \
+    '{"requests":{"cpu":"2","memory":"4Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"2","memory":"4Gi"}}' \
+    "$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+        --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-agent-res \
+        --agent-resources cpu=2,memory=4Gi "$k8s_flag_proj" "$k8s_flag_handoff" 2>/dev/null \
+        | yq -c 'select(.kind == "Job") | .spec.template.spec.containers[] | select(.name == "agent") | .resources')"
+refuses "--k8s --agent-resources given twice reaches fork-sandbox-k8s.sh's refusal" \
+    "--agent-resources given twice" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-agent-res \
+    --agent-resources cpu=2 --agent-resources cpu=1 "$k8s_flag_proj" "$k8s_flag_handoff"
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness claude --model claude-sonnet-5 \
     --branch fs-k8s-flag-test-claude-harness \
@@ -12789,6 +12888,10 @@ refuses "--host-alias without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
     --host-alias 192.0.2.1=a.example.com unused-project unused-handoff
+refuses "--agent-resources without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --agent-resources cpu=2 unused-project unused-handoff
 refuses "--endpoint with a bad name shape is refused" \
     "takes a name matching" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
@@ -18307,6 +18410,51 @@ for ha_bad in "192.0.2.300=a.example.com" "192.0.2.10=Bad.example.com" "192.0.2.
     check "host-alias '${ha_bad:0:30}' refused: exit 2" "2" "$?"
 done
 
+printf '\n== check-grant --seat-resources ==\n'
+sr_has() { if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "$2"; fi; }
+cg_out="$(cg_run --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 \
+    --seat-resources core=cpu=2,memory=4Gi --host-alias 192.0.2.10=pr-7.example.com \
+    --seat-resources review-2=memory=8Gi --context-secret preview-ctx 2>/dev/null)"
+check "seat-resources grant: SEAT_RESOURCES= lines after HOST_ALIAS=, before CONTEXT_SECRET=" \
+    "$(printf 'ALLOW_NAMESPACE=preview-pr-7\nREACH_PROBE=svc.preview-pr-7:80\nHOST_ALIAS=192.0.2.10=pr-7.example.com\nSEAT_RESOURCES=core=cpu=2,memory=4Gi\nSEAT_RESOURCES=review-2=memory=8Gi\nCONTEXT_SECRET=preview-ctx')" \
+    "$cg_out"
+cg_ctx_dir="$(mktemp -d /var/tmp/claude-scratch/forks/cg-sr-ctx.XXXXXX)"; tmpdirs+=("$cg_ctx_dir")
+cg_out="$(cg_run --context-ro "$cg_ctx_dir" --seat-resources core=cpu=1 2>/dev/null)"
+check "seat-resources grant: SEAT_RESOURCES= before CONTEXT_RO=" \
+    "$(printf 'SEAT_RESOURCES=core=cpu=1\nCONTEXT_RO=%s' "$(readlink -f "$cg_ctx_dir")")" "$cg_out"
+cg_out="$(cg_run --seat-resources core=cpu=4,memory=8Gi 2>/dev/null)"
+check "seat-resources alone is a grant: exit 0" "0" "$?"
+check "seat-resources alone: only the SEAT_RESOURCES= line, value as given" \
+    "SEAT_RESOURCES=core=cpu=4,memory=8Gi" "$cg_out"
+for sr_bad in \
+    'core=cpu=5|cpu 5 is above the namespace LimitRange max' \
+    'core=memory=9Gi|memory 9Gi is above the namespace LimitRange max' \
+    'core=memory=1.5Gi|is not a Kubernetes memory quantity' \
+    'core=cpu=abc|is not a Kubernetes cpu quantity' \
+    'core=gpu=1|only cpu and memory can be set' \
+    'core=cpu=1,cpu=2|sets cpu twice' \
+    'core=|has an empty entry' \
+    'core=cpu=1,|has an empty entry' \
+    'core=cpu=|must be cpu=QTY or memory=QTY' \
+    'core|must be SEAT=cpu=QTY' \
+    '=cpu=1|must be SEAT=cpu=QTY' \
+    'Core=cpu=1|must be SEAT=cpu=QTY' \
+    '-core=cpu=1|must be SEAT=cpu=QTY' \
+    'co_re=cpu=1|must be SEAT=cpu=QTY'; do
+    IFS='|' read -r sr_bad_val sr_bad_what <<< "$sr_bad"
+    cg_err="$(cg_run --seat-resources "$sr_bad_val" 2>&1 >/dev/null)"
+    check "seat-resources '$sr_bad_val' refused: exit 2" "2" "$?"
+    sr_has "seat-resources '$sr_bad_val': an Error: saying why" "$cg_err" "$sr_bad_what"
+    sr_has "seat-resources '$sr_bad_val': the Error: names the flag and value" "$cg_err" \
+        "Error: --seat-resources '$sr_bad_val'"
+done
+cg_out="$(cg_run --seat-resources core=cpu=1 --seat-resources core=memory=1Gi 2>&1)"
+check "seat-resources naming one seat twice refused: exit 2" "2" "$?"
+sr_has "seat-resources naming one seat twice: the error says so" "$cg_out" "names seat 'core' twice"
+cg_out="$(cg_run --seat-resources "$(printf 'core=cpu=1\nCONTEXT_RO=/var/tmp/claude-scratch/forks/x')" 2>&1)"
+check "seat-resources with a newline (a forged grant line) refused: exit 2" "2" "$?"
+check "seat-resources with a newline prints no grant line" "0" "$(grep -c '^CONTEXT_RO=' <<< "$cg_out")"
+
 cs_submit_out="$(newdir)/cs-submit.yaml"; tmpdirs+=("$(dirname "$cs_submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-cs-branch --model moonshotai/kimi-k3 --context-secret preview-ctx \
@@ -22276,7 +22424,7 @@ walk_dispatch() {
 # the launcher after --branch, ahead of the project/handoff positionals --
 # for proving the cluster-only flags (--timeout, --keep, --outbox-dir,
 # --endpoint, --image, --allow-namespace, --reach-probe, --host-alias,
-# --context-secret)
+# --agent-resources, --context-secret)
 # reach the stub k8s.sh on a COMPOSED --k8s dispatch exactly as they do on
 # a legacy one, rather than being refused by the launcher's own "only apply
 # with --k8s" gate before ever getting there (the bug this round fixes --
@@ -22300,14 +22448,14 @@ if walk_dispatch_flags "$walk_flags_pod_work" "$walk_flags_branch" \
     --timeout 111 --keep --outbox-dir "$walk_flags_outbox_dir" \
     --endpoint llm --image registry.example/you/fork-sandbox:latest \
     --allow-namespace preview:8080 --reach-probe preview.svc.cluster.local:8080 \
-    --host-alias 192.0.2.1=a.example.com \
+    --host-alias 192.0.2.1=a.example.com --agent-resources cpu=2,memory=4Gi \
     --context-secret preview-ctx; then
     ok "a composed --k8s dispatch accepts every cluster-only flag at once"
 else
     no "a composed --k8s dispatch accepts every cluster-only flag at once" \
         "$(cat "$WALK_STAGE_OUT")"
 fi
-if [[ "$(cat "$WALK_STAGE_OUT")" == *"run --run-dir "*" --timeout 111"*" --keep"*" --endpoint llm"*" --image registry.example/you/fork-sandbox:latest"*" --outbox-dir $walk_flags_outbox_dir"*" --context-secret preview-ctx"*" --allow-namespace preview:8080"*" --reach-probe preview.svc.cluster.local:8080"*" --host-alias 192.0.2.1=a.example.com"* ]]; then
+if [[ "$(cat "$WALK_STAGE_OUT")" == *"run --run-dir "*" --timeout 111"*" --keep"*" --endpoint llm"*" --image registry.example/you/fork-sandbox:latest"*" --outbox-dir $walk_flags_outbox_dir"*" --context-secret preview-ctx"*" --allow-namespace preview:8080"*" --reach-probe preview.svc.cluster.local:8080"*" --host-alias 192.0.2.1=a.example.com"*" --agent-resources cpu=2,memory=4Gi"* ]]; then
     ok "every cluster-only flag reaches the stub k8s.sh's argv on the composed path"
 else
     no "every cluster-only flag reaches the stub k8s.sh's argv on the composed path" \
@@ -23088,6 +23236,15 @@ for agent_one in \
     check "composed pod: ${agent_one_kv%%=*} alone leaves the walker container as it was" \
         "$(container_named agent <<< "$comp_res_base_out")" "$(container_named agent <<< "$comp_one_out")"
 done
+comp_ar_out="$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-comp-agent-res --harness pi --model z-ai/glm-4.6 \
+    --agent-resources cpu=2,memory=4Gi \
+    --run-dir "$comp_res_fixture" "$proj_dir" "$handoff_file" 2>/dev/null)"
+check "composed pod: --agent-resources renders request = limit on the leg container" \
+    '{"requests":{"cpu":"2","memory":"4Gi","ephemeral-storage":"1Gi"},"limits":{"cpu":"2","memory":"4Gi"}}' \
+    "$(yq -c 'select(.kind == "Job") | .spec.template.spec.containers[] | select(.name == "leg") | .resources' <<< "$comp_ar_out")"
+check "composed pod: --agent-resources leaves the walker container as it was" \
+    "$(container_named agent <<< "$comp_res_base_out")" "$(container_named agent <<< "$comp_ar_out")"
 comp_res_empty_out="$(comp_res_render "$(agent_res_cfg K8S_AGENT_LIMITS_MEMORY= K8S_AGENT_REQUESTS_CPU=)")"
 check "composed pod: keys set to the empty string count as unset" \
     "$comp_res_base_out" "$comp_res_empty_out"
