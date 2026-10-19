@@ -146,9 +146,8 @@
 #                that k8s wake's --extra-ref flags. The wake is not flagged.
 #   grant-ignored thread -- a k8s seat woke on a thread whose root carries
 #                X-Grant: none (`mail send --no-grant`) although a grant
-#                file exists for it; the file was not forwarded (no
-#                --allow-namespace/--reach-probe/--context-ro/
-#                --context-secret). `mail grant` refuses such a thread, so
+#                file exists for it; the file was not forwarded (no grant
+#                flag at all). `mail grant` refuses such a thread, so
 #                this only fires for a file placed by hand.
 #   held-release thread, agent, trigger=<short-id> -- a held `backend: k8s`
 #                seat (reason=no-grant above) was released by pm_held_pass:

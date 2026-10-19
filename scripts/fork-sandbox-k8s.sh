@@ -635,8 +635,8 @@
 # --host-alias IP=HOST[,HOST...] (submit, run), repeatable: one entry in the
 # agent pod's spec.hostAliases, so each HOST resolves to IP inside the pod
 # (/etc/hosts). IP must be an IPv4 or IPv6 literal and each HOST a DNS name.
-# Nothing checks that IP is reachable: egress is still bounded by
-# --allow-namespace, so an alias pointing anywhere else fails to connect.
+# Nothing checks where IP is: an alias changes name resolution only, never
+# the egress policy, so it reaches nothing the pod could not reach by IP.
 #
 # --agent-resources cpu=QTY[,memory=QTY] (submit, run), at most once: this
 # run's cpu and/or memory for the container that runs the legs, each value
@@ -5743,7 +5743,9 @@ k8s_valid_ip_literal() {
     [[ "$ip" == ::* || "$ip" != :* ]] || return 1
     [[ "$ip" == *:: || "$ip" != *: ]] || return 1
     groups="${ip//[^:]/}"
-    if [[ "$ip" == *::* ]]; then
+    if [[ "$ip" == ::* || "$ip" == *:: ]]; then
+        (( ${#groups} <= 8 )) || return 1
+    elif [[ "$ip" == *::* ]]; then
         (( ${#groups} <= 7 )) || return 1
     else
         (( ${#groups} == 7 )) || return 1

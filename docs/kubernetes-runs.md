@@ -1933,9 +1933,12 @@ certificate's name, say — that cluster DNS does not serve:
 IP must be an IPv4 or IPv6 literal (an IPv4 octet with a leading zero is
 refused), and each HOST a DNS name: lowercase letters, digits, `-` and `.`,
 each label at most 63 characters. Anything else is refused before any cluster
-object exists. Nothing checks that IP belongs to a granted namespace: the
-pod's egress is still bounded by `--allow-namespace`, so an alias pointing
-anywhere else just fails to connect. Refused without `--k8s`.
+object exists. Nothing checks that IP belongs to a granted namespace: an
+alias changes name resolution only, never the pod's egress policy, so it
+reaches nothing the pod could not already reach by IP (its `--allow-namespace`
+grants, `K8S_AGENT_ALLOW_NS` and the proxies, on a CNI that enforces
+NetworkPolicy). Aliasing a name the pod itself relies on, such as its proxy
+Service, can only break that run. Refused without `--k8s`.
 
 ### One seat's cpu and memory: `--agent-resources` and `--seat-resources`
 

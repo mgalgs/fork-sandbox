@@ -18409,6 +18409,16 @@ for ha_bad in "192.0.2.300=a.example.com" "192.0.2.10=Bad.example.com" "192.0.2.
     cg_run --host-alias "$ha_bad" >/dev/null 2>&1
     check "host-alias '${ha_bad:0:30}' refused: exit 2" "2" "$?"
 done
+# "::" may stand for a single zero group at either end too, as the API
+# server's parser accepts; nine groups never fit.
+for ha_ip in "1:2:3:4:5:6:7::" "::2:3:4:5:6:7:8" "::" "1:2:3:4:5:6::7" "1:2:3:4:5:6:7:8"; do
+    cg_run --host-alias "$ha_ip=a.example.com" >/dev/null 2>&1
+    check "host-alias IPv6 '$ha_ip' accepted: exit 0" "0" "$?"
+done
+for ha_ip in "::1:2:3:4:5:6:7:8" "1:2:3:4:5:6:7:8::" "1::2:3:4:5:6:7:8"; do
+    cg_run --host-alias "$ha_ip=a.example.com" >/dev/null 2>&1
+    check "host-alias IPv6 '$ha_ip' (nine groups) refused: exit 2" "2" "$?"
+done
 
 printf '\n== check-grant --seat-resources ==\n'
 sr_has() { if [[ "$2" == *"$3"* ]]; then ok "$1"; else no "$1" "$2"; fi; }
