@@ -431,6 +431,16 @@ repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 export FORK_SANDBOX_RUN_SOURCE=test
 
 pass=0; fail=0; tmpdirs=()
+# Private to this suite run: every mktemp below, and so every fixture
+# project, lands under it. A run dir's origin_repo is how the exit sweep
+# tells this run's dirs from a concurrent run's (k8s_test_owns_rundir).
+k8s_test_tmp="$(realpath "$(mktemp -d)")"; tmpdirs+=("$k8s_test_tmp")
+export TMPDIR="$k8s_test_tmp"
+# The fixture projects that must live under ~/src instead (the project-root
+# rule), one per line, so the sweep claims their runs too. A file, not an
+# array: new_src_project runs in a command substitution.
+k8s_test_src_projects="$k8s_test_tmp/src-projects"
+: > "$k8s_test_src_projects"
 # Fixture commands that invoke record must never write prompt archives into
 # the operator's durable home. They use this isolated HOME.
 k8s_test_operator_home="$HOME"
@@ -459,15 +469,25 @@ k8s_test_runlog="$k8s_test_home/.claude/sandbox-runs.jsonl"
 k8s_test_runlog_before_lines=0
 [[ -f "$k8s_test_runlog" ]] && k8s_test_runlog_before_lines="$(wc -l < "$k8s_test_runlog")"
 
+# Whether run dir $1 is this suite run's own. Novelty is not enough: a
+# live run, or a concurrent run of this same suite, creates identical
+# names under the identical forks root. The run-source tag "test" rules
+# out live runs; the origin_repo under this run's private $k8s_test_tmp
+# rules out a concurrent suite, whose tag reads "test" too.
+k8s_test_owns_rundir() {
+    local origin p
+    [[ "$(cat "$1/run-source" 2>/dev/null)" == test ]] || return 1
+    origin="$(sed -n 's/^origin_repo=//p' "$1/run.env" 2>/dev/null | head -n 1)"
+    [[ -n "$origin" ]] || return 1
+    [[ "$origin" == "$k8s_test_tmp"/* ]] && return 0
+    while IFS= read -r p; do
+        [[ -n "$p" && ( "$origin" == "$p" || "$origin" == "$p"/* ) ]] && return 0
+    done < "$k8s_test_src_projects"
+    return 1
+}
+
 # Every claude-fork-sandbox.* directory under the forks root that this
-# suite's own fixtures created, one per line. Ownership, not just novelty:
-# a directory that showed up after the pre-suite snapshot is not
-# necessarily this suite's own -- a real `fork-sandbox.sh` run started
-# concurrently, from the identical mktemp template under the identical
-# forks root, looks identical at this point. Only counted when its own
-# run-source marker carries this suite's FORK_SANDBOX_RUN_SOURCE=test tag
-# (every fixture run this suite drives writes one); a live run's marker,
-# if it has one at all, will not read "test". Used both by cleanup()'s
+# suite's own fixtures created, one per line. Used both by cleanup()'s
 # sweep and by the handoff-archive guard near the end of this file, so
 # each recomputes the identical set rather than drifting apart.
 k8s_test_owned_rundirs() {
@@ -476,18 +496,19 @@ k8s_test_owned_rundirs() {
         -name 'claude-fork-sandbox.*' 2>/dev/null | sort | while IFS= read -r d; do
         [[ -z "$d" ]] && continue
         grep -qxF "$d" <<< "$k8s_test_preexisting_rundirs" && continue
-        [[ "$(cat "$d/run-source" 2>/dev/null)" == test ]] || continue
+        k8s_test_owns_rundir "$d" || continue
         printf '%s\n' "$d"
     done
 }
 
 cleanup() {
     local d
-    for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"; done
+    # Sweep first: ownership reads $k8s_test_src_projects, inside a tmpdir.
     while IFS= read -r d; do
         [[ -z "$d" ]] && continue
         rm -rf -- "$d"
     done < <(k8s_test_owned_rundirs)
+    for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"; done
 }
 trap cleanup EXIT
 ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
@@ -502,31 +523,91 @@ refuses() {
     if (( rc != 0 )) && [[ "$out" == *"$needle"* ]]; then ok "$label"; else no "$label" "status $rc: $out"; fi
 }
 newdir() { mktemp -d; }
+# yamllint finds its config by searching the cwd upward, so a bare call
+# lints against the defaults (80 columns) when the suite runs from outside
+# the repo. Pin the repo's .yamllint unless a call names its own config.
+# Defined only when installed, so the `command -v yamllint` guards still skip.
+if command -v yamllint >/dev/null 2>&1; then
+    yamllint() {
+        local a
+        for a in "$@"; do
+            [[ "$a" == -c || "$a" == -d ]] && { command yamllint "$@"; return; }
+        done
+        command yamllint -c "$repo_dir/.yamllint" "$@"
+    }
+fi
 
 printf '== exit sweep ownership (this suite'"'"'s own cleanup trap) ==\n'
-# cleanup()'s exit-time sweep, above, removes a claude-fork-sandbox.*
-# directory that showed up after the pre-existing-directories snapshot
-# ONLY when that directory's own run-source marker reads exactly "test" --
-# not merely because it is new, which a real fork-sandbox.sh run started
-# concurrently under the same forks root would also be. Exercised here
-# against throwaway directories of our own, never the real forks root, so
-# this check cannot itself delete anything live.
-sweep_owned_dir="$(newdir)"; tmpdirs+=("$sweep_owned_dir")
-printf 'test\n' > "$sweep_owned_dir/run-source"
-sweep_foreign_dir="$(newdir)"; tmpdirs+=("$sweep_foreign_dir")
-printf 'some-other-source\n' > "$sweep_foreign_dir/run-source"
-sweep_bare_dir="$(newdir)"; tmpdirs+=("$sweep_bare_dir")
-check "sweep ownership: this suite's own run-source marker reads 'test'" \
-    "test" "$(cat "$sweep_owned_dir/run-source" 2>/dev/null)"
-if [[ "$(cat "$sweep_foreign_dir/run-source" 2>/dev/null)" != test ]]; then
+# cleanup()'s exit-time sweep, above, removes only what
+# k8s_test_owns_rundir claims. Exercised here against throwaway
+# directories of our own, never the real forks root, so this check cannot
+# itself delete anything live.
+sweep_mk() {   # sweep_mk <run-source|""> <origin_repo|"">
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    [[ -n "$1" ]] && printf '%s\n' "$1" > "$d/run-source"
+    [[ -n "$2" ]] && printf 'version=1\norigin_repo=%s\n' "$2" > "$d/run.env"
+    printf '%s\n' "$d"
+}
+if k8s_test_owns_rundir "$(sweep_mk test "$k8s_test_tmp/proj")"; then
+    ok "sweep ownership: tag 'test' and a project under this run's TMPDIR is this suite's own"
+else
+    no "sweep ownership: tag 'test' and a project under this run's TMPDIR is this suite's own"
+fi
+if ! k8s_test_owns_rundir "$(sweep_mk test /tmp/tmp.concurrent-suite/proj)"; then
+    ok "sweep ownership: a concurrent suite's run (tag 'test', foreign project) is not this suite's own"
+else
+    no "sweep ownership: a concurrent suite's run (tag 'test', foreign project) is not this suite's own"
+fi
+printf '%s\n' /home/example/src/fs-k8s-listed.abc123 >> "$k8s_test_src_projects"
+if k8s_test_owns_rundir "$(sweep_mk test /home/example/src/fs-k8s-listed.abc123)"; then
+    ok "sweep ownership: a project this suite listed under ~/src is this suite's own"
+else
+    no "sweep ownership: a project this suite listed under ~/src is this suite's own"
+fi
+if ! k8s_test_owns_rundir "$(sweep_mk test /home/example/src/fs-k8s-listed.other9)"; then
+    ok "sweep ownership: an unlisted project under ~/src is not this suite's own"
+else
+    no "sweep ownership: an unlisted project under ~/src is not this suite's own"
+fi
+if ! k8s_test_owns_rundir "$(sweep_mk some-other-source "$k8s_test_tmp/proj")"; then
     ok "sweep ownership: a foreign run-source marker is not this suite's own"
 else
     no "sweep ownership: a foreign run-source marker is not this suite's own"
 fi
-if [[ "$(cat "$sweep_bare_dir/run-source" 2>/dev/null)" != test ]]; then
+if ! k8s_test_owns_rundir "$(sweep_mk "" "$k8s_test_tmp/proj")"; then
     ok "sweep ownership: a directory with no run-source marker at all is not this suite's own"
 else
     no "sweep ownership: a directory with no run-source marker at all is not this suite's own"
+fi
+if ! k8s_test_owns_rundir "$(sweep_mk test "")"; then
+    ok "sweep ownership: tag 'test' with no run.env is not this suite's own"
+else
+    no "sweep ownership: tag 'test' with no run.env is not this suite's own"
+fi
+
+# "Creates no run directory" checks never scan the shared forks root,
+# where any concurrent run's mktemp shows up. They put this shim first on
+# PATH and assert the run-dir template was never handed to mktemp.
+k8s_test_mktemp_shim="$(newdir)"; tmpdirs+=("$k8s_test_mktemp_shim")
+cat > "$k8s_test_mktemp_shim/mktemp" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${K8S_TEST_MKTEMP_LOG:-/dev/null}"
+exec $(command -v mktemp) "\$@"
+EOF
+chmod +x "$k8s_test_mktemp_shim/mktemp"
+# Run dirs requested in mktemp log $1, one per line; empty when none.
+k8s_test_rundir_mktemps() {
+    grep -F 'claude-scratch/forks/claude-fork-sandbox.' "$1" 2>/dev/null
+}
+shim_log="$(newdir)/mktemp.log"; tmpdirs+=("$(dirname "$shim_log")")
+mkdir -p "$k8s_test_tmp/claude-scratch/forks"
+shim_made="$(PATH="$k8s_test_mktemp_shim:$PATH" K8S_TEST_MKTEMP_LOG="$shim_log" \
+    mktemp -d "$k8s_test_tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX")"
+if [[ -d "$shim_made" ]] && [[ -n "$(k8s_test_rundir_mktemps "$shim_log")" ]]; then
+    ok "mktemp shim: still creates the directory, and logs a run-dir template"
+else
+    no "mktemp shim: still creates the directory, and logs a run-dir template" \
+        "made=$shim_made log=$(cat "$shim_log" 2>/dev/null)"
 fi
 
 k8s_sh="$repo_dir/scripts/fork-sandbox-k8s.sh"
@@ -845,10 +926,10 @@ handoff_file="$(newdir)/handoff.md"; tmpdirs+=("$(dirname "$handoff_file")")
 printf 'Do the thing.\n' > "$handoff_file"
 
 install_out="$(newdir)/install.yaml"; tmpdirs+=("$(dirname "$install_out")")
-if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" install --dry-run > "$install_out" 2>/tmp/fs-k8s-test-install.err; then
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" install --dry-run > "$install_out" 2>"$k8s_test_tmp"/fs-k8s-test-install.err; then
     ok "install --dry-run exits 0"
 else
-    no "install --dry-run exits 0" "$(cat /tmp/fs-k8s-test-install.err)"
+    no "install --dry-run exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-install.err)"
 fi
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$install_out" 2>&1)"
@@ -1085,15 +1166,15 @@ install -m 600 /dev/null "$config_dir2/pi.env"
 printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$config_dir2/pi.env"
 chmod 600 "$config_dir2/pi.env"
 install_out2="$(newdir)/install2.yaml"; tmpdirs+=("$(dirname "$install_out2")")
-FORK_SANDBOX_CONFIG_DIR="$config_dir2" "$k8s_sh" install --dry-run > "$install_out2" 2>/tmp/fs-k8s-test-install2.err
+FORK_SANDBOX_CONFIG_DIR="$config_dir2" "$k8s_sh" install --dry-run > "$install_out2" 2>"$k8s_test_tmp"/fs-k8s-test-install2.err
 checksum2="$(sed -n 's/.*checksum\/nginx-conf: "\([0-9a-f]*\)".*/\1/p' "$install_out2" | head -n1)"
 if [[ -n "$checksum1" && -n "$checksum2" && "$checksum1" != "$checksum2" ]]; then
     ok "checksum/nginx-conf annotation changes when the proxy config changes"
 else
     no "checksum/nginx-conf annotation changes when the proxy config changes" \
-        "checksum1='$checksum1' checksum2='$checksum2' ($(cat /tmp/fs-k8s-test-install2.err 2>/dev/null))"
+        "checksum1='$checksum1' checksum2='$checksum2' ($(cat "$k8s_test_tmp"/fs-k8s-test-install2.err 2>/dev/null))"
 fi
-rm -f /tmp/fs-k8s-test-install2.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-install2.err
 
 printf '\n== install: real (non-dry-run), legacy K8S_PROXY_UPSTREAM ==\n'
 # Same coverage as the K8S_PROXY_ENDPOINT_KEYS real-install check further
@@ -1116,11 +1197,11 @@ exit 0
 STUB
 chmod +x "$legacy_install_stub_bin/kubectl"
 if PATH="$legacy_install_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
-    "$k8s_sh" install >/dev/null 2>/tmp/fs-k8s-test-legacy-real-install.err; then
+    "$k8s_sh" install >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-legacy-real-install.err; then
     ok "a real (non-dry-run) legacy K8S_PROXY_UPSTREAM install exits 0 against a stubbed kubectl"
 else
     no "a real (non-dry-run) legacy K8S_PROXY_UPSTREAM install exits 0 against a stubbed kubectl" \
-        "$(cat /tmp/fs-k8s-test-legacy-real-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-legacy-real-install.err)"
 fi
 if grep -qF 'sk-test-dummy' "$legacy_install_log"; then
     no "the upstream key never appears in any kubectl argv (legacy)" \
@@ -1143,13 +1224,13 @@ else
     no "the legacy install's upstream-key Secret apply carries --server-side and its field manager" \
         "$(cat "$legacy_install_log")"
 fi
-if grep -qF 'sk-test-dummy' /tmp/fs-k8s-test-legacy-real-install.err; then
+if grep -qF 'sk-test-dummy' "$k8s_test_tmp"/fs-k8s-test-legacy-real-install.err; then
     no "the real install's own stderr never carries the upstream key (legacy)" \
-        "$(cat /tmp/fs-k8s-test-legacy-real-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-legacy-real-install.err)"
 else
     ok "the real install's own stderr never carries the upstream key (legacy)"
 fi
-rm -f /tmp/fs-k8s-test-legacy-real-install.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-legacy-real-install.err
 
 printf '\n== nginx -t on the rendered proxy config ==\n'
 # The gap this closes: yamllint proves the manifest is valid YAML, not that
@@ -1249,10 +1330,10 @@ fi
 submit_out="$(newdir)/submit.yaml"; tmpdirs+=("$(dirname "$submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$submit_out" 2>/tmp/fs-k8s-test-submit.err; then
+    "$proj_dir" "$handoff_file" > "$submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-submit.err; then
     ok "submit --dry-run exits 0"
 else
-    no "submit --dry-run exits 0" "$(cat /tmp/fs-k8s-test-submit.err)"
+    no "submit --dry-run exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-submit.err)"
 fi
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$submit_out" 2>&1)"
@@ -1526,21 +1607,21 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
     --allow-namespace "demo-slot-01:443" --allow-namespace "demo-slot-01:80" \
     --reach-probe "svc.demo-slot-01:80" \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-ns-dup2nd.err; then
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-ns-dup2nd.err; then
     ok "--reach-probe on the second-declared port of a twice-granted namespace is accepted"
 else
     no "--reach-probe on the second-declared port of a twice-granted namespace is accepted" \
-        "$(cat /tmp/fs-k8s-test-ns-dup2nd.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-ns-dup2nd.err)"
 fi
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
     --allow-namespace "demo-slot-01:443" --allow-namespace "demo-slot-01:80" \
     --reach-probe "svc.demo-slot-01:443" \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-ns-dup1st.err; then
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-ns-dup1st.err; then
     ok "--reach-probe on the first-declared port of a twice-granted namespace is accepted"
 else
     no "--reach-probe on the first-declared port of a twice-granted namespace is accepted" \
-        "$(cat /tmp/fs-k8s-test-ns-dup1st.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-ns-dup1st.err)"
 fi
 refuses "--reach-probe on neither port of a twice-granted namespace is still refused" \
     "they must match, or the probe can never pass the gate" \
@@ -1610,11 +1691,11 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
     --allow-namespace "demo-slot-01" \
     --reach-probe "svc.demo-slot-01:1234" \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-ns-noport.err; then
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-ns-noport.err; then
     ok "--allow-namespace with no port accepts a --reach-probe on any port"
 else
     no "--allow-namespace with no port accepts a --reach-probe on any port" \
-        "$(cat /tmp/fs-k8s-test-ns-noport.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-ns-noport.err)"
 fi
 
 # Both K8S_AGENT_ALLOW_NS (machine-wide) and --allow-namespace (this run
@@ -1635,20 +1716,20 @@ if FORK_SANDBOX_CONFIG_DIR="$both_submit_ns_config_dir" "$k8s_sh" submit --dry-r
     --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
     --allow-namespace "demo-slot-01:8000" \
     --reach-probe "svc.demo-slot-01:8000" \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-both-submit-ns.err; then
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-both-submit-ns.err; then
     ok "submit with both K8S_AGENT_ALLOW_NS and --allow-namespace exits 0"
 else
     no "submit with both K8S_AGENT_ALLOW_NS and --allow-namespace exits 0" \
-        "$(cat /tmp/fs-k8s-test-both-submit-ns.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-both-submit-ns.err)"
 fi
 if grep -qF "K8S_AGENT_ALLOW_NS opens agent egress to namespace 'static-slot'" \
-        /tmp/fs-k8s-test-both-submit-ns.err \
+        "$k8s_test_tmp"/fs-k8s-test-both-submit-ns.err \
     && grep -qF "this run's --allow-namespace opens agent egress to namespace 'demo-slot-01'" \
-        /tmp/fs-k8s-test-both-submit-ns.err; then
+        "$k8s_test_tmp"/fs-k8s-test-both-submit-ns.err; then
     ok "submit announces both the static key's and this run's own --allow-namespace grant"
 else
     no "submit announces both the static key's and this run's own --allow-namespace grant" \
-        "$(cat /tmp/fs-k8s-test-both-submit-ns.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-both-submit-ns.err)"
 fi
 # The announcements above are just wording -- the handoff also requires the
 # per-run grant object itself to carry exactly the flag's namespaces, not
@@ -1892,11 +1973,11 @@ fi
 if PATH="$nogrant_platform_dir:$PATH" FORK_SANDBOX_K8S_PLATFORM=nogrant \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-grant --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-nogrant-plain.err; then
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-nogrant-plain.err; then
     ok "the same platform, with no --allow-namespace, is never asked for the grant capability"
 else
     no "the same platform, with no --allow-namespace, is never asked for the grant capability" \
-        "$(cat /tmp/fs-k8s-test-nogrant-plain.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-nogrant-plain.err)"
 fi
 
 # A pre-existing NetworkPolicy named <safe_name>-agent-grant is refused as
@@ -1971,7 +2052,7 @@ PATH="$pi_fail_stub_dir:$PATH" K8S_STUB_LOG="$pi_fail_log" HOME="$pi_fail_home" 
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-pi-grant-fail --model moonshotai/kimi-k3 --harness pi \
     --allow-namespace "demo-slot-01:8000" --reach-probe "svc.demo-slot-01:8000" \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pi-grant-fail.out 2>&1
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-pi-grant-fail.out 2>&1
 pi_fail_rc=$?
 if (( pi_fail_rc != 0 )); then
     ok "a pi-harness run whose Job apply fails makes submit fail"
@@ -1984,7 +2065,7 @@ else
     no "the failure trap deletes the grant (and every other cluster object) for a pi-harness run too" \
         "not found in $pi_fail_log: $(cat "$pi_fail_log")"
 fi
-rm -f /tmp/fs-k8s-test-pi-grant-fail.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-pi-grant-fail.out
 
 # A plain (non---run-dir) submit's run.env is the ONLY writer for a legacy
 # --k8s run, and fork-sandbox-status.sh hard-refuses any run directory
@@ -2070,7 +2151,7 @@ chmod +x "$claude_jobfail_stub_dir/kubectl"
 PATH="$claude_jobfail_stub_dir:$PATH" K8S_STUB_LOG="$claude_jobfail_log" HOME="$claude_jobfail_home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-claude-jobfail --model claude-sonnet-5 --harness claude \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-claude-jobfail.out 2>&1
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-claude-jobfail.out 2>&1
 claude_jobfail_rc=$?
 if (( claude_jobfail_rc != 0 )) && grep -q 'job-name=' "$claude_jobfail_log"; then
     ok "a claude-harness run whose Job pod never becomes Ready makes submit fail"
@@ -2084,13 +2165,13 @@ else
     no "the claude failure trap deletes the run's Job along with its other cluster objects" \
         "not found in $claude_jobfail_log: $(cat "$claude_jobfail_log")"
 fi
-if grep -qF "if a Job for this branch was also created" /tmp/fs-k8s-test-claude-jobfail.out; then
+if grep -qF "if a Job for this branch was also created" "$k8s_test_tmp"/fs-k8s-test-claude-jobfail.out; then
     no "the claude failure trap no longer tells the operator to remove the Job by hand" \
-        "$(cat /tmp/fs-k8s-test-claude-jobfail.out)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-claude-jobfail.out)"
 else
     ok "the claude failure trap no longer tells the operator to remove the Job by hand"
 fi
-rm -f /tmp/fs-k8s-test-claude-jobfail.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-claude-jobfail.out
 
 # The Job controller creates a Job's pod asynchronously, and a real
 # `kubectl wait -l ...` exits at once with "no matching resources found"
@@ -2157,15 +2238,15 @@ PATH="$podwait_stub_dir:$PATH" K8S_STUB_LOG="$podwait_log" HOME="$podwait_home" 
     K8S_STUB_COUNTER="$podwait_counter" K8S_STUB_PODS_AFTER=2 \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-podwait --model moonshotai/kimi-k3 --harness pi \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-podwait.out 2>&1 </dev/null
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-podwait.out 2>&1 </dev/null
 podwait_rc=$?
-podwait_rd="$(sed -n 's/^  run dir:  *//p' /tmp/fs-k8s-test-podwait.out | head -1)"
+podwait_rd="$(sed -n 's/^  run dir:  *//p' "$k8s_test_tmp"/fs-k8s-test-podwait.out | head -1)"
 [[ -n "$podwait_rd" && -d "$podwait_rd" ]] && tmpdirs+=("$podwait_rd")
 if (( podwait_rc == 0 )); then
     ok "a pod that appears only after the Job apply does not fail submit"
 else
     no "a pod that appears only after the Job apply does not fail submit" \
-        "rc=$podwait_rc out=$(cat /tmp/fs-k8s-test-podwait.out) log=$(cat "$podwait_log")"
+        "rc=$podwait_rc out=$(cat "$k8s_test_tmp"/fs-k8s-test-podwait.out) log=$(cat "$podwait_log")"
 fi
 podwait_first_wait="$(grep -n ' wait .*-l job-name=' "$podwait_log" | head -1 | cut -d: -f1)"
 podwait_polls_before=0
@@ -2184,7 +2265,7 @@ if grep -q ' delete ' "$podwait_log"; then
 else
     ok "a submit that only had to wait for its pod deletes nothing"
 fi
-rm -f /tmp/fs-k8s-test-podwait.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-podwait.out
 
 # No pod ever: a date stub whose `+%s` grows by 100 per call runs the 180s
 # budget out instantly (sleep is stubbed too); every other date call is the
@@ -2210,14 +2291,14 @@ PATH="$podwait_stub_dir:$PATH" K8S_STUB_LOG="$podwait_never_log" HOME="$podwait_
     K8S_STUB_DATE_COUNTER="$podwait_never_date_counter" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-podwait-never --model moonshotai/kimi-k3 --harness pi \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-podwait-never.out 2>&1 </dev/null
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-podwait-never.out 2>&1 </dev/null
 podwait_never_rc=$?
-if (( podwait_never_rc != 0 )) && grep -q 'created no pod within 180s' /tmp/fs-k8s-test-podwait-never.out \
-    && grep -qE "describe job $podwait_never_safe_name\$" /tmp/fs-k8s-test-podwait-never.out; then
+if (( podwait_never_rc != 0 )) && grep -q 'created no pod within 180s' "$k8s_test_tmp"/fs-k8s-test-podwait-never.out \
+    && grep -qE "describe job $podwait_never_safe_name\$" "$k8s_test_tmp"/fs-k8s-test-podwait-never.out; then
     ok "a Job that never gets a pod fails submit, naming the timeout and the describe command"
 else
     no "a Job that never gets a pod fails submit, naming the timeout and the describe command" \
-        "rc=$podwait_never_rc out=$(cat /tmp/fs-k8s-test-podwait-never.out)"
+        "rc=$podwait_never_rc out=$(cat "$k8s_test_tmp"/fs-k8s-test-podwait-never.out)"
 fi
 if grep -q ' wait ' "$podwait_never_log"; then
     no "a Job that never gets a pod never reaches the Ready wait" "$(cat "$podwait_never_log")"
@@ -2229,7 +2310,7 @@ if grep -qF "delete job,pod,service,secret,configmap,networkpolicy -l fork-sandb
 else
     no "a Job that never gets a pod is cleaned up by the failure trap" "$(cat "$podwait_never_log")"
 fi
-rm -f /tmp/fs-k8s-test-podwait-never.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-podwait-never.out
 
 # The namespace quota wait. A full ResourceQuota refuses the per-run
 # claude-proxy Pod's create outright, or lets the proxy take the last slot so
@@ -2482,7 +2563,7 @@ else
     no "rendered handoff.md says only committed work leaves the sandbox" \
         "not found in $submit_out"
 fi
-rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-install.err "$k8s_test_tmp"/fs-k8s-test-submit.err
 
 printf '\n== K8S_PROXY_ENDPOINTS: named keyless endpoints ==\n'
 # Byte-identical legacy render: the load-bearing backward-compatibility
@@ -2592,10 +2673,10 @@ K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 endpoints_out="$(newdir)/endpoints-install.yaml"; tmpdirs+=("$(dirname "$endpoints_out")")
 if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" install --dry-run \
-    > "$endpoints_out" 2>/tmp/fs-k8s-test-endpoints-install.err; then
+    > "$endpoints_out" 2>"$k8s_test_tmp"/fs-k8s-test-endpoints-install.err; then
     ok "K8S_PROXY_ENDPOINTS install --dry-run exits 0"
 else
-    no "K8S_PROXY_ENDPOINTS install --dry-run exits 0" "$(cat /tmp/fs-k8s-test-endpoints-install.err)"
+    no "K8S_PROXY_ENDPOINTS install --dry-run exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-endpoints-install.err)"
 fi
 
 # submit --endpoint wires the run to the named endpoint's /e/<name>/v1
@@ -2605,11 +2686,11 @@ fi
 ep_submit_out="$(newdir)/ep-submit.yaml"; tmpdirs+=("$(dirname "$ep_submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --endpoint secondary \
-    "$proj_dir" "$handoff_file" > "$ep_submit_out" 2>/tmp/fs-k8s-test-ep-submit.err; then
+    "$proj_dir" "$handoff_file" > "$ep_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-ep-submit.err; then
     ok "submit --dry-run --endpoint against a K8S_PROXY_ENDPOINTS namespace exits 0"
 else
     no "submit --dry-run --endpoint against a K8S_PROXY_ENDPOINTS namespace exits 0" \
-        "$(cat /tmp/fs-k8s-test-ep-submit.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-ep-submit.err)"
 fi
 if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/secondary/v1"' "$ep_submit_out" \
     && ! grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/api/v1"' "$ep_submit_out"; then
@@ -3156,7 +3237,7 @@ K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 allow_out="$(newdir)/allow-install.yaml"; tmpdirs+=("$(dirname "$allow_out")")
 FORK_SANDBOX_CONFIG_DIR="$allow_config_dir" "$k8s_sh" install --dry-run \
-    > "$allow_out" 2>/tmp/fs-k8s-test-allow-install.err
+    > "$allow_out" 2>"$k8s_test_tmp"/fs-k8s-test-allow-install.err
 proxy_netpol_allow_doc="$(extract_doc_by_kind NetworkPolicy "$allow_out")"
 if grep -q 'cidr: 0.0.0.0/0' <<< "$proxy_netpol_allow_doc"; then
     no "K8S_PROXY_ALLOW replaces the default RFC1918-except block" \
@@ -3229,21 +3310,21 @@ CONF
 install -m 600 /dev/null "$http_private_config_dir/pi.env"
 printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$http_private_config_dir/pi.env"
 if FORK_SANDBOX_CONFIG_DIR="$http_private_config_dir" "$k8s_sh" install --dry-run \
-    >/tmp/fs-k8s-test-http-private.out 2>/tmp/fs-k8s-test-http-private.err; then
+    >"$k8s_test_tmp"/fs-k8s-test-http-private.out 2>"$k8s_test_tmp"/fs-k8s-test-http-private.err; then
     ok "K8S_PROXY_UPSTREAM http:// to a private address is accepted"
 else
     no "K8S_PROXY_UPSTREAM http:// to a private address is accepted" \
-        "$(cat /tmp/fs-k8s-test-http-private.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-http-private.err)"
 fi
 # Accepted is not the same as reachable: this exact config's default
 # egress policy excepts the only address it can ever dial (see
 # validate_upstream_url's own header), so install must say so rather than
 # render a NetworkPolicy that provably never lets this proxy connect.
-if grep -q 'K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint' /tmp/fs-k8s-test-http-private.err; then
+if grep -q 'K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint' "$k8s_test_tmp"/fs-k8s-test-http-private.err; then
     ok "K8S_PROXY_UPSTREAM http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable"
 else
     no "K8S_PROXY_UPSTREAM http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable" \
-        "$(cat /tmp/fs-k8s-test-http-private.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-http-private.err)"
 fi
 
 http_public_config_dir="$(newdir)"; tmpdirs+=("$http_public_config_dir")
@@ -3267,18 +3348,18 @@ K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 if FORK_SANDBOX_CONFIG_DIR="$endpoints_http_private_config_dir" "$k8s_sh" install --dry-run \
-    >/tmp/fs-k8s-test-endpoints-http-private.out 2>/tmp/fs-k8s-test-endpoints-http-private.err; then
+    >"$k8s_test_tmp"/fs-k8s-test-endpoints-http-private.out 2>"$k8s_test_tmp"/fs-k8s-test-endpoints-http-private.err; then
     ok "K8S_PROXY_ENDPOINTS http:// to a private address is accepted"
 else
     no "K8S_PROXY_ENDPOINTS http:// to a private address is accepted" \
-        "$(cat /tmp/fs-k8s-test-endpoints-http-private.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-endpoints-http-private.err)"
 fi
 # Same reachability warning as the legacy K8S_PROXY_UPSTREAM case above.
-if grep -q 'K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint' /tmp/fs-k8s-test-endpoints-http-private.err; then
+if grep -q 'K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint' "$k8s_test_tmp"/fs-k8s-test-endpoints-http-private.err; then
     ok "K8S_PROXY_ENDPOINTS http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable"
 else
     no "K8S_PROXY_ENDPOINTS http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable" \
-        "$(cat /tmp/fs-k8s-test-endpoints-http-private.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-endpoints-http-private.err)"
 fi
 
 endpoints_http_public_config_dir="$(newdir)"; tmpdirs+=("$endpoints_http_public_config_dir")
@@ -3350,11 +3431,11 @@ K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8001/v1
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 if FORK_SANDBOX_CONFIG_DIR="$svc_dns_config_dir" "$k8s_sh" install --dry-run \
-    >/tmp/fs-k8s-test-svc-dns.out 2>/tmp/fs-k8s-test-svc-dns.err; then
+    >"$k8s_test_tmp"/fs-k8s-test-svc-dns.out 2>"$k8s_test_tmp"/fs-k8s-test-svc-dns.err; then
     ok "K8S_PROXY_ENDPOINTS http:// to a .svc.cluster.local name is accepted"
 else
     no "K8S_PROXY_ENDPOINTS http:// to a .svc.cluster.local name is accepted" \
-        "$(cat /tmp/fs-k8s-test-svc-dns.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-dns.err)"
 fi
 
 # A custom K8S_CLUSTER_DOMAIN is honored -- cluster.local is only the
@@ -3369,11 +3450,11 @@ K8S_CLUSTER_DOMAIN=some-other.domain
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 if FORK_SANDBOX_CONFIG_DIR="$custom_domain_config_dir" "$k8s_sh" install --dry-run \
-    >/tmp/fs-k8s-test-custom-domain.out 2>/tmp/fs-k8s-test-custom-domain.err; then
+    >"$k8s_test_tmp"/fs-k8s-test-custom-domain.out 2>"$k8s_test_tmp"/fs-k8s-test-custom-domain.err; then
     ok "http:// to a .svc.<K8S_CLUSTER_DOMAIN> name is accepted with a custom domain"
 else
     no "http:// to a .svc.<K8S_CLUSTER_DOMAIN> name is accepted with a custom domain" \
-        "$(cat /tmp/fs-k8s-test-custom-domain.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-custom-domain.err)"
 fi
 
 # K8S_CLUSTER_DOMAIN is substituted unquoted into manifests, a sed
@@ -3464,11 +3545,11 @@ K8S_PROXY_ENDPOINTS=primary=https://svc-a.example-ns.svc.cluster.local:443/v1
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 if FORK_SANDBOX_CONFIG_DIR="$svc_dns_https_443_config_dir" "$k8s_sh" install --dry-run \
-    >/tmp/fs-k8s-test-svc-dns-https-443.out 2>/tmp/fs-k8s-test-svc-dns-https-443.err; then
+    >"$k8s_test_tmp"/fs-k8s-test-svc-dns-https-443.out 2>"$k8s_test_tmp"/fs-k8s-test-svc-dns-https-443.err; then
     ok "https:// to a .svc. name on port 443 is still accepted"
 else
     no "https:// to a .svc. name on port 443 is still accepted" \
-        "$(cat /tmp/fs-k8s-test-svc-dns-https-443.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-dns-https-443.err)"
 fi
 
 # A custom K8S_PROXY_ALLOW that opens this endpoint's port to a NON-private
@@ -3487,19 +3568,19 @@ K8S_PROXY_ALLOW=192.0.2.0/24:8080
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 if FORK_SANDBOX_CONFIG_DIR="$svc_dns_public_allow_config_dir" "$k8s_sh" install --dry-run \
-    >/tmp/fs-k8s-test-svc-dns-public-allow.out 2>/tmp/fs-k8s-test-svc-dns-public-allow.err; then
+    >"$k8s_test_tmp"/fs-k8s-test-svc-dns-public-allow.out 2>"$k8s_test_tmp"/fs-k8s-test-svc-dns-public-allow.err; then
     ok "a .svc. http:// endpoint whose port a public K8S_PROXY_ALLOW CIDR opens is accepted, not refused"
 else
     no "a .svc. http:// endpoint whose port a public K8S_PROXY_ALLOW CIDR opens is accepted, not refused" \
-        "$(cat /tmp/fs-k8s-test-svc-dns-public-allow.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-dns-public-allow.err)"
 fi
-if grep -qF "K8S_PROXY_ENDPOINTS entry 'primary'" /tmp/fs-k8s-test-svc-dns-public-allow.err \
-    && grep -qF '192.0.2.0/24:8080' /tmp/fs-k8s-test-svc-dns-public-allow.err \
-    && grep -qF 'leave the cluster in cleartext' /tmp/fs-k8s-test-svc-dns-public-allow.err; then
+if grep -qF "K8S_PROXY_ENDPOINTS entry 'primary'" "$k8s_test_tmp"/fs-k8s-test-svc-dns-public-allow.err \
+    && grep -qF '192.0.2.0/24:8080' "$k8s_test_tmp"/fs-k8s-test-svc-dns-public-allow.err \
+    && grep -qF 'leave the cluster in cleartext' "$k8s_test_tmp"/fs-k8s-test-svc-dns-public-allow.err; then
     ok "the public-CIDR warning names the endpoint and the matching K8S_PROXY_ALLOW entry"
 else
     no "the public-CIDR warning names the endpoint and the matching K8S_PROXY_ALLOW entry" \
-        "$(cat /tmp/fs-k8s-test-svc-dns-public-allow.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-dns-public-allow.err)"
 fi
 
 # The same shape, but the matching K8S_PROXY_ALLOW entry's CIDR is private
@@ -3641,7 +3722,7 @@ K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 leading_zero_allow_octet_out="$(newdir)/leading-zero-octet-install.yaml"; tmpdirs+=("$(dirname "$leading_zero_allow_octet_out")")
 FORK_SANDBOX_CONFIG_DIR="$leading_zero_allow_octet_config_dir" "$k8s_sh" install --dry-run \
-    > "$leading_zero_allow_octet_out" 2>/tmp/fs-k8s-test-leading-zero-octet-install.err
+    > "$leading_zero_allow_octet_out" 2>"$k8s_test_tmp"/fs-k8s-test-leading-zero-octet-install.err
 leading_zero_allow_octet_netpol_doc="$(extract_doc_by_kind NetworkPolicy "$leading_zero_allow_octet_out")"
 if grep -q 'cidr: 192.0.2.15/32' <<< "$leading_zero_allow_octet_netpol_doc" \
     && ! grep -qF '192.000.002.015' "$leading_zero_allow_octet_out"; then
@@ -3718,7 +3799,7 @@ K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 open_all_allow_out="$(newdir)/open-all-install.yaml"; tmpdirs+=("$(dirname "$open_all_allow_out")")
 FORK_SANDBOX_CONFIG_DIR="$open_all_allow_config_dir" "$k8s_sh" install --dry-run \
-    > "$open_all_allow_out" 2>/tmp/fs-k8s-test-open-all-install.err
+    > "$open_all_allow_out" 2>"$k8s_test_tmp"/fs-k8s-test-open-all-install.err
 open_all_netpol_doc="$(extract_doc_by_kind NetworkPolicy "$open_all_allow_out")"
 if grep -q 'cidr: 0.0.0.0/0' <<< "$open_all_netpol_doc"; then
     ok "a 0.0.0.0/0 K8S_PROXY_ALLOW entry is still accepted and rendered unchanged"
@@ -3757,7 +3838,7 @@ K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 allow_ns_out="$(newdir)/allow-ns-install.yaml"; tmpdirs+=("$(dirname "$allow_ns_out")")
 FORK_SANDBOX_CONFIG_DIR="$allow_ns_config_dir" "$k8s_sh" install --dry-run \
-    > "$allow_ns_out" 2>/tmp/fs-k8s-test-allow-ns-install.err
+    > "$allow_ns_out" 2>"$k8s_test_tmp"/fs-k8s-test-allow-ns-install.err
 proxy_netpol_allow_ns_doc="$(extract_doc_by_kind NetworkPolicy "$allow_ns_out")"
 if grep -qF 'cidr: 0.0.0.0/0' <<< "$proxy_netpol_allow_ns_doc" \
     && grep -q 'namespaceSelector' <<< "$proxy_netpol_allow_ns_doc" \
@@ -3773,9 +3854,9 @@ fi
 # entry must print no reachability warning at all, unlike the false positive
 # this used to print (judged only against K8S_PROXY_ALLOW/the default ipBlock
 # policy, which can never reach a ClusterIP -- see parse_proxy_allow_ns).
-if grep -q 'Warning:' /tmp/fs-k8s-test-allow-ns-install.err; then
+if grep -q 'Warning:' "$k8s_test_tmp"/fs-k8s-test-allow-ns-install.err; then
     no "a K8S_PROXY_ALLOW_NS-covered Service endpoint prints no reachability warning" \
-        "$(cat /tmp/fs-k8s-test-allow-ns-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-allow-ns-install.err)"
 else
     ok "a K8S_PROXY_ALLOW_NS-covered Service endpoint prints no reachability warning"
 fi
@@ -3794,15 +3875,15 @@ K8S_PROXY_ALLOW_NS=example-ns:9999
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 FORK_SANDBOX_CONFIG_DIR="$allow_ns_wrongport_config_dir" "$k8s_sh" install --dry-run \
-    > /dev/null 2>/tmp/fs-k8s-test-allow-ns-wrongport-install.err
-if grep -qF 'to K8S_PROXY_ALLOW_NS to fix that.' /tmp/fs-k8s-test-allow-ns-wrongport-install.err \
-    && ! grep -qF 'K8S_PROXY_ALLOW=<cidr>' /tmp/fs-k8s-test-allow-ns-wrongport-install.err; then
+    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-test-allow-ns-wrongport-install.err
+if grep -qF 'to K8S_PROXY_ALLOW_NS to fix that.' "$k8s_test_tmp"/fs-k8s-test-allow-ns-wrongport-install.err \
+    && ! grep -qF 'K8S_PROXY_ALLOW=<cidr>' "$k8s_test_tmp"/fs-k8s-test-allow-ns-wrongport-install.err; then
     ok "a K8S_PROXY_ALLOW_NS entry on the wrong port still warns, naming K8S_PROXY_ALLOW_NS"
 else
     no "a K8S_PROXY_ALLOW_NS entry on the wrong port still warns, naming K8S_PROXY_ALLOW_NS" \
-        "$(cat /tmp/fs-k8s-test-allow-ns-wrongport-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-allow-ns-wrongport-install.err)"
 fi
-rm -f /tmp/fs-k8s-test-allow-ns-wrongport-install.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-allow-ns-wrongport-install.err
 
 # A set K8S_PROXY_ALLOW_NS=<namespace> with no port renders the
 # namespaceSelector rule with no ports: key at all (every port).
@@ -3817,7 +3898,7 @@ K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 allow_ns_noport_out="$(newdir)/allow-ns-noport-install.yaml"; tmpdirs+=("$(dirname "$allow_ns_noport_out")")
 FORK_SANDBOX_CONFIG_DIR="$allow_ns_noport_config_dir" "$k8s_sh" install --dry-run \
-    > "$allow_ns_noport_out" 2>/tmp/fs-k8s-test-allow-ns-noport-install.err
+    > "$allow_ns_noport_out" 2>"$k8s_test_tmp"/fs-k8s-test-allow-ns-noport-install.err
 proxy_netpol_allow_ns_noport_doc="$(extract_doc_by_kind NetworkPolicy "$allow_ns_noport_out")"
 if grep -qF 'kubernetes.io/metadata.name: example-ns' <<< "$proxy_netpol_allow_ns_noport_doc"; then
     ok "K8S_PROXY_ALLOW_NS=<ns> (no port) renders the namespaceSelector rule"
@@ -3832,9 +3913,9 @@ if [[ "$ns_line_after" == *'ports:'* ]]; then
 else
     ok "K8S_PROXY_ALLOW_NS=<ns> (no port) omits the ports: key entirely"
 fi
-if grep -q 'Warning:' /tmp/fs-k8s-test-allow-ns-noport-install.err; then
+if grep -q 'Warning:' "$k8s_test_tmp"/fs-k8s-test-allow-ns-noport-install.err; then
     no "a K8S_PROXY_ALLOW_NS=<ns> (every port) covered Service endpoint prints no reachability warning" \
-        "$(cat /tmp/fs-k8s-test-allow-ns-noport-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-allow-ns-noport-install.err)"
 else
     ok "a K8S_PROXY_ALLOW_NS=<ns> (every port) covered Service endpoint prints no reachability warning"
 fi
@@ -3854,7 +3935,7 @@ K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 combined_allow_out="$(newdir)/combined-allow-install.yaml"; tmpdirs+=("$(dirname "$combined_allow_out")")
 FORK_SANDBOX_CONFIG_DIR="$combined_allow_config_dir" "$k8s_sh" install --dry-run \
-    > "$combined_allow_out" 2>/tmp/fs-k8s-test-combined-allow-install.err
+    > "$combined_allow_out" 2>"$k8s_test_tmp"/fs-k8s-test-combined-allow-install.err
 proxy_netpol_combined_doc="$(extract_doc_by_kind NetworkPolicy "$combined_allow_out")"
 if grep -qF 'cidr: 10.0.0.5/32' <<< "$proxy_netpol_combined_doc" \
     && grep -q 'namespaceSelector' <<< "$proxy_netpol_combined_doc" \
@@ -3865,9 +3946,9 @@ else
     no "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS compose in the same NetworkPolicy" \
         "$proxy_netpol_combined_doc"
 fi
-if grep -q 'Warning:' /tmp/fs-k8s-test-combined-allow-install.err; then
+if grep -q 'Warning:' "$k8s_test_tmp"/fs-k8s-test-combined-allow-install.err; then
     no "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS composing covers both endpoints with no warning" \
-        "$(cat /tmp/fs-k8s-test-combined-allow-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-combined-allow-install.err)"
 else
     ok "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS composing covers both endpoints with no warning"
 fi
@@ -3890,7 +3971,7 @@ install -m 600 /dev/null "$agent_ns_config_dir/pi.env"
 printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$agent_ns_config_dir/pi.env"
 agent_ns_out="$(newdir)/agent-allow-ns-install.yaml"; tmpdirs+=("$(dirname "$agent_ns_out")")
 FORK_SANDBOX_CONFIG_DIR="$agent_ns_config_dir" "$k8s_sh" install --dry-run \
-    > "$agent_ns_out" 2>/tmp/fs-k8s-test-agent-allow-ns-install.err
+    > "$agent_ns_out" 2>"$k8s_test_tmp"/fs-k8s-test-agent-allow-ns-install.err
 agent_netpol_doc="$(extract_doc_matching 'fork-sandbox-agent-egress' "$agent_ns_out")"
 proxy_netpol_untouched_doc="$(extract_doc_by_kind NetworkPolicy "$agent_ns_out")"
 
@@ -3919,15 +4000,15 @@ fi
 # whole reason this is a caller key rather than something a plugin reads on
 # its own, so it is a tested property, not a nicety.
 if grep -qF "opens agent egress to namespace 'preview-alpha' on TCP port 8000" \
-        /tmp/fs-k8s-test-agent-allow-ns-install.err \
+        "$k8s_test_tmp"/fs-k8s-test-agent-allow-ns-install.err \
     && grep -qF "opens agent egress to namespace 'preview-beta' on every port and protocol" \
-        /tmp/fs-k8s-test-agent-allow-ns-install.err \
+        "$k8s_test_tmp"/fs-k8s-test-agent-allow-ns-install.err \
     && grep -qF 'K8S_DENIED_PROBE must name a destination outside those namespaces' \
-        /tmp/fs-k8s-test-agent-allow-ns-install.err; then
+        "$k8s_test_tmp"/fs-k8s-test-agent-allow-ns-install.err; then
     ok "K8S_AGENT_ALLOW_NS announces every entry it opens, and the probe caveat"
 else
     no "K8S_AGENT_ALLOW_NS announces every entry it opens, and the probe caveat" \
-        "$(cat /tmp/fs-k8s-test-agent-allow-ns-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-agent-allow-ns-install.err)"
 fi
 
 # Unset (every existing install) must leave the agent policy exactly sealed.
@@ -3982,7 +4063,7 @@ install -m 600 /dev/null "$both_ns_config_dir/pi.env"
 printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$both_ns_config_dir/pi.env"
 both_ns_out="$(newdir)/both-allow-ns-install.yaml"; tmpdirs+=("$(dirname "$both_ns_out")")
 FORK_SANDBOX_CONFIG_DIR="$both_ns_config_dir" "$k8s_sh" install --dry-run \
-    > "$both_ns_out" 2>/tmp/fs-k8s-test-both-allow-ns-install.err
+    > "$both_ns_out" 2>"$k8s_test_tmp"/fs-k8s-test-both-allow-ns-install.err
 both_proxy_doc="$(extract_doc_by_kind NetworkPolicy "$both_ns_out")"
 both_agent_doc="$(extract_doc_matching 'fork-sandbox-agent-egress' "$both_ns_out")"
 
@@ -4048,11 +4129,11 @@ sed -i 's/^K8S_PROXY_ALLOW_NS=.*/K8S_PROXY_ALLOW_NS=example-ns:08/' \
 leading_zero_ns_port_out="$(newdir)/leading-zero-ns-port-install.yaml"
 tmpdirs+=("$(dirname "$leading_zero_ns_port_out")")
 if FORK_SANDBOX_CONFIG_DIR="$leading_zero_ns_port_config_dir" "$k8s_sh" install --dry-run \
-    > "$leading_zero_ns_port_out" 2>/tmp/fs-k8s-test-leading-zero-ns-port.err; then
+    > "$leading_zero_ns_port_out" 2>"$k8s_test_tmp"/fs-k8s-test-leading-zero-ns-port.err; then
     ok "a leading-zero port in K8S_PROXY_ALLOW_NS (decimal-valid) is accepted, not crashed on"
 else
     no "a leading-zero port in K8S_PROXY_ALLOW_NS (decimal-valid) is accepted, not crashed on" \
-        "$(cat /tmp/fs-k8s-test-leading-zero-ns-port.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-leading-zero-ns-port.err)"
 fi
 leading_zero_ns_port_netpol="$(extract_doc_by_kind NetworkPolicy "$leading_zero_ns_port_out")"
 if grep -qF 'port: 8' <<< "$leading_zero_ns_port_netpol" \
@@ -4233,8 +4314,8 @@ else
         "$uncovered_carried_private_allow_err"
 fi
 
-rm -f /tmp/fs-k8s-test-allow-ns-install.err /tmp/fs-k8s-test-allow-ns-noport-install.err \
-    /tmp/fs-k8s-test-combined-allow-install.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-allow-ns-install.err "$k8s_test_tmp"/fs-k8s-test-allow-ns-noport-install.err \
+    "$k8s_test_tmp"/fs-k8s-test-combined-allow-install.err
 
 printf '\n== K8S_PROXY_ENDPOINT_KEYS -- optionally-keyed named endpoints ==\n'
 # 'primary' stays keyless; 'secondary' is keyed by MY_API_KEY in pi.env --
@@ -4253,10 +4334,10 @@ printf 'MY_API_KEY=sk-secondary-test-dummy\n' >> "$keyed_config_dir/pi.env"
 
 keyed_out="$(newdir)/keyed-install.yaml"; tmpdirs+=("$(dirname "$keyed_out")")
 if FORK_SANDBOX_CONFIG_DIR="$keyed_config_dir" "$k8s_sh" install --dry-run \
-    > "$keyed_out" 2>/tmp/fs-k8s-test-keyed-install.err; then
+    > "$keyed_out" 2>"$k8s_test_tmp"/fs-k8s-test-keyed-install.err; then
     ok "a keyed endpoints install --dry-run exits 0"
 else
-    no "a keyed endpoints install --dry-run exits 0" "$(cat /tmp/fs-k8s-test-keyed-install.err)"
+    no "a keyed endpoints install --dry-run exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-keyed-install.err)"
 fi
 
 if grep -qF "would create/update Secret fork-sandbox-upstream-key entry for K8S_PROXY_ENDPOINTS endpoint 'secondary'" "$keyed_out"; then
@@ -4365,11 +4446,11 @@ exit 0
 STUB
 chmod +x "$keyed_install_stub_bin/kubectl"
 if PATH="$keyed_install_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$keyed_config_dir" \
-    "$k8s_sh" install >/dev/null 2>/tmp/fs-k8s-test-keyed-real-install.err; then
+    "$k8s_sh" install >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-keyed-real-install.err; then
     ok "a real (non-dry-run) keyed endpoints install exits 0 against a stubbed kubectl"
 else
     no "a real (non-dry-run) keyed endpoints install exits 0 against a stubbed kubectl" \
-        "$(cat /tmp/fs-k8s-test-keyed-real-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-keyed-real-install.err)"
 fi
 if grep -qF 'sk-secondary-test-dummy' "$keyed_install_log"; then
     no "the keyed value never appears in any kubectl argv" \
@@ -4394,9 +4475,9 @@ else
     no "the keyed install's upstream-key Secret apply carries --server-side and its field manager" \
         "$(cat "$keyed_install_log")"
 fi
-if grep -qF 'sk-secondary-test-dummy' /tmp/fs-k8s-test-keyed-real-install.err; then
+if grep -qF 'sk-secondary-test-dummy' "$k8s_test_tmp"/fs-k8s-test-keyed-real-install.err; then
     no "the real install's own stderr never carries the keyed value" \
-        "$(cat /tmp/fs-k8s-test-keyed-real-install.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-keyed-real-install.err)"
 else
     ok "the real install's own stderr never carries the keyed value"
 fi
@@ -4624,7 +4705,7 @@ refuses "a K8S_PROXY_ENDPOINT_KEYS entry with a malformed VAR_NAME is refused" \
     "is not a valid environment variable name" \
     env FORK_SANDBOX_CONFIG_DIR="$bad_var_config_dir" "$k8s_sh" install --dry-run
 
-rm -f /tmp/fs-k8s-test-keyed-install.err /tmp/fs-k8s-test-keyed-real-install.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-keyed-install.err "$k8s_test_tmp"/fs-k8s-test-keyed-real-install.err
 
 printf '\n== K8S_PROXY_ENDPOINT_EMBEDDINGS -- opt-in embeddings routes ==\n'
 # embed_fixture <dir> <endpoints> <keys> <embeddings>: a k8s.env (plus a pi.env
@@ -4936,11 +5017,11 @@ else
     fi
 fi
 
-rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
-    /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
-    /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err \
-    /tmp/fs-k8s-test-svc-dns.out /tmp/fs-k8s-test-svc-dns.err \
-    /tmp/fs-k8s-test-custom-domain.out /tmp/fs-k8s-test-custom-domain.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-endpoints-install.err "$k8s_test_tmp"/fs-k8s-test-allow-install.err \
+    "$k8s_test_tmp"/fs-k8s-test-http-private.out "$k8s_test_tmp"/fs-k8s-test-http-private.err \
+    "$k8s_test_tmp"/fs-k8s-test-endpoints-http-private.out "$k8s_test_tmp"/fs-k8s-test-endpoints-http-private.err \
+    "$k8s_test_tmp"/fs-k8s-test-svc-dns.out "$k8s_test_tmp"/fs-k8s-test-svc-dns.err \
+    "$k8s_test_tmp"/fs-k8s-test-custom-domain.out "$k8s_test_tmp"/fs-k8s-test-custom-domain.err
 
 printf '\n== K8S_PI_IDLE_TIMEOUT -- a cluster pi seat own request timeout ==\n'
 # idle_fixture <dir> <K8S_PI_IDLE_TIMEOUT> <K8S_PROXY_READ_TIMEOUT>: the same
@@ -4972,7 +5053,7 @@ idle_submit() {
     local out_file; out_file="$(newdir)/idle-submit.yaml"; tmpdirs+=("$(dirname "$out_file")")
     FORK_SANDBOX_CONFIG_DIR="$1" "$k8s_sh" submit --dry-run \
         --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-        "$proj_dir" "$handoff_file" > "$out_file" 2>/tmp/fs-k8s-test-idle.err
+        "$proj_dir" "$handoff_file" > "$out_file" 2>"$k8s_test_tmp"/fs-k8s-test-idle.err
     idle_rc=$?
     idle_out="$(cat "$out_file")"
 }
@@ -4986,7 +5067,7 @@ if (( idle_rc == 0 )) \
     ok "K8S_PI_IDLE_TIMEOUT=20m renders PI_HTTP_IDLE_TIMEOUT_MS=1200000"
 else
     no "K8S_PI_IDLE_TIMEOUT=20m renders PI_HTTP_IDLE_TIMEOUT_MS=1200000" \
-        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+        "rc=$idle_rc: $(cat "$k8s_test_tmp"/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
 fi
 
 idle_fallback_dir="$(newdir)"; tmpdirs+=("$idle_fallback_dir")
@@ -4997,7 +5078,7 @@ if (( idle_rc == 0 )) \
     ok "K8S_PROXY_READ_TIMEOUT=90s alone renders the derived PI_HTTP_IDLE_TIMEOUT_MS=90000"
 else
     no "K8S_PROXY_READ_TIMEOUT=90s alone renders the derived PI_HTTP_IDLE_TIMEOUT_MS=90000" \
-        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+        "rc=$idle_rc: $(cat "$k8s_test_tmp"/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
 fi
 
 idle_cap_dir="$(newdir)"; tmpdirs+=("$idle_cap_dir")
@@ -5008,7 +5089,7 @@ if (( idle_rc == 0 )) \
     ok "K8S_PI_IDLE_TIMEOUT at exactly the cap is accepted"
 else
     no "K8S_PI_IDLE_TIMEOUT at exactly the cap is accepted" \
-        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err)"
+        "rc=$idle_rc: $(cat "$k8s_test_tmp"/fs-k8s-test-idle.err)"
 fi
 
 idle_clamp_dir="$(newdir)"; tmpdirs+=("$idle_clamp_dir")
@@ -5019,7 +5100,7 @@ if (( idle_rc == 0 )) \
     ok "a K8S_PROXY_READ_TIMEOUT fallback over the cap is clamped, not refused"
 else
     no "a K8S_PROXY_READ_TIMEOUT fallback over the cap is clamped, not refused" \
-        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+        "rc=$idle_rc: $(cat "$k8s_test_tmp"/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
 fi
 
 idle_both_dir="$(newdir)"; tmpdirs+=("$idle_both_dir")
@@ -5030,7 +5111,7 @@ if (( idle_rc == 0 )) \
     ok "K8S_PI_IDLE_TIMEOUT takes precedence over K8S_PROXY_READ_TIMEOUT when both are set"
 else
     no "K8S_PI_IDLE_TIMEOUT takes precedence over K8S_PROXY_READ_TIMEOUT when both are set" \
-        "rc=$idle_rc: $(cat /tmp/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
+        "rc=$idle_rc: $(cat "$k8s_test_tmp"/fs-k8s-test-idle.err) -- $(grep -A1 'name: PI_HTTP_IDLE_TIMEOUT_MS' <<<"$idle_out")"
 fi
 
 idle_none_dir="$(newdir)"; tmpdirs+=("$idle_none_dir")
@@ -5054,10 +5135,10 @@ printf '{"theme":"dark"}' > "$pias_dir/settings.json"
 pias_out_file="$(newdir)/pias-submit.yaml"; tmpdirs+=("$(dirname "$pias_out_file")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" FORK_SANDBOX_PI_AGENT_SETTINGS="$pias_dir/settings.json" \
     "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$pias_out_file" 2>/tmp/fs-k8s-test-pias.err; then
+    "$proj_dir" "$handoff_file" > "$pias_out_file" 2>"$k8s_test_tmp"/fs-k8s-test-pias.err; then
     ok "submit with FORK_SANDBOX_PI_AGENT_SETTINGS set exits 0"
 else
-    no "submit with FORK_SANDBOX_PI_AGENT_SETTINGS set exits 0" "$(cat /tmp/fs-k8s-test-pias.err)"
+    no "submit with FORK_SANDBOX_PI_AGENT_SETTINGS set exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-pias.err)"
 fi
 if grep -qF '  pi-agent-settings.json: |' "$pias_out_file" \
     && grep -qF '{"theme":"dark"}' "$pias_out_file"; then
@@ -5103,10 +5184,10 @@ JSON
 claude_submit_out="$(newdir)/claude-submit.yaml"; tmpdirs+=("$(dirname "$claude_submit_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
-    "$proj_dir" "$handoff_file" > "$claude_submit_out" 2>/tmp/fs-k8s-test-claude-submit.err; then
+    "$proj_dir" "$handoff_file" > "$claude_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-submit.err; then
     ok "submit --dry-run --harness claude exits 0"
 else
-    no "submit --dry-run --harness claude exits 0" "$(cat /tmp/fs-k8s-test-claude-submit.err)"
+    no "submit --dry-run --harness claude exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-claude-submit.err)"
 fi
 if command -v yamllint >/dev/null 2>&1; then
     # Line-length excluded, same as the --review-loop render below: this
@@ -5386,7 +5467,7 @@ else
     no "submit --dry-run --harness claude notes the Secret it would create, without a value" \
         "not found in $claude_submit_out"
 fi
-rm -f /tmp/fs-k8s-test-claude-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-claude-submit.err
 
 printf '\n== fork-sandbox-k8s.sh submit --dry-run: --refresh-at / --refresh-max ==\n'
 # A claude run refreshes by default (0.5 of a 1M window = 500000 tokens,
@@ -5550,11 +5631,11 @@ printf 'CLAUDE_CREDENTIALS=%s\n' "$claude_override_cred" > "$claude_override_con
 claude_override_out="$(newdir)/claude-override-submit.yaml"; tmpdirs+=("$(dirname "$claude_override_out")")
 if HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_override_config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
-    "$proj_dir" "$handoff_file" > "$claude_override_out" 2>/tmp/fs-k8s-test-claude-override.err; then
+    "$proj_dir" "$handoff_file" > "$claude_override_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-override.err; then
     ok "submit --dry-run --harness claude with CLAUDE_CREDENTIALS exits 0 despite an empty HOME"
 else
     no "submit --dry-run --harness claude with CLAUDE_CREDENTIALS exits 0 despite an empty HOME" \
-        "$(cat /tmp/fs-k8s-test-claude-override.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-claude-override.err)"
 fi
 if grep -q '"accessToken": "sandbox"' "$claude_override_out"; then
     ok "CLAUDE_CREDENTIALS override still renders the sandbox placeholder access token"
@@ -5568,7 +5649,7 @@ if grep -qF "$claude_override_token" "$claude_override_out"; then
 else
     ok "CLAUDE_CREDENTIALS override's real access token never leaks into the output"
 fi
-rm -f /tmp/fs-k8s-test-claude-override.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-claude-override.err
 
 # A `claude setup-token` credential carries no scopes, and a CLI that finds
 # no scopes on its OAuth credential reports "Not logged in" and exits before
@@ -5728,11 +5809,11 @@ balance_hook_dir_flagwins="$(balance_fake_hook flagwins "touch $balance_flag_mar
 if PATH="$balance_hook_dir_flagwins:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
     "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
     --harness claude --claude-credentials "$claude_override_cred" \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-flagwins.out 2>&1; then
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-balance-flagwins.out 2>&1; then
     ok "--claude-credentials on submit beats a configured pool: exits 0"
 else
     no "--claude-credentials on submit beats a configured pool: exits 0" \
-        "$(cat /tmp/fs-k8s-test-balance-flagwins.out)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-balance-flagwins.out)"
 fi
 if [[ -f "$balance_flag_marker" ]]; then
     no "--claude-credentials on submit beats a configured pool: the hook is not invoked" \
@@ -5740,7 +5821,7 @@ if [[ -f "$balance_flag_marker" ]]; then
 else
     ok "--claude-credentials on submit beats a configured pool: the hook is not invoked"
 fi
-rm -f /tmp/fs-k8s-test-balance-flagwins.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-balance-flagwins.out
 
 # Happy path (hook's choice used, recorded into run.env/summary.json) needs
 # a full non-dry-run submit through to a running pod -- driven further down
@@ -5755,18 +5836,18 @@ rm -f "$balance_pi_marker"
 balance_hook_dir_pi="$(balance_fake_hook pimarker "touch $balance_pi_marker; printf '%s\n' \"\$1\"")"
 if PATH="$balance_hook_dir_pi:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
     "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-pi.out 2>&1; then
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-balance-pi.out 2>&1; then
     ok "a pure pi submit never invokes the headroom hook: exits 0"
 else
     no "a pure pi submit never invokes the headroom hook: exits 0" \
-        "$(cat /tmp/fs-k8s-test-balance-pi.out)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-balance-pi.out)"
 fi
 if [[ -f "$balance_pi_marker" ]]; then
     no "a pure pi submit never invokes the headroom hook" "marker file exists"
 else
     ok "a pure pi submit never invokes the headroom hook"
 fi
-rm -f /tmp/fs-k8s-test-balance-pi.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-balance-pi.out
 
 # One representative config error: a pool without a hook is refused loudly,
 # proving this entry point surfaces fs_balance_claude_credential's own
@@ -5834,13 +5915,13 @@ refuses "run --claude-credentials naming a missing file is refused (forwarded to
 if PATH="$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
     "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
     --harness claude --claude-credentials "$claude_override_cred" \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-flagok.out 2>&1; then
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-balance-flagok.out 2>&1; then
     ok "submit --claude-credentials naming an existing file exits 0"
 else
     no "submit --claude-credentials naming an existing file exits 0" \
-        "$(cat /tmp/fs-k8s-test-balance-flagok.out)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-balance-flagok.out)"
 fi
-rm -f /tmp/fs-k8s-test-balance-flagok.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-balance-flagok.out
 
 # --claude-credentials naming a missing file is refused even on a
 # --harness pi submit, which will never read the file -- the same
@@ -5860,13 +5941,13 @@ refuses "--claude-credentials naming a missing file is refused even on a --harne
 if PATH="$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
     "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
     --claude-credentials "$claude_override_cred" \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-pi-flag.out 2>&1; then
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-balance-pi-flag.out 2>&1; then
     ok "--claude-credentials naming an existing file on a --harness pi submit exits 0"
 else
     no "--claude-credentials naming an existing file on a --harness pi submit exits 0" \
-        "$(cat /tmp/fs-k8s-test-balance-pi-flag.out)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-balance-pi-flag.out)"
 fi
-rm -f /tmp/fs-k8s-test-balance-pi-flag.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-balance-pi-flag.out
 
 # The cleanup trap must exist before Secret creation: a label failure leaves
 # an unlabeled Secret behind, so only the explicit by-name delete can catch
@@ -5890,7 +5971,7 @@ label_stub_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$label_stub_log")"
 PATH="$submit_stub_dir:$PATH" K8S_STUB_LOG="$label_stub_log" HOME="$claude_home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-label-failure --model claude-sonnet-5 --harness claude \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-label.out 2>&1
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-label.out 2>&1
 label_rc=$?
 if (( label_rc == 0 )); then
     no "label failure makes submit fail and invokes by-name Secret cleanup" "submit unexpectedly succeeded"
@@ -5911,7 +5992,7 @@ if grep -qF "$claude_fixture_token" "$label_stub_log"; then
 else
     ok "the real access token never appears in any kubectl argv at submit"
 fi
-rm -f /tmp/fs-k8s-test-label.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-label.out
 
 # Long branches with the same truncated prefix must still name distinct
 # objects, while the already-pinned short naming rule remains unchanged.
@@ -5979,11 +6060,11 @@ long_branch="claude-harness-review-fix-round-2-with-extra-words-appended-to-push
 long_submit_out="$(newdir)/claude-long-submit.yaml"; tmpdirs+=("$(dirname "$long_submit_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch "$long_branch" --model claude-sonnet-5 --harness claude \
-    "$proj_dir" "$handoff_file" > "$long_submit_out" 2>/tmp/fs-k8s-test-claude-long-submit.err; then
+    "$proj_dir" "$handoff_file" > "$long_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-long-submit.err; then
     ok "submit --dry-run --harness claude (long branch) exits 0"
 else
     no "submit --dry-run --harness claude (long branch) exits 0" \
-        "$(cat /tmp/fs-k8s-test-claude-long-submit.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-claude-long-submit.err)"
 fi
 # The claude-proxy Service name must still fit a Service's 63-char RFC 1035
 # label cap once the "-claude-proxy" suffix (13 chars) lands on it.
@@ -5995,7 +6076,7 @@ else
     no "long-branch claude-proxy Service name fits the 63-char label cap" \
         "name='$long_proxy_name' (${#long_proxy_name} chars) in $long_submit_out"
 fi
-rm -f /tmp/fs-k8s-test-claude-long-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-claude-long-submit.err
 
 # submit_out above carries no --review-model, so it must render no
 # REVIEW_MODEL env at all -- the flag is opt-in for both harnesses.
@@ -6013,11 +6094,11 @@ printf '\n== fork-sandbox-k8s.sh submit --dry-run --review-model (both harnesses
 pi_rm_submit_out="$(newdir)/pi-rm-submit.yaml"; tmpdirs+=("$(dirname "$pi_rm_submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --review-model opus \
-    "$proj_dir" "$handoff_file" > "$pi_rm_submit_out" 2>/tmp/fs-k8s-test-pi-rm-submit.err; then
+    "$proj_dir" "$handoff_file" > "$pi_rm_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-pi-rm-submit.err; then
     ok "submit --dry-run --harness pi --review-model exits 0"
 else
     no "submit --dry-run --harness pi --review-model exits 0" \
-        "$(cat /tmp/fs-k8s-test-pi-rm-submit.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-pi-rm-submit.err)"
 fi
 if grep -q 'name: REVIEW_MODEL' "$pi_rm_submit_out" \
     && grep -A1 'name: REVIEW_MODEL' "$pi_rm_submit_out" | grep -q 'value: "opus"'; then
@@ -6032,16 +6113,16 @@ if grep -q 'name: CLAUDE_PROXY_BASE_URL' "$pi_rm_submit_out"; then
 else
     ok "a pi run with --review-model still renders no CLAUDE_PROXY_BASE_URL"
 fi
-rm -f /tmp/fs-k8s-test-pi-rm-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pi-rm-submit.err
 
 claude_rm_submit_out="$(newdir)/claude-rm-submit.yaml"; tmpdirs+=("$(dirname "$claude_rm_submit_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --review-model opus \
-    "$proj_dir" "$handoff_file" > "$claude_rm_submit_out" 2>/tmp/fs-k8s-test-claude-rm-submit.err; then
+    "$proj_dir" "$handoff_file" > "$claude_rm_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-rm-submit.err; then
     ok "submit --dry-run --harness claude --review-model exits 0"
 else
     no "submit --dry-run --harness claude --review-model exits 0" \
-        "$(cat /tmp/fs-k8s-test-claude-rm-submit.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-claude-rm-submit.err)"
 fi
 if grep -q 'name: REVIEW_MODEL' "$claude_rm_submit_out" \
     && grep -A1 'name: REVIEW_MODEL' "$claude_rm_submit_out" | grep -q 'value: "opus"'; then
@@ -6050,7 +6131,7 @@ else
     no "a claude run's rendered Job sets REVIEW_MODEL when --review-model is given" \
         "not found in $claude_rm_submit_out"
 fi
-rm -f /tmp/fs-k8s-test-claude-rm-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-claude-rm-submit.err
 
 printf '\n== fork-sandbox-k8s.sh submit/run --pi-args ==\n'
 # --pi-args is extra arguments for the pod's pi coding leg. It travels
@@ -6062,11 +6143,11 @@ pialg_submit_out="$(newdir)/pialg-submit.yaml"; tmpdirs+=("$(dirname "$pialg_sub
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
     --pi-args "--thinking low" \
-    "$proj_dir" "$handoff_file" > "$pialg_submit_out" 2>/tmp/fs-k8s-test-pialg-submit.err; then
+    "$proj_dir" "$handoff_file" > "$pialg_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-pialg-submit.err; then
     ok "submit --dry-run --pi-args exits 0 and prints the rendered YAML"
 else
     no "submit --dry-run --pi-args exits 0 and prints the rendered YAML" \
-        "$(cat /tmp/fs-k8s-test-pialg-submit.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-pialg-submit.err)"
 fi
 if grep -q 'name: PI_ARGS' "$pialg_submit_out" \
     && grep -A1 'name: PI_ARGS' "$pialg_submit_out" | grep -q 'value: "--thinking low"'; then
@@ -6075,7 +6156,7 @@ else
     no "the rendered Job carries PI_ARGS with the value verbatim" \
         "$(grep -A1 'name: PI_ARGS' "$pialg_submit_out")"
 fi
-rm -f /tmp/fs-k8s-test-pialg-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pialg-submit.err
 
 # submit_out above carries no --pi-args, so it must render no PI_ARGS env
 # at all -- absence asserted, not an empty value.
@@ -6262,15 +6343,15 @@ PATH="$pialg_stub_bin:$PATH" K8S_STUB_LOG="$pialg_klog" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
     --pi-args "--thinking it's" \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
 if (( pialg_rc != 0 )) && [[ ! -s "$pialg_klog" ]] \
-    && grep -q 'single quote' /tmp/fs-k8s-test-pialg-unsafe.out; then
+    && grep -q 'single quote' "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out; then
     ok "a refused --pi-args value creates nothing (the stubbed kubectl recorded no call)"
 else
     no "a refused --pi-args value creates nothing (the stubbed kubectl recorded no call)" \
-        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat /tmp/fs-k8s-test-pialg-unsafe.out)"
+        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out)"
 fi
-rm -f /tmp/fs-k8s-test-pialg-unsafe.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out
 # Same "nothing created" proof for the YAML-scalar rejections: a double
 # quote and a backslash must also die before the first kubectl call.
 pialg_rc=0
@@ -6278,29 +6359,29 @@ PATH="$pialg_stub_bin:$PATH" K8S_STUB_LOG="$pialg_klog" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
     --pi-args 'a"b' \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
 if (( pialg_rc != 0 )) && [[ ! -s "$pialg_klog" ]] \
-    && grep -q 'double quote' /tmp/fs-k8s-test-pialg-unsafe.out; then
+    && grep -q 'double quote' "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out; then
     ok "a --pi-args value with a double quote creates nothing (the stubbed kubectl recorded no call)"
 else
     no "a --pi-args value with a double quote creates nothing (the stubbed kubectl recorded no call)" \
-        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat /tmp/fs-k8s-test-pialg-unsafe.out)"
+        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out)"
 fi
-rm -f /tmp/fs-k8s-test-pialg-unsafe.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out
 pialg_rc=0
 PATH="$pialg_stub_bin:$PATH" K8S_STUB_LOG="$pialg_klog" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
     --pi-args 'a\nb' \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
 if (( pialg_rc != 0 )) && [[ ! -s "$pialg_klog" ]] \
-    && grep -q 'backslash' /tmp/fs-k8s-test-pialg-unsafe.out; then
+    && grep -q 'backslash' "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out; then
     ok "a --pi-args value with a backslash creates nothing (the stubbed kubectl recorded no call)"
 else
     no "a --pi-args value with a backslash creates nothing (the stubbed kubectl recorded no call)" \
-        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat /tmp/fs-k8s-test-pialg-unsafe.out)"
+        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out)"
 fi
-rm -f /tmp/fs-k8s-test-pialg-unsafe.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out
 
 refuses "submit --pi-args with --harness claude is refused" \
     "passes flags to pi, which a claude run" \
@@ -6418,12 +6499,12 @@ PATH="$refresh_stub_dir:$PATH" HOME="$refresh_home1" \
     STUB_CALL_LOG="$refresh_calllog1" FS_CLAUDE_TOKEN_CONTRACT_DIR="$refresh_contract_dir1" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-refresh-soon --model claude-sonnet-5 --harness claude \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-refresh1.err
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-refresh1.err
 if grep -qF 'mcp list' "$refresh_calllog1" 2>/dev/null; then
     ok "submit refreshes the host credential when less than 120m remain"
 else
     no "submit refreshes the host credential when less than 120m remain" \
-        "call log: $(cat "$refresh_calllog1" 2>/dev/null) err: $(cat /tmp/fs-k8s-test-refresh1.err)"
+        "call log: $(cat "$refresh_calllog1" 2>/dev/null) err: $(cat "$k8s_test_tmp"/fs-k8s-test-refresh1.err)"
 fi
 if grep -qF 'refreshed-access-token' "$refresh_home1/.claude/.credentials.json"; then
     ok "the refreshed token actually lands in the host's own credential file"
@@ -6431,7 +6512,7 @@ else
     no "the refreshed token actually lands in the host's own credential file" \
         "$(cat "$refresh_home1/.claude/.credentials.json")"
 fi
-rm -f /tmp/fs-k8s-test-refresh1.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-refresh1.err
 
 # >= 120m remaining: fs_claude_refresh_if_needed is a silent no-op -- the
 # stub is never invoked, and the credential file is untouched.
@@ -6448,7 +6529,7 @@ PATH="$refresh_stub_dir:$PATH" HOME="$refresh_home2" \
     STUB_CALL_LOG="$refresh_calllog2" FS_CLAUDE_TOKEN_CONTRACT_DIR="$refresh_contract_dir2" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-refresh-far --model claude-sonnet-5 --harness claude \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-refresh2.err
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-refresh2.err
 if grep -qF 'mcp list' "$refresh_calllog2" 2>/dev/null; then
     no "submit never refreshes when 120m or more remain" \
         "call log: $(cat "$refresh_calllog2" 2>/dev/null)"
@@ -6461,7 +6542,7 @@ else
     no "the credential file is untouched when no refresh was needed" \
         "$(cat "$refresh_home2/.claude/.credentials.json")"
 fi
-rm -f /tmp/fs-k8s-test-refresh2.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-refresh2.err
 
 printf '\n== fork-sandbox-k8s.sh rm removes the per-run claude-proxy objects ==\n'
 # No live cluster here (see this file's own header), so `rm`'s kubectl
@@ -6476,10 +6557,10 @@ exit 0
 STUB
 chmod +x "$kubectl_stub_bin/kubectl"
 if PATH="$kubectl_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
-    "$k8s_sh" rm --branch fs-k8s-test-branch >/dev/null 2>/tmp/fs-k8s-test-rm.err; then
+    "$k8s_sh" rm --branch fs-k8s-test-branch >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-rm.err; then
     ok "rm exits 0 against a stubbed kubectl"
 else
-    no "rm exits 0 against a stubbed kubectl" "$(cat /tmp/fs-k8s-test-rm.err)"
+    no "rm exits 0 against a stubbed kubectl" "$(cat "$k8s_test_tmp"/fs-k8s-test-rm.err)"
 fi
 if grep -q "delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$claude_run_name --ignore-not-found" "$kubectl_log"; then
     ok "rm issues the label-based delete covering the claude-proxy Pod/Service/Secret/ConfigMap/NetworkPolicy"
@@ -6493,7 +6574,7 @@ if grep -q "delete job $claude_run_name --ignore-not-found" "$kubectl_log" \
 else
     no "rm still issues its original job/configmap deletes too" "$(cat "$kubectl_log")"
 fi
-rm -f /tmp/fs-k8s-test-rm.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-rm.err
 
 printf '\n== fork-sandbox-k8s.sh install --dry-run excludes 31-claude-proxy.yaml ==\n'
 if grep -q 'claude-proxy' "$install_out"; then
@@ -6523,10 +6604,10 @@ proj_base_sha="$(git -C "$proj_dir" rev-parse --verify --quiet HEAD)"
 rl_submit_out="$(newdir)/rl-submit.yaml"; tmpdirs+=("$(dirname "$rl_submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-rl-branch --model moonshotai/kimi-k3 --review-loop 2 \
-    "$proj_dir" "$handoff_file" > "$rl_submit_out" 2>/tmp/fs-k8s-test-rl-submit.err; then
+    "$proj_dir" "$handoff_file" > "$rl_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-rl-submit.err; then
     ok "submit --dry-run --review-loop 2 exits 0"
 else
-    no "submit --dry-run --review-loop 2 exits 0" "$(cat /tmp/fs-k8s-test-rl-submit.err)"
+    no "submit --dry-run --review-loop 2 exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-rl-submit.err)"
 fi
 # Item: --harness claude --review-loop with no --review-model is refused
 # here directly, not just by fork-sandbox.sh's own --k8s gate -- this
@@ -6663,17 +6744,17 @@ if out="$(bash "$rlrender_fn_file" \
         /work/clone/.git/review-verdict.md fs-k8s-test-rl-branch "$proj_base_sha" \
         "$repo_dir/skills/code-review-portable/SKILL.md" "$review_loop_sh" \
         /work/outbox "" "$rlrender_missing_handoff" \
-        2>/tmp/fs-k8s-test-rlrender.err)"; then
+        2>"$k8s_test_tmp"/fs-k8s-test-rlrender.err)"; then
     no "render_review_loop_configmap_keys fails on a missing handoff" \
         "exited 0; output starts: $(head -n 3 <<< "$out")"
 else
     ok "render_review_loop_configmap_keys fails on a missing handoff"
 fi
-if grep -q "missing or unreadable at prompt-build time" /tmp/fs-k8s-test-rlrender.err; then
+if grep -q "missing or unreadable at prompt-build time" "$k8s_test_tmp"/fs-k8s-test-rlrender.err; then
     ok "the missing-handoff failure names the prompt-build-time guarantee"
 else
     no "the missing-handoff failure names the prompt-build-time guarantee" \
-        "stderr: $(cat /tmp/fs-k8s-test-rlrender.err)"
+        "stderr: $(cat "$k8s_test_tmp"/fs-k8s-test-rlrender.err)"
 fi
 if out="$(bash "$rlrender_fn_file" \
         /work/clone /work/inbox /work/skills/code-review-portable \
@@ -6683,7 +6764,7 @@ if out="$(bash "$rlrender_fn_file" \
     ok "render_review_loop_configmap_keys exits 0 with a readable handoff"
 else
     no "render_review_loop_configmap_keys exits 0 with a readable handoff" \
-        "$(cat /tmp/fs-k8s-test-rlrender.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-rlrender.err)"
 fi
 if [[ "$out" == *"  review-prompt.md: |"* && "$out" == *"  fix-prompt-header.md: |"* \
     && "$out" == *"Do the thing."* ]]; then
@@ -6692,7 +6773,7 @@ else
     no "the successful render carries both prompt keys and the embedded handoff" \
         "output starts: $(head -n 3 <<< "$out")"
 fi
-rm -f /tmp/fs-k8s-test-rlrender.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-rlrender.err
 
 # Item: the rendered review prompt names the POD's paths, never a host path
 # -- proof this run's clone-under-/var/tmp and the operator's real project
@@ -6769,16 +6850,16 @@ refuses "submit --review-loop abc is rejected" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-rl-bad --model moonshotai/kimi-k3 --review-loop abc \
     "$proj_dir" "$handoff_file"
-rm -f /tmp/fs-k8s-test-rl-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-rl-submit.err
 
 printf '\n== fork-sandbox-k8s.sh run --dry-run (fixture config, no cluster) ==\n'
 run_out="$(newdir)/run.yaml"; tmpdirs+=("$(dirname "$run_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$run_out" 2>/tmp/fs-k8s-test-run.err; then
+    "$proj_dir" "$handoff_file" > "$run_out" 2>"$k8s_test_tmp"/fs-k8s-test-run.err; then
     ok "run --dry-run exits 0"
 else
-    no "run --dry-run exits 0" "$(cat /tmp/fs-k8s-test-run.err)"
+    no "run --dry-run exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-run.err)"
 fi
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$run_out" 2>&1)"
@@ -6795,7 +6876,7 @@ else
     no "run --dry-run renders the same Job YAML as submit --dry-run" \
         "$(diff "$submit_out" "$run_out" 2>&1 | head -n 20)"
 fi
-rm -f /tmp/fs-k8s-test-run.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-run.err
 
 refuses "run rejects a missing --branch" \
     "run requires --branch" \
@@ -6835,43 +6916,43 @@ om_bare_out="$(newdir)/om-bare.yaml"; tmpdirs+=("$(dirname "$om_bare_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-om-bare --model moonshotai/kimi-k3 \
     --outbox-max "$((100 * 1024 * 1024))" \
-    "$proj_dir" "$handoff_file" > "$om_bare_out" 2>/tmp/fs-k8s-test-om.err; then
+    "$proj_dir" "$handoff_file" > "$om_bare_out" 2>"$k8s_test_tmp"/fs-k8s-test-om.err; then
     ok "submit --outbox-max <bare digits> exits 0"
 else
-    no "submit --outbox-max <bare digits> exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+    no "submit --outbox-max <bare digits> exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-om.err)"
 fi
 check_outbox_max_render "submit --outbox-max <bare digits>" "$om_bare_out" "$((100 * 1024 * 1024))" 100
 
 om_k_out="$(newdir)/om-k.yaml"; tmpdirs+=("$(dirname "$om_k_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-om-k --model moonshotai/kimi-k3 --outbox-max 131072K \
-    "$proj_dir" "$handoff_file" > "$om_k_out" 2>/tmp/fs-k8s-test-om.err; then
+    "$proj_dir" "$handoff_file" > "$om_k_out" 2>"$k8s_test_tmp"/fs-k8s-test-om.err; then
     ok "submit --outbox-max 131072K exits 0"
 else
-    no "submit --outbox-max 131072K exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+    no "submit --outbox-max 131072K exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-om.err)"
 fi
 check_outbox_max_render "submit --outbox-max 131072K" "$om_k_out" "$((131072 * 1024))" 128
 
 om_m_out="$(newdir)/om-m.yaml"; tmpdirs+=("$(dirname "$om_m_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-om-m --model moonshotai/kimi-k3 --outbox-max 256M \
-    "$proj_dir" "$handoff_file" > "$om_m_out" 2>/tmp/fs-k8s-test-om.err; then
+    "$proj_dir" "$handoff_file" > "$om_m_out" 2>"$k8s_test_tmp"/fs-k8s-test-om.err; then
     ok "submit --outbox-max 256M exits 0"
 else
-    no "submit --outbox-max 256M exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+    no "submit --outbox-max 256M exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-om.err)"
 fi
 check_outbox_max_render "submit --outbox-max 256M" "$om_m_out" "$((256 * 1024 * 1024))" 256
 
 om_g_out="$(newdir)/om-g.yaml"; tmpdirs+=("$(dirname "$om_g_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-om-g --model moonshotai/kimi-k3 --outbox-max 2G \
-    "$proj_dir" "$handoff_file" > "$om_g_out" 2>/tmp/fs-k8s-test-om.err; then
+    "$proj_dir" "$handoff_file" > "$om_g_out" 2>"$k8s_test_tmp"/fs-k8s-test-om.err; then
     ok "submit --outbox-max 2G exits 0"
 else
-    no "submit --outbox-max 2G exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+    no "submit --outbox-max 2G exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-om.err)"
 fi
 check_outbox_max_render "submit --outbox-max 2G" "$om_g_out" "$((2 * 1024 * 1024 * 1024))" 2048
-rm -f /tmp/fs-k8s-test-om.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-om.err
 
 # `run --dry-run --outbox-max` is a different code path than the direct
 # submit case above: cmd_run parses its own copy for its own pull-back
@@ -6882,13 +6963,13 @@ rm -f /tmp/fs-k8s-test-om.err
 om_run_out="$(newdir)/om-run.yaml"; tmpdirs+=("$(dirname "$om_run_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
     --branch fs-k8s-test-om-run --model moonshotai/kimi-k3 --outbox-max 256M \
-    "$proj_dir" "$handoff_file" > "$om_run_out" 2>/tmp/fs-k8s-test-om-run.err; then
+    "$proj_dir" "$handoff_file" > "$om_run_out" 2>"$k8s_test_tmp"/fs-k8s-test-om-run.err; then
     ok "run --outbox-max 256M exits 0"
 else
-    no "run --outbox-max 256M exits 0" "$(cat /tmp/fs-k8s-test-om-run.err)"
+    no "run --outbox-max 256M exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-om-run.err)"
 fi
 check_outbox_max_render "run --outbox-max 256M (forwarded to submit)" "$om_run_out" "$((256 * 1024 * 1024))" 256
-rm -f /tmp/fs-k8s-test-om-run.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-om-run.err
 
 # Bad values are rejected before anything is created -- same convention as
 # the --review-loop bad-value checks above -- for both verbs, since each
@@ -6923,10 +7004,10 @@ om_rl_out="$(newdir)/om-rl.yaml"; tmpdirs+=("$(dirname "$om_rl_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-om-rl --model moonshotai/kimi-k3 \
     --review-loop 2 --outbox-max 512K \
-    "$proj_dir" "$handoff_file" > "$om_rl_out" 2>/tmp/fs-k8s-test-om-rl.err; then
+    "$proj_dir" "$handoff_file" > "$om_rl_out" 2>"$k8s_test_tmp"/fs-k8s-test-om-rl.err; then
     ok "submit --review-loop 2 --outbox-max 512K exits 0"
 else
-    no "submit --review-loop 2 --outbox-max 512K exits 0" "$(cat /tmp/fs-k8s-test-om-rl.err)"
+    no "submit --review-loop 2 --outbox-max 512K exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-om-rl.err)"
 fi
 om_rl_mib_count="$(grep -c '0 MiB budget' "$om_rl_out" || true)"
 check "--review-loop + --outbox-max 512K: all three preambles (handoff.md, review-prompt.md, fix-prompt-header.md) state 0 MiB budget" \
@@ -6934,7 +7015,7 @@ check "--review-loop + --outbox-max 512K: all three preambles (handoff.md, revie
 om_rl_env_count="$(grep -cF 'value: "524288"' "$om_rl_out" || true)"
 check "--review-loop + --outbox-max 512K: exactly one OUTBOX_MAX_BYTES Job-spec env entry carries 524288" \
     1 "$om_rl_env_count"
-rm -f /tmp/fs-k8s-test-om-rl.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-om-rl.err
 
 # Default OUTBOX_MAX_BYTES (FS_OUTBOX_MAX_BYTES, unraised) still renders when
 # --outbox-max is absent -- reusing submit_out from the plain submit
@@ -7001,12 +7082,12 @@ printf 'gathered notes\n' > "$cr_dir/notes.md"
 cr_submit_out="$(newdir)/cr-submit.yaml"; tmpdirs+=("$(dirname "$cr_submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-cr-branch --model moonshotai/kimi-k3 --context-ro "$cr_dir" \
-    "$proj_dir" "$handoff_file" > "$cr_submit_out" 2>/tmp/fs-k8s-test-cr-submit.err; then
+    "$proj_dir" "$handoff_file" > "$cr_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-cr-submit.err; then
     ok "submit --dry-run --context-ro exits 0"
 else
-    no "submit --dry-run --context-ro exits 0" "$(cat /tmp/fs-k8s-test-cr-submit.err)"
+    no "submit --dry-run --context-ro exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-cr-submit.err)"
 fi
-rm -f /tmp/fs-k8s-test-cr-submit.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-cr-submit.err
 
 if grep -q '^  context-extract.sh: |$' "$cr_submit_out"; then
     ok "submit --context-ro renders the context-extract.sh ConfigMap key"
@@ -7125,12 +7206,12 @@ refuses "submit --context-ro with many hard links still reports its own error" \
 cr_run_out="$(newdir)/cr-run.yaml"; tmpdirs+=("$(dirname "$cr_run_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
     --branch fs-k8s-test-cr-branch --model moonshotai/kimi-k3 --context-ro "$cr_dir" \
-    "$proj_dir" "$handoff_file" > "$cr_run_out" 2>/tmp/fs-k8s-test-cr-run.err; then
+    "$proj_dir" "$handoff_file" > "$cr_run_out" 2>"$k8s_test_tmp"/fs-k8s-test-cr-run.err; then
     ok "run --dry-run --context-ro exits 0"
 else
-    no "run --dry-run --context-ro exits 0" "$(cat /tmp/fs-k8s-test-cr-run.err)"
+    no "run --dry-run --context-ro exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-cr-run.err)"
 fi
-rm -f /tmp/fs-k8s-test-cr-run.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-cr-run.err
 check "run --dry-run --context-ro renders byte-for-byte the same as submit --dry-run --context-ro" \
     "$(cat "$cr_submit_out")" "$(cat "$cr_run_out")"
 
@@ -7154,15 +7235,15 @@ chmod +x "$cr_order_kubectl"
 PATH="$cr_order_stub:$(dirname "$cr_order_kubectl"):$PATH" K8S_STUB_LOG="$cr_order_log" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-cr-over-cap --model moonshotai/kimi-k3 --context-ro "$cr_big_dir" \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-cr-big.out 2>&1
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-cr-big.out 2>&1
 cr_order_rc=$?
 if (( cr_order_rc == 0 )); then
     no "oversized context is refused before kubectl apply" "submit unexpectedly succeeded"
 else
-    if [[ ! -s "$cr_order_log" ]] && grep -q 'over the .* byte' /tmp/fs-k8s-test-cr-big.out; then
+    if [[ ! -s "$cr_order_log" ]] && grep -q 'over the .* byte' "$k8s_test_tmp"/fs-k8s-test-cr-big.out; then
         ok "oversized context is refused before kubectl apply"
     else
-        no "oversized context is refused before kubectl apply" "log=$(cat "$cr_order_log") out=$(cat /tmp/fs-k8s-test-cr-big.out)"
+        no "oversized context is refused before kubectl apply" "log=$(cat "$cr_order_log") out=$(cat "$k8s_test_tmp"/fs-k8s-test-cr-big.out)"
     fi
 fi
 # This failure is strictly host-side -- no kubectl apply ever ran, so no
@@ -7170,14 +7251,14 @@ fi
 # to find -- so the run directory submit had already created and printed
 # above must not survive it either, or it leaks forever with nothing able
 # to join to it.
-cr_order_rd="$(sed -n 's/^  run dir:  *//p' /tmp/fs-k8s-test-cr-big.out | head -1)"
+cr_order_rd="$(sed -n 's/^  run dir:  *//p' "$k8s_test_tmp"/fs-k8s-test-cr-big.out | head -1)"
 if [[ -n "$cr_order_rd" ]] && [[ ! -e "$cr_order_rd" ]]; then
     ok "an over-cap context also removes the run dir it never got to use"
 else
     no "an over-cap context also removes the run dir it never got to use" \
         "run_dir=$cr_order_rd $([[ -e "$cr_order_rd" ]] && echo STILL_PRESENT)"
 fi
-rm -f /tmp/fs-k8s-test-cr-big.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-cr-big.out
 
 # A context exec failure must remove the already-sized host archive. The git
 # wrapper lets validation and the repository push complete without a remote;
@@ -7209,7 +7290,7 @@ PATH="$(dirname "$cr_exec_git"):$(dirname "$cr_exec_kubectl"):$PATH" \
     TMPDIR="$cr_exec_tmp" K8S_STUB_LOG="$cr_exec_log" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-cr-exec-failure --model moonshotai/kimi-k3 --context-ro "$cr_dir" \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-cr-exec.out 2>&1
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-cr-exec.out 2>&1
 cr_exec_rc=$?
 if (( cr_exec_rc == 0 )); then
     no "context exec failure removes the temporary archive" "submit unexpectedly succeeded"
@@ -7221,7 +7302,7 @@ else
         no "context exec failure removes the temporary archive" "tmp=$(find "$cr_exec_tmp" -type f) log=$(cat "$cr_exec_log")"
     fi
 fi
-rm -f /tmp/fs-k8s-test-cr-exec.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-cr-exec.out
 
 # --thread-dir/--attach-dir: same transport as --context-ro (spooled tar,
 # kubectl exec through the same extractor, same CONTEXT_MAX_BYTES cap,
@@ -7245,12 +7326,12 @@ td_test_scratch_push() {
     wf_out="$(newdir)/${tag}-submit.yaml"; tmpdirs+=("$(dirname "$wf_out")")
     if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
         --branch "fs-k8s-test-${tag}-branch" --model moonshotai/kimi-k3 "$flag" "$d" \
-        "$proj_dir" "$handoff_file" > "$wf_out" 2>"/tmp/fs-k8s-test-${tag}.err"; then
+        "$proj_dir" "$handoff_file" > "$wf_out" 2>"$k8s_test_tmp/fs-k8s-test-${tag}.err"; then
         ok "submit --dry-run $flag exits 0"
     else
-        no "submit --dry-run $flag exits 0" "$(cat "/tmp/fs-k8s-test-${tag}.err")"
+        no "submit --dry-run $flag exits 0" "$(cat "$k8s_test_tmp/fs-k8s-test-${tag}.err")"
     fi
-    rm -f "/tmp/fs-k8s-test-${tag}.err"
+    rm -f "$k8s_test_tmp/fs-k8s-test-${tag}.err"
 
     if grep -qF "mountPath: $pod_path" "$wf_out"; then
         ok "submit $flag renders the emptyDir mount at $pod_path"
@@ -7285,13 +7366,13 @@ td_test_scratch_push() {
     printf 'x\n' > "$outside_forks/f.txt"
     if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
         --branch "fs-k8s-test-${tag}-of" --model moonshotai/kimi-k3 "$flag" "$outside_forks" \
-        "$proj_dir" "$handoff_file" >"/tmp/fs-k8s-test-${tag}-of.out" 2>&1; then
+        "$proj_dir" "$handoff_file" >"$k8s_test_tmp/fs-k8s-test-${tag}-of.out" 2>&1; then
         ok "submit $flag under the scratch root but outside forks/ is accepted"
     else
         no "submit $flag under the scratch root but outside forks/ is accepted" \
-            "$(cat "/tmp/fs-k8s-test-${tag}-of.out")"
+            "$(cat "$k8s_test_tmp/fs-k8s-test-${tag}-of.out")"
     fi
-    rm -f "/tmp/fs-k8s-test-${tag}-of.out"
+    rm -f "$k8s_test_tmp/fs-k8s-test-${tag}-of.out"
 
     # Symlink: refused on the host, before the Job is ever created.
     local sym_dir; sym_dir="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-${tag}-sym.XXXXXX")"; tmpdirs+=("$sym_dir")
@@ -7316,12 +7397,12 @@ td_test_scratch_push() {
     local run_out; run_out="$(newdir)/${tag}-run.yaml"; tmpdirs+=("$(dirname "$run_out")")
     if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
         --branch "fs-k8s-test-${tag}-branch" --model moonshotai/kimi-k3 "$flag" "$d" \
-        "$proj_dir" "$handoff_file" > "$run_out" 2>"/tmp/fs-k8s-test-${tag}-run.err"; then
+        "$proj_dir" "$handoff_file" > "$run_out" 2>"$k8s_test_tmp/fs-k8s-test-${tag}-run.err"; then
         ok "run --dry-run $flag exits 0"
     else
-        no "run --dry-run $flag exits 0" "$(cat "/tmp/fs-k8s-test-${tag}-run.err")"
+        no "run --dry-run $flag exits 0" "$(cat "$k8s_test_tmp/fs-k8s-test-${tag}-run.err")"
     fi
-    rm -f "/tmp/fs-k8s-test-${tag}-run.err"
+    rm -f "$k8s_test_tmp/fs-k8s-test-${tag}-run.err"
     check "run --dry-run $flag renders byte-for-byte the same as submit --dry-run $flag" \
         "$(cat "$wf_out")" "$(cat "$run_out")"
 
@@ -7346,17 +7427,17 @@ STUB
     PATH="$order_stub:$(dirname "$order_kubectl"):$PATH" K8S_STUB_LOG="$order_log" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
         --branch "fs-k8s-test-${tag}-over-cap" --model moonshotai/kimi-k3 "$flag" "$big_dir" \
-        "$proj_dir" "$handoff_file" >"/tmp/fs-k8s-test-${tag}-big.out" 2>&1
+        "$proj_dir" "$handoff_file" >"$k8s_test_tmp/fs-k8s-test-${tag}-big.out" 2>&1
     rc=$?
     if (( rc == 0 )); then
         no "oversized $flag is refused before kubectl apply" "submit unexpectedly succeeded"
-    elif [[ ! -s "$order_log" ]] && grep -q 'over the .* byte' "/tmp/fs-k8s-test-${tag}-big.out"; then
+    elif [[ ! -s "$order_log" ]] && grep -q 'over the .* byte' "$k8s_test_tmp/fs-k8s-test-${tag}-big.out"; then
         ok "oversized $flag is refused before kubectl apply"
     else
         no "oversized $flag is refused before kubectl apply" \
-            "log=$(cat "$order_log") out=$(cat "/tmp/fs-k8s-test-${tag}-big.out")"
+            "log=$(cat "$order_log") out=$(cat "$k8s_test_tmp/fs-k8s-test-${tag}-big.out")"
     fi
-    rm -f "/tmp/fs-k8s-test-${tag}-big.out"
+    rm -f "$k8s_test_tmp/fs-k8s-test-${tag}-big.out"
 
     # The non-dry-run push issues an exec to the extractor with the right
     # destination, before the sentinel exec -- mirrors --context-ro's own
@@ -7398,7 +7479,7 @@ STUB
         K8S_STUB_CAPTURE_DEST="$pod_path" K8S_STUB_CAPTURE_TAR="$exec_tar" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
         --branch "fs-k8s-test-${tag}-exec-order" --model moonshotai/kimi-k3 "$flag" "$d" \
-        "$proj_dir" "$handoff_file" >"/tmp/fs-k8s-test-${tag}-exec.out" 2>&1
+        "$proj_dir" "$handoff_file" >"$k8s_test_tmp/fs-k8s-test-${tag}-exec.out" 2>&1
     rc=$?
     if (( rc == 0 )) \
         && grep -qF "exec -i -c agent stub-pod -- sh /mnt/fork-sandbox/context-extract.sh $pod_path" "$exec_log" \
@@ -7407,9 +7488,9 @@ STUB
         ok "the non-dry-run push for $flag execs the extractor at $pod_path before the sentinel"
     else
         no "the non-dry-run push for $flag execs the extractor at $pod_path before the sentinel" \
-            "rc=$rc log=$(cat "$exec_log") out=$(cat "/tmp/fs-k8s-test-${tag}-exec.out")"
+            "rc=$rc log=$(cat "$exec_log") out=$(cat "$k8s_test_tmp/fs-k8s-test-${tag}-exec.out")"
     fi
-    rm -f "/tmp/fs-k8s-test-${tag}-exec.out"
+    rm -f "$k8s_test_tmp/fs-k8s-test-${tag}-exec.out"
 
     # The archive actually pushed for this flag: real k8s_spool_dir_entries
     # output, captured off the stubbed kubectl exec's stdin above -- not a
@@ -10033,7 +10114,7 @@ collectstub_collect() {
 
 # The default standalone destination is reused and refreshed for a later
 # collect of the same branch, including its sibling evidence directory.
-collect_default_root="/var/tmp/claude-scratch/forks/k8s-fs-k8s-test-collect-default"
+collect_default_root="/var/tmp/claude-scratch/forks/k8s-fs-k8s-test-collect-default-$$"
 tmpdirs+=("$collect_default_root")
 collect_default_first="$(newdir)"; collect_default_second="$(newdir)"
 collect_default_work_first="$(newdir)"; collect_default_work_second="$(newdir)"
@@ -10046,19 +10127,19 @@ collect_default_log="$(newdir)/kubectl.log"; collect_default_out="$(newdir)/coll
 tmpdirs+=("$(dirname "$collect_default_log")" "$(dirname "$collect_default_out")")
 if K8S_STUB_OUTBOX_RC=0 K8S_STUB_OUTBOX_DIR="$collect_default_first" K8S_STUB_WORK_DIR="$collect_default_work_first" \
     collectstub_collect "$collect_default_log" "$collect_default_out" \
-    --branch fs-k8s-test-collect-default "$proj_dir" \
+    --branch fs-k8s-test-collect-default-$$ "$proj_dir" \
     && K8S_STUB_OUTBOX_RC=0 K8S_STUB_OUTBOX_DIR="$collect_default_second" K8S_STUB_WORK_DIR="$collect_default_work_second" \
     collectstub_collect "$collect_default_log" "$collect_default_out" \
-    --branch fs-k8s-test-collect-default "$proj_dir" \
+    --branch fs-k8s-test-collect-default-$$ "$proj_dir" \
     && [[ -f "$collect_default_root/outbox/second.txt" \
         && ! -e "$collect_default_root/outbox/first.txt" \
         && -f "$collect_default_root/evidence/events-2.jsonl" \
         && ! -e "$collect_default_root/evidence/events.jsonl" ]] \
-    && [[ "$(find /var/tmp/claude-scratch/forks -maxdepth 1 -type d -name 'k8s-fs-k8s-test-collect-default*' | wc -l)" == 1 ]]; then
+    && [[ "$(find /var/tmp/claude-scratch/forks -maxdepth 1 -type d -name "k8s-fs-k8s-test-collect-default-$$*" | wc -l)" == 1 ]]; then
     ok "standalone re-collect reuses one branch directory with only current artifacts"
 else
     no "standalone re-collect reuses one branch directory with only current artifacts" \
-        "$(cat "$collect_default_out"; find /var/tmp/claude-scratch/forks -maxdepth 1 -type d -name 'k8s-fs-k8s-test-collect-default*')"
+        "$(cat "$collect_default_out"; find /var/tmp/claude-scratch/forks -maxdepth 1 -type d -name "k8s-fs-k8s-test-collect-default-$$*")"
 fi
 
 # 1. A readable outbox lands at the --outbox-dir path, and the fetch still
@@ -11323,10 +11404,10 @@ of_parent="$(newdir)"; tmpdirs+=("$of_parent")
 of_wf_tar="$of_parent/wf.tar"
 tar cf "$of_wf_tar" -C "$of_src" .
 of_wf_dest="$of_parent/wf_dest"
-if "$outbox_extract_sh" "$of_wf_tar" "$of_wf_dest" >/tmp/fs-k8s-outbox-wf.err 2>&1; then
+if "$outbox_extract_sh" "$of_wf_tar" "$of_wf_dest" >"$k8s_test_tmp"/fs-k8s-outbox-wf.err 2>&1; then
     ok "well-formed archive extracts"
 else
-    no "well-formed archive extracts" "$(cat /tmp/fs-k8s-outbox-wf.err)"
+    no "well-formed archive extracts" "$(cat "$k8s_test_tmp"/fs-k8s-outbox-wf.err)"
 fi
 if [[ "$(cat "$of_wf_dest/foo.txt" 2>/dev/null)" == "hello" \
     && "$(cat "$of_wf_dest/sub/bar.txt" 2>/dev/null)" == "world" ]]; then
@@ -11335,7 +11416,7 @@ else
     no "well-formed archive's files land with their content intact" \
         "$(find "$of_wf_dest" 2>&1)"
 fi
-rm -f /tmp/fs-k8s-outbox-wf.err
+rm -f "$k8s_test_tmp"/fs-k8s-outbox-wf.err
 
 # absolute path: refused outright, whole archive, before anything is
 # extracted -- the dest directory must not even be created.
@@ -11469,10 +11550,10 @@ else
 fi
 of_cap_dest_hi="$of_cap_parent/cap_dest_hi"
 if "$outbox_extract_sh" "$of_cap_tar" "$of_cap_dest_hi" 1000000 \
-    >/tmp/fs-k8s-outbox-cap.err 2>&1; then
+    >"$k8s_test_tmp"/fs-k8s-outbox-cap.err 2>&1; then
     ok "an explicit high \$3 cap extracts the same archive"
 else
-    no "an explicit high \$3 cap extracts the same archive" "$(cat /tmp/fs-k8s-outbox-cap.err)"
+    no "an explicit high \$3 cap extracts the same archive" "$(cat "$k8s_test_tmp"/fs-k8s-outbox-cap.err)"
 fi
 if [[ "$(cat "$of_cap_dest_hi/small.txt" 2>/dev/null)" == "a small file, well under any default cap" ]]; then
     ok "explicit high \$3 cap: the file lands with its content intact"
@@ -11480,7 +11561,7 @@ else
     no "explicit high \$3 cap: the file lands with its content intact" \
         "$(find "$of_cap_dest_hi" 2>&1)"
 fi
-rm -f /tmp/fs-k8s-outbox-cap.err
+rm -f "$k8s_test_tmp"/fs-k8s-outbox-cap.err
 
 # A $3 above 256 MiB -- the shared context-extract.sh script's own default
 # ceiling, meant for --context-ro -- must still be honored, not silently
@@ -11496,13 +11577,13 @@ of_huge_tar="$of_huge_parent/huge.tar"
 tar cf "$of_huge_tar" -C "$of_huge_src" .
 of_huge_dest="$of_huge_parent/huge_dest"
 if "$outbox_extract_sh" "$of_huge_tar" "$of_huge_dest" $((300 * 1024 * 1024)) \
-        >/tmp/fs-k8s-outbox-huge.err 2>&1; then
+        >"$k8s_test_tmp"/fs-k8s-outbox-huge.err 2>&1; then
     ok "a \$3 above 256 MiB is honored, not silently capped there"
 else
     no "a \$3 above 256 MiB is honored, not silently capped there" \
-        "$(cat /tmp/fs-k8s-outbox-huge.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-outbox-huge.err)"
 fi
-rm -f /tmp/fs-k8s-outbox-huge.err
+rm -f "$k8s_test_tmp"/fs-k8s-outbox-huge.err
 # These three fixtures are ~257 MiB apiece (source, tar, extracted copy);
 # /tmp is a tmpfs, so held-until-EXIT here (this suite's default cleanup)
 # means ~770 MiB of RAM for the rest of the run. Removed the moment this
@@ -11536,10 +11617,10 @@ cf_wf_tar="$cf_parent/wf.tar"
 tar cf "$cf_wf_tar" -C "$cf_src" .
 cf_wf_dest="$cf_parent/wf_dest"
 if "$context_extract_sh" "$cf_wf_dest" 100000000 < "$cf_wf_tar" \
-        >/tmp/fs-k8s-ctx-wf.err 2>&1; then
+        >"$k8s_test_tmp"/fs-k8s-ctx-wf.err 2>&1; then
     ok "well-formed archive extracts"
 else
-    no "well-formed archive extracts" "$(cat /tmp/fs-k8s-ctx-wf.err)"
+    no "well-formed archive extracts" "$(cat "$k8s_test_tmp"/fs-k8s-ctx-wf.err)"
 fi
 if [[ "$(cat "$cf_wf_dest/foo.txt" 2>/dev/null)" == "hello" \
     && "$(cat "$cf_wf_dest/sub/bar.txt" 2>/dev/null)" == "world" ]]; then
@@ -11548,7 +11629,7 @@ else
     no "well-formed archive's files land with their content intact" \
         "$(find "$cf_wf_dest" 2>&1)"
 fi
-rm -f /tmp/fs-k8s-ctx-wf.err
+rm -f "$k8s_test_tmp"/fs-k8s-ctx-wf.err
 
 # A regular member whose filename contains the words " link to " is not a
 # link entry; only tar's leading type character identifies links here.
@@ -11559,12 +11640,12 @@ cf_phrase_tar="$cf_phrase_parent/phrase.tar"
 tar cf "$cf_phrase_tar" -C "$cf_phrase_src" .
 cf_phrase_dest="$cf_phrase_parent/phrase_dest"
 if "$context_extract_sh" "$cf_phrase_dest" 100000000 < "$cf_phrase_tar" \
-        >/tmp/fs-k8s-ctx-phrase.err 2>&1; then
+        >"$k8s_test_tmp"/fs-k8s-ctx-phrase.err 2>&1; then
     ok "a regular filename containing ' link to ' extracts"
 else
-    no "a regular filename containing ' link to ' extracts" "$(cat /tmp/fs-k8s-ctx-phrase.err)"
+    no "a regular filename containing ' link to ' extracts" "$(cat "$k8s_test_tmp"/fs-k8s-ctx-phrase.err)"
 fi
-rm -f /tmp/fs-k8s-ctx-phrase.err
+rm -f "$k8s_test_tmp"/fs-k8s-ctx-phrase.err
 
 # An existing, EMPTY DEST_DIR is accepted -- the shape a --thread-dir/
 # --attach-dir push always sees, since the pod spec's emptyDir volume
@@ -11572,10 +11653,10 @@ rm -f /tmp/fs-k8s-ctx-phrase.err
 cf_exist_dest="$cf_parent/exist_dest"
 mkdir -p "$cf_exist_dest"
 if "$context_extract_sh" "$cf_exist_dest" 100000000 < "$cf_wf_tar" \
-        >/tmp/fs-k8s-ctx-exist.err 2>&1; then
+        >"$k8s_test_tmp"/fs-k8s-ctx-exist.err 2>&1; then
     ok "an existing EMPTY DEST_DIR is accepted"
 else
-    no "an existing EMPTY DEST_DIR is accepted" "$(cat /tmp/fs-k8s-ctx-exist.err)"
+    no "an existing EMPTY DEST_DIR is accepted" "$(cat "$k8s_test_tmp"/fs-k8s-ctx-exist.err)"
 fi
 if [[ "$(cat "$cf_exist_dest/foo.txt" 2>/dev/null)" == "hello" ]]; then
     ok "an existing EMPTY DEST_DIR: the archive's files land inside it"
@@ -11583,7 +11664,7 @@ else
     no "an existing EMPTY DEST_DIR: the archive's files land inside it" \
         "$(find "$cf_exist_dest" 2>&1)"
 fi
-rm -f /tmp/fs-k8s-ctx-exist.err
+rm -f "$k8s_test_tmp"/fs-k8s-ctx-exist.err
 
 # An existing DEST_DIR's own metadata survives extraction even when this
 # process is denied every chmod/utime/chown on it -- the real
@@ -11656,7 +11737,7 @@ int chown(const char *path, uid_t owner, gid_t group) {
 }
 SHIM_C
     if cc -shared -fPIC -o "$cf_shim_dir/shim.so" "$cf_shim_dir/shim.c" -ldl \
-            >/tmp/fs-k8s-ctx-shim-cc.err 2>&1; then
+            >"$k8s_test_tmp"/fs-k8s-ctx-shim-cc.err 2>&1; then
         # The fixture archive: a real --thread-dir push through a stubbed
         # submit, captured off the stubbed kubectl exec's stdin -- the
         # actual entries-only shape k8s_spool_dir_entries produces, not a
@@ -11738,9 +11819,9 @@ STUB
         fi
     else
         printf '  SKIP  metadata-survives-EPERM test: could not compile the LD_PRELOAD shim\n'
-        printf '        %s\n' "$(cat /tmp/fs-k8s-ctx-shim-cc.err)"
+        printf '        %s\n' "$(cat "$k8s_test_tmp"/fs-k8s-ctx-shim-cc.err)"
     fi
-    rm -f /tmp/fs-k8s-ctx-shim-cc.err
+    rm -f "$k8s_test_tmp"/fs-k8s-ctx-shim-cc.err
 else
     printf '  SKIP  metadata-survives-EPERM test: no C compiler (cc) on PATH\n'
 fi
@@ -11862,12 +11943,12 @@ fi
 # the cap check compares against the given MAX_BYTES, not a hidden default.
 cf_hi_dest="$cf_parent/wf_dest_hi"
 if "$context_extract_sh" "$cf_hi_dest" 1000000 < "$cf_wf_tar" \
-        >/tmp/fs-k8s-ctx-hi.err 2>&1; then
+        >"$k8s_test_tmp"/fs-k8s-ctx-hi.err 2>&1; then
     ok "the same well-formed archive extracts under a generous cap"
 else
-    no "the same well-formed archive extracts under a generous cap" "$(cat /tmp/fs-k8s-ctx-hi.err)"
+    no "the same well-formed archive extracts under a generous cap" "$(cat "$k8s_test_tmp"/fs-k8s-ctx-hi.err)"
 fi
-rm -f /tmp/fs-k8s-ctx-hi.err
+rm -f "$k8s_test_tmp"/fs-k8s-ctx-hi.err
 
 # The 256 MiB literal on this stdin/kubectl-exec path cannot be raised by
 # MAX_BYTES, however large -- there is deliberately no env var for that (see
@@ -11879,13 +11960,13 @@ rm -f /tmp/fs-k8s-ctx-hi.err
 # for more than the literal allows.
 cf_big_max_dest="$cf_parent/wf_dest_big_max"
 if "$context_extract_sh" "$cf_big_max_dest" 100000000000 < "$cf_wf_tar" \
-        >/tmp/fs-k8s-ctx-bigmax.err 2>&1; then
+        >"$k8s_test_tmp"/fs-k8s-ctx-bigmax.err 2>&1; then
     ok "a small archive extracts under a MAX_BYTES far above the literal"
 else
     no "a small archive extracts under a MAX_BYTES far above the literal" \
-        "$(cat /tmp/fs-k8s-ctx-bigmax.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-ctx-bigmax.err)"
 fi
-rm -f /tmp/fs-k8s-ctx-bigmax.err
+rm -f "$k8s_test_tmp"/fs-k8s-ctx-bigmax.err
 
 # Second, an archive over the literal but comfortably under MAX_BYTES is
 # still refused -- proving the clamp itself needs a real >256 MiB fixture,
@@ -11971,13 +12052,13 @@ fi
 # -- confirms the cap compares against the actual count, not a hidden
 # always-refuse.
 if env FS_EXTRACT_MAX_ENTRIES=1000 "$context_extract_sh" "$cf_many_dest" 100000000 < "$cf_many_tar" \
-        >/tmp/fs-k8s-ctx-many.err 2>&1 \
+        >"$k8s_test_tmp"/fs-k8s-ctx-many.err 2>&1 \
     && [[ -e "$cf_many_dest/f0" ]]; then
     ok "the same archive extracts under an entry-count cap that admits it"
 else
-    no "the same archive extracts under an entry-count cap that admits it" "$(cat /tmp/fs-k8s-ctx-many.err)"
+    no "the same archive extracts under an entry-count cap that admits it" "$(cat "$k8s_test_tmp"/fs-k8s-ctx-many.err)"
 fi
-rm -f /tmp/fs-k8s-ctx-many.err
+rm -f "$k8s_test_tmp"/fs-k8s-ctx-many.err
 rm -rf -- "$cf_clamp_src" "$cf_clamp_parent"
 
 # git disables the ext:: transport by default, so a push or fetch built
@@ -12430,6 +12511,7 @@ mkdir -p "$HOME/src"
 new_src_project() {
     local d
     d="$(mktemp -d "$HOME/src/fs-k8s-flag-test.XXXXXX")"
+    realpath "$d" >> "$k8s_test_src_projects"
     (
         cd "$d" \
             && git init -q . \
@@ -12467,13 +12549,13 @@ refuses "--k8s with no --harness and no --model on a legacy install is refused b
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-default-harness \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /dev/null 2>/tmp/fs-k8s-flag-test-default-harness.err; then
+    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-default-harness.err; then
     ok "--k8s with no --harness defaults to pi"
 else
     no "--k8s with no --harness defaults to pi" \
-        "$(cat /tmp/fs-k8s-flag-test-default-harness.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-default-harness.err)"
 fi
-rm -f /tmp/fs-k8s-flag-test-default-harness.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-default-harness.err
 check "--k8s --host-alias reaches the rendered pod spec on the legacy path" \
     '[{"ip":"192.0.2.1","hostnames":["a.example.com"]}]' \
     "$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -12495,13 +12577,13 @@ if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dr
     --harness claude --model claude-sonnet-5 \
     --branch fs-k8s-flag-test-claude-harness \
     "$k8s_flag_claude_proj" "$k8s_flag_handoff" \
-    > /dev/null 2>/tmp/fs-k8s-flag-test-claude-harness.err; then
+    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-claude-harness.err; then
     ok "--k8s --harness claude is accepted"
 else
     no "--k8s --harness claude is accepted" \
-        "$(cat /tmp/fs-k8s-flag-test-claude-harness.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-claude-harness.err)"
 fi
-rm -f /tmp/fs-k8s-flag-test-claude-harness.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-claude-harness.err
 refuses "--k8s --harness claude with no --model needs a model" \
     "--k8s --harness claude needs --model" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -12532,10 +12614,10 @@ refuses "--k8s --claude-args is refused" \
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --no-services \
     --branch fs-k8s-flag-test-no-services \
-    "$k8s_flag_proj" "$k8s_flag_handoff" > /dev/null 2>/tmp/fs-k8s-no-services.err; then
+    "$k8s_flag_proj" "$k8s_flag_handoff" > /dev/null 2>"$k8s_test_tmp"/fs-k8s-no-services.err; then
     ok "--k8s forwards --no-services"
 else
-    no "--k8s forwards --no-services" "$(cat /tmp/fs-k8s-no-services.err)"
+    no "--k8s forwards --no-services" "$(cat "$k8s_test_tmp"/fs-k8s-no-services.err)"
 fi
 # --services-trust-ref is carried through to the dispatched run. A checked-out
 # service spec is disabled without the trust ref, so the rendered sidecar
@@ -12556,15 +12638,15 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --checkout "$k8s_flag_services_sha" \
     --services-trust-ref fs-k8s-launcher-services \
     --branch fs-k8s-flag-test-services-branch \
-    "$k8s_flag_proj" "$k8s_flag_handoff" > "$k8s_flag_services_out" 2>/tmp/fs-k8s-flag-test-services.err; then
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$k8s_flag_services_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-services.err; then
     ok "--k8s --services-trust-ref --dry-run reaches the dispatched command"
 else
     no "--k8s --services-trust-ref --dry-run reaches the dispatched command" \
-        "$(cat /tmp/fs-k8s-flag-test-services.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-services.err)"
 fi
 check "--k8s --services-trust-ref forwards the flag and enables the checked-out spec" \
     2 "$(awk '/^      initContainers:/{f=1} f&&/^      containers:/{f=0} f' "$k8s_flag_services_out" | grep -c '^        - name:')"
-rm -f /tmp/fs-k8s-flag-test-services.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-services.err
 refuses "--k8s --keep-session is refused" \
     "--keep-session is not supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -12592,19 +12674,19 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --context-ro "$k8s_flag_cr_dir" \
     --branch fs-k8s-flag-test-cr-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /tmp/fs-k8s-flag-test-cr.yaml 2>/tmp/fs-k8s-flag-test-cr.err; then
+    > "$k8s_test_tmp"/fs-k8s-flag-test-cr.yaml 2>"$k8s_test_tmp"/fs-k8s-flag-test-cr.err; then
     ok "--k8s --context-ro --dry-run is no longer refused"
 else
     no "--k8s --context-ro --dry-run is no longer refused" \
-        "$(cat /tmp/fs-k8s-flag-test-cr.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-cr.err)"
 fi
-if grep -q '## Gathered context' /tmp/fs-k8s-flag-test-cr.yaml; then
+if grep -q '## Gathered context' "$k8s_test_tmp"/fs-k8s-flag-test-cr.yaml; then
     ok "--k8s --context-ro --dry-run forwards the flag to fork-sandbox-k8s.sh"
 else
     no "--k8s --context-ro --dry-run forwards the flag to fork-sandbox-k8s.sh" \
-        "not found in /tmp/fs-k8s-flag-test-cr.yaml"
+        "not found in $k8s_test_tmp/fs-k8s-flag-test-cr.yaml"
 fi
-rm -f /tmp/fs-k8s-flag-test-cr.err /tmp/fs-k8s-flag-test-cr.yaml
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-cr.err "$k8s_test_tmp"/fs-k8s-flag-test-cr.yaml
 # --attach-dir and --thread-dir are carried through too, not refused --
 # fork-sandbox-k8s.sh's own submit applies fs_validate_scratch_dir's wider
 # whole-scratch-root boundary itself, so a directory under the scratch root
@@ -12618,19 +12700,19 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --attach-dir "$k8s_flag_attach_dir" \
     --branch fs-k8s-flag-test-attach-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /tmp/fs-k8s-flag-test-attach.yaml 2>/tmp/fs-k8s-flag-test-attach.err; then
+    > "$k8s_test_tmp"/fs-k8s-flag-test-attach.yaml 2>"$k8s_test_tmp"/fs-k8s-flag-test-attach.err; then
     ok "--k8s --attach-dir --dry-run is no longer refused"
 else
     no "--k8s --attach-dir --dry-run is no longer refused" \
-        "$(cat /tmp/fs-k8s-flag-test-attach.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-attach.err)"
 fi
-if grep -qF 'mountPath: /attachments' /tmp/fs-k8s-flag-test-attach.yaml; then
+if grep -qF 'mountPath: /attachments' "$k8s_test_tmp"/fs-k8s-flag-test-attach.yaml; then
     ok "--k8s --attach-dir --dry-run forwards the flag to fork-sandbox-k8s.sh"
 else
     no "--k8s --attach-dir --dry-run forwards the flag to fork-sandbox-k8s.sh" \
-        "not found in /tmp/fs-k8s-flag-test-attach.yaml"
+        "not found in $k8s_test_tmp/fs-k8s-flag-test-attach.yaml"
 fi
-rm -f /tmp/fs-k8s-flag-test-attach.err /tmp/fs-k8s-flag-test-attach.yaml
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-attach.err "$k8s_test_tmp"/fs-k8s-flag-test-attach.yaml
 k8s_flag_thread_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-test-thread.XXXXXX)"
 tmpdirs+=("$k8s_flag_thread_dir")
 printf 'thread.txt\n' > "$k8s_flag_thread_dir/thread.txt"
@@ -12639,19 +12721,19 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --thread-dir "$k8s_flag_thread_dir" \
     --branch fs-k8s-flag-test-thread-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /tmp/fs-k8s-flag-test-thread.yaml 2>/tmp/fs-k8s-flag-test-thread.err; then
+    > "$k8s_test_tmp"/fs-k8s-flag-test-thread.yaml 2>"$k8s_test_tmp"/fs-k8s-flag-test-thread.err; then
     ok "--k8s --thread-dir --dry-run is no longer refused"
 else
     no "--k8s --thread-dir --dry-run is no longer refused" \
-        "$(cat /tmp/fs-k8s-flag-test-thread.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-thread.err)"
 fi
-if grep -qF 'mountPath: /thread' /tmp/fs-k8s-flag-test-thread.yaml; then
+if grep -qF 'mountPath: /thread' "$k8s_test_tmp"/fs-k8s-flag-test-thread.yaml; then
     ok "--k8s --thread-dir --dry-run forwards the flag to fork-sandbox-k8s.sh"
 else
     no "--k8s --thread-dir --dry-run forwards the flag to fork-sandbox-k8s.sh" \
-        "not found in /tmp/fs-k8s-flag-test-thread.yaml"
+        "not found in $k8s_test_tmp/fs-k8s-flag-test-thread.yaml"
 fi
-rm -f /tmp/fs-k8s-flag-test-thread.err /tmp/fs-k8s-flag-test-thread.yaml
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-thread.err "$k8s_test_tmp"/fs-k8s-flag-test-thread.yaml
 # --endpoint is carried through, not refused -- on a K8S_PROXY_ENDPOINTS
 # install the forwarded flag must reach the render: the Job's PROXY_BASE_URL
 # lands at the named endpoint's /e/<name>/v1 instead of the legacy /api/v1
@@ -12661,10 +12743,10 @@ if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --endpoint secondary \
     --branch fs-k8s-flag-test-ep-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > "$k8s_flag_ep_out" 2>/tmp/fs-k8s-flag-test-ep.err; then
+    > "$k8s_flag_ep_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-ep.err; then
     ok "--k8s --endpoint --dry-run exits 0"
 else
-    no "--k8s --endpoint --dry-run exits 0" "$(cat /tmp/fs-k8s-flag-test-ep.err)"
+    no "--k8s --endpoint --dry-run exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-ep.err)"
 fi
 if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/secondary/v1"' "$k8s_flag_ep_out" \
     && ! grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/api/v1"' "$k8s_flag_ep_out"; then
@@ -12673,7 +12755,7 @@ else
     no "--k8s --endpoint --dry-run forwards the flag to fork-sandbox-k8s.sh" \
         "$(grep -A1 'name: PROXY_BASE_URL' "$k8s_flag_ep_out")"
 fi
-rm -f /tmp/fs-k8s-flag-test-ep.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-ep.err
 # --endpoint is also the launcher-side way off the pi model requirement:
 # on a K8S_PROXY_ENDPOINTS install the pod discovers its model, so a
 # model-less --k8s --endpoint --dry-run must reach the render with the
@@ -12684,11 +12766,11 @@ if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$fs_sh" --k8s --dry-run \
     --endpoint secondary \
     --branch fs-k8s-flag-test-ep-nomodel-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > "$k8s_flag_ep_nm_out" 2>/tmp/fs-k8s-flag-test-ep-nomodel.err; then
+    > "$k8s_flag_ep_nm_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-ep-nomodel.err; then
     ok "--k8s --endpoint --dry-run without --model exits 0"
 else
     no "--k8s --endpoint --dry-run without --model exits 0" \
-        "$(cat /tmp/fs-k8s-flag-test-ep-nomodel.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-ep-nomodel.err)"
 fi
 if [[ "$(grep -cF -- '- name: MODEL_DISCOVERY' "$k8s_flag_ep_nm_out")" == 1 ]] \
     && grep -A1 -F -- '- name: MODEL_DISCOVERY' "$k8s_flag_ep_nm_out" | grep -qF 'value: "1"'; then
@@ -12700,7 +12782,7 @@ fi
 model_env="$(grep -A1 'name: MODEL$' "$k8s_flag_ep_nm_out" | tail -n1)"
 check "the no-model --k8s --endpoint render carries an empty MODEL env" \
     '              value: ""' "$model_env"
-rm -f /tmp/fs-k8s-flag-test-ep-nomodel.err "$k8s_flag_ep_nm_out"
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-ep-nomodel.err "$k8s_flag_ep_nm_out"
 # And the launcher no longer pre-empts the endpoint rule at all: with no
 # --model and no --endpoint, K8S_DEFAULT_ENDPOINT in k8s.env alone is
 # enough for a pi --k8s run to pass the launcher's own validation and
@@ -12710,11 +12792,11 @@ k8s_flag_def_out="$(newdir)/k8s-flag-def.yaml"; tmpdirs+=("$(dirname "$k8s_flag_
 if FORK_SANDBOX_CONFIG_DIR="$default_ep_config_dir" "$fs_sh" --k8s --dry-run \
     --branch fs-k8s-flag-test-def-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > "$k8s_flag_def_out" 2>/tmp/fs-k8s-flag-test-def.err; then
+    > "$k8s_flag_def_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-def.err; then
     ok "--k8s --dry-run with neither --model nor --endpoint passes the launcher when k8s.env names a default"
 else
     no "--k8s --dry-run with neither --model nor --endpoint passes the launcher when k8s.env names a default" \
-        "$(cat /tmp/fs-k8s-flag-test-def.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-def.err)"
 fi
 if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/secondary/v1"' "$k8s_flag_def_out" \
     && ! grep -qF '/e/primary/v1' "$k8s_flag_def_out"; then
@@ -12723,7 +12805,7 @@ else
     no "the no-model no-endpoint --k8s render is wired to K8S_DEFAULT_ENDPOINT's endpoint" \
         "$(grep -A1 'name: PROXY_BASE_URL' "$k8s_flag_def_out")"
 fi
-rm -f /tmp/fs-k8s-flag-test-def.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-def.err
 # --harness claude keeps the model requirement even with --endpoint --
 # the pod's discovery lists the pi endpoint's model ids, never a Claude
 # Code model name -- and the launcher refuses it before any render.
@@ -12750,19 +12832,19 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --review-loop 2 \
     --branch fs-k8s-flag-test-rl-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /tmp/fs-k8s-flag-test-rl.yaml 2>/tmp/fs-k8s-flag-test-rl.err; then
+    > "$k8s_test_tmp"/fs-k8s-flag-test-rl.yaml 2>"$k8s_test_tmp"/fs-k8s-flag-test-rl.err; then
     ok "--k8s --review-loop 2 --dry-run is no longer refused"
 else
     no "--k8s --review-loop 2 --dry-run is no longer refused" \
-        "$(cat /tmp/fs-k8s-flag-test-rl.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-rl.err)"
 fi
-if grep -qF '  review-prompt.md: |' /tmp/fs-k8s-flag-test-rl.yaml; then
+if grep -qF '  review-prompt.md: |' "$k8s_test_tmp"/fs-k8s-flag-test-rl.yaml; then
     ok "--k8s --review-loop 2 --dry-run renders the review-prompt.md ConfigMap key"
 else
     no "--k8s --review-loop 2 --dry-run renders the review-prompt.md ConfigMap key" \
-        "not found in /tmp/fs-k8s-flag-test-rl.yaml"
+        "not found in $k8s_test_tmp/fs-k8s-flag-test-rl.yaml"
 fi
-rm -f /tmp/fs-k8s-flag-test-rl.err /tmp/fs-k8s-flag-test-rl.yaml
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-rl.err "$k8s_test_tmp"/fs-k8s-flag-test-rl.yaml
 
 # --review-model is now carried on both harnesses (models.json lists every
 # distinct id among --model and --review-model), but only alongside
@@ -12790,11 +12872,11 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --review-loop 2 --review-model opus \
     --branch fs-k8s-flag-test-pi-review-model \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > "$pi_review_model_out" 2>/tmp/fs-k8s-flag-test-pi-review-model.err; then
+    > "$pi_review_model_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-pi-review-model.err; then
     ok "--k8s --harness pi --review-model with --review-loop is accepted"
 else
     no "--k8s --harness pi --review-model with --review-loop is accepted" \
-        "$(cat /tmp/fs-k8s-flag-test-pi-review-model.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-pi-review-model.err)"
 fi
 if grep -q 'name: REVIEW_MODEL' "$pi_review_model_out" \
     && grep -A1 'name: REVIEW_MODEL' "$pi_review_model_out" | grep -q 'value: "opus"'; then
@@ -12803,7 +12885,7 @@ else
     no "--k8s --harness pi forwards --review-model through to the rendered Job env" \
         "not found in $pi_review_model_out"
 fi
-rm -f /tmp/fs-k8s-flag-test-pi-review-model.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-pi-review-model.err
 
 refuses "--k8s --harness pi --review-harness is refused (the pod's review loop is always pi)" \
     "not supported with --k8s --harness" \
@@ -12833,11 +12915,11 @@ if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dr
     --review-harness pi --review-model moonshotai/kimi-k3 \
     --branch fs-k8s-flag-test-claude-review \
     "$k8s_flag_claude_proj" "$k8s_flag_handoff" \
-    > "$claude_review_out" 2>/tmp/fs-k8s-flag-test-claude-review.err; then
+    > "$claude_review_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-claude-review.err; then
     ok "--k8s --harness claude --review-loop --review-harness pi --review-model is accepted"
 else
     no "--k8s --harness claude --review-loop --review-harness pi --review-model is accepted" \
-        "$(cat /tmp/fs-k8s-flag-test-claude-review.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-claude-review.err)"
 fi
 if grep -q 'name: REVIEW_MODEL' "$claude_review_out" \
     && grep -A1 'name: REVIEW_MODEL' "$claude_review_out" | grep -q 'value: "moonshotai/kimi-k3"'; then
@@ -12846,7 +12928,7 @@ else
     no "--k8s --harness claude forwards --review-model through to the rendered Job env" \
         "not found in $claude_review_out"
 fi
-rm -f /tmp/fs-k8s-flag-test-claude-review.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-claude-review.err
 
 # --context-secret is forwarded to fork-sandbox-k8s.sh (which validates the
 # name and, in a real submit, the labels); refused without --k8s, and refused
@@ -12855,15 +12937,15 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 \
     --context-secret preview-ctx --branch fs-k8s-flag-test-cs-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /tmp/fs-k8s-flag-test-cs.yaml 2>/tmp/fs-k8s-flag-test-cs.err \
-    && grep -q 'secretName: preview-ctx' /tmp/fs-k8s-flag-test-cs.yaml \
-    && grep -q '## Context secret' /tmp/fs-k8s-flag-test-cs.yaml; then
+    > "$k8s_test_tmp"/fs-k8s-flag-test-cs.yaml 2>"$k8s_test_tmp"/fs-k8s-flag-test-cs.err \
+    && grep -q 'secretName: preview-ctx' "$k8s_test_tmp"/fs-k8s-flag-test-cs.yaml \
+    && grep -q '## Context secret' "$k8s_test_tmp"/fs-k8s-flag-test-cs.yaml; then
     ok "--k8s --context-secret --dry-run forwards the flag to fork-sandbox-k8s.sh"
 else
     no "--k8s --context-secret --dry-run forwards the flag to fork-sandbox-k8s.sh" \
-        "$(cat /tmp/fs-k8s-flag-test-cs.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-cs.err)"
 fi
-rm -f /tmp/fs-k8s-flag-test-cs.err /tmp/fs-k8s-flag-test-cs.yaml
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-cs.err "$k8s_test_tmp"/fs-k8s-flag-test-cs.yaml
 refuses "--k8s --context-secret with a reserved name is refused by fork-sandbox-k8s.sh" \
     "starts with 'fork-sandbox-'" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -12896,7 +12978,7 @@ refuses "--keep without --k8s is refused" \
 refuses "--outbox-dir without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
-    --outbox-dir /tmp/fs-k8s-flag-test-outbox unused-project unused-handoff
+    --outbox-dir "$k8s_test_tmp"/fs-k8s-flag-test-outbox unused-project unused-handoff
 refuses "--endpoint without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
@@ -12933,12 +13015,12 @@ refuses "--k8s refuses a handoff outside the scratch dir" \
     "must live under /var/tmp/claude-scratch" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
-    "$k8s_flag_proj" /tmp/fs-k8s-flag-test-outside-scratch.md
+    "$k8s_flag_proj" "$k8s_test_tmp"/fs-k8s-flag-test-outside-scratch.md
 refuses "--k8s refuses a project outside ~/src" \
     "must live under ~/src" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
-    /tmp/fs-k8s-flag-test-outside-src "$k8s_flag_handoff"
+    "$k8s_test_tmp"/fs-k8s-flag-test-outside-src "$k8s_flag_handoff"
 
 # The --config_dir wiring itself, not just the default it falls back to: a
 # fixture HOME with its own projects.env, naming a root that is NOT ~/src,
@@ -12972,13 +13054,13 @@ projroot_proj="$(mktemp -d "$projroot_home/code/fs-k8s-projroot-test.XXXXXX")"
 if HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-projroot \
     "$projroot_proj" "$k8s_flag_handoff" \
-    > /dev/null 2>/tmp/fs-k8s-flag-test-projroot.err; then
+    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-projroot.err; then
     ok "--k8s accepts a project under a configured PROJECT_ROOTS root"
 else
     no "--k8s accepts a project under a configured PROJECT_ROOTS root" \
-        "$(cat /tmp/fs-k8s-flag-test-projroot.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-projroot.err)"
 fi
-rm -f /tmp/fs-k8s-flag-test-projroot.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-projroot.err
 refuses "--k8s refuses a project outside a configured PROJECT_ROOTS root, naming projects.env" \
     "$projroot_config/projects.env" \
     env HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" --k8s --dry-run \
@@ -13007,29 +13089,29 @@ dispatch_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$dispatch_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > "$dispatch_out" 2>/tmp/fs-k8s-flag-test-dispatch.err; then
+    > "$dispatch_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-dispatch.err; then
     ok "--k8s --harness pi --dry-run exits 0"
 else
-    no "--k8s --harness pi --dry-run exits 0" "$(cat /tmp/fs-k8s-flag-test-dispatch.err)"
+    no "--k8s --harness pi --dry-run exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-dispatch.err)"
 fi
 direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$direct_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
     --branch fs-k8s-flag-test-branch --model moonshotai/kimi-k3 \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > "$direct_out" 2>/tmp/fs-k8s-flag-test-direct.err; then
+    > "$direct_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-direct.err; then
     ok "direct run --dry-run (matching args) exits 0"
 else
     no "direct run --dry-run (matching args) exits 0" \
-        "$(cat /tmp/fs-k8s-flag-test-direct.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-direct.err)"
 fi
-rm -f /tmp/fs-k8s-flag-test-direct.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-direct.err
 if diff -q "$direct_out" "$dispatch_out" >/dev/null 2>&1; then
     ok "--k8s renders the same Job YAML as a direct run --dry-run call"
 else
     no "--k8s renders the same Job YAML as a direct run --dry-run call" \
         "$(diff "$direct_out" "$dispatch_out" 2>&1 | head -n 20)"
 fi
-rm -f /tmp/fs-k8s-flag-test-dispatch.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-dispatch.err
 
 # --branch omitted: --k8s generates one, unlike a direct `run` call, which
 # requires --branch up front. The generated name follows submit's own
@@ -13039,10 +13121,10 @@ nobranch_out="$(newdir)/nobranch.yaml"; tmpdirs+=("$(dirname "$nobranch_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > "$nobranch_out" 2>/tmp/fs-k8s-flag-test-nobranch.err; then
+    > "$nobranch_out" 2>"$k8s_test_tmp"/fs-k8s-flag-test-nobranch.err; then
     ok "--k8s without --branch exits 0"
 else
-    no "--k8s without --branch exits 0" "$(cat /tmp/fs-k8s-flag-test-nobranch.err)"
+    no "--k8s without --branch exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-nobranch.err)"
 fi
 if grep -qE 'value: "k8s-[0-9]{8}-[0-9]{6}"' "$nobranch_out"; then
     ok "--k8s without --branch generates a k8s-<timestamp> branch"
@@ -13050,7 +13132,7 @@ else
     no "--k8s without --branch generates a k8s-<timestamp> branch" \
         "$(cat "$nobranch_out")"
 fi
-rm -f /tmp/fs-k8s-flag-test-nobranch.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-nobranch.err
 
 # --timeout/--keep are accepted with --k8s (--dry-run never reaches the poll
 # loop they configure, but they must not be refused as unsupported flags).
@@ -13058,27 +13140,27 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --timeout 42 --keep \
     --branch fs-k8s-flag-test-branch2 \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /dev/null 2>/tmp/fs-k8s-flag-test-timeout.err; then
+    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-timeout.err; then
     ok "--k8s accepts --timeout and --keep"
 else
-    no "--k8s accepts --timeout and --keep" "$(cat /tmp/fs-k8s-flag-test-timeout.err)"
+    no "--k8s accepts --timeout and --keep" "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-timeout.err)"
 fi
-rm -f /tmp/fs-k8s-flag-test-timeout.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-timeout.err
 
 # --outbox-dir is likewise accepted with --k8s and threaded through to
 # fork-sandbox-k8s.sh run (--dry-run never reaches the pull-back step it
 # configures, but the flag must not be refused as unknown on either leg of
 # the dispatch).
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --outbox-dir /tmp/fs-k8s-flag-test-outbox \
+    --harness pi --model moonshotai/kimi-k3 --outbox-dir "$k8s_test_tmp"/fs-k8s-flag-test-outbox \
     --branch fs-k8s-flag-test-branch3 \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
-    > /dev/null 2>/tmp/fs-k8s-flag-test-outboxdir.err; then
+    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-outboxdir.err; then
     ok "--k8s accepts --outbox-dir"
 else
-    no "--k8s accepts --outbox-dir" "$(cat /tmp/fs-k8s-flag-test-outboxdir.err)"
+    no "--k8s accepts --outbox-dir" "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-outboxdir.err)"
 fi
-rm -f /tmp/fs-k8s-flag-test-outboxdir.err
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-outboxdir.err
 
 printf '\n== --checkout: a named ref as the branch start (no cluster) ==\n'
 # The push's source side was hardcoded HEAD, so a cluster run could only
@@ -13090,6 +13172,7 @@ printf '\n== --checkout: a named ref as the branch start (no cluster) ==\n'
 # git): that pair is what makes "nothing was created" assertable against
 # the stub's own log rather than by eyeballing the output.
 co_proj="$(mktemp -d "$HOME/src/fs-k8s-checkout-test.XXXXXX")"; tmpdirs+=("$co_proj")
+realpath "$co_proj" >> "$k8s_test_src_projects"
 # Built with the operator's global and system git config neutralised. An
 # operator who sets commit.gpgsign or tag.gpgSign (both are common, and both
 # are set on at least one machine this suite runs on) otherwise gets a
@@ -13279,11 +13362,11 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --review-loop 1 --checkout "$co_tag" \
     --branch fs-k8s-test-co-dispatch \
     "$co_proj" "$k8s_flag_handoff" \
-    > "$co_out8" 2>/tmp/fs-k8s-co-dispatch.err; then
+    > "$co_out8" 2>"$k8s_test_tmp"/fs-k8s-co-dispatch.err; then
     ok "fork-sandbox.sh --k8s --checkout --dry-run is no longer refused"
 else
     no "fork-sandbox.sh --k8s --checkout --dry-run is no longer refused" \
-        "$(cat /tmp/fs-k8s-co-dispatch.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-co-dispatch.err)"
 fi
 co_out9="$(newdir)/co-9.yaml"; tmpdirs+=("$(dirname "$co_out9")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
@@ -13302,7 +13385,7 @@ else
     no "--k8s --checkout forwards the flag (render matches the direct run --checkout call, base is the checkout sha)" \
         "$(diff "$co_out8" "$co_out9" 2>&1 | head -n 20)"
 fi
-rm -f /tmp/fs-k8s-co-dispatch.err
+rm -f "$k8s_test_tmp"/fs-k8s-co-dispatch.err
 
 printf '\n== --extra-ref: extra branches pushed beside the run branch (no cluster) ==\n'
 # submit --extra-ref NAME=SHA pushes one more refspec, <sha>:refs/heads/<name>,
@@ -15281,7 +15364,7 @@ owner_env_dir="$(mk_label_config 'K8S_RUN_OWNER=example-team')"
 owner_env_out="$(newdir)/owner-env.yaml"; tmpdirs+=("$(dirname "$owner_env_out")")
 FORK_SANDBOX_CONFIG_DIR="$owner_env_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$owner_env_out" 2>/tmp/fs-k8s-test-owner.err
+    "$proj_dir" "$handoff_file" > "$owner_env_out" 2>"$k8s_test_tmp"/fs-k8s-test-owner.err
 check "K8S_RUN_OWNER renders fork-sandbox/owner on all 3 render sites" 3 \
     "$(grep -cF 'fork-sandbox/owner: example-team' "$owner_env_out")"
 
@@ -15289,7 +15372,7 @@ check "K8S_RUN_OWNER renders fork-sandbox/owner on all 3 render sites" 3 \
 user_owner_out="$(newdir)/user-owner.yaml"; tmpdirs+=("$(dirname "$user_owner_out")")
 USER=alice FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$user_owner_out" 2>/tmp/fs-k8s-test-user-owner.err
+    "$proj_dir" "$handoff_file" > "$user_owner_out" 2>"$k8s_test_tmp"/fs-k8s-test-user-owner.err
 check "\$USER is used as fork-sandbox/owner when K8S_RUN_OWNER is unset" 3 \
     "$(grep -cF 'fork-sandbox/owner: alice' "$user_owner_out")"
 
@@ -15299,7 +15382,7 @@ check "\$USER is used as fork-sandbox/owner when K8S_RUN_OWNER is unset" 3 \
 sanitize_owner_out="$(newdir)/sanitize-owner.yaml"; tmpdirs+=("$(dirname "$sanitize_owner_out")")
 USER='Alice.Smith$' FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$sanitize_owner_out" 2>/tmp/fs-k8s-test-sanitize-owner.err
+    "$proj_dir" "$handoff_file" > "$sanitize_owner_out" 2>"$k8s_test_tmp"/fs-k8s-test-sanitize-owner.err
 check "a \$USER needing sanitizing renders sanitized as fork-sandbox/owner" 3 \
     "$(grep -cF 'fork-sandbox/owner: alice-smith' "$sanitize_owner_out")"
 
@@ -15312,7 +15395,7 @@ check "a \$USER needing sanitizing renders sanitized as fork-sandbox/owner" 3 \
 edge_owner_out="$(newdir)/edge-owner.yaml"; tmpdirs+=("$(dirname "$edge_owner_out")")
 USER='..bob' FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$edge_owner_out" 2>/tmp/fs-k8s-test-edge-owner.err
+    "$proj_dir" "$handoff_file" > "$edge_owner_out" 2>"$k8s_test_tmp"/fs-k8s-test-edge-owner.err
 check "a \$USER sanitizing to a leading hyphen renders trimmed" 3 \
     "$(grep -cF 'fork-sandbox/owner: bob' "$edge_owner_out")"
 if grep -q 'fork-sandbox/owner: -' "$edge_owner_out"; then
@@ -15329,7 +15412,7 @@ long_owner_out="$(newdir)/long-owner.yaml"; tmpdirs+=("$(dirname "$long_owner_ou
 long_user="$(printf 'a%.0s' $(seq 62))-xy"
 USER="$long_user" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$long_owner_out" 2>/tmp/fs-k8s-test-long-owner.err
+    "$proj_dir" "$handoff_file" > "$long_owner_out" 2>"$k8s_test_tmp"/fs-k8s-test-long-owner.err
 check "an over-long \$USER renders capped at 63 with no trailing hyphen" 3 \
     "$(grep -cF "fork-sandbox/owner: $(printf 'a%.0s' $(seq 62))" "$long_owner_out")"
 if grep -qE 'fork-sandbox/owner: .{64,}' "$long_owner_out"; then
@@ -15344,7 +15427,7 @@ fi
 no_owner_out="$(newdir)/no-owner.yaml"; tmpdirs+=("$(dirname "$no_owner_out")")
 USER='' FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$no_owner_out" 2>/tmp/fs-k8s-test-no-owner.err
+    "$proj_dir" "$handoff_file" > "$no_owner_out" 2>"$k8s_test_tmp"/fs-k8s-test-no-owner.err
 if grep -q 'fork-sandbox/owner:' "$no_owner_out"; then
     no "the fork-sandbox/owner label is omitted when neither K8S_RUN_OWNER nor \$USER yields a value" \
         "found a fork-sandbox/owner label in $no_owner_out"
@@ -15364,7 +15447,7 @@ refuses "an invalid explicit K8S_RUN_OWNER is refused, naming the key and the ru
 plain_label_out="$(newdir)/plain-label.yaml"; tmpdirs+=("$(dirname "$plain_label_out")")
 FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label extra=example-value \
-    "$proj_dir" "$handoff_file" > "$plain_label_out" 2>/tmp/fs-k8s-test-plain-label.err
+    "$proj_dir" "$handoff_file" > "$plain_label_out" 2>"$k8s_test_tmp"/fs-k8s-test-plain-label.err
 check "--label renders fork-sandbox.io/<key> on all 3 render sites" 3 \
     "$(grep -cF 'fork-sandbox.io/extra: example-value' "$plain_label_out")"
 
@@ -15376,7 +15459,7 @@ claude_label_out="$(newdir)/claude-label.yaml"; tmpdirs+=("$(dirname "$claude_la
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
     --label extra=example-value \
-    "$proj_dir" "$handoff_file" > "$claude_label_out" 2>/tmp/fs-k8s-test-claude-label.err
+    "$proj_dir" "$handoff_file" > "$claude_label_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-label.err
 check "--label renders on the claude-proxy objects too (7 render sites total)" 7 \
     "$(grep -cF 'fork-sandbox.io/extra: example-value' "$claude_label_out")"
 if grep -q '__EXTRA_LABELS__' "$claude_label_out"; then
@@ -15397,7 +15480,7 @@ run_labels_dir="$(mk_label_config 'K8S_RUN_LABELS=team=example-team,purpose=demo
 run_labels_out="$(newdir)/run-labels.yaml"; tmpdirs+=("$(dirname "$run_labels_out")")
 FORK_SANDBOX_CONFIG_DIR="$run_labels_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$run_labels_out" 2>/tmp/fs-k8s-test-run-labels.err
+    "$proj_dir" "$handoff_file" > "$run_labels_out" 2>"$k8s_test_tmp"/fs-k8s-test-run-labels.err
 if grep -qF 'fork-sandbox.io/team: example-team' "$run_labels_out" \
     && grep -qF 'fork-sandbox.io/purpose: demo' "$run_labels_out"; then
     ok "K8S_RUN_LABELS supplies file-level label defaults"
@@ -15410,7 +15493,7 @@ fi
 override_out="$(newdir)/override.yaml"; tmpdirs+=("$(dirname "$override_out")")
 FORK_SANDBOX_CONFIG_DIR="$run_labels_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label team=override-team \
-    "$proj_dir" "$handoff_file" > "$override_out" 2>/tmp/fs-k8s-test-override.err
+    "$proj_dir" "$handoff_file" > "$override_out" 2>"$k8s_test_tmp"/fs-k8s-test-override.err
 if grep -qF 'fork-sandbox.io/team: override-team' "$override_out" \
     && ! grep -qF 'fork-sandbox.io/team: example-team' "$override_out" \
     && grep -qF 'fork-sandbox.io/purpose: demo' "$override_out"; then
@@ -15419,15 +15502,15 @@ else
     no "--label overrides one K8S_RUN_LABELS key while a file-only key survives" \
         "not found in $override_out"
 fi
-if grep -qF "overrides K8S_RUN_LABELS's 'team=example-team'." /tmp/fs-k8s-test-override.err; then
+if grep -qF "overrides K8S_RUN_LABELS's 'team=example-team'." "$k8s_test_tmp"/fs-k8s-test-override.err; then
     ok "the --label override is announced on stderr"
 else
-    no "the --label override is announced on stderr" "$(cat /tmp/fs-k8s-test-override.err)"
+    no "the --label override is announced on stderr" "$(cat "$k8s_test_tmp"/fs-k8s-test-override.err)"
 fi
-rm -f /tmp/fs-k8s-test-owner.err /tmp/fs-k8s-test-user-owner.err \
-    /tmp/fs-k8s-test-sanitize-owner.err /tmp/fs-k8s-test-no-owner.err \
-    /tmp/fs-k8s-test-plain-label.err /tmp/fs-k8s-test-claude-label.err \
-    /tmp/fs-k8s-test-run-labels.err /tmp/fs-k8s-test-override.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-owner.err "$k8s_test_tmp"/fs-k8s-test-user-owner.err \
+    "$k8s_test_tmp"/fs-k8s-test-sanitize-owner.err "$k8s_test_tmp"/fs-k8s-test-no-owner.err \
+    "$k8s_test_tmp"/fs-k8s-test-plain-label.err "$k8s_test_tmp"/fs-k8s-test-claude-label.err \
+    "$k8s_test_tmp"/fs-k8s-test-run-labels.err "$k8s_test_tmp"/fs-k8s-test-override.err
 
 # 10. Refusals, each naming the offending entry, nothing created.
 refuses "--label with the reserved key 'app' is refused" \
@@ -15501,7 +15584,7 @@ combined_out="$(newdir)/combined.yaml"; tmpdirs+=("$(dirname "$combined_out")")
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$combined_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
     --label extra=example-value \
-    "$proj_dir" "$handoff_file" > "$combined_out" 2>/tmp/fs-k8s-test-combined.err
+    "$proj_dir" "$handoff_file" > "$combined_out" 2>"$k8s_test_tmp"/fs-k8s-test-combined.err
 selector_block="$(grep -A4 -E 'selector:|matchLabels:' "$combined_out" || true)"
 if grep -qF 'fork-sandbox/owner' <<< "$selector_block" || grep -qF 'fork-sandbox.io/' <<< "$selector_block"; then
     no "no selector/matchLabels block leaks fork-sandbox/owner or a fork-sandbox.io/ label" \
@@ -15509,7 +15592,7 @@ if grep -qF 'fork-sandbox/owner' <<< "$selector_block" || grep -qF 'fork-sandbox
 else
     ok "no selector/matchLabels block leaks fork-sandbox/owner or a fork-sandbox.io/ label"
 fi
-rm -f /tmp/fs-k8s-test-combined.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-combined.err
 
 printf '\n== fork-sandbox-k8s.sh: per-project and per-run images ==\n'
 # mk_image_config mirrors mk_label_config above: the same fixture k8s.env
@@ -15541,26 +15624,26 @@ proj_basename="$(basename "$proj_dir")"
 plain_image_out="$(newdir)/plain-image.yaml"; tmpdirs+=("$(dirname "$plain_image_out")")
 FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$plain_image_out" 2>/tmp/fs-k8s-test-plain-image.err
+    "$proj_dir" "$handoff_file" > "$plain_image_out" 2>"$k8s_test_tmp"/fs-k8s-test-plain-image.err
 check "no --image, no K8S_PROJECT_IMAGES: both image: lines are K8S_IMAGE" \
     "2" "$(grep -cF 'image: registry.example/you/fork-sandbox:latest' "$plain_image_out")"
 check "no --image, no K8S_PROJECT_IMAGES: stderr is silent" \
-    "" "$(cat /tmp/fs-k8s-test-plain-image.err)"
+    "" "$(cat "$k8s_test_tmp"/fs-k8s-test-plain-image.err)"
 check "no --image, no K8S_PROJECT_IMAGES: renders byte-identically to the earlier baseline" \
     "same" "$(cmp -s "$submit_out" "$plain_image_out" && echo same || echo different)"
-rm -f /tmp/fs-k8s-test-plain-image.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-plain-image.err
 other_project_dir="$(mk_image_config 'K8S_PROJECT_IMAGES=other-project=registry.example/other:1')"
 other_project_out="$(newdir)/other-project.yaml"; tmpdirs+=("$(dirname "$other_project_out")")
 FORK_SANDBOX_CONFIG_DIR="$other_project_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$other_project_out" 2>/tmp/fs-k8s-test-other-project.err
+    "$proj_dir" "$handoff_file" > "$other_project_out" 2>"$k8s_test_tmp"/fs-k8s-test-other-project.err
 check "a K8S_PROJECT_IMAGES entry for a different project renders byte-identically" \
     "same" "$(cmp -s "$submit_out" "$other_project_out" && echo same || echo different)"
 check "a K8S_PROJECT_IMAGES miss is announced on stderr" \
-    "1" "$(grep -c "no K8S_PROJECT_IMAGES entry for project" /tmp/fs-k8s-test-other-project.err)"
+    "1" "$(grep -c "no K8S_PROJECT_IMAGES entry for project" "$k8s_test_tmp"/fs-k8s-test-other-project.err)"
 check "the miss notice names the project's basename" \
-    "1" "$(grep -cF "'$proj_basename'; using K8S_IMAGE." /tmp/fs-k8s-test-other-project.err)"
-rm -f /tmp/fs-k8s-test-other-project.err
+    "1" "$(grep -cF "'$proj_basename'; using K8S_IMAGE." "$k8s_test_tmp"/fs-k8s-test-other-project.err)"
+rm -f "$k8s_test_tmp"/fs-k8s-test-other-project.err
 
 # T2 (R2): --image wins over a matching K8S_PROJECT_IMAGES entry and over
 # K8S_IMAGE, and announces the source on stderr.
@@ -15568,35 +15651,35 @@ project_image_dir="$(mk_image_config "K8S_PROJECT_IMAGES=$proj_basename=registry
 flag_image_out="$(newdir)/flag-image.yaml"; tmpdirs+=("$(dirname "$flag_image_out")")
 FORK_SANDBOX_CONFIG_DIR="$project_image_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image registry.example/proj:2 \
-    "$proj_dir" "$handoff_file" > "$flag_image_out" 2>/tmp/fs-k8s-test-image-flag.err
+    "$proj_dir" "$handoff_file" > "$flag_image_out" 2>"$k8s_test_tmp"/fs-k8s-test-image-flag.err
 check "--image wins over K8S_PROJECT_IMAGES and K8S_IMAGE: both image: lines" \
     "2" "$(grep -cF 'image: registry.example/proj:2' "$flag_image_out")"
-if grep -qF -- "--image 'registry.example/proj:2'" /tmp/fs-k8s-test-image-flag.err; then
+if grep -qF -- "--image 'registry.example/proj:2'" "$k8s_test_tmp"/fs-k8s-test-image-flag.err; then
     ok "--image's source is announced on stderr"
 else
-    no "--image's source is announced on stderr" "$(cat /tmp/fs-k8s-test-image-flag.err)"
+    no "--image's source is announced on stderr" "$(cat "$k8s_test_tmp"/fs-k8s-test-image-flag.err)"
 fi
-rm -f /tmp/fs-k8s-test-image-flag.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-image-flag.err
 
 # T3 (R3): no --image, K8S_PROJECT_IMAGES names this project's basename --
 # that entry wins over K8S_IMAGE, and announces the source on stderr.
 project_image_out="$(newdir)/project-image.yaml"; tmpdirs+=("$(dirname "$project_image_out")")
 FORK_SANDBOX_CONFIG_DIR="$project_image_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$project_image_out" 2>/tmp/fs-k8s-test-image-project.err
+    "$proj_dir" "$handoff_file" > "$project_image_out" 2>"$k8s_test_tmp"/fs-k8s-test-image-project.err
 check "K8S_PROJECT_IMAGES entry for this project wins over K8S_IMAGE: both image: lines" \
     "2" "$(grep -cF 'image: registry.example/project-default:1' "$project_image_out")"
-if grep -qF "K8S_PROJECT_IMAGES entry" /tmp/fs-k8s-test-image-project.err; then
+if grep -qF "K8S_PROJECT_IMAGES entry" "$k8s_test_tmp"/fs-k8s-test-image-project.err; then
     ok "the K8S_PROJECT_IMAGES source is announced on stderr (key)"
 else
-    no "the K8S_PROJECT_IMAGES source is announced on stderr (key)" "$(cat /tmp/fs-k8s-test-image-project.err)"
+    no "the K8S_PROJECT_IMAGES source is announced on stderr (key)" "$(cat "$k8s_test_tmp"/fs-k8s-test-image-project.err)"
 fi
-if grep -qF "$proj_basename=registry.example/project-default:1" /tmp/fs-k8s-test-image-project.err; then
+if grep -qF "$proj_basename=registry.example/project-default:1" "$k8s_test_tmp"/fs-k8s-test-image-project.err; then
     ok "the K8S_PROJECT_IMAGES source is announced on stderr (project)"
 else
-    no "the K8S_PROJECT_IMAGES source is announced on stderr (project)" "$(cat /tmp/fs-k8s-test-image-project.err)"
+    no "the K8S_PROJECT_IMAGES source is announced on stderr (project)" "$(cat "$k8s_test_tmp"/fs-k8s-test-image-project.err)"
 fi
-rm -f /tmp/fs-k8s-test-image-project.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-image-project.err
 
 # T4 (R4): K8S_IMAGE becomes optional once a project entry covers this
 # project, but stays required (unchanged message) for a plain run.
@@ -15614,13 +15697,13 @@ printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$no_k8s_image_with_project_dir/p
 chmod 600 "$no_k8s_image_with_project_dir/pi.env"
 if FORK_SANDBOX_CONFIG_DIR="$no_k8s_image_with_project_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-no-k8s-image.err; then
+    "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-no-k8s-image.err; then
     ok "no K8S_IMAGE is fine when a K8S_PROJECT_IMAGES entry covers this project"
 else
     no "no K8S_IMAGE is fine when a K8S_PROJECT_IMAGES entry covers this project" \
-        "$(cat /tmp/fs-k8s-test-no-k8s-image.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-no-k8s-image.err)"
 fi
-rm -f /tmp/fs-k8s-test-no-k8s-image.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-no-k8s-image.err
 no_k8s_image_dir="$(newdir)"; tmpdirs+=("$no_k8s_image_dir")
 cat > "$no_k8s_image_dir/k8s.env" <<'CONF'
 K8S_CONTEXT=test-context
@@ -15681,21 +15764,21 @@ digest_ref="registry.example/you/fork-sandbox@sha256:$(printf 'a%.0s' {1..64})"
 digest_image_out="$(newdir)/digest-image.yaml"; tmpdirs+=("$(dirname "$digest_image_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image "$digest_ref" \
-    "$proj_dir" "$handoff_file" > "$digest_image_out" 2>/tmp/fs-k8s-test-digest-image.err; then
+    "$proj_dir" "$handoff_file" > "$digest_image_out" 2>"$k8s_test_tmp"/fs-k8s-test-digest-image.err; then
     ok "--image accepts a digest ref"
 else
-    no "--image accepts a digest ref" "$(cat /tmp/fs-k8s-test-digest-image.err)"
+    no "--image accepts a digest ref" "$(cat "$k8s_test_tmp"/fs-k8s-test-digest-image.err)"
 fi
-rm -f /tmp/fs-k8s-test-digest-image.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-digest-image.err
 localhost_image_out="$(newdir)/localhost-image.yaml"; tmpdirs+=("$(dirname "$localhost_image_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --image localhost:5000/you/fork-sandbox:1 \
-    "$proj_dir" "$handoff_file" > "$localhost_image_out" 2>/tmp/fs-k8s-test-localhost-image.err; then
+    "$proj_dir" "$handoff_file" > "$localhost_image_out" 2>"$k8s_test_tmp"/fs-k8s-test-localhost-image.err; then
     ok "--image accepts a localhost:PORT ref"
 else
-    no "--image accepts a localhost:PORT ref" "$(cat /tmp/fs-k8s-test-localhost-image.err)"
+    no "--image accepts a localhost:PORT ref" "$(cat "$k8s_test_tmp"/fs-k8s-test-localhost-image.err)"
 fi
-rm -f /tmp/fs-k8s-test-localhost-image.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-localhost-image.err
 
 printf '\n== no jq variable named after a jq keyword ==\n'
 # jq 1.7 and older reject `$label` (and every other keyword) as a variable
@@ -15901,13 +15984,13 @@ svc_refuses() {
 svc_nosvc_out="$(newdir)/svc-nosvc.yaml"; tmpdirs+=("$(dirname "$svc_nosvc_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-none --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$svc_nosvc_out" 2>/tmp/fs-k8s-test-svc-none.err; then
+    "$proj_dir" "$handoff_file" > "$svc_nosvc_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-none.err; then
     ok "submit --dry-run with no services spec exits 0"
 else
-    no "submit --dry-run with no services spec exits 0" "$(cat /tmp/fs-k8s-test-svc-none.err)"
+    no "submit --dry-run with no services spec exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-none.err)"
 fi
-if [[ -s /tmp/fs-k8s-test-svc-none.err ]]; then
-    no "no services spec: nothing warns on stderr" "$(cat /tmp/fs-k8s-test-svc-none.err)"
+if [[ -s "$k8s_test_tmp"/fs-k8s-test-svc-none.err ]]; then
+    no "no services spec: nothing warns on stderr" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-none.err)"
 else
     ok "no services spec: nothing warns on stderr"
 fi
@@ -15944,18 +16027,18 @@ sandboxEnv:
 svc1_out="$(newdir)/svc1.yaml"; tmpdirs+=("$(dirname "$svc1_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc1 --model moonshotai/kimi-k3 \
-    "$svc1_dir" "$handoff_file" > "$svc1_out" 2>/tmp/fs-k8s-test-svc1.err; then
+    "$svc1_dir" "$handoff_file" > "$svc1_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc1.err; then
     ok "submit --dry-run with a valid one-service spec exits 0"
 else
-    no "submit --dry-run with a valid one-service spec exits 0" "$(cat /tmp/fs-k8s-test-svc1.err)"
+    no "submit --dry-run with a valid one-service spec exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc1.err)"
 fi
 svc1_off_out="$(newdir)/svc1-off.yaml"; tmpdirs+=("$(dirname "$svc1_off_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run --no-services \
     --branch fs-k8s-test-svc1-off --model moonshotai/kimi-k3 \
-    "$svc1_dir" "$handoff_file" > "$svc1_off_out" 2>/tmp/fs-k8s-test-svc1-off.err; then
+    "$svc1_dir" "$handoff_file" > "$svc1_off_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc1-off.err; then
     ok "--no-services accepts a repo with a services spec"
 else
-    no "--no-services accepts a repo with a services spec" "$(cat /tmp/fs-k8s-test-svc1-off.err)"
+    no "--no-services accepts a repo with a services spec" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc1-off.err)"
 fi
 check "--no-services leaves only the egress-gate init container" 1 "$(svc_initcontainers_count "$svc1_off_out")"
 if grep -qF -- '- name: postgres' "$svc1_off_out"; then
@@ -16076,10 +16159,10 @@ services:
 svc2_out="$(newdir)/svc2.yaml"; tmpdirs+=("$(dirname "$svc2_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc2 --model moonshotai/kimi-k3 \
-    "$svc2_dir" "$handoff_file" > "$svc2_out" 2>/tmp/fs-k8s-test-svc2.err; then
+    "$svc2_dir" "$handoff_file" > "$svc2_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc2.err; then
     ok "submit --dry-run with a valid two-service spec exits 0"
 else
-    no "submit --dry-run with a valid two-service spec exits 0" "$(cat /tmp/fs-k8s-test-svc2.err)"
+    no "submit --dry-run with a valid two-service spec exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc2.err)"
 fi
 check "two-service spec: initContainers has exactly three entries (egress-gate, a, b)" \
     3 "$(svc_initcontainers_count "$svc2_out")"
@@ -16120,10 +16203,10 @@ services:
 svc_cap_out="$(newdir)/svc-cap.yaml"; tmpdirs+=("$(dirname "$svc_cap_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-cap --model moonshotai/kimi-k3 \
-    "$svc_cap_dir" "$handoff_file" > "$svc_cap_out" 2>/tmp/fs-k8s-test-svc-cap.err; then
+    "$svc_cap_dir" "$handoff_file" > "$svc_cap_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-cap.err; then
     ok "omitted and partial resources render successfully"
 else
-    no "omitted and partial resources render successfully" "$(cat /tmp/fs-k8s-test-svc-cap.err)"
+    no "omitted and partial resources render successfully" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-cap.err)"
 fi
 svc_cap_block="$(awk '/^        - name: capped$/{f=1} f&&/^        - name:/&&!/^        - name: capped$/{exit} f' "$svc_cap_out")"
 svc_partial_block="$(awk '/^        - name: partial$/{f=1} f&&/^        - name:/&&!/^        - name: partial$/{exit} f' "$svc_cap_out")"
@@ -16177,11 +16260,11 @@ services:
 svc_budget_render_out="$(newdir)/svc-budget-render.yaml"; tmpdirs+=("$(dirname "$svc_budget_render_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-budget-render --model moonshotai/kimi-k3 \
-    "$svc_budget_dir" "$handoff_file" > "$svc_budget_render_out" 2>/tmp/fs-k8s-test-svc-budget-render.err; then
+    "$svc_budget_dir" "$handoff_file" > "$svc_budget_render_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-budget-render.err; then
     ok "rendering with an explicit readyWhen.startupSeconds exits 0"
 else
     no "rendering with an explicit readyWhen.startupSeconds exits 0" \
-        "$(cat /tmp/fs-k8s-test-svc-budget-render.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-budget-render.err)"
 fi
 if grep -A1 -F -- '- name: SERVICE_READY_CHECKS' "$svc_budget_render_out" \
     | grep -qF 'value: "postgres:5432:45"'; then
@@ -16238,15 +16321,15 @@ PATH="$svc_budget_stub_dir:$PATH" K8S_STUB_LOG="$svc_budget_log" HOME="$svc_budg
     K8S_STUB_DATE_COUNTER="$svc_budget_date_counter" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-svc-budget --model moonshotai/kimi-k3 --harness pi \
-    "$svc_budget_dir" "$handoff_file" >/tmp/fs-k8s-test-svc-budget.out 2>&1 </dev/null
+    "$svc_budget_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-svc-budget.out 2>&1 </dev/null
 svc_budget_rc=$?
-if (( svc_budget_rc != 0 )) && grep -q 'created no pod within 225s' /tmp/fs-k8s-test-svc-budget.out; then
+if (( svc_budget_rc != 0 )) && grep -q 'created no pod within 225s' "$k8s_test_tmp"/fs-k8s-test-svc-budget.out; then
     ok "pod-ready budget is 180s base + the service's own 45s readyWhen window (225s)"
 else
     no "pod-ready budget is 180s base + the service's own 45s readyWhen window (225s)" \
-        "rc=$svc_budget_rc out=$(cat /tmp/fs-k8s-test-svc-budget.out)"
+        "rc=$svc_budget_rc out=$(cat "$k8s_test_tmp"/fs-k8s-test-svc-budget.out)"
 fi
-rm -f /tmp/fs-k8s-test-svc-budget.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-svc-budget.out
 
 printf '\n== per-run services: submit'"'"'s timeout diagnostics name the unready container ==\n'
 # Acceptance "On timeout, submit's error names the unready container(s),
@@ -16315,9 +16398,9 @@ svc_diag_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$svc_diag_log")")
 PATH="$svc_diag_stub_dir:$PATH" K8S_STUB_LOG="$svc_diag_log" HOME="$svc_diag_home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-svc-diag --model moonshotai/kimi-k3 --harness pi \
-    "$svc_diag_dir" "$handoff_file" >/tmp/fs-k8s-test-svc-diag.out 2>&1 </dev/null
+    "$svc_diag_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-svc-diag.out 2>&1 </dev/null
 svc_diag_rc=$?
-svc_diag_out="$(cat /tmp/fs-k8s-test-svc-diag.out)"
+svc_diag_out="$(cat "$k8s_test_tmp"/fs-k8s-test-svc-diag.out)"
 if (( svc_diag_rc != 0 )) && [[ "$svc_diag_out" == *"postgres"* ]]; then
     ok "timeout diagnostics name the unready container"
 else
@@ -16360,7 +16443,7 @@ if [[ "$svc_diag_out" != *"egress-gate: restarts="* && "$svc_diag_out" != *"agen
 else
     no "timeout diagnostics do not name containers that are already ready" "$svc_diag_out"
 fi
-rm -f /tmp/fs-k8s-test-svc-diag.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-svc-diag.out
 
 printf '\n== per-run services: timeout diagnostics never print the agent'"'"'s own log ==\n'
 # The agent container is the one place --context-secret and the claude-token
@@ -16415,9 +16498,9 @@ agent_diag_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$agent_diag_log")"
 PATH="$agent_diag_stub_dir:$PATH" K8S_STUB_LOG="$agent_diag_log" HOME="$agent_diag_home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-agent-diag --model moonshotai/kimi-k3 --harness pi \
-    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-agent-diag.out 2>&1 </dev/null
+    "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-agent-diag.out 2>&1 </dev/null
 agent_diag_rc=$?
-agent_diag_out="$(cat /tmp/fs-k8s-test-agent-diag.out)"
+agent_diag_out="$(cat "$k8s_test_tmp"/fs-k8s-test-agent-diag.out)"
 if [[ "$agent_diag_out" != *"leaked-context-secret-marker-should-never-print"* ]]; then
     ok "timeout diagnostics never print the agent container's raw log"
 else
@@ -16435,7 +16518,7 @@ if [[ "$agent_diag_out" == *"log tail omitted"* ]]; then
 else
     no "timeout diagnostics explain why the agent's log tail is omitted" "$agent_diag_out"
 fi
-rm -f /tmp/fs-k8s-test-agent-diag.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-agent-diag.out
 
 printf '\n== per-run services: timeout diagnostics tail a sidecar the checker, not kubelet, knows failed ==\n'
 # A service sidecar carries no readinessProbe of its own (a kubelet
@@ -16510,9 +16593,9 @@ sidecar_diag_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$sidecar_diag_lo
 PATH="$sidecar_diag_stub_dir:$PATH" K8S_STUB_LOG="$sidecar_diag_log" HOME="$sidecar_diag_home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-sidecar-diag --model moonshotai/kimi-k3 --harness pi \
-    "$sidecar_diag_dir" "$handoff_file" >/tmp/fs-k8s-test-sidecar-diag.out 2>&1 </dev/null
+    "$sidecar_diag_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-sidecar-diag.out 2>&1 </dev/null
 sidecar_diag_rc=$?
-sidecar_diag_out="$(cat /tmp/fs-k8s-test-sidecar-diag.out)"
+sidecar_diag_out="$(cat "$k8s_test_tmp"/fs-k8s-test-sidecar-diag.out)"
 if (( sidecar_diag_rc != 0 )) && [[ "$sidecar_diag_out" == *"service-ready"* ]]; then
     ok "timeout diagnostics name the failed service-ready checker"
 else
@@ -16538,7 +16621,7 @@ if [[ "$sidecar_diag_out" == *"previous log tail (kubectl logs"*"--previous)"* ]
 else
     no "timeout diagnostics also tail the previous log for a restarted ready-but-broken sidecar" "$sidecar_diag_out"
 fi
-rm -f /tmp/fs-k8s-test-sidecar-diag.out
+rm -f "$k8s_test_tmp"/fs-k8s-test-sidecar-diag.out
 
 waiting_diag_out="$(PATH="$sidecar_diag_stub_dir:$PATH" K8S_STUB_WAITING=1 \
     K8S_STUB_LOG="$sidecar_diag_log" HOME="$sidecar_diag_home" \
@@ -16567,6 +16650,7 @@ fi
 
 printf '\n== per-run services: --services-trust-ref gates the spec like the local hook ==\n'
 svc_trust_dir="$(mktemp -d "$HOME/src/fs-k8s-svc-trust-test.XXXXXX")"; tmpdirs+=("$svc_trust_dir")
+realpath "$svc_trust_dir" >> "$k8s_test_src_projects"
 (
     cd "$svc_trust_dir" \
         && git init -q . \
@@ -16586,7 +16670,7 @@ svc_trust_a_out="$(newdir)/svc-trust-a.yaml"; tmpdirs+=("$(dirname "$svc_trust_a
 FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-svc-trust-a --model moonshotai/kimi-k3 \
     --checkout "$svc_trust_unchanged_sha" --services-trust-ref "$svc_trust_tag" \
-    "$svc_trust_dir" "$handoff_file" > "$svc_trust_a_out" 2>/tmp/fs-k8s-test-svc-trust-a.err
+    "$svc_trust_dir" "$handoff_file" > "$svc_trust_a_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-trust-a.err
 check "--services-trust-ref, unchanged relative to it: services stay enabled" \
     2 "$(svc_initcontainers_count "$svc_trust_a_out")"
 
@@ -16603,28 +16687,28 @@ svc_trust_b_out="$(newdir)/svc-trust-b.yaml"; tmpdirs+=("$(dirname "$svc_trust_b
 FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-svc-trust-b --model moonshotai/kimi-k3 \
     --checkout "$svc_trust_changed_sha" --services-trust-ref "$svc_trust_tag" \
-    "$svc_trust_dir" "$handoff_file" > "$svc_trust_b_out" 2>/tmp/fs-k8s-test-svc-trust-b.err
+    "$svc_trust_dir" "$handoff_file" > "$svc_trust_b_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-trust-b.err
 check "--services-trust-ref, changed relative to it: services disabled" \
     1 "$(svc_initcontainers_count "$svc_trust_b_out")"
-if grep -qF 'relative to the trusted' /tmp/fs-k8s-test-svc-trust-b.err; then
+if grep -qF 'relative to the trusted' "$k8s_test_tmp"/fs-k8s-test-svc-trust-b.err; then
     ok "--services-trust-ref, changed relative to it: warns naming the trust gate"
 else
     no "--services-trust-ref, changed relative to it: warns naming the trust gate" \
-        "$(cat /tmp/fs-k8s-test-svc-trust-b.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-trust-b.err)"
 fi
 
 svc_trust_c_out="$(newdir)/svc-trust-c.yaml"; tmpdirs+=("$(dirname "$svc_trust_c_out")")
 FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-svc-trust-c --model moonshotai/kimi-k3 \
     --checkout "$svc_trust_changed_sha" \
-    "$svc_trust_dir" "$handoff_file" > "$svc_trust_c_out" 2>/tmp/fs-k8s-test-svc-trust-c.err
+    "$svc_trust_dir" "$handoff_file" > "$svc_trust_c_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-trust-c.err
 check "--checkout with no --services-trust-ref: services disabled" \
     1 "$(svc_initcontainers_count "$svc_trust_c_out")"
-if grep -qF 'unanchored ref' /tmp/fs-k8s-test-svc-trust-c.err; then
+if grep -qF 'unanchored ref' "$k8s_test_tmp"/fs-k8s-test-svc-trust-c.err; then
     ok "--checkout with no --services-trust-ref: warns that the ref is unanchored"
 else
     no "--checkout with no --services-trust-ref: warns that the ref is unanchored" \
-        "$(cat /tmp/fs-k8s-test-svc-trust-c.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-trust-c.err)"
 fi
 
 printf '\n== per-run services: every rejection in the spec names the offending field ==\n'
@@ -16663,10 +16747,10 @@ services:
 ")"
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-name40 --model moonshotai/kimi-k3 \
-    "$svc_name40_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-svc-name40.err; then
+    "$svc_name40_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-svc-name40.err; then
     ok "40-character service name is accepted"
 else
-    no "40-character service name is accepted" "$(cat /tmp/fs-k8s-test-svc-name40.err)"
+    no "40-character service name is accepted" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-name40.err)"
 fi
 svc_refuses "reserved name" \
     "is reserved by the harness's own pod containers" \
@@ -16849,11 +16933,11 @@ svc_envnames_out="$(newdir)/svc-envnames.yaml"; tmpdirs+=("$(dirname "$svc_envna
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-envnames --model moonshotai/kimi-k3 \
     "$svc_envnames_dir" "$handoff_file" > "$svc_envnames_out" \
-    2>/tmp/fs-k8s-test-svc-envnames.err; then
+    2>"$k8s_test_tmp"/fs-k8s-test-svc-envnames.err; then
     ok "services[].env with dotted and dashed names renders"
 else
     no "services[].env with dotted and dashed names renders" \
-        "$(cat /tmp/fs-k8s-test-svc-envnames.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-envnames.err)"
 fi
 for needle in '- name: discovery.type' '- name: bootstrap.memory_lock' \
     '- name: node.store.allow_mmap' '- name: my-env-name'; do
@@ -16922,11 +17006,11 @@ svc_sbx_env_out="$(newdir)/svc-sbx-env.yaml"; tmpdirs+=("$(dirname "$svc_sbx_env
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-sbxenv --model moonshotai/kimi-k3 \
     "$svc_sbx_env_dir" "$handoff_file" > "$svc_sbx_env_out" \
-    2>/tmp/fs-k8s-test-svc-sbxenv.err; then
+    2>"$k8s_test_tmp"/fs-k8s-test-svc-sbxenv.err; then
     ok "sandboxEnv: a shell-safe name still renders"
 else
     no "sandboxEnv: a shell-safe name still renders" \
-        "$(cat /tmp/fs-k8s-test-svc-sbxenv.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-sbxenv.err)"
 fi
 if grep -qF 'DISABLE_SECURITY_PLUGIN=true' "$svc_sbx_env_out"; then
     ok "sandboxEnv: DISABLE_SECURITY_PLUGIN renders into the env file"
@@ -16947,10 +17031,10 @@ printf 'version: 1\nservices:\n  - name: search\n    image: registry.example/roo
 svc_val_out="$(newdir)/svc-validate.out"; tmpdirs+=("$(dirname "$svc_val_out")")
 if env FORK_SANDBOX_CONFIG_DIR="$config_dir" python3 "$svc_parse_py" \
     "$svc_validate_dir/services.yaml" > "$svc_val_out" \
-    2>/tmp/fs-k8s-test-svc-val.err; then
+    2>"$k8s_test_tmp"/fs-k8s-test-svc-val.err; then
     ok "validate-only: a valid spec exits 0"
 else
-    no "validate-only: a valid spec exits 0" "$(cat /tmp/fs-k8s-test-svc-val.err)"
+    no "validate-only: a valid spec exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-val.err)"
 fi
 if grep -qF 'valid services spec' "$svc_val_out"; then
     ok "validate-only: success says the spec is valid"
@@ -17027,11 +17111,11 @@ printf 'version: 1\nservices:\n  - name: a\n    image: registry.example/x:1\n   
     > "$svc_validate_dir/two.yaml"
 if env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_dir" python3 "$svc_parse_py" \
     "$svc_validate_dir/two.yaml" > "$svc_val_cfg_out" \
-    2>/tmp/fs-k8s-test-svc-val-cfg.err; then
+    2>"$k8s_test_tmp"/fs-k8s-test-svc-val-cfg.err; then
     ok "validate-only: two services pass under K8S_SERVICES_MAX=2"
 else
     no "validate-only: two services pass under K8S_SERVICES_MAX=2" \
-        "$(cat /tmp/fs-k8s-test-svc-val-cfg.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-val-cfg.err)"
 fi
 if grep -qF "K8S_SERVICES_MAX=2 (from $svc_val_cfg_dir/k8s.env)" \
         "$svc_val_cfg_out" \
@@ -17081,11 +17165,11 @@ printf 'K8S_SERVICES_MAX=\n' > "$svc_val_cfg_bad/k8s.env"
 svc_val_empty_out="$(newdir)/svc-validate-empty.out"; tmpdirs+=("$(dirname "$svc_val_empty_out")")
 if env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
     "$svc_validate_dir/services.yaml" > "$svc_val_empty_out" \
-    2>/tmp/fs-k8s-test-svc-val-empty.err; then
+    2>"$k8s_test_tmp"/fs-k8s-test-svc-val-empty.err; then
     ok "validate-only: an empty K8S_SERVICES_MAX falls back to the default 8"
 else
     no "validate-only: an empty K8S_SERVICES_MAX falls back to the default 8" \
-        "$(cat /tmp/fs-k8s-test-svc-val-empty.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-val-empty.err)"
 fi
 if grep -qF 'K8S_SERVICES_MAX=8 (built-in default)' "$svc_val_empty_out"; then
     ok "validate-only: the empty-value fallback is reported as the default"
@@ -17273,11 +17357,11 @@ svc_t15_dir="$(svc_mk_repo "$svc_mixed_spec")"
 svc_t15_out="$(newdir)/svc-t15.yaml"; tmpdirs+=("$(dirname "$svc_t15_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-reg-t15 --model moonshotai/kimi-k3 \
-    "$svc_t15_dir" "$handoff_file" > "$svc_t15_out" 2>/tmp/fs-k8s-test-svc-reg-t15.err; then
+    "$svc_t15_dir" "$handoff_file" > "$svc_t15_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-reg-t15.err; then
     ok "neither registry key set: a mixed-registry spec still renders"
 else
     no "neither registry key set: a mixed-registry spec still renders" \
-        "$(cat /tmp/fs-k8s-test-svc-reg-t15.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-reg-t15.err)"
 fi
 for needle in 'image: "redis:7"' 'image: "registry.example/a:1"' \
     'image: "ghcr.io/x/y:1"' "image: \"$svc_digest\""; do
@@ -17327,9 +17411,9 @@ check "a trailing slash on K8S_SERVICE_REGISTRY resolves identically" \
 svc_t16_noservice_out="$(newdir)/svc-t16-none.yaml"; tmpdirs+=("$(dirname "$svc_t16_noservice_out")")
 FORK_SANDBOX_CONFIG_DIR="$svc_prefix_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-reg-none --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > "$svc_t16_noservice_out" 2>/tmp/fs-k8s-test-svc-reg-t16-none.err
+    "$proj_dir" "$handoff_file" > "$svc_t16_noservice_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-reg-t16-none.err
 check "K8S_SERVICE_REGISTRY set, no spec: still silent on stderr" \
-    "" "$(cat /tmp/fs-k8s-test-svc-reg-t16-none.err)"
+    "" "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-reg-t16-none.err)"
 
 # T17 (R17): a './' ref with K8S_SERVICE_REGISTRY unset is refused, naming
 # the field and the key, in submit --dry-run and in validate-only alike.
@@ -17377,11 +17461,11 @@ svc_allow_repo_dir="$(svc_mk_repo "$svc_allow_spec")"
 svc_t18_out="$(newdir)/svc-t18.yaml"; tmpdirs+=("$(dirname "$svc_t18_out")")
 if FORK_SANDBOX_CONFIG_DIR="$svc_allow_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-svc-allow --model moonshotai/kimi-k3 \
-    "$svc_allow_repo_dir" "$handoff_file" > "$svc_t18_out" 2>/tmp/fs-k8s-test-svc-allow.err; then
+    "$svc_allow_repo_dir" "$handoff_file" > "$svc_t18_out" 2>"$k8s_test_tmp"/fs-k8s-test-svc-allow.err; then
     ok "an allowlisted host, the prefix's own host, and a relative ref all accept"
 else
     no "an allowlisted host, the prefix's own host, and a relative ref all accept" \
-        "$(cat /tmp/fs-k8s-test-svc-allow.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-svc-allow.err)"
 fi
 check "the relative ref resolved against the prefix's own host" \
     "yes" "$(grep -qF 'image: "registry.example/rel:1"' "$svc_t18_out" && echo yes || echo no)"
@@ -17482,18 +17566,13 @@ services:
 printf '\n== the durable run log: cmd_submit creates and populates the run directory ==\n'
 # --dry-run contacts nothing, and that includes the host filesystem outside
 # rendering: no run directory may appear under the forks root.
-rundir_dryrun_marker="$(mktemp /var/tmp/claude-scratch/forks/fs-k8s-test-rundir-marker.XXXXXX)"
-FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+rundir_dryrun_mktemps="$(newdir)/mktemp.log"; tmpdirs+=("$(dirname "$rundir_dryrun_mktemps")")
+PATH="$k8s_test_mktemp_shim:$PATH" K8S_TEST_MKTEMP_LOG="$rundir_dryrun_mktemps" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-rundir-dryrun --model moonshotai/kimi-k3 \
-    "$proj_dir" "$handoff_file" > /dev/null 2>/tmp/fs-k8s-test-rundir-dryrun.err
-rundir_dryrun_leak="$(find /var/tmp/claude-scratch/forks -maxdepth 1 \
-    -name 'claude-fork-sandbox.*' -newer "$rundir_dryrun_marker" 2>/dev/null)"
-if [[ -z "$rundir_dryrun_leak" ]]; then
-    ok "submit --dry-run creates no run directory"
-else
-    no "submit --dry-run creates no run directory" "$rundir_dryrun_leak"
-fi
-rm -f "$rundir_dryrun_marker"
+    "$proj_dir" "$handoff_file" > /dev/null 2>"$k8s_test_tmp"/fs-k8s-test-rundir-dryrun.err
+check "submit --dry-run creates no run directory" \
+    "" "$(k8s_test_rundir_mktemps "$rundir_dryrun_mktemps")"
 
 rundir_handoff="$(newdir)/handoff.md"; tmpdirs+=("$(dirname "$rundir_handoff")")
 printf 'do the submit-time task\n\n\n' > "$rundir_handoff"
@@ -18100,17 +18179,17 @@ taskmeta_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$taskmeta_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --branch fs-k8s-flag-test-taskmeta --model moonshotai/kimi-k3 \
     --task-meta '{"kind":"implement"}' \
-    "$k8s_flag_proj" "$k8s_flag_handoff" > "$taskmeta_out" 2>/tmp/fs-k8s-test-taskmeta.err; then
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$taskmeta_out" 2>"$k8s_test_tmp"/fs-k8s-test-taskmeta.err; then
     ok "fork-sandbox.sh --k8s --task-meta is no longer refused"
 else
-    no "fork-sandbox.sh --k8s --task-meta is no longer refused" "$(cat /tmp/fs-k8s-test-taskmeta.err)"
+    no "fork-sandbox.sh --k8s --task-meta is no longer refused" "$(cat "$k8s_test_tmp"/fs-k8s-test-taskmeta.err)"
 fi
-if grep -q "is not yet supported with --k8s" /tmp/fs-k8s-test-taskmeta.err 2>/dev/null; then
-    no "the old --task-meta refusal message is gone" "$(cat /tmp/fs-k8s-test-taskmeta.err)"
+if grep -q "is not yet supported with --k8s" "$k8s_test_tmp"/fs-k8s-test-taskmeta.err 2>/dev/null; then
+    no "the old --task-meta refusal message is gone" "$(cat "$k8s_test_tmp"/fs-k8s-test-taskmeta.err)"
 else
     ok "the old --task-meta refusal message is gone"
 fi
-rm -f /tmp/fs-k8s-test-taskmeta.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-taskmeta.err
 
 taskmeta_direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$taskmeta_direct_out")")
 FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
@@ -19073,17 +19152,17 @@ pm_cfg1="$(pm_base_config_dir)"
 pm_log1="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log1")")
 pm_out1="$(newdir)/pm-install.yaml"; tmpdirs+=("$(dirname "$pm_out1")")
 if PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log1" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
-    "$k8s_sh" install --postmaster --dry-run > "$pm_out1" 2>/tmp/fs-k8s-test-pm1.err; then
+    "$k8s_sh" install --postmaster --dry-run > "$pm_out1" 2>"$k8s_test_tmp"/fs-k8s-test-pm1.err; then
     ok "install --postmaster --dry-run exits 0 on the base fixture"
 else
-    no "install --postmaster --dry-run exits 0 on the base fixture" "$(cat /tmp/fs-k8s-test-pm1.err)"
+    no "install --postmaster --dry-run exits 0 on the base fixture" "$(cat "$k8s_test_tmp"/fs-k8s-test-pm1.err)"
 fi
 check "base fixture dry-run leaves no __ placeholder" "0" "$(grep -c '__' "$pm_out1")"
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$pm_out1" 2>&1)"
     if [[ -z "$out" ]]; then ok "yamllint: base fixture install --postmaster --dry-run"; else no "yamllint: base fixture install --postmaster --dry-run" "$out"; fi
 fi
-rm -f /tmp/fs-k8s-test-pm1.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pm1.err
 
 # 2. storageClassName: absent by default (only the header comment's own
 # mention of the token name, at (cluster default), survives -- the
@@ -19281,19 +19360,19 @@ echo content > "$pm_cfg_handlers/handlers/not-executable.sh"
 chmod 644 "$pm_cfg_handlers/handlers/not-executable.sh"
 pm_log_handlers="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_handlers")")
 pm_out_handlers="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_handlers" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_handlers" \
-    "$k8s_sh" install --postmaster --dry-run 2>/tmp/fs-k8s-test-pm-handlers.err)"
+    "$k8s_sh" install --postmaster --dry-run 2>"$k8s_test_tmp"/fs-k8s-test-pm-handlers.err)"
 pm_handlers_rc=$?
 check "a non-executable handler does not fail the install" "0" "$pm_handlers_rc"
-if grep -q "is not executable; skipping it from the handlers" /tmp/fs-k8s-test-pm-handlers.err; then
+if grep -q "is not executable; skipping it from the handlers" "$k8s_test_tmp"/fs-k8s-test-pm-handlers.err; then
     ok "a non-executable handler is skipped with a warning"
 else
-    no "a non-executable handler is skipped with a warning" "$(cat /tmp/fs-k8s-test-pm-handlers.err)"
+    no "a non-executable handler is skipped with a warning" "$(cat "$k8s_test_tmp"/fs-k8s-test-pm-handlers.err)"
 fi
 check "the executable handler reaches the rendered ConfigMap" \
     "1" "$(grep -c 'executable-hook.sh' <<< "$pm_out_handlers")"
 check "the non-executable handler never reaches the rendered ConfigMap" \
     "0" "$(grep -c 'not-executable.sh' <<< "$pm_out_handlers")"
-rm -f /tmp/fs-k8s-test-pm-handlers.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pm-handlers.err
 
 # 8. The 900 KiB total ConfigMap payload guard.
 pm_cfg_big="$(pm_mk_optdir "$pm_cfg1" personas)"
@@ -19358,13 +19437,13 @@ chmod 600 "$pm_cfg_rootscp/deploy-key" "$pm_cfg_rootscp/pi.env"
 sed -i 's|^K8S_POSTMASTER_REPO_URL=.*|K8S_POSTMASTER_REPO_URL=git@git.example:proj.git|' "$pm_cfg_rootscp/k8s.env"
 pm_log_rootscp="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_rootscp")")
 if PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_rootscp" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_rootscp" \
-    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-rootscp.err; then
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-rootscp.err; then
     ok "root-level scp URL with no explicit project derives a valid name"
 else
     no "root-level scp URL with no explicit project derives a valid name" \
-        "$(cat /tmp/fs-k8s-test-rootscp.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-rootscp.err)"
 fi
-rm -f /tmp/fs-k8s-test-rootscp.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-rootscp.err
 
 # 10c. No fleet.yaml on the laptop refuses before any kubectl call: a
 # cluster postmaster's `deliver --cluster` refuses to start at all
@@ -19407,15 +19486,15 @@ fi
 # 12. The Secret's key file content never appears in stdout or stderr.
 pm_log_secret="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_secret")")
 pm_secret_out="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_secret" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
-    "$k8s_sh" install --postmaster --dry-run 2>/tmp/fs-k8s-test-pm-secret.err)"
+    "$k8s_sh" install --postmaster --dry-run 2>"$k8s_test_tmp"/fs-k8s-test-pm-secret.err)"
 if grep -qF 'dummy-key-material-for-tests-only' <<< "$pm_secret_out" || \
-   grep -qF 'dummy-key-material-for-tests-only' /tmp/fs-k8s-test-pm-secret.err; then
+   grep -qF 'dummy-key-material-for-tests-only' "$k8s_test_tmp"/fs-k8s-test-pm-secret.err; then
     no "the deploy key content never appears in dry-run stdout/stderr" "leaked"
 else
     ok "the deploy key content never appears in dry-run stdout/stderr"
 fi
 if grep -qF 'git.example ssh-ed25519 AAAAtest' <<< "$pm_secret_out" || \
-   grep -qF 'git.example ssh-ed25519 AAAAtest' /tmp/fs-k8s-test-pm-secret.err; then
+   grep -qF 'git.example ssh-ed25519 AAAAtest' "$k8s_test_tmp"/fs-k8s-test-pm-secret.err; then
     no "the known_hosts content never appears in dry-run stdout/stderr" "leaked"
 else
     ok "the known_hosts content never appears in dry-run stdout/stderr"
@@ -19425,7 +19504,7 @@ if grep -qF '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- 
 else
     no "the dry-run prints the Secret placeholder line instead of its content" "$pm_secret_out"
 fi
-rm -f /tmp/fs-k8s-test-pm-secret.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pm-secret.err
 
 # 13. FORK_SANDBOX_K8S_PLATFORM set to a non-generic plugin warns but does
 # not refuse: the postmaster pod always resolves the generic plugin, so a
@@ -19441,39 +19520,39 @@ chmod +x "$pm_platform_dir/fork-sandbox-k8s-platform-some-other-plugin"
 pm_log_platform="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_platform")")
 if PATH="$pm_platform_dir:$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_platform" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
     FORK_SANDBOX_K8S_PLATFORM=some-other-plugin \
-    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-pm-platform.err; then
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-pm-platform.err; then
     ok "install --postmaster still succeeds with a non-generic FORK_SANDBOX_K8S_PLATFORM"
 else
     no "install --postmaster still succeeds with a non-generic FORK_SANDBOX_K8S_PLATFORM" \
-        "$(cat /tmp/fs-k8s-test-pm-platform.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-pm-platform.err)"
 fi
-if grep -qF "FORK_SANDBOX_K8S_PLATFORM='some-other-plugin' is set" /tmp/fs-k8s-test-pm-platform.err; then
+if grep -qF "FORK_SANDBOX_K8S_PLATFORM='some-other-plugin' is set" "$k8s_test_tmp"/fs-k8s-test-pm-platform.err; then
     ok "a non-generic FORK_SANDBOX_K8S_PLATFORM warns on stderr"
 else
-    no "a non-generic FORK_SANDBOX_K8S_PLATFORM warns on stderr" "$(cat /tmp/fs-k8s-test-pm-platform.err)"
+    no "a non-generic FORK_SANDBOX_K8S_PLATFORM warns on stderr" "$(cat "$k8s_test_tmp"/fs-k8s-test-pm-platform.err)"
 fi
-rm -f /tmp/fs-k8s-test-pm-platform.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pm-platform.err
 
 pm_log_platform_unset="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_platform_unset")")
 PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_platform_unset" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
-    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-pm-platform-unset.err
-if grep -qF "FORK_SANDBOX_K8S_PLATFORM" /tmp/fs-k8s-test-pm-platform-unset.err; then
-    no "no warning when FORK_SANDBOX_K8S_PLATFORM is unset" "$(cat /tmp/fs-k8s-test-pm-platform-unset.err)"
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-pm-platform-unset.err
+if grep -qF "FORK_SANDBOX_K8S_PLATFORM" "$k8s_test_tmp"/fs-k8s-test-pm-platform-unset.err; then
+    no "no warning when FORK_SANDBOX_K8S_PLATFORM is unset" "$(cat "$k8s_test_tmp"/fs-k8s-test-pm-platform-unset.err)"
 else
     ok "no warning when FORK_SANDBOX_K8S_PLATFORM is unset"
 fi
-rm -f /tmp/fs-k8s-test-pm-platform-unset.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pm-platform-unset.err
 
 pm_log_platform_generic="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_platform_generic")")
 PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_platform_generic" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
     FORK_SANDBOX_K8S_PLATFORM=generic \
-    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-pm-platform-generic.err
-if grep -qF "FORK_SANDBOX_K8S_PLATFORM" /tmp/fs-k8s-test-pm-platform-generic.err; then
-    no "no warning when FORK_SANDBOX_K8S_PLATFORM=generic" "$(cat /tmp/fs-k8s-test-pm-platform-generic.err)"
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-pm-platform-generic.err
+if grep -qF "FORK_SANDBOX_K8S_PLATFORM" "$k8s_test_tmp"/fs-k8s-test-pm-platform-generic.err; then
+    no "no warning when FORK_SANDBOX_K8S_PLATFORM=generic" "$(cat "$k8s_test_tmp"/fs-k8s-test-pm-platform-generic.err)"
 else
     ok "no warning when FORK_SANDBOX_K8S_PLATFORM=generic"
 fi
-rm -f /tmp/fs-k8s-test-pm-platform-generic.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-pm-platform-generic.err
 
 # 14. The mail API: deployed beside the postmaster only when
 # K8S_MAIL_API_TOKENS_FILE is set; the operator list; the install-time
@@ -20688,12 +20767,12 @@ rd_pi_dry_out="$(newdir)/rd-pi-dry.yaml"; tmpdirs+=("$(dirname "$rd_pi_dry_out")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-rd-pi-dry --harness pi --model z-ai/glm-4.6 \
     --run-dir "$rd_pi_dry" "$proj_dir" "$handoff_file" \
-    > "$rd_pi_dry_out" 2>/tmp/fs-k8s-test-rd-pi-dry.err; then
+    > "$rd_pi_dry_out" 2>"$k8s_test_tmp"/fs-k8s-test-rd-pi-dry.err; then
     ok "submit --dry-run --run-dir (all-pi pipeline.json) exits 0"
 else
-    no "submit --dry-run --run-dir (all-pi pipeline.json) exits 0" "$(cat /tmp/fs-k8s-test-rd-pi-dry.err)"
+    no "submit --dry-run --run-dir (all-pi pipeline.json) exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-rd-pi-dry.err)"
 fi
-rm -f /tmp/fs-k8s-test-rd-pi-dry.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-rd-pi-dry.err
 if grep -qF "mountPath: $rd_pi_dry" "$rd_pi_dry_out" && grep -q 'name: RUN_DIR' "$rd_pi_dry_out" \
     && grep -qF "value: \"$rd_pi_dry\"" "$rd_pi_dry_out"; then
     ok "submit --dry-run --run-dir mounts an emptyDir at the run dir's own path and sets RUN_DIR"
@@ -20713,13 +20792,13 @@ rd_claude_dry_out="$(newdir)/rd-claude-dry.yaml"; tmpdirs+=("$(dirname "$rd_clau
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-rd-claude-dry --harness pi --model z-ai/glm-4.6 \
     --run-dir "$rd_claude_dry" "$proj_dir" "$handoff_file" \
-    > "$rd_claude_dry_out" 2>/tmp/fs-k8s-test-rd-claude-dry.err; then
+    > "$rd_claude_dry_out" 2>"$k8s_test_tmp"/fs-k8s-test-rd-claude-dry.err; then
     ok "submit --dry-run --run-dir (a claude seat in pipeline.json, --harness pi) exits 0"
 else
     no "submit --dry-run --run-dir (a claude seat in pipeline.json, --harness pi) exits 0" \
-        "$(cat /tmp/fs-k8s-test-rd-claude-dry.err)"
+        "$(cat "$k8s_test_tmp"/fs-k8s-test-rd-claude-dry.err)"
 fi
-rm -f /tmp/fs-k8s-test-rd-claude-dry.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-rd-claude-dry.err
 if grep -q 'claude-token' "$rd_claude_dry_out" && grep -q 'CLAUDE_PROXY_BASE_URL' "$rd_claude_dry_out"; then
     ok "submit --dry-run --run-dir with any claude seat in pipeline.json creates the claude token Secret and CLAUDE_PROXY_BASE_URL, even with --harness pi"
 else
@@ -20987,8 +21066,9 @@ fi
 rdlive_dir="$(rd_make_fixture pi)"; tmpdirs+=("$rdlive_dir")
 rdlive_log="$(newdir)/kubectl.log"; rdlive_out="$(newdir)/rdlive-out.txt"
 tmpdirs+=("$(dirname "$rdlive_log")" "$(dirname "$rdlive_out")")
-rdlive_before="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
-if HOME="$k8s_test_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rdlive_log" \
+rdlive_mktemps="$(newdir)/mktemp.log"; tmpdirs+=("$(dirname "$rdlive_mktemps")")
+if HOME="$k8s_test_home" PATH="$k8s_test_mktemp_shim:$runstub_dir:$PATH" K8S_STUB_LOG="$rdlive_log" \
+    K8S_TEST_MKTEMP_LOG="$rdlive_mktemps" \
     K8S_STUB_BASE_SHA="$(git -C "$proj_dir" rev-parse HEAD)" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" \
     "$k8s_sh" submit --branch fs-k8s-test-rdlive --harness pi --model z-ai/glm-4.6 \
@@ -20997,8 +21077,8 @@ if HOME="$k8s_test_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rdlive_log" \
 else
     no "submit --run-dir (valid, live) exits 0" "$(cat "$rdlive_out")"
 fi
-rdlive_after="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
-check "submit --run-dir creates no fresh mktemp'd run directory" "$rdlive_before" "$rdlive_after"
+check "submit --run-dir creates no fresh mktemp'd run directory" \
+    "" "$(k8s_test_rundir_mktemps "$rdlive_mktemps")"
 if [[ -f "$rdlive_dir/run.env" ]] && grep -qx 'RUNNER=1' "$rdlive_dir/run.env"; then
     ok "submit --run-dir writes run.env with RUNNER=1 into the staged directory itself"
 else
@@ -21580,13 +21660,13 @@ assert "Infinity" not in text and "NaN" not in text, "non-finite bareword leaked
 doc = json.loads(text)
 assert doc.get("cost_usd") is None, "cost_usd was not sanitized: " + repr(doc.get("cost_usd"))
 assert doc.get("total_cost_usd") == 0.25, "total_cost_usd was wrongly touched: " + repr(doc.get("total_cost_usd"))
-' "$rdcol10_run_dir/summary.json" 2>/tmp/fs-k8s-rdcol10.err; then
+' "$rdcol10_run_dir/summary.json" 2>"$k8s_test_tmp"/fs-k8s-rdcol10.err; then
     ok "collect nulls out a non-finite pod-reported cost_usd rather than passing it through"
 else
     no "collect nulls out a non-finite pod-reported cost_usd rather than passing it through" \
-        "$(cat "$rdcol10_run_dir/summary.json" 2>/dev/null) $(cat /tmp/fs-k8s-rdcol10.err 2>/dev/null)"
+        "$(cat "$rdcol10_run_dir/summary.json" 2>/dev/null) $(cat "$k8s_test_tmp"/fs-k8s-rdcol10.err 2>/dev/null)"
 fi
-rm -f /tmp/fs-k8s-rdcol10.err
+rm -f "$k8s_test_tmp"/fs-k8s-rdcol10.err
 
 printf '\n== fork-sandbox-k8s.sh collect + fork-sandbox-status.sh: a composed run shaped like a real cluster run ==\n'
 # Items 1-4, 9 and 10 of the live-cluster-run review, all against one
@@ -22297,9 +22377,10 @@ chmod +x "$walk_scripts/fork-sandbox-k8s.sh"
 walk_missing_scripts="$(newdir)/scripts-missing-leg"
 cp -r "$walk_scripts" "$walk_missing_scripts"
 rm -f "$walk_missing_scripts/fork-sandbox-k8s-leg.sh"
-walk_missing_rundirs_before="$(find "$k8s_test_forks_root" -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
+walk_missing_mktemps="$(newdir)/mktemp.log"
 walk_missing_out="$(newdir)/missing-leg-out.txt"
 if HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+    PATH="$k8s_test_mktemp_shim:$PATH" K8S_TEST_MKTEMP_LOG="$walk_missing_mktemps" \
     FORK_SANDBOX_PRESETS_DIR="$walk_presets_dir" \
     "$walk_missing_scripts/fork-sandbox.sh" --preset walk --k8s \
     "$walk_proj" "$walk_handoff" > "$walk_missing_out" 2>&1; then
@@ -22311,9 +22392,8 @@ else
     no "a --k8s composed dispatch missing a staged pod script is refused by name" \
         "$(cat "$walk_missing_out")"
 fi
-walk_missing_rundirs_after="$(find "$k8s_test_forks_root" -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
 check "...and creates no run directory" \
-    "$walk_missing_rundirs_before" "$walk_missing_rundirs_after"
+    "" "$(k8s_test_rundir_mktemps "$walk_missing_mktemps")"
 
 # A fixture claude credential and a real copy of the lib, for the pod side's
 # claude_pod_credentials and rd_block_file's own `source "$mounts_dir/lib.sh"`.
@@ -23017,12 +23097,12 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-split-shape --harness pi --model z-ai/glm-4.6 \
     --context-secret preview-ctx \
     --run-dir "$split_fixture" "$proj_dir" "$handoff_file" \
-    > "$split_out" 2>/tmp/fs-k8s-test-split.err; then
+    > "$split_out" 2>"$k8s_test_tmp"/fs-k8s-test-split.err; then
     ok "submit --dry-run --run-dir (container-split shape) exits 0"
 else
-    no "submit --dry-run --run-dir (container-split shape) exits 0" "$(cat /tmp/fs-k8s-test-split.err)"
+    no "submit --dry-run --run-dir (container-split shape) exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-split.err)"
 fi
-rm -f /tmp/fs-k8s-test-split.err
+rm -f "$k8s_test_tmp"/fs-k8s-test-split.err
 if python3 -c 'import yaml' 2>/dev/null; then
     split_shape="$(python3 - "$split_out" "$split_fixture" <<'PY'
 import sys, yaml
