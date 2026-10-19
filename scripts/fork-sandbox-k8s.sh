@@ -890,9 +890,9 @@
 #                         survive one -- set the key instead). Optional;
 #                         default to 10, 10, 20Gi, 20 and 40Gi. pods must be
 #                         a positive integer, the cpu keys a Kubernetes
-#                         cpu quantity (4, 0.5, 500m), the memory keys an
-#                         integer with an optional suffix (512Mi, 20Gi,
-#                         20G). A claude seat is two pods (the agent and
+#                         cpu quantity (4, 0.5, 500m), the memory keys a
+#                         number with an optional suffix, required after a
+#                         fraction (512Mi, 1.5Gi, 20G). A claude seat is two pods (the agent and
 #                         its per-run claude-proxy), so raise K8S_QUOTA_PODS
 #                         for concurrent claude runs. A malformed value is
 #                         refused by install before anything is applied.
@@ -926,8 +926,9 @@
 #                         container, the claude-proxy pods and the
 #                         postmaster are untouched. The cpu keys take a
 #                         Kubernetes cpu quantity (2, 0.5, 500m), the memory
-#                         and storage keys take an integer with an optional
-#                         suffix (512Mi, 6Gi, 6G); zero is refused except
+#                         and storage keys take a number with an optional
+#                         suffix, required after a fraction (512Mi, 1.5Gi,
+#                         6G); zero is refused except
 #                         for the storage request disable value. Refused,
 #                         naming the key, before anything is applied: a
 #                         malformed value, a request above its limit, a
@@ -1496,8 +1497,9 @@ k8s_quantity_value() {
             else if (v ~ /^[0-9]+(\.[0-9]+)?$/) { n = v * 1000 }
             else exit
         } else {
-            if (v !~ /^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$/) exit
-            s = v; sub(/^[0-9]+/, "", s); sub(/[^0-9].*$/, "", v)
+            # A fraction needs a suffix: a bare "1.5" is millibytes to Kubernetes.
+            if (v !~ /^[0-9]+$/ && v !~ /^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)$/) exit
+            s = v; sub(/^[0-9]+(\.[0-9]+)?/, "", s); v = substr(v, 1, length(v) - length(s))
             split("Ki Mi Gi Ti Pi Ei k M G T P E", u, " ")
             split("1024 1048576 1073741824 1099511627776 1125899906842624 1152921504606846976 1000 1000000 1000000000 1000000000000 1000000000000000 1000000000000000000", m, " ")
             f = 1
@@ -1524,7 +1526,7 @@ k8s_validate_agent_resources() {
             if [[ "$kind" == cpu ]]; then
                 what="a Kubernetes cpu quantity (2, 0.5 or 500m) greater than zero"
             else
-                what="a Kubernetes memory quantity greater than zero: an integer with an optional binary or decimal suffix (512Mi, 6Gi, 6G)"
+                what="a Kubernetes memory quantity greater than zero: a number with an optional binary or decimal suffix, required after a fraction (512Mi, 1.5Gi, 6G)"
             fi
             if [[ -z "$(k8s_quantity_value "${kind/ephemeral_storage/memory}" "$val")" ]]; then
                 echo "Error: $key in $k8s_env must be $what," >&2
@@ -3911,8 +3913,8 @@ cmd_install() {
                 quota_re='^([0-9]+(\.[0-9]+)?|[0-9]+m)$'
                 quota_what="a Kubernetes cpu quantity (4, 0.5 or 500m)" ;;
             *)
-                quota_re='^[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$'
-                quota_what="an integer with an optional binary or decimal suffix (512Mi, 20Gi, 20G)" ;;
+                quota_re='^([0-9]+|[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E))$'
+                quota_what="a number with an optional binary or decimal suffix, required after a fraction (512Mi, 1.5Gi, 20G)" ;;
         esac
         if [[ ! "$quota_val" =~ $quota_re ]]; then
             echo "Error: $quota_key in $k8s_env must be $quota_what," >&2
@@ -5864,7 +5866,7 @@ k8s_parse_resources_spec() {
             if [[ "$key" == cpu ]]; then
                 echo "Error: $flag '$whole': cpu '$val' is not a Kubernetes cpu quantity (2, 0.5 or 500m) above zero." >&2
             else
-                echo "Error: $flag '$whole': memory '$val' is not a Kubernetes memory quantity (512Mi, 6Gi, 6G) above zero." >&2
+                echo "Error: $flag '$whole': memory '$val' is not a Kubernetes memory quantity (512Mi, 1.5Gi, 6G) above zero." >&2
             fi
             exit 1
         fi

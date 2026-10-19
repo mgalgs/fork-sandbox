@@ -3359,9 +3359,9 @@ column, which is what the manifest has always shipped:
 | --------------------------- | ------- | --------------------------------------- |
 | `K8S_QUOTA_PODS`            | `10`    | positive integer                        |
 | `K8S_QUOTA_REQUESTS_CPU`    | `10`    | cpu quantity: `4`, `0.5`, `500m`        |
-| `K8S_QUOTA_REQUESTS_MEMORY` | `20Gi`  | integer, optional suffix: `512Mi`, `20G` |
+| `K8S_QUOTA_REQUESTS_MEMORY` | `20Gi`  | number, optional suffix: `512Mi`, `1.5Gi`, `20G` |
 | `K8S_QUOTA_LIMITS_CPU`      | `20`    | cpu quantity                            |
-| `K8S_QUOTA_LIMITS_MEMORY`   | `40Gi`  | integer, optional suffix                |
+| `K8S_QUOTA_LIMITS_MEMORY`   | `40Gi`  | number, optional suffix                |
 
 Raise them when concurrent runs outgrow the defaults. A claude seat is two
 pods — the agent and its per-run claude-proxy — so a panel of six claude
@@ -3401,11 +3401,11 @@ container is called `leg`.
 | Key                        | Default                 | Shape                                    |
 | -------------------------- | ----------------------- | ---------------------------------------- |
 | `K8S_AGENT_REQUESTS_CPU`    | unset (see below: the limit, else `LimitRange` `250m`) | cpu quantity: `2`, `0.5`, `500m`    |
-| `K8S_AGENT_REQUESTS_MEMORY` | unset (see below: the limit, else `LimitRange` `512Mi`) | integer, optional suffix: `512Mi`, `6G` |
+| `K8S_AGENT_REQUESTS_MEMORY` | unset (see below: the limit, else `LimitRange` `512Mi`) | number, optional suffix: `512Mi`, `1.5Gi`, `6G` |
 | `K8S_AGENT_LIMITS_CPU`      | unset (`LimitRange`: `1`)    | cpu quantity                        |
-| `K8S_AGENT_LIMITS_MEMORY`   | unset (`LimitRange`: `2Gi`)  | integer, optional suffix            |
-| `K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE` | `1Gi` when neither storage key is set; `0` disables | integer, optional suffix (or `0`) |
-| `K8S_AGENT_LIMITS_EPHEMERAL_STORAGE` | unset (no limit) | integer, optional suffix |
+| `K8S_AGENT_LIMITS_MEMORY`   | unset (`LimitRange`: `2Gi`)  | number, optional suffix            |
+| `K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE` | `1Gi` when neither storage key is set; `0` disables | number, optional suffix (or `0`) |
+| `K8S_AGENT_LIMITS_EPHEMERAL_STORAGE` | unset (no limit) | number, optional suffix |
 | `K8S_AGENT_PRIORITY_CLASS` | unset | existing PriorityClass name (DNS-1123 subdomain) |
 
 `K8S_AGENT_PRIORITY_CLASS` sets `priorityClassName` on every agent Job pod and on separate per-run Claude or Codex proxy Pods. Unset omits the field. Create the PriorityClass in the cluster first; `install` only checks for it and warns if missing.
@@ -3448,7 +3448,7 @@ value); a request above its limit; a limit above
 the `LimitRange` max (4 cpu / 8Gi), which would otherwise surface as a pod
 admission rejection at submit time; and a request above the `LimitRange`
 default limit while its own limit is unset (the pod would get a limit below
-its request). Memory takes integers only (`1536Mi`, not `1.5Gi`).
+its request). A fractional memory or storage value needs a suffix (`1.5Gi`, not `1.5`).
 
 The namespace quota has to leave room for seats at this size.
 `K8S_QUOTA_LIMITS_MEMORY` (default `40Gi`) counts the limits of every pod in

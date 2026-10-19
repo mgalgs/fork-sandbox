@@ -915,6 +915,12 @@ install -m 600 "$config_dir/pi.env" "$quota_one_config_dir/pi.env"
 quota_one_out="$(FORK_SANDBOX_CONFIG_DIR="$quota_one_config_dir" "$k8s_sh" install --dry-run 2>/dev/null | quota_of)"
 check "K8S_QUOTA_PODS alone changes only pods" \
     "${quota_default_expected/pods: \"10\"/pods: \"30\"}" "$quota_one_out"
+quota_frac_config_dir="$(newdir)"; tmpdirs+=("$quota_frac_config_dir")
+{ cat "$config_dir/k8s.env"; printf 'K8S_QUOTA_REQUESTS_MEMORY=12.5Gi\n'; } > "$quota_frac_config_dir/k8s.env"
+install -m 600 "$config_dir/pi.env" "$quota_frac_config_dir/pi.env"
+quota_frac_out="$(FORK_SANDBOX_CONFIG_DIR="$quota_frac_config_dir" "$k8s_sh" install --dry-run 2>/dev/null | quota_of)"
+check "a fractional K8S_QUOTA_REQUESTS_MEMORY with a suffix renders as given" \
+    "${quota_default_expected/requests.memory: 20Gi/requests.memory: 12.5Gi}" "$quota_frac_out"
 
 # A malformed value is refused before anything is applied, naming the key.
 # The stubbed kubectl logs every call; an empty log proves nothing was
@@ -945,7 +951,9 @@ quota_bad_cases=(
     'K8S_QUOTA_REQUESTS_MEMORY|lots'
     'K8S_QUOTA_REQUESTS_MEMORY|20: Gi'
     'K8S_QUOTA_REQUESTS_MEMORY|20Gi|x'
-    'K8S_QUOTA_REQUESTS_MEMORY|1.5Gi'
+    'K8S_QUOTA_REQUESTS_MEMORY|1.5'
+    'K8S_QUOTA_REQUESTS_MEMORY|1.Gi'
+    'K8S_QUOTA_LIMITS_MEMORY|.5Gi'
     'K8S_QUOTA_REQUESTS_MEMORY|20m'
     'K8S_QUOTA_REQUESTS_MEMORY|20Gi'$'\r'
     'K8S_QUOTA_LIMITS_CPU|1m0'
@@ -1337,7 +1345,8 @@ for agent_one in \
     'K8S_AGENT_REQUESTS_CPU=500m|requests|cpu|500m' \
     'K8S_AGENT_REQUESTS_MEMORY=1Gi|requests|memory|1Gi' \
     'K8S_AGENT_LIMITS_CPU=2|limits|cpu|2' \
-    'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi'; do
+    'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi' \
+    'K8S_AGENT_LIMITS_MEMORY=1.5Gi|limits|memory|1.5Gi'; do
     IFS='|' read -r agent_one_kv agent_one_sect agent_one_field agent_one_val <<< "$agent_one"
     agent_one_expected="          resources:
             requests:"
@@ -1406,6 +1415,11 @@ agent_bad_cases=(
     'storage request above limit|K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=2Gi K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=1Gi|K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE|is above K8S_AGENT_LIMITS_EPHEMERAL_STORAGE'
     'bad memory|K8S_AGENT_LIMITS_MEMORY=lots|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
     'GB is not a quantity|K8S_AGENT_LIMITS_MEMORY=6GB|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
+    'bare fraction memory|K8S_AGENT_LIMITS_MEMORY=1.5|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
+    'trailing-dot memory|K8S_AGENT_LIMITS_MEMORY=1.Gi|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
+    'bare fraction storage|K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=2.5|K8S_AGENT_LIMITS_EPHEMERAL_STORAGE|a Kubernetes memory quantity'
+    'fractional memory request above limit|K8S_AGENT_REQUESTS_MEMORY=1.6Gi K8S_AGENT_LIMITS_MEMORY=1536Mi|K8S_AGENT_REQUESTS_MEMORY|is above K8S_AGENT_LIMITS_MEMORY'
+    'fractional memory limit above max|K8S_AGENT_LIMITS_MEMORY=8.5Gi|K8S_AGENT_LIMITS_MEMORY|above the namespace LimitRange max'
     'cpu unit on memory|K8S_AGENT_REQUESTS_MEMORY=500m|K8S_AGENT_REQUESTS_MEMORY|a Kubernetes memory quantity'
     'zero memory|K8S_AGENT_REQUESTS_MEMORY=0|K8S_AGENT_REQUESTS_MEMORY|a Kubernetes memory quantity'
     'quoted memory|K8S_AGENT_LIMITS_MEMORY="6Gi"|K8S_AGENT_LIMITS_MEMORY|a Kubernetes memory quantity'
@@ -1452,7 +1466,10 @@ for agent_ok_kvs in \
     'K8S_AGENT_LIMITS_CPU=4000m' \
     'K8S_AGENT_REQUESTS_CPU=1000m' \
     'K8S_AGENT_REQUESTS_MEMORY=2Gi' \
-    'K8S_AGENT_REQUESTS_MEMORY=6Gi K8S_AGENT_LIMITS_MEMORY=6Gi'; do
+    'K8S_AGENT_REQUESTS_MEMORY=6Gi K8S_AGENT_LIMITS_MEMORY=6Gi' \
+    'K8S_AGENT_REQUESTS_MEMORY=1536Mi K8S_AGENT_LIMITS_MEMORY=1.5Gi' \
+    'K8S_AGENT_LIMITS_MEMORY=7.5Gi' \
+    'K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=0.5Gi K8S_AGENT_LIMITS_EPHEMERAL_STORAGE=2.5G'; do
     read -r -a agent_ok_arr <<< "$agent_ok_kvs"
     if agent_res_render "$(agent_res_cfg "${agent_ok_arr[@]}")" | grep -q '^ *resources:'; then
         ok "accepted: $agent_ok_kvs"
@@ -1731,6 +1748,9 @@ ar_cfg="$(agent_res_cfg K8S_AGENT_REQUESTS_MEMORY=6Gi K8S_AGENT_LIMITS_MEMORY=6G
 check "submit --agent-resources below a k8s.env request sets both: no request above its limit" \
     '{"requests":{"memory":"4Gi","ephemeral-storage":"1Gi"},"limits":{"memory":"4Gi"}}' \
     "$(ar_job "$(ar_submit "$ar_cfg" --agent-resources memory=4Gi 2>/dev/null)")"
+check "submit --agent-resources takes a fractional memory quantity" \
+    '{"requests":{"memory":"1.5Gi","ephemeral-storage":"1Gi"},"limits":{"memory":"1.5Gi"}}' \
+    "$(ar_job "$(ar_submit "$ar_cfg" --agent-resources memory=1.5Gi 2>/dev/null)")"
 check "submit without --agent-resources keeps the base render" \
     '{"requests":{"ephemeral-storage":"1Gi"}}' "$(ar_job "$(ar_submit "$config_dir" 2>/dev/null)")"
 check "run --agent-resources forwards to submit's render" \
@@ -1743,7 +1763,8 @@ for ar_bad in \
     'cpu=2Gi|is not a Kubernetes cpu quantity' \
     'cpu=0|is not a Kubernetes cpu quantity' \
     'cpu=-1|is not a Kubernetes cpu quantity' \
-    'memory=1.5Gi|is not a Kubernetes memory quantity' \
+    'memory=1.5|is not a Kubernetes memory quantity' \
+    'memory=1.Gi|is not a Kubernetes memory quantity' \
     'memory=6GB|is not a Kubernetes memory quantity' \
     'memory=1: 2|is not a Kubernetes memory quantity' \
     'cpu=5|cpu 5 is above the namespace LimitRange max' \
@@ -18436,10 +18457,12 @@ cg_out="$(cg_run --seat-resources core=cpu=4,memory=8Gi 2>/dev/null)"
 check "seat-resources alone is a grant: exit 0" "0" "$?"
 check "seat-resources alone: only the SEAT_RESOURCES= line, value as given" \
     "SEAT_RESOURCES=core=cpu=4,memory=8Gi" "$cg_out"
+check "seat-resources takes a fractional memory quantity" \
+    "SEAT_RESOURCES=core=memory=1.5Gi" "$(cg_run --seat-resources core=memory=1.5Gi 2>/dev/null)"
 for sr_bad in \
     'core=cpu=5|cpu 5 is above the namespace LimitRange max' \
     'core=memory=9Gi|memory 9Gi is above the namespace LimitRange max' \
-    'core=memory=1.5Gi|is not a Kubernetes memory quantity' \
+    'core=memory=1.5|is not a Kubernetes memory quantity' \
     'core=cpu=abc|is not a Kubernetes cpu quantity' \
     'core=gpu=1|only cpu and memory can be set' \
     'core=cpu=1,cpu=2|sets cpu twice' \
@@ -23224,7 +23247,8 @@ for agent_one in \
     'K8S_AGENT_REQUESTS_CPU=500m|requests|cpu|500m' \
     'K8S_AGENT_REQUESTS_MEMORY=1Gi|requests|memory|1Gi' \
     'K8S_AGENT_LIMITS_CPU=2|limits|cpu|2' \
-    'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi'; do
+    'K8S_AGENT_LIMITS_MEMORY=6Gi|limits|memory|6Gi' \
+    'K8S_AGENT_LIMITS_MEMORY=1.5Gi|limits|memory|1.5Gi'; do
     IFS='|' read -r agent_one_kv agent_one_sect agent_one_field agent_one_val <<< "$agent_one"
     comp_one_out="$(comp_res_render "$(agent_res_cfg "$agent_one_kv")")"
     agent_one_expected="          resources:
