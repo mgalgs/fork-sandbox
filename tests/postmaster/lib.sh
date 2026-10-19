@@ -514,6 +514,7 @@ case "\${1:-}" in
         exit 0 ;;
 esac
 printf '%s\n' "\$*" >> "$K8S_WAKE_BIN/rm-calls.log"
+[[ -f "$K8S_WAKE_BIN/rm-rc" ]] && exit "\$(cat "$K8S_WAKE_BIN/rm-rc")"
 exit 0
 STUB
     chmod +x -- "$K8S_WAKE_BIN/fork-sandbox-k8s.sh"

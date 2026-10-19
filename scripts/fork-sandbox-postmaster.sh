@@ -749,6 +749,20 @@
 # removes the file. Without this, a run outliving two rollouts would be
 # declared dead while its Job still ran, and its seat woken a second time.
 #
+# K8S RETENTION. A k8s wake that failed keeps its Job, pods, ConfigMaps,
+# NetworkPolicies and Secrets as evidence (fork-sandbox-k8s.sh's own reap
+# rule), and a retry runs under a new branch, so nothing else ever removes
+# them. pm_k8s_retention_pass does, once a run has been harvested for
+# $FORK_SANDBOX_POSTMASTER_K8S_RETENTION seconds (default 259200 = 3 days;
+# 0 disables): `fork-sandbox-k8s.sh rm --branch <branch>`, recorded in
+# $STATE/k8s-reaped/<run id> and emitted as `k8s-reaped`. It runs at most
+# every $FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY seconds (default 600),
+# and only for a branch this script minted whose `wait --probe` exits 0 or
+# 2 -- never a Job still running (a wait timeout's, say). At most
+# $PM_K8S_REAP_PER_PASS runs are probed per pass. A failed rm is retried
+# next time. Objects of runs the postmaster did not launch are never
+# touched.
+#
 # ROUTE PLAN. A message's routed marker is written before its seats are
 # woken, so a process that dies part-way through a multi-seat message (a
 # pod replaced mid-pass, SIGKILL after the grace period, a set -e exit)
@@ -5904,6 +5918,63 @@ pm_harvest_pass() {
     done
 }
 
+# ---- k8s retention ----
+
+# Only a branch this script mints (pm_spawn_wake) is ever removed: run
+# records are writable from the cluster mail API container.
+PM_K8S_REAP_BRANCH_RE='^sbx-mail-[0-9a-f]{8}-[a-z][a-z0-9-]{0,30}-[0-9]+$'
+# Probes per pass: each may take its full --timeout against a live Job.
+PM_K8S_REAP_PER_PASS=5
+
+pm_require_k8s_retention() {
+    local key raw
+    for key in FORK_SANDBOX_POSTMASTER_K8S_RETENTION FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY; do
+        raw="${!key-}"
+        [[ -z "$raw" || "$raw" =~ ^[0-9]+$ ]] && continue
+        echo "Error: postmaster: \$$key '$raw' is not a non-negative integer (seconds)." >&2
+        return 1
+    done
+}
+
+# See K8S RETENTION in the header.
+pm_k8s_retention_pass() {
+    local retention="${FORK_SANDBOX_POSTMASTER_K8S_RETENTION:-259200}"
+    local every="${FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY:-600}"
+    (( retention > 0 )) || return 0
+    local stamp="$STATE/k8s-retention-last" reaped="$STATE/k8s-reaped" now last
+    now="$(date +%s)"
+    last="$(pm_trim "$(cat -- "$stamp" 2>/dev/null || true)")"
+    [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < every )) && return 0
+    mkdir -p -- "$reaped"
+    printf '%s\n' "$now" > "$stamp"
+    local k8s="${FORK_SANDBOX_POSTMASTER_K8S:-$script_dir/fork-sandbox-k8s.sh}"
+    local f rid branch harvested_at probe_rc tried=0
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ "$rid" =~ $PM_WAKE_EXIT_ID_RE ]] || continue
+        [[ -e "$HARVESTED/$rid" && ! -e "$reaped/$rid" ]] || continue
+        [[ "$(fs_pm_env_get "$f" BACKEND)" == k8s ]] || continue
+        harvested_at="$("$FS_STAT" -c %Y -- "$HARVESTED/$rid" 2>/dev/null)" || continue
+        (( now - harvested_at >= retention )) || continue
+        branch="$(fs_pm_env_get "$f" BRANCH)"
+        if [[ ! "$branch" =~ $PM_K8S_REAP_BRANCH_RE ]]; then
+            : > "$reaped/$rid"
+            continue
+        fi
+        (( tried++ >= PM_K8S_REAP_PER_PASS )) && break
+        # Exit 0 (finished) or 2 (failed or gone) only: 1 is a Job still
+        # running, 4 a cluster that could not be asked.
+        probe_rc=0
+        "$k8s" wait --branch "$branch" --probe --timeout 5 >/dev/null 2>&1 || probe_rc=$?
+        (( probe_rc == 0 || probe_rc == 2 )) || continue
+        if "$k8s" rm --branch "$branch" >/dev/null 2>&1; then
+            : > "$reaped/$rid"
+            pm_event "k8s-reaped run=$rid branch=$branch"
+        fi
+    done
+}
+
 # ---- shutdown drain ----
 
 # True while a k8s wake is still building its run: from spawn until the pod
@@ -6435,6 +6506,7 @@ cmd_deliver() {
     pm_require_k8s_timeout || return 1
     pm_require_fetch_window || return 1
     pm_require_drain_timeout || return 1
+    pm_require_k8s_retention || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1
@@ -6451,6 +6523,7 @@ cmd_deliver() {
         pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
+        pm_k8s_retention_pass
         pm_deferral_pass
         pm_hook_pass "$project"
         return 0
@@ -6465,6 +6538,7 @@ cmd_deliver() {
         pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
+        pm_k8s_retention_pass
         pm_deferral_pass
         pm_hook_pass "$project"
         (( stop )) && break

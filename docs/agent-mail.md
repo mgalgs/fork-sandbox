@@ -971,6 +971,16 @@ next `deliver` pass picks the grant up and dispatches the held trigger. See
 wake gets (default 14400 = 4h); a value that is set but not a positive
 integer fails `deliver` at startup, the same posture as
 `$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`.
+
+A k8s wake that fails leaves its cluster objects in place as evidence. The
+postmaster removes them (`fork-sandbox-k8s.sh rm --branch`) once the run
+has been harvested for `$FORK_SANDBOX_POSTMASTER_K8S_RETENTION` seconds
+(default 259200 = 3 days; `0` keeps them forever), checking at most every
+`$FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY` seconds (default 600). It
+never removes a Job that `wait --probe` reports as still running, nor
+anything from a run it did not launch itself. Each removal emits a
+`k8s-reaped` event.
+
 `$FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline` runs the wake wrapper
 synchronously instead of inside its own detached tmux session — a test
 seam, not an operator setting.
