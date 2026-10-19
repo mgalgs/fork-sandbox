@@ -276,15 +276,39 @@ The verb clones the deploy repo named by `K8S_POSTMASTER_DEPLOY_REPO` in
 `k8s.env`. It sets every `<NAME>_SHA` to the current head of `main` on
 `<NAME>_REPO`, then commits and pushes to the deploy repo's `main`. It
 never force-pushes: if `main` moved meanwhile, the push is refused,
-nothing is deployed, and you run it again. If every pin is already at
-`main`, it says so and pushes nothing. `--dry-run` prints the pin diff
-and pushes nothing.
+nothing is deployed, and you run it again. If nothing changed, it says so
+and pushes nothing. `--dry-run` prints the diff and pushes nothing.
+
+A pin can carry two optional extras:
+
+```
+HOOK_REPO=ssh://git@example.com/you/app.git
+HOOK_BRANCH=dev
+HOOK_SHA=<40-hex sha>
+HOOK_TEMPLATE=scripts/hook-launcher
+HOOK_RENDER_TO=config/hooks/on-harvest.app,config/hooks/on-quiescent.app
+```
+
+- `<NAME>_BRANCH` follows a branch other than `main`.
+- `<NAME>_TEMPLATE` and `<NAME>_RENDER_TO` go together. On every run,
+  `deploy-main` reads the template from `<NAME>_REPO` at the new sha,
+  replaces each `@PIN@` with that sha, and writes the result, with the
+  template's mode, to each comma-separated path in the deploy repo. The
+  rendered files land in the same commit as the `_SHA` line, so a file
+  that embeds a sha cannot fall behind its pin. A rendered file edited by
+  hand is overwritten on the next run. A template with no `@PIN@` is
+  refused.
+
+The laptop running `deploy-main` reads every pinned repo, so the deploy
+repo's CI needs read access only to the repos it clones itself. A repo
+used only for rendering needs no CI credential.
 
 It takes no sha on purpose. It can only deploy what has already merged to
-`main`, so an operator can allow it without a prompt and still review
-every deploy where the code is merged. Git runs with
+the pinned branch, so an operator can allow it without a prompt and still
+review every deploy where the code is merged. Git runs with
 `GIT_ALLOW_PROTOCOL=https:ssh:file`, and every URL must use one of those
-schemes. To roll back to an older sha, edit `pins.env` by hand.
+schemes. To roll back to an older sha, edit `pins.env` and the rendered
+files by hand.
 
 ## The mail API
 

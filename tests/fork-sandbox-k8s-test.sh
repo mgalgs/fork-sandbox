@@ -25671,7 +25671,7 @@ check "deploy-main keeps the REPO lines" "2" "$(git -C "$dm_root/deploy.git" sho
 dm_before="$(dm_commits)"
 dm_run "$dm_cfg"
 check "deploy-main at main: exits 0" "0" "$dm_rc"
-dm_has "deploy-main at main: says so" "$dm_out" "already at main"
+dm_has "deploy-main at main: says so" "$dm_out" "already at the head of its branch"
 check "deploy-main at main: no new commit" "$dm_before" "$(dm_commits)"
 
 dm_run "$dm_cfg" --force
@@ -25720,6 +25720,110 @@ check "deploy-main: a refused push exits 1" "1" "$dm_rc"
 dm_has "deploy-main: a refused push says nothing is deployed" "$dm_out" "nothing is deployed"
 check "deploy-main: a refused push leaves main alone" "$dm_before" "$(dm_commits)"
 rm -f "$dm_root/deploy.git/hooks/pre-receive"
+dm_run "$dm_cfg"   # moves A, which "a 3" left behind
+
+# A pin that follows a branch other than main and renders a template from
+# the pinned sha into the deploy repo. "h" has a stale main and a dev whose
+# template body changes after the deploy repo last rendered it.
+dm_git init -q "$dm_root/h"
+git -C "$dm_root/h" config uploadpack.allowFilter true
+mkdir -p "$dm_root/h/tpl"
+printf '#!/bin/sh\nPIN=@PIN@\necho one\n' > "$dm_root/h/tpl/launch"
+chmod 0755 "$dm_root/h/tpl/launch"
+dm_git -C "$dm_root/h" add tpl/launch
+dm_git -C "$dm_root/h" commit -q -m "h 1"
+dm_h_main="$(git -C "$dm_root/h" rev-parse HEAD)"
+dm_git -C "$dm_root/h" checkout -q -b dev
+dm_h_old="$dm_h_main"
+dm_git -C "$dm_root/seed" pull -q origin main
+mkdir -p "$dm_root/seed/out"
+printf '#!/bin/sh\nPIN=%s\necho one\n' "$dm_h_old" > "$dm_root/seed/out/one"
+printf 'H_REPO=file://%s/h\nH_BRANCH=dev\nH_SHA=%s\nH_TEMPLATE=tpl/launch\nH_RENDER_TO=out/one,out/two\n' \
+    "$dm_root" "$dm_h_old" >> "$dm_root/seed/pins.env"
+dm_git -C "$dm_root/seed" add -A
+dm_git -C "$dm_root/seed" commit -q -m "add H"
+dm_git -C "$dm_root/seed" push -q origin HEAD:main
+printf '#!/bin/sh\nPIN=@PIN@\necho two\n' > "$dm_root/h/tpl/launch"
+dm_git -C "$dm_root/h" commit -q -am "h 2"
+dm_h_new="$(git -C "$dm_root/h" rev-parse HEAD)"
+dm_h_want="$(printf '#!/bin/sh\nPIN=%s\necho two\n_' "$dm_h_new")"
+dm_show() { git -C "$dm_root/deploy.git" show "main:$1"; }
+
+dm_before="$(dm_commits)"
+dm_run "$dm_cfg" --dry-run
+check "deploy-main render --dry-run exits 0" "0" "$dm_rc"
+dm_has "deploy-main render --dry-run shows the new PIN" "$dm_out" "+PIN=$dm_h_new"
+dm_has "deploy-main render --dry-run shows the template's own change" "$dm_out" "+echo two"
+dm_has "deploy-main render --dry-run shows a new output file" "$dm_out" "out/two"
+check "deploy-main render --dry-run pushes nothing" "$dm_before" "$(dm_commits)"
+
+dm_run "$dm_cfg"
+check "deploy-main render exits 0" "0" "$dm_rc"
+check "deploy-main pins H to the head of dev, not main" "$dm_h_new" "$(dm_pin H)"
+check "deploy-main renders the template at the pin into out/one" "$dm_h_want" "$(dm_show out/one; printf _)"
+check "deploy-main renders the same into out/two" "$dm_h_want" "$(dm_show out/two; printf _)"
+check "deploy-main keeps the template's mode" "100755 100755" \
+    "$(git -C "$dm_root/deploy.git" ls-tree main -- out/one out/two | cut -d' ' -f1 | paste -sd' ' -)"
+check "deploy-main's render commit names the pin" "Pin H ${dm_h_new:0:10}" \
+    "$(git -C "$dm_root/deploy.git" log -1 --format=%s main)"
+
+dm_before="$(dm_commits)"
+dm_run "$dm_cfg"
+dm_has "deploy-main with every render current: nothing to deploy" "$dm_out" "nothing to deploy"
+check "deploy-main with every render current: no new commit" "$dm_before" "$(dm_commits)"
+
+# An output edited by hand drifts from the template at an unmoved pin.
+dm_git -C "$dm_root/seed" pull -q origin main
+printf 'stale\n' > "$dm_root/seed/out/two"
+dm_git -C "$dm_root/seed" commit -q -am "hand edit"
+dm_git -C "$dm_root/seed" push -q origin HEAD:main
+dm_run "$dm_cfg"
+check "deploy-main re-renders a drifted output at an unmoved pin" "$dm_h_want" "$(dm_show out/two; printf _)"
+check "deploy-main's re-render commit says so" "Re-render H" \
+    "$(git -C "$dm_root/deploy.git" log -1 --format=%s main)"
+
+# dm_bad_pins <description> <expected error> <sed expr on pins.env>: the
+# edited pins.env is refused and nothing is pushed.
+dm_bad_pins() {
+    dm_git -C "$dm_root/seed" pull -q origin main
+    cp "$dm_root/seed/pins.env" "$dm_root/pins.good"
+    sed -i "$3" "$dm_root/seed/pins.env"
+    dm_git -C "$dm_root/seed" commit -q -am "bad: $1"
+    dm_git -C "$dm_root/seed" push -q origin HEAD:main
+    dm_before="$(dm_commits)"
+    dm_run "$dm_cfg"
+    check "deploy-main refuses $1: exits 1" "1" "$dm_rc"
+    dm_has "deploy-main refuses $1: says why" "$dm_out" "$2"
+    check "deploy-main refuses $1: pushes nothing" "$dm_before" "$(dm_commits)"
+    cp "$dm_root/pins.good" "$dm_root/seed/pins.env"
+    dm_git -C "$dm_root/seed" commit -q -am "restore"
+    dm_git -C "$dm_root/seed" push -q origin HEAD:main
+}
+dm_bad_pins "a template with no RENDER_TO" "set both H_TEMPLATE and H_RENDER_TO" '/^H_RENDER_TO=/d'
+dm_bad_pins "a RENDER_TO with no template" "set both H_TEMPLATE and H_RENDER_TO" '/^H_TEMPLATE=/d'
+dm_bad_pins "a branch that is an option" "H_BRANCH must be a branch name" 's/^H_BRANCH=.*/H_BRANCH=--upload-pack=x/'
+dm_bad_pins "a missing branch" "could not clone nope" 's/^H_BRANCH=.*/H_BRANCH=nope/'
+dm_bad_pins "a template that is not there" "tpl/gone is not a file" 's|^H_TEMPLATE=.*|H_TEMPLATE=tpl/gone|'
+dm_bad_pins "an output outside the repo" "must be a relative path" 's|^H_RENDER_TO=.*|H_RENDER_TO=out/one,../escape|'
+dm_bad_pins "an output inside .git" "must be a relative path" 's|^H_RENDER_TO=.*|H_RENDER_TO=.git/hooks/post-commit|'
+dm_bad_pins "pins.env as an output" "other than pins.env" 's|^H_RENDER_TO=.*|H_RENDER_TO=pins.env|'
+check "deploy-main wrote nothing outside the deploy repo" "0" "$( [[ -e "$dm_root/escape" ]] && echo 1 || echo 0 )"
+
+dm_git -C "$dm_root/seed" pull -q origin main
+ln -s "$dm_root" "$dm_root/seed/link"
+dm_git -C "$dm_root/seed" add link
+dm_git -C "$dm_root/seed" commit -q -m "a symlink out"
+dm_git -C "$dm_root/seed" push -q origin HEAD:main
+dm_bad_pins "an output through a symlink" "passes through a symlink" 's|^H_RENDER_TO=.*|H_RENDER_TO=link/escape|'
+check "deploy-main wrote nothing through the symlink" "0" "$( [[ -e "$dm_root/escape" ]] && echo 1 || echo 0 )"
+
+printf '#!/bin/sh\necho no pin\n' > "$dm_root/h/tpl/launch"
+dm_git -C "$dm_root/h" commit -q -am "h 3"
+dm_before="$(dm_commits)"
+dm_run "$dm_cfg"
+check "deploy-main refuses a template without @PIN@" "1" "$dm_rc"
+dm_has "deploy-main names the template without @PIN@" "$dm_out" "has no @PIN@"
+check "deploy-main pushes nothing for a template without @PIN@" "$dm_before" "$(dm_commits)"
 
 printf '\n== fork-sandbox-k8s.sh peek streams the current legs own transcript ==\n'
 # No live cluster (see this file's own header): a stub kubectl ahead of the

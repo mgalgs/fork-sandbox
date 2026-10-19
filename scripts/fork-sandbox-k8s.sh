@@ -113,11 +113,13 @@
 #
 # deploy-main is the operator's half of a CI-driven deploy: it clones the
 # deploy repo K8S_POSTMASTER_DEPLOY_REPO names, sets every <NAME>_SHA in its
-# pins.env to the current head of `main` on the repo its <NAME>_REPO line
-# names, commits, and pushes to the deploy repo's main, never forced. The
-# deploy repo's CI does the rest. It takes no sha, so it can only deploy
-# what has already merged; --dry-run prints the pin diff and pushes
-# nothing. See docs/cluster-postmaster.md, "Deploying from a deploy repo".
+# pins.env to the current head of <NAME>_BRANCH (default `main`) on the repo
+# its <NAME>_REPO line names, re-renders every file a <NAME>_TEMPLATE /
+# <NAME>_RENDER_TO pair declares from the template at that sha, commits, and
+# pushes to the deploy repo's main, never forced. The deploy repo's CI does
+# the rest. It takes no sha, so it can only deploy what has already merged;
+# --dry-run prints the diff and pushes nothing. See
+# docs/cluster-postmaster.md, "Deploying from a deploy repo".
 #
 # submit renders a Job for one run, applies it, pushes the project's repo
 # into the pod over the same `kubectl exec` channel the work later returns
@@ -5306,6 +5308,47 @@ deploy_url_ok() {
     [[ "$1" =~ ^(https|ssh|file)://[^[:space:]]+$ ]]
 }
 
+# A relative path with no ., .. or empty component, never inside .git.
+deploy_path_ok() {
+    [[ "$1" =~ ^[A-Za-z0-9_.][A-Za-z0-9_./-]*$ && "/$1/" != *//* && \
+        "/$1/" != */./* && "/$1/" != */../* && "$1/" != .git/* ]]
+}
+
+# deploy_render NAME SRC TEMPLATE RENDER_TO SHA WORK: write the template at
+# SRC's HEAD, every @PIN@ replaced by SHA, to each comma-separated RENDER_TO
+# path in WORK/deploy, with the template's mode.
+deploy_render() {
+    local name="$1" src="$2" tpl="$3" to="$4" sha="$5" work="$6"
+    local root mode out dst real
+    deploy_path_ok "$tpl" || deploy_fail "${name}_TEMPLATE must be a relative path, got '$tpl'."
+    mode="$(git -C "$src" ls-tree HEAD -- "$tpl" | cut -d' ' -f1)"
+    [[ "$mode" == 100644 || "$mode" == 100755 ]] || \
+        deploy_fail "${name}_TEMPLATE: $tpl is not a file at ${sha:0:10} of ${name}_REPO."
+    git -C "$src" cat-file blob "HEAD:$tpl" > "$work/template" || \
+        deploy_fail "${name}_TEMPLATE: could not read $tpl at ${sha:0:10}."
+    grep -q '@PIN@' "$work/template" || \
+        deploy_fail "${name}_TEMPLATE: $tpl at ${sha:0:10} has no @PIN@ to replace."
+    sed "s/@PIN@/$sha/g" "$work/template" > "$work/rendered"
+    chmod "${mode:3}" "$work/rendered"
+
+    root="$("$FS_REALPATH" -- "$work/deploy")"
+    local -a outs=()
+    IFS=, read -ra outs <<< "$to"
+    for out in "${outs[@]}"; do
+        deploy_path_ok "$out" && [[ "$out" != pins.env ]] || \
+            deploy_fail "${name}_RENDER_TO: '$out' must be a relative path other than pins.env."
+        dst="$root/$out"
+        # A symlink in the deploy repo must not carry the write outside it.
+        real="$("$FS_REALPATH" -m -- "$dst")"
+        [[ ! -L "$dst" && "$real" == "$dst" ]] || \
+            deploy_fail "${name}_RENDER_TO: '$out' passes through a symlink."
+        [[ ! -d "$dst" ]] || deploy_fail "${name}_RENDER_TO: '$out' is a directory."
+        mkdir -p -- "$(dirname -- "$dst")"
+        cp -- "$work/rendered" "$dst"
+        chmod "${mode:3}" "$dst"
+    done
+}
+
 cmd_deploy_main() {
     local dry_run=0
     while (( $# )); do
@@ -5336,32 +5379,63 @@ cmd_deploy_main() {
     done < "$pins"
     (( ${#names[@]} )) || deploy_fail "pins.env holds no <NAME>_SHA line."
 
-    local name url sha old
-    local -a moved=()
+    local name url branch tpl to src sha old before
+    local -a moved=() rerendered=()
+    mkdir "$work/src"
     for name in "${names[@]}"; do
         url="$(read_env_value "$pins" "${name}_REPO" || true)"
         [[ -n "$url" ]] || deploy_fail "pins.env has ${name}_SHA but no ${name}_REPO naming its repo."
         deploy_url_ok "$url" || deploy_fail "${name}_REPO must be an https://, ssh:// or file:// URL, got '$url'."
-        sha="$(git ls-remote "$url" refs/heads/main | cut -f1)" || true
-        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || deploy_fail "could not read the head of main from $url."
+        branch="$(read_env_value "$pins" "${name}_BRANCH" || true)"
+        branch="${branch:-main}"
+        if [[ "$branch" == -* ]] || ! git check-ref-format "refs/heads/$branch"; then
+            deploy_fail "${name}_BRANCH must be a branch name, got '$branch'."
+        fi
+        tpl="$(read_env_value "$pins" "${name}_TEMPLATE" || true)"
+        to="$(read_env_value "$pins" "${name}_RENDER_TO" || true)"
+        if [[ -n "$tpl" && -z "$to" ]] || [[ -z "$tpl" && -n "$to" ]]; then
+            deploy_fail "pins.env must set both ${name}_TEMPLATE and ${name}_RENDER_TO, or neither."
+        fi
+        if [[ -n "$tpl" ]]; then
+            # The sha comes from the clone, not ls-remote, so the template
+            # rendered is the one at the sha pinned.
+            src="$work/src/$name"
+            git clone --quiet --depth 1 --branch "$branch" --filter=blob:none --no-checkout \
+                -- "$url" "$src" || deploy_fail "could not clone $branch of $url."
+            sha="$(git -C "$src" rev-parse HEAD)" || true
+        else
+            sha="$(git ls-remote "$url" "refs/heads/$branch" | cut -f1)" || true
+        fi
+        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || deploy_fail "could not read the head of $branch from $url."
         old="$(read_env_value "$pins" "${name}_SHA" || true)"
-        [[ "$old" == "$sha" ]] && continue
-        sed -i "s/^${name}_SHA=.*/${name}_SHA=$sha/" "$pins"
-        moved+=("$name ${sha:0:10}")
+        if [[ "$old" != "$sha" ]]; then
+            sed -i "s/^${name}_SHA=.*/${name}_SHA=$sha/" "$pins"
+            moved+=("$name ${sha:0:10}")
+        fi
+        [[ -n "$tpl" ]] || continue
+        before="$(git -C "$work/deploy" status --porcelain)"
+        deploy_render "$name" "$src" "$tpl" "$to" "$sha" "$work"
+        [[ "$old" == "$sha" && "$(git -C "$work/deploy" status --porcelain)" != "$before" ]] && \
+            rerendered+=("$name")
     done
 
-    if (( ${#moved[@]} == 0 )); then
-        echo "deploy-main: every pin is already at main; nothing to deploy." >&2
+    git -C "$work/deploy" add -A
+    if git -C "$work/deploy" diff --cached --quiet; then
+        echo "deploy-main: every pin is already at the head of its branch; nothing to deploy." >&2
         return 0
     fi
-    git -C "$work/deploy" diff
+    git -C "$work/deploy" diff --cached
     if (( dry_run )); then
         echo "deploy-main: dry run; nothing pushed." >&2
         return 0
     fi
+    local -a parts=()
+    (( ${#moved[@]} )) && parts+=("Pin $(printf '%s\n' "${moved[@]}" | paste -sd, - | sed 's/,/, /g')")
+    (( ${#rerendered[@]} )) && parts+=("re-render ${rerendered[*]}")
     local msg
-    msg="Pin $(printf '%s\n' "${moved[@]}" | paste -sd, - | sed 's/,/, /g')"
-    git -C "$work/deploy" commit --quiet -am "$msg" || deploy_fail "could not commit the pin change."
+    msg="$(printf '%s\n' "${parts[@]}" | paste -sd';' - | sed 's/;/; /g')"
+    msg="${msg^}"
+    git -C "$work/deploy" commit --quiet -m "$msg" || deploy_fail "could not commit the pin change."
     git -C "$work/deploy" push --quiet origin HEAD:main || deploy_fail \
         "the push was refused, so nothing is deployed. If the deploy repo's main moved, run deploy-main again."
     echo "deploy-main: pushed $(git -C "$work/deploy" rev-parse --short=10 HEAD) ($msg) to the deploy repo's main; its CI deploys it." >&2
