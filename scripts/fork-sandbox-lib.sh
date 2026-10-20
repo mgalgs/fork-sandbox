@@ -1022,6 +1022,41 @@ fs_services_dir() {
     printf '%s\n' "$root/.agents/sandbox-services"
 }
 
+# Is a REUSED --clone-dir's services contract trusted? The clone holds
+# whatever the previous wake's sandbox left there, so neither its working
+# tree nor its .git can vouch for itself. Trusted only when <start-sha> (the
+# commit this wake's branch started at) is a commit in the origin, did not
+# change the contract relative to <anchor> (three-dot, as --services-trust-ref
+# does), and the clone's contract dirs hold exactly that commit's files --
+# nothing edited, added or symlinked. Every git call runs in the origin.
+# Returns 0 trusted, 1 not.
+fs_reused_services_trusted() {
+    local origin="$1" anchor="$2" start="$3" clone="$4" tmp p rc=0
+    local -a paths=(.agents/sandbox-services .claude/sandbox-services) tracked=()
+    git -C "$origin" cat-file -e "$start^{commit}" 2>/dev/null || return 1
+    git -C "$origin" diff --quiet "$anchor...$start" -- "${paths[@]/%//}" 2>/dev/null || return 1
+    mapfile -t tracked < <(git -C "$origin" ls-tree -d --name-only "$start" -- "${paths[@]}")
+    tmp="$(mktemp -d)" || return 1
+    if (( ${#tracked[@]} )) \
+        && ! git -C "$origin" archive "$start" -- "${tracked[@]}" | tar -x -C "$tmp"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    for p in "${paths[@]}"; do
+        mkdir -p "$tmp/$p"
+        if [[ -L "$clone/${p%%/*}" || -L "$clone/$p" \
+            || ( -e "$clone/$p" && ! -d "$clone/$p" ) ]]; then
+            rc=1
+        elif [[ -d "$clone/$p" ]]; then
+            diff -r -q --no-dereference "$tmp/$p" "$clone/$p" >/dev/null 2>&1 || rc=1
+        elif [[ -n "$(ls -A "$tmp/$p")" ]]; then
+            rc=1
+        fi
+    done
+    rm -rf "$tmp"
+    return "$rc"
+}
+
 # An optional third argument names the directory the list is read from
 # (default: the clone's own services dir). The clone's list is the checked-out
 # ref's copy, so a caller that cannot trust the ref passes the ORIGIN's own

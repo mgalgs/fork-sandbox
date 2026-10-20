@@ -70,6 +70,14 @@ back into the real checkout.
   relative to `<ref>`. The hook is host-side code; pr-review-sandbox.sh
   passes the pull request's base, so a PR that introduces or edits the hook
   cannot make it run.
+- **A reused workspace cannot run a hook it changed.** A `--clone-dir`
+  workspace is the previous wake's sandbox output. On reuse, the hook and
+  the provision-ro list are honoured only if the commit this wake starts
+  at is in the origin, did not change the contract relative to
+  `--services-trust-ref` (default: the origin's `HEAD`), and the
+  workspace's contract directories match that commit file for file. An
+  edit, an extra file or a symlink, committed or not, turns services and
+  provisioning off for the run.
 - **Failure is a warning, not a wedge.** If `up` fails, the session still
   runs; the prompt gets a correction telling it the services are absent.
 - **The session is told what it has.** The generated prompt gets a "Per-run

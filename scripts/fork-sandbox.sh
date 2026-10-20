@@ -423,6 +423,9 @@
 #                        letting the clone's own history override the ref
 #                        that was asked for. <dir> naming a directory that
 #                        exists but is not a git repository is a hard error.
+#                        A reused <dir>'s per-run services run only if its
+#                        contract still matches a trusted commit (see
+#                        docs/sandbox-services.md).
 #                        The per-run fetch-back to the origin repo, below, is
 #                        unchanged either way -- every run still pushes its
 #                        branch home regardless of where its clone lives.
@@ -6648,6 +6651,19 @@ if ! $no_services && [[ -d "$services_hook_dir" ]]; then
             exit 1
         fi
     fi
+    # Everything above judges committed refs. A reused --clone-dir is the
+    # previous wake's sandbox output, so its contract must also match a
+    # trusted commit file for file (fs_reused_services_trusted).
+    if (( services_trusted )) && [[ "$clone_reused" == true ]] \
+        && ! fs_reused_services_trusted "$origin_repo" \
+            "${services_trust_ref:-$(git -C "$origin_repo" rev-parse HEAD)}" \
+            "$reuse_start_sha" "$clone_dir"; then
+        echo "Warning: this reused --clone-dir's sandbox-services contract" >&2
+        echo "(.agents/ or .claude/sandbox-services/) does not match a trusted" >&2
+        echo "commit -- an earlier wake changed it, committed or not -- so" >&2
+        echo "per-run services and provisioning are disabled for this run." >&2
+        services_trusted=0
+    fi
     if (( services_trusted )); then
         provision_enabled=1
         if [[ -f "$services_hook_dir/sandbox-services.sh" ]]; then
@@ -6680,7 +6696,8 @@ fi
 # unrestricted network — content the trust check above does not cover, since it
 # diffs only the sandbox-services dir and a hostile ref can edit a Dockerfile
 # alone. Refuse the mechanism rather than run it. The clone is still trusted
-# committed state at this point (the sandbox has not started), so checking it
+# committed state at this point (the sandbox has not started, and a reused
+# clone's contract was just matched against a trusted commit), so checking it
 # here equals checking the copy taken below.
 #
 # This scans the hook dir only. A repo using the overlay variant keeps its base

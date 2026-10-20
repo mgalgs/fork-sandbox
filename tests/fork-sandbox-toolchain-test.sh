@@ -714,6 +714,62 @@ pc_run nosvc --checkout ref-hostile --no-services
 lacks "--no-services still disables provision-ro" "--bind-ro-at" "$pc_flags"
 
 echo ""
+echo "== reused --clone-dir and the services contract (launcher) =="
+
+# A reused --clone-dir holds whatever the previous wake's sandbox left in it,
+# committed or not, so its services contract is only as trusted as the check
+# says. Each tamper below is undone before the next run.
+rc_ws="$pc_handoff_dir/ws"
+rc_hook="$rc_ws/.agents/sandbox-services/sandbox-services.sh"
+rc_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$rc_ws" \
+    -c user.name=Tester -c user.email=t@fork-sandbox.invalid "$@"; }
+rc_ran() {
+    if [[ -e "$pc_marker" ]]; then ok "$1"; else no "$1" "$pc_out"; fi
+}
+rc_not_ran() {
+    if [[ -e "$pc_marker" ]]; then no "$1" "hook ran"; else ok "$1"; fi
+}
+
+pc_run rc-first --clone-dir "$rc_ws"
+rc_ran "control: a first wake with --clone-dir runs the hook"
+
+pc_run rc-same --clone-dir "$rc_ws"
+rc_ran "control: an untouched reused clone runs the hook"
+contains "control: an untouched reused clone binds the origin's .venv" "$pc_venv_real" "$pc_flags"
+
+printf '# planted by the sandbox\n' >> "$rc_hook"
+pc_run rc-dirty --clone-dir "$rc_ws"
+rc_not_ran "a reused clone with an uncommitted hook edit runs no hook"
+lacks "a reused clone with an uncommitted hook edit gets no provision-ro" "--bind-ro-at" "$pc_flags"
+contains "the warning names the reused workspace" "reused --clone-dir" "$pc_out"
+rc_git checkout -q -- .
+
+printf '# committed by the sandbox\n' >> "$rc_hook"
+rc_git commit -q -am "sandbox edits the hook"
+pc_run rc-committed --clone-dir "$rc_ws"
+rc_not_ran "a reused clone whose lineage committed a hook edit runs no hook"
+rc_git reset -q --hard HEAD~1
+
+printf '.venv\n.secret-dir\n' > "$rc_ws/.agents/sandbox-services/provision-ro"
+pc_run rc-list --clone-dir "$rc_ws"
+lacks "a reused clone's edited provision-ro list binds nothing it added" \
+    "$pc_secret_real" "$pc_flags"
+rc_git checkout -q -- .
+
+printf 'stray\n' > "$rc_ws/.agents/sandbox-services/extra.sh"
+pc_run rc-untracked --clone-dir "$rc_ws"
+rc_not_ran "a reused clone with an untracked file in the contract dir runs no hook"
+rm -f "$rc_ws/.agents/sandbox-services/extra.sh"
+
+pc_run rc-checkout --clone-dir "$rc_ws" --checkout ref-same --services-trust-ref main
+rc_ran "control: a reused clone moved to an anchored, unchanged ref runs the hook"
+
+printf '# carried over the checkout\n' >> "$rc_hook"
+pc_run rc-checkout-dirty --clone-dir "$rc_ws" --checkout ref-same --services-trust-ref main
+rc_not_ran "an uncommitted hook edit carried over --checkout runs no hook"
+rc_git checkout -q -- .
+
+echo ""
 echo "== fs_harness_error =="
 
 he_dir="$scratch/harness-error"; mkdir -p "$he_dir"
