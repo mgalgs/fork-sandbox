@@ -64,7 +64,8 @@ path is single-leg only in this phase, no maintainer tier, no repeat, no
 composed pipeline).
 
 `services` is fleet.yaml-only and takes a YAML boolean. It controls
-whether a k8s postmaster wake launches the project's per-run services.
+whether a postmaster wake, local or k8s, launches the project's per-run
+services.
 
 `wake-when` is fleet.yaml-only as well: a suffix (^[a-z0-9][a-z0-9._-]*$)
 naming the postmaster's per-seat wake gate, $HOOKS_DIR/wake-when.<suffix>

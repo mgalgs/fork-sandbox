@@ -846,6 +846,12 @@ see "The review target" below for what `sets` and `follow` mean:
 | `grant` | the literal string `required` | only with `backend: k8s` |
 | `review-target` | the literal string `sets` or `follow` | only with `backend: k8s`; at most one seat per fleet may be `sets` |
 
+`services` (fleet.yaml-only, a YAML boolean, any backend) set to `false`
+wakes the seat with `--no-services`: no per-run services and no
+provision-ro binds. Left unset, a local seat gets the project's services
+like any run, and a k8s seat falls back to `K8S_POSTMASTER_SEAT_SERVICES`
+in `k8s.env`.
+
 `refresh-at` works on a `backend: k8s` claude seat exactly as on a local one
 (it is forwarded as `--refresh-at`); on a pi seat it is accepted and ignored,
 since it may arrive from repo persona frontmatter the machine cannot unset.

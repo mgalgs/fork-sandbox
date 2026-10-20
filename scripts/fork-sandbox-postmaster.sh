@@ -4388,6 +4388,7 @@ pm_spawn_wake() {
     # branch history are useful continuity on every harness, not just the
     # ones with a resumable transcript.
     spawn_args+=(--clone-dir "$PM_WORKSPACES/$tid/$agent")
+    [[ "$seat_services" == false ]] && spawn_args+=(--no-services)
 
     # The LLM-seat counterpart of the handler path's FS_HANDLER_ATTACH_DIR:
     # most threads carry no attachments at all, so the bind is added only

@@ -789,4 +789,25 @@ contains "budget override 1: flag names the override value" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "thread budget 1 exhausted"
 unset FORK_SANDBOX_THREAD_BUDGET
 
+# ---- a local seat's `services` key ----
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@alice' 'services default' 'review' 8 >/dev/null
+once
+check "local services: an unset key passes no --no-services" 0 \
+    "$(grep -c -- '^--no-services$' "$STUB_ARGV_LOG")"
+lsvc_saved_fleet="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+sed -i 's/^  alice: {}$/  alice:\n    services: false/' "$FORK_SANDBOX_FLEET_FILE"
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@alice' 'no services' 'review' 8 >/dev/null
+once
+check "local services: the seat still spawns" 1 \
+    "$(grep -c -- '^sbx-mail-.*-alice-' "$STUB_ARGV_LOG")"
+check "local services: false passes --no-services" 1 \
+    "$(grep -c -- '^--no-services$' "$STUB_ARGV_LOG")"
+printf '%s\n' "$lsvc_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"
+
 finish_suite
