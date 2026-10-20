@@ -770,7 +770,7 @@ grants_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env'
 out="$("$mail" grant "$grant_tid" --seat-resources core=cpu=8 2>&1)"
 check "grant with a --seat-resources cpu above the LimitRange max exits 2" "2" "$?"
 contains "the over-max refusal is an Error: naming the max" "$out" "Error: --seat-resources 'core=cpu=8': cpu 8 is above the namespace LimitRange max"
-"$mail" grant "$grant_tid" --seat-resources core=memory=1.5Gi >/dev/null 2>&1
+"$mail" grant "$grant_tid" --seat-resources core=memory=lots >/dev/null 2>&1
 check "grant with a non-quantity --seat-resources memory exits 2" "2" "$?"
 "$mail" grant "$grant_tid" --seat-resources core=cpu=1 --seat-resources core=memory=2Gi >/dev/null 2>&1
 check "grant naming one seat in two --seat-resources exits 2" "2" "$?"
