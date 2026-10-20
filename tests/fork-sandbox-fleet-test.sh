@@ -1388,7 +1388,14 @@ check "on-silence: flag passes check" 0 "$("$fleet" check >/dev/null 2>&1; echo 
 check "on-silence: resolves as the 19th line" flag "$("$fleet" resolve riffler | sed -n 19p)"
 check "on-silence: services keeps the 18th beside it" false "$("$fleet" resolve riffler | sed -n 18p)"
 check "on-silence: empty on a seat that sets none" "" "$("$fleet" resolve tuner | sed -n 19p)"
-bad "on-silence: any other value is refused" "agents.riffler.on-silence: takes 'flag', not 'ignore'" <<'EOF'
+printf '%s\n' 'agents:' '  riffler:' '    on-silence: retry' > "$FORK_SANDBOX_FLEET_FILE.retry"
+saved_fleet_retry="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+cp "$FORK_SANDBOX_FLEET_FILE.retry" "$FORK_SANDBOX_FLEET_FILE"
+rm -f "$FORK_SANDBOX_FLEET_FILE.retry"
+check "on-silence: retry passes check" 0 "$("$fleet" check >/dev/null 2>&1; echo $?)"
+check "on-silence: retry resolves as the 19th line" retry "$("$fleet" resolve riffler | sed -n 19p)"
+printf '%s\n' "$saved_fleet_retry" > "$FORK_SANDBOX_FLEET_FILE"
+bad "on-silence: any other value is refused" "agents.riffler.on-silence: takes 'flag' or 'retry', not 'ignore'" <<'EOF'
 agents:
   riffler:
     on-silence: ignore

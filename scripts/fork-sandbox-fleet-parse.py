@@ -72,10 +72,11 @@ naming the postmaster's per-seat wake gate, $HOOKS_DIR/wake-when.<suffix>
 (see docs/agent-mail.md). Unlike `grant` it is legal on a handler seat: the
 gate guards a spawn, whatever the seat is.
 
-`on-silence` is fleet.yaml-only and LLM-only. Its one value, `flag`, has
-the postmaster flag the thread when a wake of the seat exits 0 having
-posted nothing (see docs/agent-mail.md). Leave it unset on a seat whose
-protocol allows a silent wake.
+`on-silence` is fleet.yaml-only and LLM-only. `flag` has the postmaster
+flag the thread when a wake of the seat exits 0 having posted nothing;
+`retry` does the same and also re-wakes the seat once when every reply
+file it wrote was discarded as malformed (see docs/agent-mail.md). Leave
+it unset on a seat whose protocol allows a silent wake.
 
 `review-target` is fleet.yaml-only too, same reason as `backend`: a seat
 must not know it is the one moving a review thread's shared target.
@@ -589,10 +590,10 @@ def check_wake_when(value, path, errors):
 
 
 def check_on_silence(value, path, errors):
-    """The only accepted value is 'flag'. Absent means a wake that posts
-    nothing is a valid outcome, which is the default."""
-    if value != "flag":
-        errors.append(f"{path}: takes 'flag', not '{value}'")
+    """Accepted values are 'flag' and 'retry'. Absent means a wake that
+    posts nothing is a valid outcome, which is the default."""
+    if value not in ("flag", "retry"):
+        errors.append(f"{path}: takes 'flag' or 'retry', not '{value}'")
         return ""
     return value
 
