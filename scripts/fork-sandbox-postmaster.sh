@@ -541,7 +541,7 @@
 # THE WAKE
 #
 # Spawned via `fork-sandbox.sh --branch <b> --harness <h> [--model <m>]
-# [--network <n>] [--pi-args "--thinking <level>"] [--preset <p>]
+# [--network <n>] [--pi-args "--thinking <level>" | --effort <level>] [--preset <p>]
 # [--attach-dir <dir>] [--thread-dir <dir>] <project> <handoff>`.
 # --attach-dir is added only when the thread's attachments directory under
 # the mail store exists and is non-empty (see pm_spawn_wake); it binds that
@@ -578,7 +578,8 @@
 # less-pi guard and a sealed seat's model discovery (pi); those harnesses
 # get no --model flag at all when unset, so fork-sandbox.sh's own
 # resolution/refusal applies exactly as it would for any other caller.
-# thinking is passed as --pi-args only when the harness is pi. --preset,
+# thinking is passed as --pi-args "--thinking <level>" on the pi harness
+# and as --effort <level> on the claude harness; codex ignores it. --preset,
 # when the seat has one, is placed first in spawn_args -- documentation
 # only, since fork-sandbox.sh applies the seat's own harness/model/
 # network/thinking flags over whatever the preset sets, key by key,
@@ -4180,6 +4181,7 @@ pm_spawn_wake() {
         if [[ "$harness" == pi && -n "$thinking" ]]; then
             spawn_args+=(--pi-args "--thinking $thinking")
         fi
+        [[ "$harness" == claude && -n "$thinking" ]] && spawn_args+=(--effort "$thinking")
         if [[ "$harness" == claude && -n "$refresh_at" ]]; then
             spawn_args+=(--refresh-at "$refresh_at")
         fi
@@ -4374,6 +4376,7 @@ pm_spawn_wake() {
     if [[ "$harness" == pi && -n "$thinking" ]]; then
         spawn_args+=(--pi-args "--thinking $thinking")
     fi
+    [[ "$harness" == claude && -n "$thinking" ]] && spawn_args+=(--effort "$thinking")
     # --refresh-at only works with --harness claude (fork-sandbox.sh
     # refuses it outright, by name, on every other harness).
     if [[ "$harness" == claude && -n "$refresh_at" ]]; then

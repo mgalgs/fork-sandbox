@@ -164,6 +164,13 @@ fs_require_sandbox_wrapper() {
     return 1
 }
 
+# The levels `claude --effort` accepts. Shared by fork-sandbox.sh --effort,
+# fork-sandbox-k8s.sh --effort and `fleet check` (a claude seat's thinking).
+FS_EFFORT_LEVELS="low medium high xhigh max"
+fs_effort_ok() {
+    [[ " $FS_EFFORT_LEVELS " == *" $1 "* && "$1" != *" "* && -n "$1" ]]
+}
+
 # Refuse a value that would break out of a generated command or a key=value
 # record. A single quote ends the shell string these scripts build, and a
 # newline ends a line in the run record that fork-sandbox-status.sh reads

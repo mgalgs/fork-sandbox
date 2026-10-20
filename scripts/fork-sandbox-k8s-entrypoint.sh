@@ -100,6 +100,9 @@
 #                   discover_model_facts below into a warning that names
 #                   the guessed value as a guess. Unset (the default)
 #                   means refuse.
+#   CLAUDE_EFFORT   the claude coding leg's --effort level, from
+#                   fork-sandbox-k8s.sh's --effort. Unset means the CLI
+#                   default.
 #   PI_ARGS         extra arguments for the pi coding-leg invocation,
 #                   verbatim from fork-sandbox-k8s.sh's --pi-args, e.g.
 #                   "--thinking low". Rendered only when non-empty, so
@@ -325,6 +328,7 @@ esac
 : "${MODEL_DISCOVERY:=}"
 : "${ALLOW_UNLISTED_MODEL:=}"
 : "${PI_ARGS:=}"
+: "${CLAUDE_EFFORT:=}"
 : "${PI_HTTP_IDLE_TIMEOUT_MS:=}"
 : "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
 : "${RUN_DIR:=}"
@@ -1588,6 +1592,7 @@ else
     claude_argv=(claude --dangerously-skip-permissions --print --verbose
         --output-format stream-json --model "$claude_model"
         --settings "$work_dir/inbox-settings.json" --include-hook-events)
+    [[ -n "$CLAUDE_EFFORT" ]] && claude_argv+=(--effort "$CLAUDE_EFFORT")
     if [[ "$SESSION_HARNESS_STORE" == 1 ]]; then
         echo "fork-sandbox-k8s-entrypoint: seeding the claude session store" >&2
         mkdir -p "$HOME/.claude/projects"

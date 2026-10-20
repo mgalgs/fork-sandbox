@@ -82,6 +82,9 @@
 # --dry-run:             resolve and print the harness and model, then exit
 #                        without creating a clone, run directory or session.
 # --claude-args "...":   extra arguments passed verbatim to the claude CLI
+# --effort <level>:      the claude CLI's --effort for the coding leg: low,
+#                        medium, high, xhigh or max. Only with --harness
+#                        claude. Unlike --claude-args, --k8s carries it.
 # --pi-args "...":       extra arguments passed verbatim to pi, e.g.
 #                        "--thinking low". Only with --harness pi, the
 #                        harness that starts pi.
@@ -1823,6 +1826,7 @@ network=""
 review_network=""
 dry_run=false
 claude_extra_args=""
+effort_arg=""
 pi_extra_args=""
 codex_extra_args=""
 sandbox_args=""
@@ -1964,6 +1968,14 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --claude-args)
             claude_extra_args="${2:?--claude-args requires a value}"
+            shift 2
+            ;;
+        --effort)
+            effort_arg="${2:?--effort requires a level}"
+            fs_effort_ok "$effort_arg" || {
+                echo "Error: --effort must be one of: $FS_EFFORT_LEVELS (got '$effort_arg')." >&2
+                exit 1
+            }
             shift 2
             ;;
         --pi-args)
@@ -3137,6 +3149,12 @@ if [[ "$k8s_mode" == true && "$harness_given" != true ]]; then
     harness="pi"
 fi
 
+if [[ -n "$effort_arg" && "$harness" != claude ]]; then
+    echo "Error: --effort sets the claude CLI's effort, which a $harness run" >&2
+    echo "never starts. Drop it, or use --harness claude." >&2
+    exit 1
+fi
+
 # The implement leg's resolved network value, set here (before the model
 # checks just below, which must already know whether this is a sealed pi
 # run) rather than beside the --k8s dispatch further down.
@@ -3551,6 +3569,11 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
     # harness or picking one seat to override.
     if [[ -n "$claude_extra_args" ]]; then
         echo "Error: --claude-args cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; give the agent its own claude-args key instead." >&2
+        exit 1
+    fi
+    if [[ -n "$effort_arg" ]]; then
+        echo "Error: --effort cannot be combined with preset '$preset_name':" >&2
         echo "composed pipeline; give the agent its own claude-args key instead." >&2
         exit 1
     fi
@@ -4035,6 +4058,7 @@ if [[ "$k8s_mode" == true ]]; then
     # refuses the combination there); this dispatch just carries the value
     # through unvalidated, like --review-loop's JSON above.
     [[ -n "$pi_extra_args" ]] && k8s_argv+=(--pi-args "$pi_extra_args")
+    [[ -n "$effort_arg" ]] && k8s_argv+=(--effort "$effort_arg")
     # Forwarded whenever resolved to something -- flag, claude-env, or a
     # balancer choice -- so fork-sandbox-k8s.sh's own cmd_submit sees an
     # operator-supplied --claude-credentials and skips its own resolution
@@ -4983,6 +5007,10 @@ pi_run_session_dir=""
 # time, for a second harness, without the two runs seeing or clobbering
 # each other's state -- see fs_resolve_harness just above its case
 # statement for how.
+
+if [[ -n "$effort_arg" ]]; then
+    claude_extra_args="${claude_extra_args:+$claude_extra_args }--effort $effort_arg"
+fi
 
 # --claude-args names the claude CLI, which no other harness starts.
 if [[ -n "$claude_extra_args" && "$harness" != "claude" ]]; then

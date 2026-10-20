@@ -124,6 +124,7 @@ once
 check "k8s case4: --endpoint forwarded" kim-endpoint "$(argv_after --endpoint "$STUB_ARGV_LOG")"
 check "k8s case4: pi thinking forwarded as --pi-args" '--thinking medium' \
     "$(argv_after --pi-args "$STUB_ARGV_LOG")"
+check "k8s case4: a pi seat gets no --effort" 0 "$(grep -c -- '^--effort$' "$STUB_ARGV_LOG")"
 # A pi seat is given-mode (fs_harness_session_caps): --session-id is
 # derived, not discovered, so it arrives on the very first wake -- unlike
 # karen's (claude, discover-mode) case1 above, which gets no --session-id
@@ -147,6 +148,9 @@ once
 check "k8s case4b: a claude k8s seat gets --refresh-at" 0.4 \
     "$(argv_after --refresh-at "$STUB_ARGV_LOG")"
 check "k8s case4b: --clone-dir stays absent" 0 "$(grep -c -- '^--clone-dir$' "$STUB_ARGV_LOG")"
+check "k8s case4b: a claude k8s seat's thinking is forwarded as --effort" xhigh \
+    "$(argv_after --effort "$STUB_ARGV_LOG")"
+check "k8s case4b: a claude seat gets no --pi-args" 0 "$(grep -c -- '^--pi-args$' "$STUB_ARGV_LOG")"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT

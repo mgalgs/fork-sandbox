@@ -2337,6 +2337,13 @@ would be a positional pi rejects. `fork-sandbox.sh --k8s` forwards
 `--pi-args` unvalidated; the harness cross-check above is what refuses
 it, not the dispatcher.
 
+**`--effort LEVEL` sets the claude coding leg's `claude --effort`.**
+`submit` and `run` accept it with `--harness claude` only, and only one of
+`low`, `medium`, `high`, `xhigh` or `max`. It reaches the pod as the
+`CLAUDE_EFFORT` env var. Review legs never get it. `fork-sandbox.sh
+--effort` forwards it with `--k8s` and passes it to the local claude CLI
+otherwise. The postmaster sets it from a claude seat's `thinking`.
+
 ### 1b. proxy, per-run, for claude — **Status: built.**
 
 `--harness claude` does not fit mode 1 above: OpenRouter's key is a

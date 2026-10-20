@@ -6414,6 +6414,38 @@ else
         "$(diff "$pialg_run_out" "$pialg_run_submit_out" 2>&1 | head -n 20)"
 fi
 
+printf '\n== fork-sandbox-k8s.sh submit/run --effort ==\n'
+effort_submit_out="$(newdir)/effort-submit.yaml"; tmpdirs+=("$(dirname "$effort_submit_out")")
+effort_run_out="$(newdir)/effort-run.yaml"; tmpdirs+=("$(dirname "$effort_run_out")")
+if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --effort xhigh \
+    "$proj_dir" "$handoff_file" > "$effort_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-effort.err; then
+    ok "submit --dry-run --harness claude --effort exits 0"
+else
+    no "submit --dry-run --harness claude --effort exits 0" "$(cat "$k8s_test_tmp"/fs-k8s-test-effort.err)"
+fi
+check "the rendered Job carries CLAUDE_EFFORT" 'value: "xhigh"' \
+    "$(grep -A1 'name: CLAUDE_EFFORT' "$effort_submit_out" | sed -n '2s/^ *//p')"
+check "a claude submit without --effort renders no CLAUDE_EFFORT" 0 \
+    "$(grep -c 'name: CLAUDE_EFFORT' "$claude_rm_submit_out")"
+HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --effort xhigh \
+    "$proj_dir" "$handoff_file" > "$effort_run_out" 2>/dev/null
+check "run --effort forwards it to submit unchanged" "" "$(diff "$effort_run_out" "$effort_submit_out" 2>&1 | head -n 5)"
+refuses "submit --effort with a pi harness is refused" \
+    "sets the claude CLI's effort, which a pi run" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --effort high \
+    "$proj_dir" "$handoff_file"
+refuses "submit --effort with an unknown level is refused" \
+    "--effort must be one of: low medium high xhigh max" \
+    env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --effort 'high"' \
+    "$proj_dir" "$handoff_file"
+check "the entrypoint adds --effort to the claude coding leg from CLAUDE_EFFORT" 1 \
+    "$(grep -cxF '    [[ -n "$CLAUDE_EFFORT" ]] && claude_argv+=(--effort "$CLAUDE_EFFORT")' "$entrypoint_sh")"
+rm -f "$k8s_test_tmp"/fs-k8s-test-effort.err
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude: credential expiry ==\n'
 claude_home_expired="$(newdir)"; tmpdirs+=("$claude_home_expired")
 mkdir -p "$claude_home_expired/.claude"
@@ -18237,6 +18269,29 @@ refuses "--k8s --harness claude --pi-args is still refused (by cmd_submit's harn
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness claude --branch fs-k8s-flag-test-piargs-bad --model claude-sonnet-5 \
     --pi-args '--thinking high' \
+    "$k8s_flag_proj" "$k8s_flag_handoff"
+
+printf '\n== fork-sandbox.sh --effort ==\n'
+effort_dispatch_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$effort_dispatch_out")")
+effort_direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$effort_direct_out")")
+HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --branch fs-k8s-flag-test-effort --model claude-sonnet-5 --effort max \
+    "$k8s_flag_claude_proj" "$k8s_flag_handoff" > "$effort_dispatch_out" 2>"$effort_dispatch_out.err"
+HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-flag-test-effort --model claude-sonnet-5 --harness claude --effort max \
+    "$k8s_flag_claude_proj" "$k8s_flag_handoff" > "$effort_direct_out" 2>/dev/null
+check "--k8s --effort renders a CLAUDE_EFFORT env" 1 \
+    "$(grep -c 'name: CLAUDE_EFFORT' "$effort_dispatch_out")$(grep -i error "$effort_dispatch_out.err")"
+check "--k8s --effort renders byte-for-byte the same as a direct run --dry-run" \
+    "$(cat "$effort_direct_out")" "$(cat "$effort_dispatch_out")"
+refuses "fork-sandbox.sh --effort on a pi run is refused" \
+    "sets the claude CLI's effort, which a pi run" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --branch fs-k8s-flag-test-effort-bad --model moonshotai/kimi-k3 --effort high \
+    "$k8s_flag_proj" "$k8s_flag_handoff"
+refuses "fork-sandbox.sh --effort with an unknown level is refused" \
+    "--effort must be one of: low medium high xhigh max" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run --effort turbo \
     "$k8s_flag_proj" "$k8s_flag_handoff"
 
 printf '\n== fork-sandbox.sh --k8s: --image is forwarded ==\n'

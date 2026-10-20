@@ -345,6 +345,28 @@ def check_network_harness_pair(harness, network, path, errors):
                        f"'{harness}' has no self-hosted-endpoint path")
 
 
+# Must match FS_EFFORT_LEVELS in fork-sandbox-lib.sh.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def check_thinking_effort(harness, thinking, preset, path, errors):
+    """A claude seat's `thinking` becomes `claude --effort <thinking>` at
+    wake, so it must be a level the CLI takes. `harness` is the resolved
+    value, with empty already defaulted to claude as postmaster.sh does.
+    fork-sandbox.sh refuses --effort beside a composed preset, so a claude
+    seat with a preset may not set thinking at all."""
+    if harness != "claude" or not thinking:
+        return
+    if thinking not in EFFORT_LEVELS:
+        errors.append(f"{path}.thinking: on a claude seat this is the "
+                      f"--effort level, one of {', '.join(EFFORT_LEVELS)}; "
+                      f"not '{thinking}'")
+    elif preset:
+        errors.append(f"{path}.thinking: a claude seat with a preset cannot "
+                      f"set thinking; give the preset's agent a claude-args "
+                      f"key instead")
+
+
 def check_triage_seat(value, label, errors):
     """Validates the top-level `triage:` block -- the wake classifier's own
     sandbox seat, distinct from the per-agent `triage: false` opt-out
@@ -928,6 +950,10 @@ def cmd_check(fleet_file, label, personas_dir):
                 agent["network"] or fm["network"],
                 f"agents.{name}", errors)
             resolved_presets[name] = agent["preset"] or fm.get("preset", "")
+            check_thinking_effort(
+                agent["harness"] or fm["harness"] or "claude",
+                agent["thinking"] or fm["thinking"],
+                resolved_presets[name], f"agents.{name}", errors)
             if agent["backend"] == "k8s":
                 # Unlike check_network_harness_pair's own no-defaulting
                 # rule above, this check judges the RESOLVED value a k8s

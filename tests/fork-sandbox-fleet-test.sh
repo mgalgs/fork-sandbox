@@ -252,6 +252,41 @@ agents:
 EOF
 rm -f "$FORK_SANDBOX_PERSONAS_DIR/merged-sealed.md"
 
+bad "a claude seat's thinking must be a claude --effort level" \
+    "on a claude seat this is the --effort level" "agents.riffler.thinking" <<'EOF'
+agents:
+  riffler:
+    thinking: medium-ish
+EOF
+
+bad "an unset harness is claude, so its thinking is checked too" \
+    "on a claude seat this is the --effort level" "agents.tuner.thinking" <<'EOF'
+agents:
+  tuner:
+    thinking: "off"
+EOF
+
+# effort_good <label> <fleet yaml on stdin>: `check` accepts it.
+effort_good() {
+    local goodfile="$FORK_SANDBOX_FLEET_FILE_DIR/good.yaml" out saved="$FORK_SANDBOX_FLEET_FILE"
+    cat > "$goodfile"
+    out="$(FORK_SANDBOX_FLEET_FILE="$goodfile" "$fleet" check 2>&1)"
+    check "$1" "0:" "$?:$out"
+}
+effort_good "a claude seat takes every --effort level as thinking" <<'EOF'
+agents:
+  riffler:
+    thinking: xhigh
+  tuner:
+    thinking: max
+EOF
+effort_good "a pi seat's thinking is not an --effort level and is not checked as one" <<'EOF'
+agents:
+  scout:
+    harness: pi
+    thinking: minimal
+EOF
+
 bad "wake-on-cc must be a YAML boolean, not a string" \
     "agents.riffler.wake-on-cc: must be a YAML boolean" <<'EOF'
 agents:
@@ -868,6 +903,14 @@ agents:
 pipeline:
   - action: code
     agent: coder
+EOF
+
+bad "a claude seat with a preset cannot set thinking" \
+    "a claude seat with a preset cannot set thinking" <<'EOF'
+agents:
+  riffler:
+    preset: deep
+    thinking: high
 EOF
 
 bad "preset name shape is refused (path-shaped)" \

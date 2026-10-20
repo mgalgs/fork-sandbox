@@ -661,6 +661,7 @@ if grep -qF -- '--pi-args' "$STUB_ARGV_LOG"; then
 else
     ok "seat alice: no --pi-args on a claude harness"
 fi
+check "seat alice: thinking passed as --effort on a claude harness" "high" "$(argv_after '--effort' "$STUB_ARGV_LOG")"
 
 : > "$STUB_ARGV_LOG"
 send_msg '@alice' '@bob' 'seat bob' 'body' 8 >/dev/null
@@ -674,6 +675,7 @@ else
 fi
 check "seat bob: network from fleet.yaml" "sealed" "$(argv_after '--network' "$STUB_ARGV_LOG")"
 check "seat bob: thinking passed as --pi-args on a pi harness" "--thinking medium" "$(argv_after '--pi-args' "$STUB_ARGV_LOG")"
+check "seat bob: no --effort on a pi harness" 0 "$(grep -c -- '^--effort$' "$STUB_ARGV_LOG")"
 
 : > "$STUB_ARGV_LOG"
 send_msg '@alice' '@carol' 'seat carol' 'body' 8 >/dev/null
@@ -686,6 +688,7 @@ if grep -qF -- '--pi-args' "$STUB_ARGV_LOG"; then
 else
     ok "seat carol: no --pi-args on a claude harness"
 fi
+check "seat carol: no --effort without thinking" 0 "$(grep -c -- '^--effort$' "$STUB_ARGV_LOG")"
 if grep -qF -- '--preset' "$STUB_ARGV_LOG"; then
     no "seat carol: no --preset flag on a presetless seat (regression guard)"
 else

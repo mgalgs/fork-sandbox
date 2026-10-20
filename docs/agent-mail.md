@@ -611,6 +611,13 @@ standing instructions, opaque to the registry — with optional YAML
 frontmatter carrying `description`, `harness`, `model`, `network`
 (`pinned` or `sealed`), `thinking`, `wake-on-cc`, `triage` and `preset`.
 
+`thinking` means what the harness makes of it. A pi seat wakes with
+`--pi-args "--thinking <value>"`. A claude seat (including one with no
+harness set) wakes with `--effort <value>`, so the value must be one of
+`low`, `medium`, `high`, `xhigh` or `max`; `fleet check` refuses anything
+else, and refuses `thinking` on a claude seat that also has a `preset`.
+A codex seat ignores it.
+
 ```markdown
 ---
 description: reads patches like a maintainer, slow to approve

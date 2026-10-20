@@ -2685,6 +2685,20 @@ if [[ -n "${rd_claude_review_args:-}" ]]; then
         "$(sed -n 2p "$argv_log")" "--effort high"
 fi
 
+# --effort reaches the local claude CLI the same way --claude-args does.
+prep_stub $'commit\nnoop'
+rd_claude_effort="$(run_stubbed --effort xhigh \
+    --review-loop 1 --review-harness claude --review-model opus \
+    --branch "sandbox-test-claude-effort-$$")" && tmpdirs+=("$rd_claude_effort")
+if [[ -n "${rd_claude_effort:-}" ]]; then
+    contains "--effort reaches the implement leg's claude CLI" \
+        "$(sed -n 1p "$argv_log")" "--effort xhigh"
+    lacks "--effort does not reach a separately resolved review leg" \
+        "$(sed -n 2p "$argv_log")" "--effort xhigh"
+else
+    no "--effort reaches the implement leg's claude CLI" "the stubbed run failed"
+fi
+
 # The ordinary review and maintainer paths copy the implementation command,
 # rather than resolving a dedicated harness. They must remove the same
 # implementation-only Codex arguments before changing their models.
@@ -4917,6 +4931,9 @@ refuses "--pi-args is refused against a composed pipeline preset" \
 refuses "--codex-args is refused against a composed pipeline preset" \
     "cannot be combined with preset 'composed-cargs'" \
     --preset composed-cargs --codex-args '-c model_reasoning_effort=high'
+refuses "--effort is refused against a composed pipeline preset" \
+    "--effort cannot be combined with preset 'composed-cargs'" \
+    --preset composed-cargs --effort high
 
 # The transcript store wires into the pipeline's own first code step's
 # seat now, not just the legacy implement seat -- composed-cargs's first

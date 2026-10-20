@@ -8,7 +8,7 @@
 #        fork-sandbox-k8s.sh deploy-main [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME [--model MODEL]
 #                            [--endpoint NAME] [--harness pi|claude|codex]
-#                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
+#                            [--pi-args ARGS] [--effort LEVEL] [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR | --context-secret NAME]
 #                            [--thread-dir DIR] [--attach-dir DIR] [--run-dir DIR]
@@ -24,7 +24,7 @@
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
-#                            [--harness pi|claude|codex] [--pi-args ARGS]
+#                            [--harness pi|claude|codex] [--pi-args ARGS] [--effort LEVEL]
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR | --context-secret NAME]
@@ -585,6 +585,10 @@
 # var (exactly the path --model takes) and is split on whitespace into an
 # array the entrypoint expands as arguments: splitting, never eval, never
 # a shell-string interpolation. Unset or empty adds no arguments at all.
+#
+# --effort LEVEL (submit, run): the claude CLI's --effort for the pod's
+# claude coding leg, one of low, medium, high, xhigh, max. --harness claude
+# only. It travels as the CLAUDE_EFFORT env var.
 #
 # --claude-credentials PATH (submit, run; --harness claude only): pins the
 # OAuth credential file this run reads, overriding both CLAUDE_CREDENTIALS in
@@ -6400,7 +6404,7 @@ k8s_job_quota_blocked() {
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
-    local pi_args="" services_trust_ref="" no_services=false task_meta="" claude_credentials_flag=""
+    local pi_args="" effort="" services_trust_ref="" no_services=false task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir="" image_flag="" run_dir_flag=""
     # Recorded in run.env for `resume` only; submit itself acts on none.
     local outbox_dir="" keep=false run_timeout=3600
@@ -6432,6 +6436,7 @@ cmd_submit() {
             --image) image_flag="${2:?--image requires an image reference}"; shift 2 ;;
             --harness) harness="${2:?--harness requires a harness}"; shift 2 ;;
             --pi-args) pi_args="${2:?--pi-args requires a value}"; shift 2 ;;
+            --effort) effort="${2:?--effort requires a level}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
@@ -6557,6 +6562,17 @@ cmd_submit() {
         echo "Error: --pi-args passes flags to pi, which a claude run" >&2
         echo "never starts. Drop it, or use --harness pi." >&2
         exit 1
+    fi
+    if [[ -n "$effort" ]]; then
+        fs_effort_ok "$effort" || {
+            echo "Error: --effort must be one of: $FS_EFFORT_LEVELS (got '$effort')." >&2
+            exit 1
+        }
+        if [[ "$harness" != claude ]]; then
+            echo "Error: --effort sets the claude CLI's effort, which a $harness run" >&2
+            echo "never starts. Drop it, or use --harness claude." >&2
+            exit 1
+        fi
     fi
 
     # The named endpoint this run is wired to, on a K8S_PROXY_ENDPOINTS
@@ -7675,6 +7691,17 @@ CENV
 )"
     fi
 
+    # CLAUDE_EFFORT, whenever --effort was given (claude harness only, one
+    # of FS_EFFORT_LEVELS, both checked above).
+    local claude_effort_env=""
+    if [[ -n "$effort" ]]; then
+        claude_effort_env=$'\n'"$(cat <<CENV
+            - name: CLAUDE_EFFORT
+              value: "$effort"
+CENV
+)"
+    fi
+
     # EXTRA_REFS, whenever --extra-ref was given: space-separated NAME=SHA
     # pairs, one per extra branch pushed alongside $branch. The entrypoint
     # creates a local branch per name and checks the sha. Every character is
@@ -8088,7 +8115,7 @@ CENV
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${pi_idle_timeout_env}${review_loop_env}${claude_env}${codex_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${pi_idle_timeout_env}${review_loop_env}${claude_env}${codex_env}${review_model_env}${pi_args_env}${claude_effort_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
             - name: FORK_SANDBOX_LEG_HANDOFF_DIR
               value: "$leg_handoff_dir"
           securityContext:
@@ -8218,7 +8245,7 @@ VYAML
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${pi_idle_timeout_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${pi_idle_timeout_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${claude_effort_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}${run_dir_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -12262,7 +12289,7 @@ EOF
 cmd_run() {
     local dry_run=false keep=false timeout="" timeout_given=false branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" context_secret="" harness="" review_model="" endpoint=""
-    local checkout_ref="" pi_args="" services_trust_ref="" no_services=false task_meta="" claude_credentials_flag=""
+    local checkout_ref="" pi_args="" effort="" services_trust_ref="" no_services=false task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir="" image_flag="" run_dir_flag=""
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
@@ -12286,6 +12313,7 @@ cmd_run() {
             --image) image_flag="${2:?--image requires an image reference}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --pi-args) pi_args="${2:?--pi-args requires a value}"; shift 2 ;;
+            --effort) effort="${2:?--effort requires a level}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
@@ -12441,6 +12469,7 @@ cmd_run() {
     # anything is created. An empty --pi-args means "absent", not an
     # empty argument the pod's pi would see as a positional.
     [[ -n "$pi_args" ]] && submit_argv+=(--pi-args "$pi_args")
+    [[ -n "$effort" ]] && submit_argv+=(--effort "$effort")
     # Passed through whenever the flag was given at all, "0" included --
     # cmd_submit does the actual positive-integer validation below, and a
     # bad value here must reach that error rather than silently collapse

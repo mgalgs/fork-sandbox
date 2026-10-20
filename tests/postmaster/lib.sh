@@ -115,6 +115,7 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/alice.md" <<'EOF'
 ---
 model: opus
+thinking: high
 ---
 Alice reviews code carefully, flagging subtle bugs before they ship.
 EOF
@@ -151,7 +152,11 @@ cat > "$FORK_SANDBOX_PERSONAS_DIR/karl.md" <<'EOF'
 Karl is a backend: k8s seat with grant: required, used by the hold tests.
 EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/kara.md" <<'EOF'
-Kara is a claude backend: k8s seat with refresh-at, used by the refresh-at tests.
+---
+thinking: xhigh
+---
+Kara is a claude backend: k8s seat with refresh-at, used by the refresh-at
+and --effort tests.
 EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/kim.md" <<'EOF'
 ---
