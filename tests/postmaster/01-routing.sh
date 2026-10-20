@@ -808,6 +808,26 @@ check "local services: the seat still spawns" 1 \
     "$(grep -c -- '^sbx-mail-.*-alice-' "$STUB_ARGV_LOG")"
 check "local services: false passes --no-services" 1 \
     "$(grep -c -- '^--no-services$' "$STUB_ARGV_LOG")"
+
+# ---- a thread's --services-env reaches only seats with services on ----
+lsenv_cfg="$work/services-env-cfg"; mkdir -p "$lsenv_cfg"
+printf 'SERVICES_ENV_ALLOW=SE_TOKEN SE_TIER\n' > "$lsenv_cfg/services.env"
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+: > "$STUB_ARGV_LOG"
+printf 'review\n' > "$work/body.tmp"
+FORK_SANDBOX_CONFIG_DIR="$lsenv_cfg" "$MAIL" send --from @carol --to @alice,@bob \
+    --subject 'services env' --body "$work/body.tmp" \
+    --services-env 'SE_TOKEN=a b' --services-env SE_TIER=medium >/dev/null 2>&1
+once
+check "services-env: both seats spawn" 2 "$(grep -c -- '^----CALL----$' "$STUB_ARGV_LOG")"
+lsenv_calls="$(awk 'BEGIN{RS="----CALL----\n"} /sbx-mail-[^\n]*-bob-/{print}' "$STUB_ARGV_LOG")"
+check "services-env: the seat with services on gets both values, in order" \
+    $'--services-env\nSE_TOKEN=a b\n--services-env\nSE_TIER=medium' \
+    "$(grep -A1 -- '^--services-env$' <<<"$lsenv_calls" | grep -v -- '^--$')"
+lsenv_calls="$(awk 'BEGIN{RS="----CALL----\n"} /sbx-mail-[^\n]*-alice-/{print}' "$STUB_ARGV_LOG")"
+check "services-env: a services: false seat gets none" 0 \
+    "$(grep -c -- '^--services-env$' <<<"$lsenv_calls")"
 printf '%s\n' "$lsvc_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"
 
 finish_suite

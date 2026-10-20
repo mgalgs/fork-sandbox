@@ -12,7 +12,7 @@
 #                              [--seat-resources SEAT=cpu=QTY[,memory=QTY]]...
 #                              [--context-ro DIR] [--context-secret NAME]
 #                              [--review-target <branch>:<sha>] [--budget <n>]
-#                              [--no-grant]
+#                              [--no-grant] [--services-env KEY=VAL]...
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
@@ -47,8 +47,9 @@
 # and write nothing to the store. The printed form is PORTABLE: every bare
 # address is qualified with this host's peer name, so it means the same on
 # any host. --emit does not carry grants, --review-target, --budget,
-# --no-grant or the upstream flags (refused). It exists so lane-mail.sh can
-# deliver a message to another host before anything is written here.
+# --no-grant, --services-env or the upstream flags (refused). It exists so
+# lane-mail.sh can deliver a message to another host before anything is
+# written here.
 #
 # --emit WITH one or more --attach prints a LANE-MAIL-BUNDLE instead of the
 # plain message: the plain message framed with its byte count, then one
@@ -143,6 +144,11 @@
 #                                                  # here and moved by the
 #                                                  # postmaster's `sets` seat
 #                                                  # -- see docs/agent-mail.md
+#   <root>/.postmaster/services-env/<thread-id>.env  # KEY=VAL lines the
+#                                                  # postmaster passes to the
+#                                                  # thread's local seats'
+#                                                  # services hook, written by
+#                                                  # `send --services-env`
 #
 # <thread-id> is the Message-ID of the thread's root message (the message
 # `send` created it with). NNN starts at 001 and counts arrival order within
@@ -585,6 +591,32 @@ mail_write_grant() {
     return 0
 }
 
+# Checks --services-env values with the lib's fs_services_env_check, against
+# the allowlist in this host's fork-sandbox config dir. A subshell, so the
+# lib's globals stay out of this store tool.
+mail_check_services_env() {
+    (
+        # Not followed: the lib's own globals, set only in this subshell,
+        # would read to shellcheck as this script's.
+        # shellcheck source=/dev/null
+        source "$script_dir/fork-sandbox-lib.sh"
+        fs_services_env_check "${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}" "$@"
+    )
+}
+
+# Writes the per-thread services-env file for <tid>, one KEY=VAL per line in
+# the order given, atomically -- send-only, so always a fresh write, as
+# mail_write_review_target.
+mail_write_services_env() {
+    local tid="$1"; shift
+    local se_dir="$MAIL_ROOT/.postmaster/services-env"
+    mkdir -p -- "$se_dir" || return 1
+    local tmp
+    tmp="$(mktemp "$se_dir/.services-env.XXXXXX")" || return 1
+    printf '%s\n' "$@" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -- "$tmp" "$se_dir/$tid.env" || { rm -f -- "$tmp"; return 1; }
+}
+
 # Validates a `--review-target <branch>:<sha>` value, split on the LAST
 # ':' -- a branch name cannot itself contain ':' (git check-ref-format),
 # so the split is unambiguous. Prints "<branch>\t<sha>" on success. This
@@ -991,7 +1023,7 @@ mail_emit_check() {
     local verb="$1" n_multi="$2" other="$3"
     if (( n_multi > 0 )) || [[ -n "$other" ]]; then
         echo "Error: $verb: --emit does not carry grants, a review target, a" >&2
-        echo "thread budget, --no-grant or upstream flags." >&2
+        echo "thread budget, --no-grant, --services-env or upstream flags." >&2
         return 1
     fi
 }
@@ -1055,11 +1087,13 @@ cmd_send() {
     local from="" to="" cc="" subject="" body_arg="" hops=8
     local -a attach_files=() extra_headers=()
     local -a grant_allow_ns=() grant_reach_probe=() grant_host_alias=() grant_seat_resources=()
+    local -a services_env=()
     local grant_context_ro="" grant_context_secret="" review_target_arg="" emit=0
     local budget="" no_grant=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --emit) emit=1; shift ;;
+            --services-env) services_env+=("${2:?--services-env requires KEY=VALUE}"); shift 2 ;;
             --no-grant) no_grant=1; shift ;;
             --budget) budget="${2:?--budget requires a positive integer}"; shift 2 ;;
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -1127,7 +1161,7 @@ cmd_send() {
         local no_grant_mark=""
         (( no_grant )) && no_grant_mark="no-grant"
         mail_emit_check send \
-            "$(( ${#grant_allow_ns[@]} + ${#grant_reach_probe[@]} + ${#grant_host_alias[@]} + ${#grant_seat_resources[@]} ))" \
+            "$(( ${#grant_allow_ns[@]} + ${#grant_reach_probe[@]} + ${#grant_host_alias[@]} + ${#grant_seat_resources[@]} + ${#services_env[@]} ))" \
             "$grant_context_ro$grant_context_secret$review_target_arg$budget$no_grant_mark" || return 1
     fi
 
@@ -1163,6 +1197,12 @@ cmd_send() {
         review_target_sha="${rt_out#*$'\t'}"
     fi
 
+    local saw_services_env=0
+    if (( ${#services_env[@]} )); then
+        mail_check_services_env "${services_env[@]}" || return 1
+        saw_services_env=1
+    fi
+
     local body_file; body_file="$(mktemp "$MAIL_ROOT/.mail.body.XXXXXX")"
     mail_read_body_arg "$body_arg" "$body_file" || { rm -f -- "$body_file"; return 1; }
     if mail_body_is_empty "$body_file"; then
@@ -1195,6 +1235,13 @@ cmd_send() {
         fi
     fi
 
+    if (( saw_services_env )) && ! mail_write_services_env "$uuid" "${services_env[@]}"; then
+        (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
+        (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
+        rm -f -- "$body_file"
+        return 1
+    fi
+
     local attach_csv=""
     local -a attach_pairs=()
     if (( ${#attach_files[@]} > 0 )); then
@@ -1212,6 +1259,7 @@ cmd_send() {
             attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || {
                 (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
                 (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
+                (( saw_services_env )) && rm -f -- "$MAIL_ROOT/.postmaster/services-env/$uuid.env"
                 rm -f -- "$body_file"
                 return 1
             }
@@ -1267,6 +1315,7 @@ cmd_send() {
     mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || {
         (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
         (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
+        (( saw_services_env )) && rm -f -- "$MAIL_ROOT/.postmaster/services-env/$uuid.env"
         rm -f -- "$body_file"
         return 1
     }
@@ -1311,6 +1360,11 @@ cmd_reply() {
             --review-target)
                 echo "Error: reply: --review-target applies to a new thread only (mail send); a reply that moves" >&2
                 echo "the target is the 'sets' seat's own Version: header instead." >&2
+                return 1
+                ;;
+            --services-env)
+                echo "Error: reply: --services-env applies to a new thread only (mail send); a thread's" >&2
+                echo "services environment is chosen when it is opened." >&2
                 return 1
                 ;;
             -h|--help) usage; exit 0 ;;

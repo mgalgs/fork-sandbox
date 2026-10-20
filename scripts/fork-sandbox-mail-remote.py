@@ -89,7 +89,7 @@ VALUE_FLAGS = {
     "--from", "--to", "--cc", "--subject", "--body", "--attach", "--hops",
     "--header", "--allow-namespace", "--reach-probe", "--host-alias",
     "--seat-resources", "--context-ro",
-    "--context-secret", "--reply-to", "--budget",
+    "--context-secret", "--reply-to", "--budget", "--services-env",
 }
 
 

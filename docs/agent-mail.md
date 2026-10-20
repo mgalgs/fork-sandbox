@@ -142,6 +142,10 @@ Under `$FORK_SANDBOX_MAIL_ROOT` (default
                                                    moved" below)
 <root>/.postmaster/upstream-state/<thread-id>.env  open or closed (see
                                                    "Upstream closed" below)
+<root>/.postmaster/services-env/<thread-id>.env  KEY=VALUE lines for the
+                                                   seats' services hook (see
+                                                   "A thread's services-hook
+                                                   environment" below)
 ```
 
 A thread id is the Message-ID of the message that started it, so a thread
@@ -850,7 +854,8 @@ and `follow` mean:
 wakes the seat with `--no-services`: no per-run services and no
 provision-ro binds. Left unset, a local seat gets the project's services
 like any run, and a k8s seat falls back to `K8S_POSTMASTER_SEAT_SERVICES`
-in `k8s.env`.
+in `k8s.env`. It is also how a seat opts out of a thread's
+`--services-env` (see "A thread's services-hook environment" below).
 
 `refresh-at` works on a `backend: k8s` claude seat exactly as on a local one
 (it is forwarded as `--refresh-at`); on a pi seat it is accepted and ignored,
@@ -997,6 +1002,32 @@ anything from a run it did not launch itself. Each removal emits a
 `$FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline` runs the wake wrapper
 synchronously instead of inside its own detached tmux session — a test
 seam, not an operator setting.
+
+## A thread's services-hook environment
+
+A project's services hook (docs/sandbox-services.md) may need settings that
+differ by thread: a panel that tests against a restored fixture needs the
+fixture's name, while a thread that only writes prose needs no fixture at
+all. `mail send --services-env KEY=VALUE` (repeatable) attaches them to the
+new thread:
+
+    fork-sandbox mail send --from @kickoff --to @panel --subject ... --body - \
+        --services-env FIXTURE_TIER=medium
+
+- **Send only.** `reply` refuses it, and so do `--emit` and so a cross-host
+  lane-mail send. The mail API refuses it too: its seats are cluster seats,
+  which run no services hook.
+- **Checked when sent.** The same allowlist as `fork-sandbox run
+  --services-env` applies (`SERVICES_ENV_ALLOW` in
+  `~/.config/fork-sandbox/services.env`, plus the names refused outright).
+  A refused value writes nothing: no thread, no state file.
+- **Stored as thread state.** `.postmaster/services-env/<thread-id>.env`
+  holds one `KEY=VALUE` per line, in the order given, written atomically
+  before the root message is placed.
+- **Forwarded to local seats with services on.** Every wake of a local seat
+  on the thread gets each line as `--services-env`, and fork-sandbox.sh checks
+  them against the allowlist again. A seat with `services: false` gets none.
+  A `backend: k8s` seat gets none either: its pod runs no host-side hook.
 
 ## The review target
 

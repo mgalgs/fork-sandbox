@@ -670,6 +670,51 @@ rc=$?
 check "reply with a grant flag exits 1" "1" "$rc"
 contains "reply's refusal names send as the way to set a grant" "$out" "grant flags apply to a new thread only"
 
+printf '\n== send: --services-env ==\n'
+
+se_cfg="$(mktemp -d)"
+se_dir="$FORK_SANDBOX_MAIL_ROOT/.postmaster/services-env"
+se_count() { find "$se_dir" -name '*.env' 2>/dev/null | wc -l; }
+se_send() {
+    FORK_SANDBOX_CONFIG_DIR="$se_cfg" "$mail" send --from @alice --to @bob \
+        --subject "services env" --body - "$@" <<< "hi"
+}
+
+threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+out="$(se_send --services-env SE_TOKEN=a 2>&1)"; rc=$?
+check "send --services-env with no allowlist exits 1" "1" "$rc"
+contains "the refusal names the allowlist key" "$out" "SERVICES_ENV_ALLOW"
+check "a refused --services-env creates no thread dir" "$threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "a refused --services-env writes no file" "0" "$(se_count)"
+
+printf 'SERVICES_ENV_ALLOW=SE_TOKEN SE_TIER BASH_ENV\n' > "$se_cfg/services.env"
+out="$(se_send --services-env BASH_ENV=/tmp/x 2>&1)"; rc=$?
+check "an allowlisted but refused name exits 1" "1" "$rc"
+contains "BASH_ENV is refused even when allowlisted" "$out" "is refused"
+
+se_tid="$(se_send --services-env 'SE_TOKEN=a b=c' --services-env SE_TIER=medium 2>/dev/null)"; rc=$?
+check "send with allowlisted --services-env exits 0" "0" "$rc"
+check "the services-env file holds the values in order" $'SE_TOKEN=a b=c\nSE_TIER=medium' \
+    "$(cat -- "$se_dir/$se_tid.env" 2>/dev/null)"
+
+se_before="$(se_count)"
+out="$(se_send --services-env SE_TOKEN=a --attach "$big" 2>&1)"; rc=$?
+if (( rc != 0 )); then ok "send with --services-env but a failing attachment fails"
+else no "send with --services-env but a failing attachment fails" "it succeeded"; fi
+check "no orphaned services-env file is left behind" "$se_before" "$(se_count)"
+
+out="$("$mail" reply --from @bob --reply-to "$se_tid" --body - \
+    --services-env SE_TOKEN=b <<< "x" 2>&1)"; rc=$?
+check "reply with --services-env exits 1" "1" "$rc"
+contains "reply's refusal says --services-env is send only" "$out" \
+    "--services-env applies to a new thread only"
+
+out="$(se_send --emit --services-env SE_TOKEN=a 2>&1)"; rc=$?
+check "--emit with --services-env exits 1" "1" "$rc"
+contains "--emit's refusal names --services-env" "$out" "--services-env"
+rm -rf -- "$se_cfg"
+
 printf '\n== grant / send: --host-alias ==\n'
 
 "$mail" grant "$grant_tid" --host-alias 192.0.2.10=pr-7.example.com,pr-7-mcp.example.com \

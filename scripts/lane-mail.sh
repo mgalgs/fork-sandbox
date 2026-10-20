@@ -113,7 +113,7 @@ find_remote_hosts() {
                 ;;
             --reply-to) reply_to="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
             --from|--subject|--body|--attach|--hops|--header|--allow-namespace|--reach-probe|--host-alias|--seat-resources|\
-            --context-ro|--context-secret|--review-target|--upstream-head|--upstream-state)
+            --context-ro|--context-secret|--review-target|--upstream-head|--upstream-state|--services-env)
                 shift $(( $# >= 2 ? 2 : 1 ))
                 ;;
             *) shift ;;

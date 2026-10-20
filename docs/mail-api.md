@@ -237,6 +237,10 @@ the table entirely rather than given a value form. `--context-secret` is
 allowed: a Secret name means the same thing over the API as on the host. It
 is a single-value flag and needs cap `grant`, like the other grant flags.
 
+`send` refuses `--services-env` the same way (403: "a cluster seat runs no
+services hook"), even for an operator. The values feed a local seat's
+host-side services hook, and the API's seats are cluster seats.
+
 `mail`'s own rule that a namespace grant needs at least one
 `--reach-probe` still applies over the API: the server only checks that
 the flags are individually allowed, not that they are used together, so

@@ -4404,6 +4404,15 @@ pm_spawn_wake() {
     # ones with a resumable transcript.
     spawn_args+=(--clone-dir "$PM_WORKSPACES/$tid/$agent")
     [[ "$seat_services" == false ]] && spawn_args+=(--no-services)
+    # The thread's services-hook env (`mail send --services-env`), in file
+    # order; fork-sandbox.sh re-checks every line against the allowlist.
+    # Local only: a k8s seat's pod runs no host-side hook.
+    local se_file="$MAIL_ROOT/.postmaster/services-env/$tid.env" se_line
+    if [[ "$seat_services" != false && -f "$se_file" ]]; then
+        while IFS= read -r se_line; do
+            [[ -n "$se_line" ]] && spawn_args+=(--services-env "$se_line")
+        done < "$se_file"
+    fi
 
     # A target this seat has not started from yet (a first wake, a new
     # version, a lost workspace) moves the clone there. Otherwise the clone

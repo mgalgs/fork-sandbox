@@ -476,6 +476,9 @@ check "--context-ro on send: 403 even for the operator" "403" \
     "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject s --body - --context-ro /tmp)"
 check "--context-ro on grant: 403" "403" \
     "$(xr "$tok/laptop" --tool mail -- grant "$seed" --context-ro /tmp)"
+check "--services-env on send: 403 even for the operator" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject s --body - --services-env K=v)"
+contains "--services-env on send: says why" "$(rjson error)" "a cluster seat runs no services hook"
 check "an unknown verb (deliver): 403" "403" "$(xr "$tok/laptop" --tool postmaster -- deliver)"
 contains "an unknown verb: names it" "$(rjson error)" "deliver"
 check "an unknown mail verb: 403" "403" "$(xr "$tok/laptop" --tool mail -- deliver)"

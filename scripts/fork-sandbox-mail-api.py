@@ -221,11 +221,16 @@ SPEC = {
 # name a directory of the store's host, so it is refused outright.
 # --context-secret is not refused: a Secret name means the same thing over
 # the API, and the grant cap gates it like the other grant flags.
+# --services-env feeds a host-side services hook, which only a local seat
+# runs; the API's seats are cluster seats, so it is refused too.
+HOST_PATH_WHY = "a host path has no meaning over the API"
 REFUSED_FLAGS = {
-    ("mail", "send"): {"--context-ro"},
-    ("mail", "grant"): {"--context-ro"},
+    ("mail", "send"): {
+        "--context-ro": HOST_PATH_WHY,
+        "--services-env": "a cluster seat runs no services hook",
+    },
+    ("mail", "grant"): {"--context-ro": HOST_PATH_WHY},
 }
-REFUSED_WHY = "a host path has no meaning over the API"
 
 # The review-target contract's headers: only mail's own --review-target
 # flag and the postmaster may write them, so --header is refused for both
@@ -456,7 +461,7 @@ def parse_argv(tool, argv):
         raise ApiError(403, "verb %s is not allowed for %s"
                        % (shown(verb), tool))
     min_pos, max_pos, kinds = verbs[verb]
-    refused = REFUSED_FLAGS.get((tool, verb), ())
+    refused = REFUSED_FLAGS.get((tool, verb), {})
     positionals = []
     flags = {}
     attach_at = []
@@ -469,7 +474,7 @@ def parse_argv(tool, argv):
             continue
         if tok in refused:
             raise ApiError(403, "%s %s: %s: %s"
-                           % (tool, verb, tok, REFUSED_WHY))
+                           % (tool, verb, tok, refused[tok]))
         kind = kinds.get(tok)
         if kind is None:
             raise ApiError(403, "%s %s: flag %s is not allowed"
