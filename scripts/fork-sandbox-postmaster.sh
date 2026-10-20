@@ -287,7 +287,7 @@
 # `follow` seat, or a `sets` seat with no lineage yet). A miss -- the ref is
 # missing, the fetch fails, or the fetch works and the sha is still absent --
 # does not flag at once: pm_fetch_wait_gate records the wake under
-# $STATE/fetch-wait/<thread-id>/<agent> (TRIGGER, RETRY, KIND, KEY=<branch>
+# $STATE/fetch-wait/<thread-id>/<agent> (TRIGGER, RETRY -- 1, 0 or `malformed` --, KIND, KEY=<branch>
 # <sha>, SINCE, ATTEMPTS, NOT_BEFORE), emits `defer ... reason=fetch-miss`,
 # and returns. pm_fetch_wait_pass, once per deliver pass, re-dispatches every
 # record whose NOT_BEFORE has come (backoff 15s, 30s, then 60s, the last
@@ -846,7 +846,24 @@
 # as ON_SILENCE at spawn). Such a wake flags the thread `wake for <agent>
 # posted no reply (run <id>)` (keyword `silent-wake`), and the seat's next
 # wake that posts a reply clears it, the same way a clean exit clears a
-# wake-exit flag (see pm_wake_exit_clear).
+# wake-exit flag (see pm_wake_exit_clear). `on-silence: retry` does the
+# same and, when a clean wake wrote reply files and EVERY one was discarded,
+# re-wakes the seat once on the same trigger (pm_retry_malformed_schedule):
+# no retry for a no-file wake, a newer pending message, a closed thread, or
+# a trigger that already had its one such retry (the marker
+# discards/<tid>/<agent>.spent holds the trigger id). It rides the
+# retries/ machinery with REASON=malformed but spends no crash-retry budget;
+# its handoff quotes the discard reasons kept in discards/<tid>/<agent>.
+# The seat's crash-retry record is set aside in discards/<tid>/<agent>.prior
+# while the malformed schedule is pending, and put back when the schedule
+# ends any way: it fires, a newer message supersedes it, or the thread closes
+# (pm_retry_restore_prior).
+#
+# RE-GATE. After any run is harvested with replies=0, the wake-when gate of
+# each seat with a wake-deferred line on the thread is re-run through the
+# normal spawn path (pm_regate_deferred), AFTER the run's durable record
+# (HARVESTED_AT, REPLIES, REPLY_FILES, OUTCOME) and harvested marker are
+# written, so the gate's `status --thread --json` sees the run harvested.
 # A malformed reply file (bad address, unparseable stanza, or a
 # `mail.sh` call that itself fails) is skipped and flags the thread with
 # the filename and the reason -- it never costs the run's other,
@@ -930,8 +947,15 @@
 #                                   wake was actually spawned at, so a later
 #                                   harvest stamps the reply with the target
 #                                   it read, not one that may have moved
-#                                   since -- see docs/agent-mail.md). A
-#                                   handler seat's
+#                                   since -- see docs/agent-mail.md).
+#                                   WOKEN_AT_SHA, WOKEN_AT_VERSION (the
+#                                   thread's target at spawn, for EVERY
+#                                   seat; REVIEW_TARGET_SHA keeps its
+#                                   follow-seat meaning), RETRY_KIND and
+#                                   RETRY_OF (a retry wake only), and, at
+#                                   harvest, HARVESTED_AT, REPLIES,
+#                                   REPLY_FILES, OUTCOME (clean|failed).
+#                                   A handler seat's
 #                                   run (see THE WAKE's handler variant)
 #                                   writes a deliberately minimal record
 #                                   instead: AGENT, THREAD, TRIGGER,
@@ -1032,8 +1056,9 @@
 #                                   epoch the record was first created,
 #                                   kept across a superseding TRIGGER),
 #                                   RETRY (1 when the hold absorbed a
-#                                   retry that would otherwise have fired,
-#                                   else 0). Written atomically
+#                                   crash retry that would otherwise have
+#                                   fired, `malformed` when it absorbed a
+#                                   discarded-reply retry, else 0). Written atomically
 #                                   (tmp+mv) by pm_spawn_wake, released by
 #                                   pm_held_pass; a full read/write
 #                                   contract for this file lives in
@@ -1320,6 +1345,13 @@ HANDLER_OUTBOX="$STATE/handler-outbox"
 # consumer, so every write is a full-file mktemp+mv rewrite, never an
 # in-place edit -- see pm_retry_fails_set.
 RETRIES="$STATE/retries"
+# The reasons a `retry` seat's replies were discarded, one line per
+# discarded file: $DISCARDS/<thread-id>/<agent>. Written at harvest, read
+# into the retry wake's handoff and removed there. It lives apart from
+# $RETRIES and from the held / fetch-wait records (which carry only the
+# retry's kind) so the reasons survive every detour a retry can take
+# before it spawns.
+DISCARDS="$STATE/discards"
 
 # The shape fork-sandbox.sh accepts for --resume-session. Applied to what
 # summary.json reported before it is recorded: a malformed id would make
@@ -1462,6 +1494,14 @@ pm_retry_fails_get() {
 #   LAST_FAILED_RUN  the run id of the wake whose failure produced this
 #                     STATE (pending or exhausted)
 #   RECOVERED_AT     epoch seconds a recovered STATE was reached
+#   REASON           why the retry exists: `failed` (the wake crashed or was
+#                     killed; the default whenever a TRIGGER or STATE is on
+#                     file) or `malformed` (the wake exited cleanly but every
+#                     reply file it wrote was discarded -- see
+#                     `on-silence: retry`). A malformed retry is never
+#                     counted in ATTEMPT/MAX/FAILS: it is fired once and its
+#                     schedule dropped (pm_retry_pass), so none of the
+#                     crash-retry budget is spent on it.
 # An absent/zero $fails with an empty $trigger and empty $state means
 # nothing is left to store, so the file is removed outright; otherwise
 # each field is written only when non-empty (an ATTEMPT or NOT_BEFORE with
@@ -1470,7 +1510,7 @@ pm_retry_fails_get() {
 # reader (pm_retry_pass, cmd_status) must never see a partial write.
 pm_retry_raw_write() {
     local tid="$1" agent="$2" fails="$3" trigger="$4" attempt="$5" not_before="$6" \
-          rstate="$7" max="$8" last_failed_run="$9" recovered_at="${10}"
+          rstate="$7" max="$8" last_failed_run="$9" recovered_at="${10}" reason="${11:-}"
     local has_fails=0 has_trigger=0 has_state=0
     [[ -n "$fails" && "$fails" != 0 ]] && has_fails=1
     [[ -n "$trigger" ]] && has_trigger=1
@@ -1485,6 +1525,7 @@ pm_retry_raw_write() {
     {
         (( has_fails )) && printf 'FAILS=%s\n' "$fails"
         (( has_state )) && printf 'STATE=%s\n' "$rstate"
+        (( has_trigger || has_state )) && printf 'REASON=%s\n' "${reason:-failed}"
         if (( has_trigger )); then
             printf 'TRIGGER=%s\n' "$trigger"
             printf 'ATTEMPT=%s\n' "${attempt:-0}"
@@ -1505,15 +1546,16 @@ pm_retry_raw_write() {
 # function).
 pm_retry_fails_set() {
     local tid="$1" agent="$2" fails="$3"
-    local f="$RETRIES/$tid/$agent" trigger attempt not_before rstate max last_failed_run
+    local f="$RETRIES/$tid/$agent" trigger attempt not_before rstate max last_failed_run rreason
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
     attempt="$(fs_pm_env_get "$f" ATTEMPT)"
     not_before="$(fs_pm_env_get "$f" NOT_BEFORE)"
     rstate="$(fs_pm_env_get "$f" STATE)"
     max="$(fs_pm_env_get "$f" MAX)"
     last_failed_run="$(fs_pm_env_get "$f" LAST_FAILED_RUN)"
+    rreason="$(fs_pm_env_get "$f" REASON)"
     pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before" \
-        "$rstate" "$max" "$last_failed_run" ""
+        "$rstate" "$max" "$last_failed_run" "" "$rreason"
 }
 
 # The wedge bound's own reset: FAILS back to 0 when it trips (3
@@ -1526,7 +1568,8 @@ pm_retry_fails_set() {
 # more retry than the configured cap.
 pm_retry_wedge_reset() {
     local tid="$1" agent="$2"
-    local f="$RETRIES/$tid/$agent" trigger attempt not_before rstate max last_failed_run recovered_at
+    local f="$RETRIES/$tid/$agent" trigger attempt not_before rstate max last_failed_run recovered_at rreason
+    rreason="$(fs_pm_env_get "$f" REASON)"
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
     attempt="$(fs_pm_env_get "$f" ATTEMPT)"
     not_before="$(fs_pm_env_get "$f" NOT_BEFORE)"
@@ -1535,7 +1578,7 @@ pm_retry_wedge_reset() {
     last_failed_run="$(fs_pm_env_get "$f" LAST_FAILED_RUN)"
     recovered_at="$(fs_pm_env_get "$f" RECOVERED_AT)"
     pm_retry_raw_write "$tid" "$agent" 0 "$trigger" "$attempt" "$not_before" \
-        "$rstate" "$max" "$last_failed_run" "$recovered_at"
+        "$rstate" "$max" "$last_failed_run" "$recovered_at" "$rreason"
 }
 
 # A clean exit-0 harvest. FAILS resets to 0 and NOT_BEFORE (the only field
@@ -1590,10 +1633,25 @@ pm_retry_recover() {
 # there and this leaves the file untouched rather than deleting that
 # history out from under a reader (a FAILS-only file, with no STATE at
 # all, is likewise left alone: nothing on it is a schedule either).
+# Ends a pending REASON=malformed schedule by putting back the crash-retry
+# record set aside in discards/<tid>/<agent>.prior (recovered or exhausted
+# history), keeping the current FAILS. Returns 1 when the record is not a
+# malformed schedule with a .prior, so the caller drops the schedule itself.
+pm_retry_restore_prior() {
+    local tid="$1" agent="$2"
+    local f="$RETRIES/$tid/$agent" prior="$DISCARDS/$tid/$agent.prior"
+    [[ "$(fs_pm_env_get "$f" REASON)" == malformed && -f "$prior" ]] || return 1
+    local fails
+    fails="$(pm_retry_fails_get "$tid" "$agent")"
+    mv -- "$prior" "$f"
+    pm_retry_fails_set "$tid" "$agent" "$fails"
+}
+
 pm_retry_clear_schedule() {
     local tid="$1" agent="$2"
     local f="$RETRIES/$tid/$agent"
     [[ "$(fs_pm_env_get "$f" STATE)" == pending ]] || return 0
+    pm_retry_restore_prior "$tid" "$agent" && return 0
     local fails
     fails="$(pm_retry_fails_get "$tid" "$agent")"
     pm_retry_raw_write "$tid" "$agent" "$fails" "" "" "" "" "" "" ""
@@ -1724,6 +1782,19 @@ pm_seat_last_target_sha() {
         fs_pm_env_get "$f" REVIEW_TARGET_SHA
         return 0
     done
+}
+
+# Prints the run id of <agent>'s newest run on <tid> (empty when it has
+# none). Read before this wake's own run-id is appended to $SEQ/$tid.
+pm_seat_last_run() {
+    local tid="$1" agent="$2" rid
+    [[ -f "$SEQ/$tid" ]] || return 0
+    while IFS= read -r rid; do
+        [[ -n "$rid" && -f "$RUNS/$rid.env" ]] || continue
+        [[ "$(fs_pm_env_get "$RUNS/$rid.env" AGENT)" == "$agent" ]] || continue
+        printf '%s' "$rid"
+        return 0
+    done < <(tac -- "$SEQ/$tid")
 }
 
 # Expands a To:/Cc:-shaped comma list one address at a time (fleet expand
@@ -2995,7 +3066,21 @@ pm_write_handoff() {
         fi
         printf '\n'
         printf 'The triggering message for this wake is: %s\n\n' "$trigger_mid"
-        if [[ "$is_retry" == 1 ]]; then
+        if [[ "$is_retry" == malformed ]]; then
+            local discard_line
+            printf '## Your previous reply was discarded\n\n'
+            printf 'Your previous wake for this same message exited cleanly, but the\n'
+            printf 'postmaster could not post the reply file(s) it wrote, so nothing from\n'
+            printf 'them reached the thread. Its reason for each discarded file:\n\n'
+            if [[ -f "$DISCARDS/$tid/$agent" ]]; then
+                while IFS= read -r discard_line; do
+                    printf -- '- %s\n' "$discard_line"
+                done < "$DISCARDS/$tid/$agent"
+            fi
+            printf '\nFix what the reasons name and write the reply again, as a new\n'
+            printf 'mail-*.md file in your outbox (see "Replying" below for the format).\n'
+            printf 'This is the only retry: a second discarded reply is not retried.\n\n'
+        elif [[ "$is_retry" == 1 ]]; then
             printf '## This is a retry\n\n'
             printf 'Your previous wake for this same message did not finish cleanly (it\n'
             printf 'crashed, or was killed) and is being retried. If you already sent a\n'
@@ -3193,7 +3278,7 @@ pm_fetch_wait_gate() {
     local window="${FORK_SANDBOX_POSTMASTER_FETCH_WINDOW:-300}"
     local now since="" attempts=0 not_before=0 retry_flag=0
     now="$(date +%s)"
-    [[ -n "$is_retry" ]] && retry_flag=1
+    [[ -n "$is_retry" ]] && retry_flag="$is_retry"
     local pending=0
     # A record of the other kind belongs to the other check in pm_spawn_wake
     # (a `sets` seat can need both): this one neither reads nor resolves it.
@@ -3745,10 +3830,16 @@ pm_exec_wake() {
     fi
     rm -f -- "$stderr_capture"
 
-    local mf replies=0
+    local woken_sha="" woken_version=""
+    if [[ -f "$MAIL_ROOT/.postmaster/review-target/$tid.env" ]]; then
+        woken_sha="$(fs_pm_env_get "$MAIL_ROOT/.postmaster/review-target/$tid.env" SHA)"
+        woken_version="$(fs_pm_env_get "$MAIL_ROOT/.postmaster/review-target/$tid.env" VERSION)"
+    fi
+    local mf replies=0 reply_files=0
     PM_HARVEST_POSTED=()
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
+        reply_files=$(( reply_files + 1 ))
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" "" "" "" "" "" "" "" "" ""; then
             replies=$(( replies + 1 ))
         fi
@@ -3771,7 +3862,9 @@ pm_exec_wake() {
         printf 'TRIGGER=%s\n' "$mid"
         printf 'KIND=exec\n'
         printf 'VIA=%s\n' "$via"
+        [[ -z "$woken_sha" ]] || printf 'WOKEN_AT_SHA=%s\nWOKEN_AT_VERSION=%s\n' "$woken_sha" "$woken_version"
     } > "$RUNS/$run_id.env"
+    pm_harvest_record "$RUNS/$run_id.env" "$(( rc == 0 ))" "$replies" "$reply_files"
 
     mkdir -p -- "$HARVESTED"
     : > "$HARVESTED/$run_id"
@@ -3780,6 +3873,8 @@ pm_exec_wake() {
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
     pm_seat_records_clear "$tid" "$agent"
     printf '%s\n' "$run_id" >> "$SEQ/$tid"
+
+    (( replies > 0 )) || pm_regate_deferred "$PM_PROJECT" "$tid" "$run_id"
 
     pm_hook_on_harvest "$tid" "$run_id" "" "$agent" "${PM_HARVEST_POSTED[@]}"
 }
@@ -4114,7 +4209,7 @@ pm_spawn_wake() {
             else
                 since="$(date +%s)"
             fi
-            [[ -n "$is_retry" ]] && retry_flag=1
+            [[ -n "$is_retry" ]] && retry_flag="$is_retry"
             pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag"
             pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
             if [[ "$old_trigger" != "$mid" ]]; then
@@ -4126,6 +4221,22 @@ pm_spawn_wake() {
 
     local run_id
     run_id="$(pm_new_uuid)"
+    # What the run record says about the thread's review target and about a
+    # retry. woken_* is the thread's target for EVERY seat (rt_* above is
+    # only set for a seat that is moved to it), and retry_of is the seat's
+    # previous run on the thread: the one this wake retries.
+    local woken_sha="" woken_version="" retry_of="" retry_kind=""
+    if [[ -n "$rt_sha" ]]; then
+        woken_sha="$rt_sha" woken_version="$rt_version"
+    elif [[ -f "$MAIL_ROOT/.postmaster/review-target/$tid.env" ]]; then
+        woken_sha="$(fs_pm_env_get "$MAIL_ROOT/.postmaster/review-target/$tid.env" SHA)"
+        woken_version="$(fs_pm_env_get "$MAIL_ROOT/.postmaster/review-target/$tid.env" VERSION)"
+    fi
+    if [[ -n "$is_retry" ]]; then
+        retry_kind=failed
+        [[ "$is_retry" == malformed ]] && retry_kind=malformed
+        retry_of="$(pm_seat_last_run "$tid" "$agent")"
+    fi
     local trigger_only=""
     local snap_dir="$MAIL_ROOT/.postmaster/wake-threads/$run_id"
     if ! mkdir -p -- "$snap_dir" 2>/dev/null; then
@@ -4165,6 +4276,7 @@ pm_spawn_wake() {
         pm_flag "$tid" "handoff render failed for $agent: $mid"
         return 0
     fi
+    rm -f -- "$DISCARDS/$tid/$agent"
 
     local attach_dir="$MAIL_ROOT/threads/$tid/attachments"
     local has_attach_dir=0
@@ -4367,6 +4479,8 @@ pm_spawn_wake() {
             printf 'BACKEND=k8s\n'
             printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
             printf 'ON_SILENCE=%s\n' "$on_silence"
+            [[ -z "$woken_sha" ]] || printf 'WOKEN_AT_SHA=%s\nWOKEN_AT_VERSION=%s\n' "$woken_sha" "$woken_version"
+            [[ -z "$retry_kind" ]] || printf 'RETRY_KIND=%s\nRETRY_OF=%s\n' "$retry_kind" "$retry_of"
             if [[ -n "$rt_sha" ]]; then
                 printf 'REVIEW_TARGET_BRANCH=%s\n' "$rt_branch"
                 printf 'REVIEW_TARGET_SHA=%s\n' "$rt_sha"
@@ -4484,6 +4598,8 @@ pm_spawn_wake() {
         printf 'BACKEND=local\n'
         printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
         printf 'ON_SILENCE=%s\n' "$on_silence"
+        [[ -z "$woken_sha" ]] || printf 'WOKEN_AT_SHA=%s\nWOKEN_AT_VERSION=%s\n' "$woken_sha" "$woken_version"
+        [[ -z "$retry_kind" ]] || printf 'RETRY_KIND=%s\nRETRY_OF=%s\n' "$retry_kind" "$retry_of"
         if [[ -n "$rt_sha" ]]; then
             printf 'REVIEW_TARGET_BRANCH=%s\n' "$rt_branch"
             printf 'REVIEW_TARGET_SHA=%s\n' "$rt_sha"
@@ -5093,6 +5209,7 @@ pm_parse_reply_file() {
 # The Message-ID of every message pm_harvest_one_file posted since the caller
 # last reset this, in posting order -- what on-harvest reports.
 PM_HARVEST_POSTED=()
+PM_HARVEST_DISCARDS=()
 
 # Fires on-harvest once for one run's harvest when it posted anything:
 # pm_hook_on_harvest <tid> <run-id> <branch> <agent> <posted-id>...
@@ -5117,6 +5234,15 @@ pm_flag_quote_line() {
     printf '%s' "${s:0:120}"
 }
 
+# Flags a reply file the postmaster is discarding and remembers the reason
+# for the harvest's own use (an `on-silence: retry` seat is shown it in its
+# retry handoff). Whitespace runs are flattened so one reason is one line.
+pm_harvest_discard() {
+    local tid="$1" reason="$2" keyword="${3:-}"
+    PM_HARVEST_DISCARDS+=("${reason//[$'\n\r\t']/ }")
+    pm_flag "$tid" "$reason" "$keyword"
+}
+
 pm_harvest_one_file() {
     local mf="$1" agent="$2" tid="$3" trigger="$4" trigger_hops="$5"
     local harness="${6:-}" model="${7:-}" network="${8:-}" project="${9:-}"
@@ -5135,7 +5261,7 @@ pm_harvest_one_file() {
         local reason
         reason="malformed reply file $(basename -- "$mf"): unparseable header stanza"
         [[ -n "$bad_line" ]] && reason+=": $(pm_flag_quote_line "$bad_line")"
-        pm_flag "$tid" "$reason"
+        pm_harvest_discard "$tid" "$reason"
         return 1
     fi
     unset PM_PARSE_BAD_LINE_FILE
@@ -5154,7 +5280,7 @@ pm_harvest_one_file() {
     # malformed as any other reply this store refuses to post).
     if [[ -n "$version" && "$review_target_key" != sets ]]; then
         rm -f -- "$body_file"
-        pm_flag "$tid" "malformed reply file $(basename -- "$mf"): Version: header from a seat without review-target: sets"
+        pm_harvest_discard "$tid" "malformed reply file $(basename -- "$mf"): Version: header from a seat without review-target: sets"
         return 1
     fi
 
@@ -5206,7 +5332,7 @@ pm_harvest_one_file() {
             done
             local reason
             reason="malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject (missing: $missing_joined)"
-            pm_flag "$tid" "$reason"
+            pm_harvest_discard "$tid" "$reason"
             return 1
         fi
         cmd=("$MAIL" send --from "@$agent" --to "$to" --subject "$subject" --body "$body_file" --hops "$decremented")
@@ -5256,13 +5382,13 @@ pm_harvest_one_file() {
                 rt_new_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
             else
                 rm -f -- "$body_file"
-                pm_flag "$tid" "Version: $version but the wake's branch $wake_branch did not come back"
+                pm_harvest_discard "$tid" "Version: $version but the wake's branch $wake_branch did not come back"
                 return 1
             fi
         fi
         if [[ "$rt_current" =~ ^[0-9]+$ ]] && (( version <= rt_current )); then
             rm -f -- "$body_file"
-            pm_flag "$tid" "Version: $version does not advance the review target (at $rt_current)"
+            pm_harvest_discard "$tid" "Version: $version does not advance the review target (at $rt_current)"
             return 1
         fi
         cmd+=(--header "X-Review-Target-Set: $rt_new_branch $rt_new_sha")
@@ -5295,7 +5421,7 @@ pm_harvest_one_file() {
         # "handler "-prefixed patterns, so $err_out (the mail command's own
         # stderr) can't supply a false second literal the way it can at the
         # pm_exec_wake call site above (see pm_flag_keyword's own comment).
-        pm_flag "$tid" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply"
+        pm_harvest_discard "$tid" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply"
         return 1
     fi
 
@@ -5656,6 +5782,67 @@ pm_try_adopt() {
     return 0
 }
 
+# Writes a harvested run's durable outcome into its run record (atomic
+# upserts, see pm_run_env_set): when, how many replies were posted, how many
+# reply files there were (malformed ones included) and clean or failed.
+# $1 = run record, $2 = 1 for a clean exit, $3 = replies, $4 = reply files.
+pm_harvest_record() {
+    local f="$1" clean="$2" replies="$3" reply_files="$4" outcome=failed
+    (( clean )) && outcome=clean
+    pm_run_env_set "$f" HARVESTED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    pm_run_env_set "$f" REPLIES "$replies"
+    pm_run_env_set "$f" REPLY_FILES "$reply_files"
+    pm_run_env_set "$f" OUTCOME "$outcome"
+}
+
+# Schedules the one re-wake of an `on-silence: retry` seat whose reply files
+# were all discarded: the discard reasons are stored for the retry's handoff
+# and a due-now schedule goes in the seat's retries record (REASON=malformed,
+# see pm_retry_raw_write), which the next pm_retry_pass fires.
+# $1 = thread, $2 = agent, $3 = trigger message id, $4 = the harvested run.
+pm_retry_malformed_schedule() {
+    local tid="$1" agent="$2" trigger="$3" rid="$4"
+    (( ${#PM_HARVEST_DISCARDS[@]} )) || return 0
+    mkdir -p -- "$DISCARDS/$tid"
+    printf '%s\n' "${PM_HARVEST_DISCARDS[@]}" > "$DISCARDS/$tid/$agent"
+    # The trigger's one malformed retry is spent from here on, whatever the
+    # retry's own wake does (a crash retry in between must not reopen it).
+    printf '%s\n' "$trigger" > "$DISCARDS/$tid/$agent.spent"
+    # Whatever crash-retry record the seat has (recovered, exhausted) is set
+    # aside and put back when the malformed retry fires, so its ATTEMPT/MAX
+    # history survives and a crash of the retry continues the same backoff.
+    if [[ -n "$(fs_pm_env_get "$RETRIES/$tid/$agent" TRIGGER)" ]]; then
+        cp -- "$RETRIES/$tid/$agent" "$DISCARDS/$tid/$agent.prior"
+    else
+        rm -f -- "$DISCARDS/$tid/$agent.prior"
+    fi
+    pm_retry_raw_write "$tid" "$agent" "$(pm_retry_fails_get "$tid" "$agent")" \
+        "$trigger" 0 "$(date +%s)" pending "" "$rid" "" malformed
+}
+
+# Re-runs the wake-when gate of every seat the thread has a wake-deferred
+# record for, after run $3 was harvested having posted nothing: the gate only
+# ever ran when a message arrived, and nothing else would retry it. Through
+# the ordinary spawn path, with the deferred message as the trigger: exit 0
+# wakes the seat, exit 1 records the same deferral again, anything else fails
+# open. A closed thread is skipped, and hops/budget/reserve apply as to any
+# follow-up wake.
+pm_regate_deferred() {
+    local project="$1" tid="$2" rid="$3" agent mid
+    [[ -s "$WAKE_DEFERRED/$tid" ]] || return 0
+    pm_upstream_closed "$tid" && return 0
+    local -a records=()
+    mapfile -t records < "$WAKE_DEFERRED/$tid"
+    local rec
+    for rec in "${records[@]}"; do
+        read -r agent mid <<< "$rec"
+        [[ -n "$agent" && -n "$mid" ]] || continue
+        fs_pm_find_live_run "$agent" "$tid" >/dev/null && continue
+        pm_event "regate thread=${tid:0:8} agent=$agent run=$rid"
+        pm_followup_wake "$project" "$agent" "$tid" "$mid" || true
+    done
+}
+
 pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
@@ -5706,8 +5893,10 @@ pm_harvest_run() {
         # Session state lives under this script's own state dir, not the
         # run dir that just vanished -- it is unaffected, so it is left
         # standing rather than cleared on evidence this branch never had.
+        pm_harvest_record "$f" 0 0 0
         mkdir -p -- "$HARVESTED"
         : > "$HARVESTED/$rid"
+        pm_regate_deferred "$project" "$tid" "$rid"
         return 0
     fi
     if [[ ! -f "$run_dir/summary.json" ]]; then
@@ -5862,6 +6051,7 @@ pm_harvest_run() {
 
     local mf replies=0 reply_files=0
     PM_HARVEST_POSTED=()
+    PM_HARVEST_DISCARDS=()
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
         reply_files=$(( reply_files + 1 ))
@@ -5877,9 +6067,14 @@ pm_harvest_run() {
     # so only an outbox with no reply file at all counts as silence.
     if (( clean_exit && replies > 0 )); then
         pm_wake_exit_clear "$tid" "$agent" "$rid" silent-wake "wake for $agent posted no reply " || true
-    elif (( clean_exit && reply_files == 0 )) && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == flag ]]; then
+    elif (( clean_exit && reply_files == 0 )) && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == flag || "$(fs_pm_env_get "$f" ON_SILENCE)" == retry ]]; then
         pm_flag_unless_closed "$tid" "wake for $agent posted no reply (run $rid)" silent-wake
     fi
+
+    # The run's durable outcome, written BEFORE the harvested marker (and
+    # before any re-gate below): a wake gate reads it back through
+    # `status --json` and must see this run as harvested with its count.
+    pm_harvest_record "$f" "$clean_exit" "$replies" "$reply_files"
 
     mkdir -p -- "$HARVESTED"
     : > "$HARVESTED/$rid"
@@ -5949,7 +6144,16 @@ pm_harvest_run() {
         if [[ "$backend" == k8s && "$(fs_pm_env_get "$RETRIES/$tid/$agent" STATE)" != exhausted ]]; then
             pm_k8s_streak_exhausted "$tid" "$agent" "$trigger" || true
         fi
+    elif (( clean_exit && reply_files > 0 && replies == 0 )) \
+        && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == retry \
+              && "$(cat -- "$DISCARDS/$tid/$agent.spent" 2>/dev/null || true)" != "$trigger" ]] \
+        && ! pm_upstream_closed "$tid"; then
+        # Every reply file was discarded and no newer message is pending
+        # (the branch above): re-wake once on the same trigger.
+        pm_retry_malformed_schedule "$tid" "$agent" "$trigger" "$rid"
     fi
+
+    (( replies > 0 )) || pm_regate_deferred "$project" "$tid" "$rid"
 
     pm_hook_on_harvest "$tid" "$rid" "$branch" "$agent" "${posted_ids[@]}"
 }
@@ -6146,8 +6350,24 @@ pm_retry_pass() {
                 # A refusal like the hops/budget ones: permanent for this
                 # trigger, so the schedule is dropped, not retried again.
                 pm_upstream_refuse "$tid" "$agent"
-                pm_retry_raw_write "$tid" "$agent" "$(pm_retry_fails_get "$tid" "$agent")" \
-                    "" "" "" "" "" "$(fs_pm_env_get "$f" LAST_FAILED_RUN)" ""
+                pm_retry_restore_prior "$tid" "$agent" \
+                    || pm_retry_raw_write "$tid" "$agent" "$(pm_retry_fails_get "$tid" "$agent")" \
+                        "" "" "" "" "" "$(fs_pm_env_get "$f" LAST_FAILED_RUN)" ""
+                continue
+            fi
+            if [[ "$(fs_pm_env_get "$f" REASON)" == malformed ]]; then
+                # A discarded-reply retry (`on-silence: retry`) is fired
+                # once and its schedule dropped at once, FAILS untouched:
+                # it spends none of the crash-retry budget (ATTEMPT, MAX,
+                # exhausted), and the single-retry limit is the (seat, trigger)
+                # marker $DISCARDS/<thread>/<agent>.spent. The crash record
+                # set aside at schedule time is put back untouched.
+                if ! pm_retry_restore_prior "$tid" "$agent"; then
+                    pm_retry_raw_write "$tid" "$agent" "$(pm_retry_fails_get "$tid" "$agent")" \
+                        "" "" "" "" "" "" ""
+                fi
+                pm_event "retry thread=${tid:0:8} agent=$agent trigger=${trigger:0:8} reason=malformed"
+                pm_followup_wake "$project" "$agent" "$tid" "$trigger" malformed || true
                 continue
             fi
             local fails attempt rstate max last_failed_run
@@ -6236,7 +6456,7 @@ pm_held_pass() {
             local trigger retry_flag is_retry=""
             trigger="$(fs_pm_env_get "$f" TRIGGER)"
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
-            [[ "$retry_flag" == 1 ]] && is_retry=1
+            [[ "$retry_flag" == 1 || "$retry_flag" == malformed ]] && is_retry="$retry_flag"
             rm -f -- "$f"
             local PM_WAKE_ADMITTED=1
             pm_event "held-release thread=${tid:0:8} agent=$agent trigger=${trigger:0:8}"
@@ -6281,7 +6501,7 @@ pm_fetch_wait_pass() {
             attempts="$(fs_pm_env_get "$f" ATTEMPTS)"
             trigger="$(fs_pm_env_get "$f" TRIGGER)"
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
-            [[ "$retry_flag" == 1 ]] && is_retry=1
+            [[ "$retry_flag" == 1 || "$retry_flag" == malformed ]] && is_retry="$retry_flag"
             local PM_WAKE_ADMITTED=1
             pm_followup_wake "$project" "$agent" "$tid" "$trigger" "$is_retry" || true
             if [[ -f "$f" && "$(fs_pm_env_get "$f" ATTEMPTS)" == "$attempts" ]]; then
@@ -6680,8 +6900,30 @@ cmd_status_json() {
             agent="$(fs_pm_env_get "$f" AGENT)"
             run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
             resumed="$(fs_pm_env_get "$f" RESUMED)"
-            printf '%s\0' run "$rid" "$agent" "$run_state" "$run_dir" "$resumed"
+            # The review-target pair comes from the every-seat WOKEN_AT_* keys;
+            # a run recorded before they existed falls back to the key a
+            # moved seat always had.
+            local rsha rver
+            rsha="$(fs_pm_env_get "$f" WOKEN_AT_SHA)"
+            rver="$(fs_pm_env_get "$f" WOKEN_AT_VERSION)"
+            if [[ -z "$rsha" ]]; then
+                rsha="$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)"
+                rver="$(fs_pm_env_get "$f" REVIEW_TARGET_VERSION)"
+            fi
+            printf '%s\0' run "$rid" "$agent" "$run_state" "$run_dir" "$resumed" \
+                "$(fs_pm_env_get "$f" TRIGGER)" "$rsha" "$rver" \
+                "$(fs_pm_env_get "$f" HARVESTED_AT)" "$(fs_pm_env_get "$f" REPLIES)" \
+                "$(fs_pm_env_get "$f" REPLY_FILES)" "$(fs_pm_env_get "$f" OUTCOME)" \
+                "$(fs_pm_env_get "$f" RETRY_OF)"
         done
+
+        local wda wdm
+        if [[ -s "$WAKE_DEFERRED/$tid" ]]; then
+            while read -r wda wdm; do
+                [[ -n "$wda" ]] || continue
+                printf '%s\0' wake_deferred "$wda" "$wdm"
+            done < "$WAKE_DEFERRED/$tid"
+        fi
 
         local rfile rattempt rnotbefore rdue
         for rfile in "$RETRIES/$tid"/*; do
@@ -6692,7 +6934,8 @@ cmd_status_json() {
             [[ "$rnotbefore" =~ ^[0-9]+$ ]] || rnotbefore=0
             rdue=$(( rnotbefore - now ))
             (( rdue < 0 )) && rdue=0
-            printf '%s\0' retry "$(basename -- "$rfile")" "$(fs_pm_env_get "$rfile" STATE)" "$rattempt" "$rdue"
+            printf '%s\0' retry "$(basename -- "$rfile")" "$(fs_pm_env_get "$rfile" STATE)" "$rattempt" "$rdue" \
+                "$(fs_pm_env_get "$rfile" REASON)"
         done
 
         local wf wcb wca
@@ -6723,10 +6966,10 @@ out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
        "review_target": None,
        "spawns": 0, "runs": [], "retries": [], "held": [],
        "budget": None, "budget_source": None, "spawns_total": 0,
-       "grant_mode": "missing"}
+       "grant_mode": "missing", "wake_deferred": []}
 arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "upstream_state": 3,
          "review_target": 5, "spawns": 1, "budget": 2, "spawns_total": 1, "grant_mode": 1,
-         "run": 5, "retry": 4, "held": 3, "wake_exit": 3}
+         "run": 13, "retry": 5, "held": 3, "wake_exit": 3, "wake_deferred": 2}
 wake_exits = []
 i = 0
 while i < len(tok):
@@ -6759,11 +7002,22 @@ while i < len(tok):
     elif tag == "spawns_total":
         out["spawns_total"] = int(a[0] or 0)
     elif tag == "run":
+        def num(v):
+            return int(v) if v.isdigit() else None
         out["runs"].append({"run_id": a[0], "agent": a[1], "state": a[2],
-                            "run_dir": a[3], "resumed": a[4] or None})
+                            "run_dir": a[3], "resumed": a[4] or None,
+                            "trigger": a[5] or None,
+                            "review_target_sha": a[6] or None,
+                            "review_target_version": num(a[7]),
+                            "harvested_at": a[8] or None,
+                            "replies": num(a[9]), "reply_files": num(a[10]),
+                            "outcome": a[11] or None, "retry_of": a[12] or None})
+    elif tag == "wake_deferred":
+        out["wake_deferred"].append({"agent": a[0], "message_id": a[1]})
     elif tag == "retry":
         out["retries"].append({"agent": a[0], "state": a[1] or None,
-                               "attempt": int(a[2]), "due_s": int(a[3])})
+                               "attempt": int(a[2]), "due_s": int(a[3]),
+                               "reason": a[4] or "failed"})
     elif tag == "held":
         out["held"].append({"agent": a[0], "trigger": a[1], "age_s": int(a[2])})
     elif tag == "wake_exit":

@@ -747,14 +747,15 @@ executable exists is the postmaster's question at spawn time, not
 `check`'s, and a missing one fails open. Any seat may carry it, a
 handler seat included.
 
-A per-agent `on-silence: flag` says that every wake of the seat owes a
+A per-agent `on-silence: flag` (or `retry`, below) says that every wake of the seat owes a
 reply. A wake of such a seat that exits 0 having written no reply file
 flags the thread `silent-wake`; see "Silent wakes" under "Replies". Leave it
 unset on a seat whose protocol allows a silent wake (a reviewer told to
 stay quiet until others answer, say): unset, a clean exit with an empty
 outbox is a valid outcome. It is fleet.yaml-only and LLM-only: a persona
 file naming it is refused as an unknown key, and so is a handler seat
-carrying it. `flag` is the only value.
+carrying it. `flag` and `retry` are the values; `retry` does what `flag`
+does and adds the one re-wake described under "Silent wakes".
 
 An optional top-level `budget-reserve:` block holds back the last spawns
 of a thread's budget for named seats (routing rule 3 below):
@@ -1347,6 +1348,32 @@ reset). It also includes a `review_target`
 field: an object with `branch`, `sha`, `version`, `set_by`, `set_at`, or
 `null` when the thread has no review target.
 
+`runs` lists every run of the thread, one object each:
+
+| Key | Meaning |
+|---|---|
+| `run_id` | the run's id |
+| `agent` | the seat |
+| `state` | `live` or `harvested` |
+| `run_dir` | the run directory (a k8s seat's wake dir) |
+| `resumed` | the session id the wake resumed, or `null` |
+| `trigger` | message id the wake was for; `null` on a record that predates the key |
+| `review_target_sha` | the thread's review-target sha when the wake spawned, for every seat whenever the thread has a target; `null` otherwise |
+| `review_target_version` | the same target's version (an integer), same rule |
+| `harvested_at` | ISO-8601 UTC time the run was harvested; `null` while live |
+| `replies` | replies actually posted; `null` while live |
+| `reply_files` | reply files found, malformed ones included; `null` while live |
+| `outcome` | `clean` or `failed`; `null` while live |
+| `retry_of` | the run id this run retried, or `null` |
+
+A run harvested before these keys existed shows `null` for the ones it lacks
+(`review_target_sha`/`_version` fall back to the older follow-seat-only
+record when it has one); it is never an error. `retries` lists the thread's
+retry records as `{"agent", "state", "attempt", "due_s", "reason"}`, where
+`reason` is `failed` or `malformed` (see "Silent wakes"). `wake_deferred` is
+a list of `{"agent": ..., "message_id": ...}`, one per seat whose wake gate
+deferred it and nothing has since woken (rule 5), empty when there is none.
+
 A thread that has ever seen `X-Upstream-State` also has an `upstream_state`
 field: `{"state": "open"}`, or, when closed, `{"state": "closed",
 "message_id": "<the closing message>", "at": "<UTC timestamp>"}`. The key is
@@ -1472,7 +1499,7 @@ Every route/harvest pass, `deliver` prints one porcelain line per action
 worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
 live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
-resolved fleet registry name, never raw header text. The fifteen events are
+resolved fleet registry name, never raw header text. The sixteen events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
 replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>; the `wake-exit` flag adds `log=<run-id>`, the entry
@@ -1482,7 +1509,10 @@ agent, reason=wake-exit|silent-wake, run=<failed run id>, by=<recovering run id>
 flagged=yes|no — a seat's successful wake cleared its earlier wake-exit
 flag, or a seat's reply cleared its earlier silent-wake flag; `flagged` says whether the thread is still flagged for something
 else; one line per cleared attempt), `retry` (thread, agent, trigger=<short-id>,
-attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
+attempt=<n> — a deferred retry firing; a discarded-reply retry has
+reason=malformed in place of attempt; see "Retrying a dead wake" below),
+`regate` (thread, agent, run=<harvested run id> — a deferred seat's wake gate
+re-run after that run posted no reply; see rule 5),
 `defer` (thread, agent, reason=wake-when — a seat's wake gate said not
 now; see rule 5; or reason=fetch-miss, attempt=<n> — the sha a wake needs
 is not on `origin` yet, so the wake is held and re-checked; see "Upstream
@@ -1862,6 +1892,21 @@ thread routes it.
      a review target. If a thread has both a `wake-deferred` and a
      `budget-reserved` record, it gets one flag with both reasons joined
      by `; ` and the keyword `wake-deferred,budget-reserved`.
+   - **A deferral is re-asked.** The gate runs when a message arrives, so
+     nothing would ask again if the seat the author is waiting on then
+     wakes, posts nothing usable and the thread goes quiet. After any run
+     on a thread is harvested having posted no reply (`replies` 0 — a
+     clean wake with no file, a failed wake, every file discarded), the
+     postmaster re-runs the gate of every seat with a `wake-deferred` line
+     on that thread, through the ordinary spawn path, with the deferred
+     message as the trigger (`FS_HOOK_MESSAGE`). Exit 0 wakes the seat,
+     exit 1 records the same deferral again, anything else fails open as
+     always. A closed thread is skipped, and hops, budget and reserve apply
+     as to any follow-up wake. A `regate` event names the thread, the
+     seat and the harvested run. The harvested run's record is written
+     first, so the gate (whose `status --thread <tid> --json` takes no
+     lock) sees that run as harvested with `replies: 0`. If the gate still
+     defers, the quiescence flag above fires as it always did.
 
 Together with "a Cc-only wake replies only when something genuinely
 matters, not routinely", those rules are the stop rules. Hops bound the
@@ -2021,6 +2066,35 @@ also a silence. The seat's next wake that posts a reply clears the flag
 same way a clean exit clears a wake-exit flag: the flag is replaced by the
 newest reason left standing, or removed when none is.
 
+`on-silence: retry` does everything `flag` does, and adds one thing: a
+clean wake that wrote at least one reply file, every one of which the
+postmaster discarded (`reply_files > 0` and `replies == 0`), is re-woken
+once on the same trigger message. A wake that wrote no reply file at all is
+not retried (personas are told to end a wake silently when it brings
+nothing for their lane, and a retry would be a wasted spawn); it is flagged
+exactly as under `flag`. The retry is dropped, not scheduled, when the seat
+already has a newer message pending (that wake renders the whole thread
+anyway) or the thread's upstream state is closed, and a retry whose own
+wake discards everything again, or posts nothing, gets no further retry: it
+is flagged the ordinary way. The needs-operator flag for the malformed file
+stays raised; flags are advisory and do not stop routing.
+
+The retry goes through the crash-retry machinery (`retries/`, the retry
+pass, the follow-up wake) but is due on the very next pass and spends none
+of the crash-retry budget: it never touches `ATTEMPT`, `MAX`, `FAILS` or
+`exhausted`. Its handoff has a section headed `## Your previous reply was
+discarded` quoting, one bullet per discarded file, the same reason text the
+`malformed reply file <name>: ...` flag carries; it does not carry the
+crash retry's "This is a retry" text. The reasons are kept under
+`discards/<thread-id>/<agent>` until that handoff is written, so a retry
+that is held for a grant or waits on a fetch still has them. The run
+record of the retry wake has `RETRY_KIND=malformed` and `RETRY_OF=<run id>`. The single malformed retry is per (seat, trigger): it is recorded in
+`discards/<thread-id>/<agent>.spent`, so a crash retry in between does not
+reopen it. While the malformed schedule is pending, the seat's crash-retry
+record is set aside in `discards/<thread-id>/<agent>.prior` and put back
+when the schedule ends: when the retry fires, when a newer message
+supersedes it, or when the thread closes.
+
 Posted replies are new unrouted messages. The next scan routes them. That
 loop is the whole conversation.
 
@@ -2108,6 +2182,7 @@ an exhausted one from a recovered one, not just see fields disappear:
 | `MAX` | the retry cap (`$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`'s length) in effect when `STATE` was last set to `pending` or `exhausted` |
 | `LAST_FAILED_RUN` | the run id of the wake whose failure produced the current `pending` or `exhausted` state |
 | `RECOVERED_AT` | epoch seconds a `recovered` state was reached |
+| `REASON` | why the retry exists: `failed` (the wake crashed or was killed) or `malformed` (the wake exited cleanly but every reply file was discarded; `on-silence: retry`). Present whenever `TRIGGER` or `STATE` is. A `malformed` record is `pending` with `ATTEMPT=0`, no `MAX`, and `NOT_BEFORE` now; when it fires, is superseded by a newer message, or the thread closes, it is replaced by the seat's set-aside crash record (for example `STATE=recovered`, `REASON=failed`), or removed if the seat had none; it is never counted. `status --json` retries[] reports it as `reason`, `failed` for a record that predates the field |
 
 A `recovered` record is written the first time a pair with an actual
 retry history (`STATE` `pending` or `exhausted`) harvests exit-0 clean:
@@ -2133,7 +2208,7 @@ mktemp+mv rewrite on every write, never a partial one:
 |---|---|
 | `TRIGGER` | the message id whose wake is being held |
 | `SINCE` | epoch seconds the record was first created, kept across a superseding `TRIGGER` |
-| `RETRY` | `1` when this hold was entered from `pm_retry_pass` firing an already-scheduled retry into it, else `0` |
+| `RETRY` | `1` when this hold was entered from `pm_retry_pass` firing an already-scheduled crash retry into it, `malformed` for a discarded-reply retry (the reasons are in `discards/`), else `0`. `fetch-wait/` records carry the same value |
 
 Created the first time a `backend: k8s`, `grant: required` seat's wake
 would otherwise spawn with no grant file present. A new message addressed
@@ -2179,7 +2254,7 @@ own thread scans never see it:
 | `lock` | a `flock`'d file; the pid inside is for messages only — the mutual exclusion is the kernel's advisory lock, so a killed postmaster cannot leave a stale hold |
 | `routed/<message-id>` | routing already decided for this message |
 | `route-pending/<message-id>/` | the message's seats not yet handed to a wake: `thread`, `band` (the reserve-band verdict it was judged under), `seats` (one per line, in order) and `inflight` (`<agent> <attempts>`, the seat in hand). Removed once the last seat is handled — see "A message's seats survive a restart" |
-| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake), `ON_SILENCE` (the seat's `on-silence` at spawn, read back at harvest) |
+| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake), `ON_SILENCE` (the seat's `on-silence` at spawn, read back at harvest); `WOKEN_AT_SHA`/`WOKEN_AT_VERSION` (the thread's review target at spawn, for every seat when the thread has one — unlike `REVIEW_TARGET_SHA`/`_VERSION`, written only for a seat moved to the target and read back by a local follow seat to decide whether to re-checkout); `RETRY_KIND` (`failed` or `malformed`) and `RETRY_OF` (the seat's previous run) on a retry wake; and, written at harvest, `HARVESTED_AT` (UTC), `REPLIES`, `REPLY_FILES` and `OUTCOME` (`clean` or `failed`). A run record is durable: it lives in the state dir, which is on a persistent volume in the cluster, unlike the event log |
 | `handler-outbox/<run-id>` | a handler wake's outbox; unlike an LLM wake's (part of its ephemeral scratch run dir), this sits under this same persistent state tree, so the postmaster removes it itself once harvested — nothing here outlives its own wake |
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
@@ -2194,7 +2269,10 @@ own thread scans never see it:
 | `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
-| `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT fields (see "Retrying a dead wake" above) — one file, two independent purposes |
+| `discards/<thread-id>/<agent>` | one line per reply file of a clean wake that the postmaster discarded, kept for the `on-silence: retry` handoff and removed when that handoff is written |
+| `discards/<thread-id>/<agent>.spent` | the trigger message id whose one malformed retry has been scheduled; never reopened by a crash retry |
+| `discards/<thread-id>/<agent>.prior` | the seat's crash-retry record set aside while a malformed schedule is pending; put back when that schedule ends |
+| `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT/REASON fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
 | `fetch-wait/<thread-id>/<agent>` | a wake deferred because its sha (upstream head or review target) is not on `origin` yet: `TRIGGER`, `RETRY`, `KIND`, `KEY` (`<branch> <sha>`), `SINCE`, `ATTEMPTS`, `NOT_BEFORE` — see "Upstream moved" step 3 |
 | `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |

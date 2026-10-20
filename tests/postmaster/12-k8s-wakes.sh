@@ -446,6 +446,39 @@ once
 k9_run_id="$(basename "$(latest_env_for_agent karl)" .env)"
 check "k8s case9: the released wake's handoff carries the retry section" 1 \
     "$(grep -c -- '^## This is a retry$' "$PM_STATE_DIR/handoffs/$k9_run_id.md")"
+
+# ---- case 9b: a discarded-reply (malformed) retry that fires into a hold ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+printf '%s\n' 'grant body' > "$work/body.tmp"
+k9b_mid="$("$MAIL" send --from '@carol' --to '@karl' --subject 'malformed-into-hold topic' \
+    --body "$work/body.tmp" --hops 8 --allow-namespace ns-a --reach-probe svc.ns-a:80 2>/dev/null)"
+k9b_tid="$(thread_of "$k9b_mid")"
+"$MAIL" grant "$k9b_tid" --clear >/dev/null 2>&1
+# The state a harvest leaves for an `on-silence: retry` seat whose reply files
+# were all discarded: a due-now malformed schedule and the discard reasons.
+mkdir -p "$PM_STATE_DIR/retries/$k9b_tid" "$PM_STATE_DIR/discards/$k9b_tid"
+printf 'STATE=pending\nREASON=malformed\nTRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=1\n' "$k9b_mid" \
+    > "$PM_STATE_DIR/retries/$k9b_tid/karl"
+printf '%s\n' 'malformed reply file mail-1.md: invented reason' > "$PM_STATE_DIR/discards/$k9b_tid/karl"
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case9b: no launcher call -- the malformed retry fell into a hold" 0 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+contains "k8s case9b: the held record carries RETRY=malformed" \
+    "$(cat "$PM_STATE_DIR/held/$k9b_tid/karl" 2>/dev/null)" "RETRY=malformed"
+"$MAIL" grant "$k9b_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+k9b_run_id="$(basename "$(latest_env_for_agent karl)" .env)"
+k9b_ho="$(cat "$PM_STATE_DIR/handoffs/$k9b_run_id.md" 2>/dev/null)"
+contains "k8s case9b: the released wake's handoff has the discarded-reply section" \
+    "$k9b_ho" "## Your previous reply was discarded"
+contains "k8s case9b: with the reason verbatim" "$k9b_ho" "- malformed reply file mail-1.md: invented reason"
+not_contains "k8s case9b: and not the crash text" "$k9b_ho" "## This is a retry"
+
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
 # ---- no-grant threads: X-Grant: none on the root ----

@@ -451,8 +451,14 @@ check "wake gate: FS_HOOK_MESSAGE_FILE was a readable copy of the trigger" "$mid
 check "wake gate: the export file is what mail export --json prints" same \
     "$("$MAIL" export "$tid" --json > "$work/export.cmp" 2>/dev/null; cmp -s "$work/export.cmp" "$WG_OUT/export.json" && echo same || echo differ)"
 check "wake gate: the export file is not empty" yes "$( [[ -s "$WG_OUT/export.json" ]] && echo yes)"
+# The gate's own defer is recorded after it answers, so only wake_deferred
+# (which lists it) may differ between what the gate saw and what status prints.
+wg_status_norm() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.pop("wake_deferred"); print(json.dumps(d, sort_keys=True))' "$1"; }
+"$postmaster" status --thread "$tid" --json > "$work/status.cmp" 2>/dev/null
 check "wake gate: the status file is what status --thread --json prints" same \
-    "$("$postmaster" status --thread "$tid" --json > "$work/status.cmp" 2>/dev/null; cmp -s "$work/status.cmp" "$WG_OUT/status.json" && echo same || echo differ)"
+    "$([[ "$(wg_status_norm "$work/status.cmp")" == "$(wg_status_norm "$WG_OUT/status.json")" ]] && echo same || echo differ)"
+check "wake gate: the status file shows no deferral yet, status shows the new one" "[] 1" \
+    "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["wake_deferred"]), len(json.load(open(sys.argv[2]))["wake_deferred"]))' "$WG_OUT/status.json" "$work/status.cmp" | sed 's/^0/[]/')"
 check "wake gate: the status file is not empty" yes "$( [[ -s "$WG_OUT/status.json" ]] && echo yes)"
 check "wake gate: the context dir is gone after the gate" 0 \
     "$(find "$WG_STATE" -maxdepth 1 -name 'wake-gate.*' | wc -l)"

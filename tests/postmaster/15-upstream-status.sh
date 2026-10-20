@@ -341,7 +341,7 @@ bad = []
 def want(label, got, exp):
     if got != exp:
         bad.append(f"{label}: expected {exp!r}, got {got!r}")
-want("keys", sorted(d), ["budget", "budget_source", "flag", "grant", "grant_mode", "held", "retries", "review_target", "runs", "spawns", "spawns_total", "thread", "unrouted"])
+want("keys", sorted(d), ["budget", "budget_source", "flag", "grant", "grant_mode", "held", "retries", "review_target", "runs", "spawns", "spawns_total", "thread", "unrouted", "wake_deferred"])
 want("budget", [d["budget"], d["budget_source"], d["spawns_total"]], [96, "global", 0])
 want("grant_mode", d["grant_mode"], "file")
 want("thread", d["thread"], t)
@@ -353,12 +353,19 @@ want("spawns", d["spawns"], 3)
 runs = {r["run_id"]: r for r in d["runs"]}
 want("run ids: the other thread's run is excluded", sorted(runs), ["run-done", "run-live"])
 want("live run", runs["run-live"], {"run_id": "run-live", "agent": "bob", "state": "live",
-                                     "run_dir": "/runs/one", "resumed": "sess-1234abcd"})
+                                     "run_dir": "/runs/one", "resumed": "sess-1234abcd",
+                                     "trigger": None, "review_target_sha": None, "review_target_version": None,
+                                     "harvested_at": None, "replies": None, "reply_files": None,
+                                     "outcome": None, "retry_of": None})
 want("harvested run", runs["run-done"], {"run_id": "run-done", "agent": "carol", "state": "harvested",
-                                          "run_dir": "/runs/two", "resumed": None})
+                                          "run_dir": "/runs/two", "resumed": None,
+                                          "trigger": None, "review_target_sha": None, "review_target_version": None,
+                                          "harvested_at": None, "replies": None, "reply_files": None,
+                                          "outcome": None, "retry_of": None})
 rt = {r["agent"]: r for r in d["retries"]}
-want("pending retry", rt["bob"], {"agent": "bob", "state": "pending", "attempt": 1, "due_s": 30})
-want("exhausted retry is listed too", rt["carol"], {"agent": "carol", "state": "exhausted", "attempt": 3, "due_s": 0})
+want("pending retry", rt["bob"], {"agent": "bob", "state": "pending", "attempt": 1, "due_s": 30, "reason": "failed"})
+want("exhausted retry is listed too", rt["carol"], {"agent": "carol", "state": "exhausted", "attempt": 3, "due_s": 0, "reason": "failed"})
+want("wake_deferred is an empty list when none", d["wake_deferred"], [])
 want("held (full trigger id)", d["held"], [{"agent": "karl", "trigger": "eeeeeeee-0000-4000-8000-000000000005", "age_s": 12}])
 print("\n".join(bad) if bad else "ALL-OK")
 PY
@@ -372,7 +379,7 @@ check "status --json: a flag without its journal has events null" \
 
 sfx_empty="$(sfx_pm status --thread "ffffffff-4444-4444-8444-000000000009" --json)"
 check "status --json: a thread with no state is all empty or zero" \
-    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": [], "budget": 96, "budget_source": "global", "spawns_total": 0, "grant_mode": "missing"}' \
+    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": [], "budget": 96, "budget_source": "global", "spawns_total": 0, "grant_mode": "missing", "wake_deferred": []}' \
     "$sfx_empty"
 
 sfx_rc=0; sfx_out="$(sfx_pm status --json 2>&1)" || sfx_rc=$?

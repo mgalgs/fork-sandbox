@@ -299,7 +299,7 @@ we5_json="$(we_json "$we5_tid")"
 check "wake-exit adversarial: the status output is one line of valid JSON" 1 \
     "$(printf '%s\n' "$we5_json" | wc -l)"
 check "wake-exit adversarial: top-level keys are unchanged" \
-    "budget,budget_source,flag,grant,grant_mode,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted,wake_failures" \
+    "budget,budget_source,flag,grant,grant_mode,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted,wake_deferred,wake_failures" \
     "$(we_py "$we5_json" '",".join(sorted(d))')"
 check "wake-exit adversarial: the flag is still the postmaster's own" "wake for karen exited 1" \
     "$(we_py "$we5_json" 'd["flag"]["reason"][:23]')"
@@ -379,7 +379,7 @@ new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 we8_tid="$(thread_of "$(send_msg '@carol' '@karen' 'wake exit clean' 'first' 8)")"
 once
-check "wake-exit: a clean wake adds no wake_failures key" "budget,budget_source,flag,grant,grant_mode,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted" \
+check "wake-exit: a clean wake adds no wake_failures key" "budget,budget_source,flag,grant,grant_mode,held,retries,review_target,runs,spawns,spawns_total,thread,unrouted,wake_deferred" \
     "$(we_py "$(we_json "$we8_tid")" '",".join(sorted(d))')"
 check "wake-exit: a clean wake writes no wake-exits state" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-exits" ]] && echo 1 || echo 0)"

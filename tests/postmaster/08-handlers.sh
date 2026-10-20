@@ -298,6 +298,11 @@ check "no-reply: handler ran" 1 "$(grep -c -- '^----CALL----$' "$HANDLER_LOG")"
 check "no-reply: thread is not flagged" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0)"
 
+hr_env="$(grep -l "^THREAD=$tid\$" "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env | head -n1)"
+check "no-reply: the handler run record carries its harvest outcome" "0 0 clean" \
+    "$(env_val "$hr_env" REPLIES) $(env_val "$hr_env" REPLY_FILES) $(env_val "$hr_env" OUTCOME)"
+check "no-reply: and a harvested_at" 1 "$([[ -n "$(env_val "$hr_env" HARVESTED_AT)" ]] && echo 1 || echo 0)"
+
 # --- scenario: a malformed reply file flags the thread ---
 mid="$(send_msg '@carol' '@malformed' 'Bad reply' 'trigger')"
 tid="$(thread_of "$mid")"
