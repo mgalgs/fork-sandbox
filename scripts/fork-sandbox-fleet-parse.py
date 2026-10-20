@@ -81,9 +81,7 @@ protocol allows a silent wake.
 must not know it is the one moving a review thread's shared target.
 Value is the literal string `sets` or `follow` (see docs/agent-mail.md
 for what each means to the postmaster). `check` refuses more than one
-`sets` seat per fleet, and refuses either value on a seat that does not
-also resolve to `backend: k8s` -- only the k8s spawn path takes
-`--checkout`, so a local seat has no way to spawn at a target anyway.
+`sets` seat per fleet. Either backend may carry it.
 
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
@@ -904,12 +902,6 @@ def cmd_check(fleet_file, label, personas_dir):
             errors.append(
                 f"{label}: agents.{'/'.join(sorted(setters))}: only one "
                 f"seat may carry 'review-target: sets' per fleet")
-        for name, agent in agents.items():
-            if agent["review-target"] and agent["backend"] != "k8s":
-                errors.append(
-                    f"{label}: agents.{name}.review-target: only a "
-                    f"'backend: k8s' seat can take '--checkout'; a local "
-                    f"seat keeps its persistent clone")
         for name, agent in agents.items():
             # A handler seat is a script, not an LLM seat -- the wake
             # contract never injects a persona body into it (stdin is

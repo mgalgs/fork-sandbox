@@ -1709,6 +1709,23 @@ pm_lineage_checkout() {
     return 1
 }
 
+# Prints the REVIEW_TARGET_SHA recorded by <agent>'s newest run on <tid>
+# (empty when it has none, or no run at all). Read before this wake's own
+# run-id is appended to $SEQ/$tid.
+pm_seat_last_target_sha() {
+    local tid="$1" agent="$2" i f
+    [[ -f "$SEQ/$tid" ]] || return 0
+    local -a rids=()
+    mapfile -t rids < "$SEQ/$tid"
+    for (( i = ${#rids[@]} - 1; i >= 0; i-- )); do
+        f="$RUNS/${rids[i]}.env"
+        [[ -n "${rids[i]}" && -f "$f" ]] || continue
+        [[ "$(fs_pm_env_get "$f" AGENT)" == "$agent" ]] || continue
+        fs_pm_env_get "$f" REVIEW_TARGET_SHA
+        return 0
+    done
+}
+
 # Expands a To:/Cc:-shaped comma list one address at a time (fleet expand
 # fails its WHOLE call on the first unknown address in a batch, so calling
 # it once per address is required, not stylistic -- otherwise one stray
@@ -4023,11 +4040,9 @@ pm_spawn_wake() {
 
     # A `follow` seat on a thread that has a review target spawns checked
     # out at that target's sha instead of its own lineage branch (see the
-    # k8s spawn branch below) -- resolved once, here, before the grant hold
+    # spawn branches below) -- resolved once, here, before the grant hold
     # gate, so a missing sha can flag and refuse the wake before anything
-    # else is written. `fleet check` refuses `review-target: follow` on
-    # anything but a `backend: k8s` seat, so rt_sha is only ever non-empty
-    # in the k8s branch below.
+    # else is written.
     # The `sets` seat takes the target too, but only until it has a lineage
     # of its own: its first wake on a kickoff-opened thread must start from
     # the commit it is revising, not HEAD. After that its lineage IS the
@@ -4390,6 +4405,20 @@ pm_spawn_wake() {
     spawn_args+=(--clone-dir "$PM_WORKSPACES/$tid/$agent")
     [[ "$seat_services" == false ]] && spawn_args+=(--no-services)
 
+    # A target this seat has not started from yet (a first wake, a new
+    # version, a lost workspace) moves the clone there. Otherwise the clone
+    # keeps its own lineage, which already holds the target. The trust ref
+    # is HEAD, never the target, as in the k8s branch above.
+    if [[ -n "$rt_sha" ]] \
+        && { [[ ! -d "$PM_WORKSPACES/$tid/$agent/.git" ]] \
+             || [[ "$(pm_seat_last_target_sha "$tid" "$agent")" != "$rt_sha" ]]; }; then
+        spawn_args+=(--checkout "$rt_sha")
+        local checkout_trust_ref
+        checkout_trust_ref="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+        [[ -n "$checkout_trust_ref" && "$seat_services" != false ]] \
+            && spawn_args+=(--services-trust-ref "$checkout_trust_ref")
+    fi
+
     # The LLM-seat counterpart of the handler path's FS_HANDLER_ATTACH_DIR:
     # most threads carry no attachments at all, so the bind is added only
     # when the directory exists and actually holds something -- an empty or
@@ -4446,6 +4475,11 @@ pm_spawn_wake() {
         printf 'BACKEND=local\n'
         printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
         printf 'ON_SILENCE=%s\n' "$on_silence"
+        if [[ -n "$rt_sha" ]]; then
+            printf 'REVIEW_TARGET_BRANCH=%s\n' "$rt_branch"
+            printf 'REVIEW_TARGET_SHA=%s\n' "$rt_sha"
+            printf 'REVIEW_TARGET_VERSION=%s\n' "$rt_version"
+        fi
     } > "$RUNS/$run_id.env"
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"

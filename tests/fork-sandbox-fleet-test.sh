@@ -1271,12 +1271,17 @@ agents:
     review-target: sets
 EOF
 
-bad "review-target: follow on a non-k8s seat is refused" \
-    "'backend: k8s' seat" <<'EOF'
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
   riffler:
     review-target: follow
+  tuner:
+    review-target: sets
 EOF
+check "review-target: follow and sets on local seats pass check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "review-target: a local follow resolves verbatim" "follow" "$r_review_target"
 
 bad "review-target: handler seat cannot carry review-target" \
     "not allowed alongside 'handler: exec'" <<'EOF'

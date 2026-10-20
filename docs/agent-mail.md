@@ -836,15 +836,15 @@ Three fleet.yaml-only keys mark a seat this way and configure it (persona
 frontmatter refuses all three — a seat must not know its own backend). A
 fourth, `review-target`, is fleet.yaml-only for the same reason — a seat
 must not know it is the one moving a thread's shared review target — and
-is likewise refused on any seat that does not resolve to `backend: k8s`;
-see "The review target" below for what `sets` and `follow` mean:
+is legal on either backend; see "The review target" below for what `sets`
+and `follow` mean:
 
 | key | values | rule |
 |---|---|---|
 | `backend` | `local` (default when absent) or `k8s` | anything else refused |
 | `endpoint` | RFC 1123 label (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`) | only with `backend: k8s` |
 | `grant` | the literal string `required` | only with `backend: k8s` |
-| `review-target` | the literal string `sets` or `follow` | only with `backend: k8s`; at most one seat per fleet may be `sets` |
+| `review-target` | the literal string `sets` or `follow` | at most one seat per fleet may be `sets` |
 
 `services` (fleet.yaml-only, a YAML boolean, any backend) set to `false`
 wakes the seat with `--no-services`: no per-run services and no
@@ -1009,8 +1009,7 @@ when the thread opens, and the author seat moves it when it posts a new
 version.
 
 Two `review-target` fleet keys assign the roles (see the table above;
-either value is refused on a seat that is not `backend: k8s`, since only
-the k8s spawn path takes `--checkout`):
+either backend may carry them):
 
 - `sets` — the author seat. At most one per fleet. Its harvested reply
   moves the target by carrying a `Version: <n>` header.
@@ -1075,6 +1074,16 @@ flagged (keyword `review-target`) and the triggering message stays
 pending rather than spawn a seat with nothing to check out. A `follow`
 seat on a thread with no state file, and a `sets` seat always, keep the
 ordinary lineage path.
+
+A local seat keeps a persistent clone, so it moves only when the target
+is new to it. That happens on its first wake, when the target moves to a
+new sha, or when its workspace is gone. In those cases the clone gets the
+same `--checkout <sha>` and `--services-trust-ref`. On any other wake the
+clone continues its own lineage, which already starts at the target, so
+commits the seat made between versions survive. A k8s seat has no clone
+to continue, so it checks out the target on every wake. A local `sets`
+seat is not yet handed the upstream head (`upstream-head-local-seat`
+event).
 
 ### Moving it: the `sets` seat's `Version:` header
 
