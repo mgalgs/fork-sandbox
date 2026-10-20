@@ -15,6 +15,12 @@ const picker = atom({ plugin: 'lane-complete', key: 'picker' } as const, null as
 // failed read keeps the last good list (a missed refresh is not worth a toast).
 let lanes: Lane[] = []
 
+// After a pick the engine may put the dropped draft back over our fill. For
+// this long a write of the engine's that leaves the box other than the pick is
+// written over again; an edit of the person's ends it sooner.
+const PICK_HOLD_MS = 1000
+let picked: string | null = null
+
 async function refresh($: EngineInterface) {
   try {
     const ran = await $.process.run(['bash', `${$.plugin.root}/bin/list-lanes.sh`], { timeoutMs: 5000 })
@@ -39,6 +45,7 @@ export const register: Register = on => {
   // taking keyboard focus. Only edits arrive here: Enter, Tab, Esc and
   // Up/Down never do.
   on('prompt.edit', async ($, e, next) => {
+    picked = null
     const open = await read($, picker)
     if (open === null && !(e.inputText === '@' && e.start === e.end)) return next(e)
 
@@ -60,7 +67,12 @@ export const register: Register = on => {
       await update($, picker, () => null)
       if (e.text.trim() === shown(open).text.trim()) {
         // The cursor ends at the box's end: fill has no way to place it.
-        await $.prompt.fill({ text: finish(open, lanes).text, mode: 'replace' })
+        const text = finish(open, lanes).text
+        await $.prompt.fill({ text, mode: 'replace' })
+        picked = text
+        $.clock.after(PICK_HOLD_MS, () => {
+          if (picked === text) picked = null
+        })
         return { drop: 'lane picked' }
       }
       // A box that is not the one shown was changed behind the picker: send it
@@ -73,6 +85,14 @@ export const register: Register = on => {
 
     return next({ ...e, context: [...(e.context ?? []), mentionContext(named)] })
   }).catch(($, e, next) => next(e)) // a failed note never costs the operator the prompt
+
+  on('prompt.change', async ($, e, next) => {
+    const r = await next(e)
+    if (picked !== null && e.origin.kind !== 'plugin' && e.text !== picked) {
+      await $.prompt.fill({ text: picked, mode: 'replace' })
+    }
+    return r
+  })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const open = await read($, picker)

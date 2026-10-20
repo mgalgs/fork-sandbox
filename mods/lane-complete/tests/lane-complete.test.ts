@@ -63,7 +63,7 @@ function composer($: any, on: On) {
 const shared = { text: '', cursor: 0 }
 
 async function started($: any, on: On, stdout = LIST) {
-  mock.clock(on)
+  const clock = mock.clock(on)
   on('process.run', () => answered(stdout))
   // The engine's own bottoms: the splice an edit makes, and a prompt entering.
   on('prompt.edit', (_, e) => {
@@ -77,6 +77,7 @@ async function started($: any, on: On, stdout = LIST) {
     }
   })
   on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
+  on('prompt.change', (_, e) => ({ text: e.text }))
   // `replace` puts the text in with the cursor at its end.
   on('prompt.fill', (_, e) => {
     shared.text = e.mode === 'replace' ? e.text : shared.text + e.text
@@ -87,6 +88,7 @@ async function started($: any, on: On, stdout = LIST) {
   on('ui.render', () => ({ type: 'Box', props: {}, children: [] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  return clock
 }
 
 // What the band above the prompt says: its first line while the picker is
@@ -159,6 +161,27 @@ test('Enter after a start-of-box @ (the box is not empty) inserts the lane', asy
   const bare = composer($, on)
   await bare.type('@')
   expect((await bare.enter()).box.text).toBe('@alpha ')
+})
+
+test('a dropped draft the engine puts back after a pick is written over with the pick', async ($, on) => {
+  const clock = await started($, on)
+  const c = composer($, on)
+  await c.type('ask ')
+  await c.type('@')
+  await c.type('al')
+  const typed = shared.text
+  expect((await c.enter()).box.text).toBe('ask @alpha ')
+
+  // The engine writes the dropped draft back in after the fill.
+  const back = `ask @alpha \n${typed}`
+  await $.prompt.change({ text: back, cursor: back.length, origin: { kind: 'engine' } })
+  expect(shared.text).toBe('ask @alpha ')
+
+  // Once the hold lapses, the engine's writes stand.
+  await clock.advance(1000)
+  Object.assign(shared, { text: 'recalled', cursor: 8 })
+  await $.prompt.change({ text: 'recalled', cursor: 8, origin: { kind: 'history' } })
+  expect(shared.text).toBe('recalled')
 })
 
 test('Backspace takes the filter back a character at a time, then the @', async ($, on) => {
