@@ -1057,6 +1057,63 @@ fs_reused_services_trusted() {
     return "$rc"
 }
 
+# Names a --services-env KEY may never take, allowlisted or not: each one
+# changes how the hook's own interpreter, loader or tools behave, rather
+# than telling the hook something. Exact names, then prefixes.
+FS_SERVICES_ENV_REFUSED="PATH IFS ENV BASH_ENV BASHOPTS SHELLOPTS PS4
+PROMPT_COMMAND CDPATH GLOBIGNORE HOME SHELL TMPDIR NODE_OPTIONS NODE_PATH
+PYTHONPATH PYTHONHOME PYTHONSTARTUP PERL5LIB PERL5OPT PERLLIB RUBYOPT RUBYLIB
+DOCKER_HOST DOCKER_CONFIG DOCKER_CONTEXT"
+FS_SERVICES_ENV_REFUSED_PREFIXES="LD_ DYLD_ BASH_FUNC_ GIT_ COMPOSE_
+FORK_SANDBOX_ FS_"
+
+# Checks --services-env KEY=VAL values against the operator's allowlist,
+# SERVICES_ENV_ALLOW (space-separated) in <config-dir>/services.env. The
+# values reach the services hook, which is host-side code, so the operator
+# names the keys a caller may set; no allowlist refuses every key. A refused
+# name is refused even when allowlisted. A value is one line (bash cannot
+# carry a NUL), and a KEY may appear once. Returns 0 all accepted, 1 not.
+fs_services_env_check() {
+    local config_dir="$1"; shift
+    local allow="" kv key seen=" " p
+    allow="$(fs_read_env_value "$config_dir/services.env" SERVICES_ENV_ALLOW)" || allow=""
+    for kv in "$@"; do
+        key="${kv%%=*}"
+        if [[ "$kv" != *=* || ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "Error: --services-env '$kv' must look like KEY=VALUE." >&2
+            return 1
+        fi
+        if [[ "$kv" == *$'\n'* || "$kv" == *$'\r'* ]]; then
+            echo "Error: --services-env $key: the value must be a single line." >&2
+            return 1
+        fi
+        if [[ " ${FS_SERVICES_ENV_REFUSED//$'\n'/ } " == *" $key "* ]]; then
+            echo "Error: --services-env $key is refused: it changes how the hook" >&2
+            echo "itself runs, so no allowlist can admit it." >&2
+            return 1
+        fi
+        for p in ${FS_SERVICES_ENV_REFUSED_PREFIXES}; do
+            if [[ "$key" == "$p"* ]]; then
+                echo "Error: --services-env $key is refused (prefix $p): it changes how" >&2
+                echo "the hook itself runs, so no allowlist can admit it." >&2
+                return 1
+            fi
+        done
+        if [[ " $allow " != *" $key "* ]]; then
+            echo "Error: --services-env $key is not in SERVICES_ENV_ALLOW in" >&2
+            echo "$config_dir/services.env. The services hook is host-side code," >&2
+            echo "so the operator names the keys a caller may pass it." >&2
+            return 1
+        fi
+        if [[ "$seen" == *" $key "* ]]; then
+            echo "Error: --services-env $key is given twice." >&2
+            return 1
+        fi
+        seen+="$key "
+    done
+    return 0
+}
+
 # An optional third argument names the directory the list is read from
 # (default: the clone's own services dir). The clone's list is the checked-out
 # ref's copy, so a caller that cannot trust the ref passes the ORIGIN's own

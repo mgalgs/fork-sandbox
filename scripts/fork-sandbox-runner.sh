@@ -863,7 +863,8 @@ run_cleanup() {
         # timeout on every docker-touching command here: this function is the
         # EXIT trap, and a wedged docker daemon must not hang the run forever
         # with the output hidden in sandbox.log.
-        "$FS_TIMEOUT" 120 "$services_script" down "$services_project" \
+        "$FS_TIMEOUT" 120 env ${services_env[@]+"${services_env[@]}"} \
+            "$services_script" down "$services_project" \
             >> "$sandbox_log" 2>&1 || true
         # Opportunistic sweep: remove any claude-* compose project whose run
         # dir is gone. A session killed before this ran can leak one; catch it
@@ -1019,7 +1020,8 @@ unset _fs_cred_k _fs_cred_idx _fs_cred_hvar _fs_cred_evar
 # just cannot reach the services.
 if [[ "$services_enabled" == "1" && -n "$services_script" ]]; then
     printf 'fork-sandbox: starting per-run services (%s)...\n' "$services_project" >&2
-    if ! "$services_script" up "$sockets_dir" "$clone_dir" "$services_project" \
+    if ! env ${services_env[@]+"${services_env[@]}"} \
+        "$services_script" up "$sockets_dir" "$clone_dir" "$services_project" \
         >> "$sandbox_log" 2>&1; then
         printf 'fork-sandbox: WARNING: services failed to start; see %s.\n' \
             "$sandbox_log" >&2

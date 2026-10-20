@@ -615,6 +615,7 @@ printf '.venv\n' > "$pc_proj/.agents/sandbox-services/provision-ro"
 cat > "$pc_proj/.agents/sandbox-services/sandbox-services.sh" <<'HOOK'
 #!/usr/bin/env bash
 : > "$FS_TEST_HOOK_MARKER"
+env > "$FS_TEST_HOOK_MARKER.$1"
 HOOK
 chmod +x "$pc_proj/.agents/sandbox-services/sandbox-services.sh"
 printf 'base\n' > "$pc_proj/file.txt"
@@ -640,6 +641,7 @@ pc_git switch -q main
 cat > "$pc_bin/claude-sandboxed" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$FS_TEST_ARGV"
+env > "$FS_TEST_ARGV.env"
 cat >/dev/null
 printf '{"type":"result","subtype":"success","result":"ok"}\n'
 exit 0
@@ -712,6 +714,46 @@ else ok "a ref that changes the contract runs no hook"; fi
 
 pc_run nosvc --checkout ref-hostile --no-services
 lacks "--no-services still disables provision-ro" "--bind-ro-at" "$pc_flags"
+
+echo ""
+echo "== --services-env (launcher) =="
+
+# se_refused <label> <expected text> <launcher args...>: the run is refused
+# before anything is created, with a message naming why.
+se_refused() {
+    local label="$1" want="$2"; shift 2
+    pc_run "$label" "$@"
+    contains "$label: refused with '$want'" "$want" "$pc_out"
+    if [[ -z "$pc_rundir" && ! -e "$pc_marker" ]]; then ok "$label: nothing ran"
+    else no "$label: nothing ran" "$pc_out"; fi
+}
+
+se_refused se-noallow "SERVICES_ENV_ALLOW" --services-env SE_TOKEN=abc
+printf 'SERVICES_ENV_ALLOW=SE_TOKEN SE_TIER PATH LD_PRELOAD\n' > "$pc_cfg/services.env"
+se_refused se-unlisted "SERVICES_ENV_ALLOW" --services-env SE_OTHER=1
+se_refused se-path "is refused" --services-env PATH=/tmp/evil
+se_refused se-ld "is refused (prefix LD_)" --services-env LD_PRELOAD=/tmp/evil.so
+se_refused se-newline "single line" --services-env $'SE_TOKEN=a\nb'
+se_refused se-twice "given twice" --services-env SE_TOKEN=a --services-env SE_TOKEN=b
+se_refused se-shape "KEY=VALUE" --services-env SE_TOKEN
+
+# SE_TIER in the launcher's own env stands in for an operator's tmux global.
+SE_TIER=from-global pc_run se-ok --services-env 'SE_TOKEN=a b=c' --services-env SE_TIER=medium
+for se_verb in up down; do
+    se_env="$(cat "$pc_marker.$se_verb" 2>/dev/null || true)"
+    contains "the hook's $se_verb gets the value verbatim" "SE_TOKEN=a b=c" "$se_env"
+    contains "the hook's $se_verb gets the thread value over the inherited one" \
+        "SE_TIER=medium" "$se_env"
+    lacks "the hook's $se_verb does not see the inherited value" "SE_TIER=from-global" "$se_env"
+done
+lacks "the sandbox never sees a --services-env value" "SE_TOKEN" \
+    "$(cat "$pc_argv.env" 2>/dev/null || echo SE_TOKEN-missing-env-record)"
+contains "the values are kept in the run dir's run.sh" "SE_TOKEN" \
+    "$(cat "$pc_rundir/run.sh" 2>/dev/null || true)"
+
+pc_run se-nosvc --no-services --services-env SE_TOKEN=x
+contains "--services-env with --no-services warns it is ignored" \
+    "--services-env is ignored" "$pc_out"
 
 echo ""
 echo "== reused --clone-dir and the services contract (launcher) =="

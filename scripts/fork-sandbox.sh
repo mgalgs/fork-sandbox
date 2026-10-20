@@ -473,6 +473,16 @@
 #                        review of an untrusted ref (a pull request head)
 #                        passes the trusted base here, and a hook the ref
 #                        modified is not run.
+# --services-env KEY=VAL:
+#                        pass KEY=VAL to the services hook's `up` and `down`
+#                        only -- never to the sandbox. Repeatable. KEY must be
+#                        named in SERVICES_ENV_ALLOW (space-separated) in
+#                        ~/.config/fork-sandbox/services.env; no allowlist
+#                        refuses every key, and PATH, LD_* and similar are
+#                        refused even if listed. It beats an inherited
+#                        variable of the same name. Ignored, with a warning,
+#                        when the run has no services. See
+#                        docs/sandbox-services.md.
 # --prompts-dir <dir>:   overlay model-specific prompt fragments from <dir>
 #                        onto the generated prompt for this run only. <dir>
 #                        must exist. See docs/prompt-overlays.md.
@@ -1883,6 +1893,7 @@ foreground=false
 keep_session=false
 no_services=false
 services_trust_ref=""
+services_env=()
 prompts_dir_arg=""
 refresh_at_arg=""
 refresh_at_given=false
@@ -2079,6 +2090,10 @@ while [[ "${1:-}" == -* ]]; do
             services_trust_ref="${2:?--services-trust-ref requires a ref}"
             shift 2
             ;;
+        --services-env)
+            services_env+=("${2:?--services-env requires KEY=VALUE}")
+            shift 2
+            ;;
         --prompts-dir)
             prompts_dir_arg="${2:?--prompts-dir requires a directory}"
             shift 2
@@ -2210,6 +2225,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
     esac
 done
+
+if (( ${#services_env[@]} )); then
+    fs_services_env_check "$config_dir" "${services_env[@]}" || exit 1
+fi
 
 # --wait's refusals are checked here, right after parsing and before the
 # positional args are required, because everything they depend on
@@ -4020,6 +4039,11 @@ if [[ "$k8s_mode" == true ]]; then
     $allow_existing_branch && k8s_argv+=(--allow-existing-branch)
     [[ -n "$services_trust_ref" ]] && k8s_argv+=(--services-trust-ref "$services_trust_ref")
     $no_services && k8s_argv+=(--no-services)
+    # Not forwarded: a pod runs no host-side services hook.
+    if (( ${#services_env[@]} )); then
+        echo "Warning: --services-env is ignored on --k8s: a cluster run has" >&2
+        echo "no services hook to pass it to." >&2
+    fi
     # Forwarded as the raw string, not the byte count already parsed above:
     # fork-sandbox-k8s.sh does its own parsing, so there is one source of
     # truth per process rather than a cross-process byte count to keep in
@@ -6750,6 +6774,10 @@ if (( services_enabled )); then
     fs_reject_unsafe_chars "$sockets_dir" "$services_script" "$services_project"
 fi
 fi
+if (( ${#services_env[@]} )) && (( ! services_enabled )); then
+    echo "Warning: --services-env is ignored: this run starts no per-run" >&2
+    echo "services, so there is no hook to pass it to." >&2
+fi
 
 # The self-review skills and the read-only script toolbox, so an unattended
 # session can end its work the way an interactive one does: run
@@ -9342,6 +9370,13 @@ fs_emit_run_sh_preamble() {
     printf 'services_script=%q\n' "$services_script"
     printf 'sockets_dir=%q\n' "$sockets_dir"
     printf 'services_project=%q\n' "$services_project"
+    # The hook's --services-env values live here, in the run dir the sandbox
+    # never sees; the runner hands them to the hook alone.
+    printf 'services_env=('
+    if (( ${#services_env[@]} )); then
+        printf '%q ' "${services_env[@]}"
+    fi
+    printf ')\n'
     printf 'run_log_bin=%q\n' "$run_log_bin"
     # GNU coreutils' timeout, under whatever name this machine has for it. The
     # services teardown below is an EXIT trap around a docker daemon that can

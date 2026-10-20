@@ -25,8 +25,10 @@ in, and a hostile session can at worst trash its own empty per-run stack.
 
 ## The interface
 
-The harness invokes the hook with positional arguments only. It passes no
-contract-carrying environment variables, so the hook must not rely on any.
+The harness invokes the hook with positional arguments. It sets no
+contract-carrying environment variables of its own, so the hook must not
+rely on any; the only extra environment it ever gets is what the operator
+lets a caller pass with `--services-env` (below).
 
     sandbox-services.sh up <sockets-dir> <clone-dir> <project>
     sandbox-services.sh down <project>
@@ -47,6 +49,38 @@ say). Each is bound read-only from the origin repo into the clone at the
 same relative path, so the session has a working interpreter without the
 network. Read-only is the security boundary: the sandbox must never write
 back into the real checkout.
+
+### Per-run hook environment: `--services-env`
+
+A hook that takes settings from its environment (which fixture to restore,
+say) can get them per run instead of from whatever the launching shell or
+tmux server happens to export:
+
+    fork-sandbox run --services-env FIXTURE_TIER=medium ... <project> <handoff>
+
+`--services-env KEY=VALUE` is repeatable. The values are kept in the run
+dir, which the sandbox never sees, and are set for the hook's `up` and
+`down` only, never for the session. A value given here beats an inherited
+variable of the same name.
+
+The hook is host-side code, so the operator decides which keys a caller may
+set, in `~/.config/fork-sandbox/services.env`:
+
+    SERVICES_ENV_ALLOW=FIXTURE_TIER FIXTURE_REGISTRY
+
+- With no `SERVICES_ENV_ALLOW`, every `--services-env` is refused.
+- Names that change how the hook itself runs are refused even when listed:
+  `PATH`, `HOME`, `SHELL`, `IFS`, `ENV`, `BASH_ENV` and the other shell
+  startup variables, language search paths (`PYTHONPATH`, `NODE_OPTIONS`,
+  ...), `DOCKER_HOST`/`DOCKER_CONFIG`/`DOCKER_CONTEXT`, and anything starting
+  `LD_`, `DYLD_`, `BASH_FUNC_`, `GIT_`, `COMPOSE_`, `FORK_SANDBOX_` or `FS_`.
+  The full list is `FS_SERVICES_ENV_REFUSED` in `scripts/fork-sandbox-lib.sh`.
+- A value is one line, and a KEY may be given once.
+
+A run with no services (no hook, `--no-services`, an untrusted ref) ignores
+the flag with a warning, and so does a `--k8s` run: a pod runs no host-side
+hook. An agent-mail thread can carry these values for its seats; see
+`mail send --services-env` in [agent-mail.md](agent-mail.md).
 
 ## What the harness guarantees
 

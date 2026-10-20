@@ -830,6 +830,13 @@ docker ps -aq --filter label=com.docker.compose.project=<name> | xargs -r docker
 
 Pass `--no-services` to skip the whole mechanism for a run.
 
+**Hook environment.** A hook that reads a setting from its environment
+gets it per run with `--services-env KEY=VALUE` (repeatable), not from the
+tmux server's global env, which every run would inherit. Only keys the
+operator names in `SERVICES_ENV_ALLOW` (`~/.config/fork-sandbox/services.env`)
+are accepted, and the session itself never sees them. See
+`docs/sandbox-services.md`.
+
 ## Review before building
 
 The sandbox contains the session while it runs. It does not make the code it
