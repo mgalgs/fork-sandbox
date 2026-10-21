@@ -3130,14 +3130,8 @@ else
     no "--review-only over ro-self launches"
 fi
 
-# self_coded is a per-step signal from the parser, not just step 1's: a
-# coder that also sits the MAINTAIN seat (not the review seat) must have
-# its own coding arguments held back from that leg too, the same as the
-# self-review case above. A prior regression only ever read step 1's
-# self_coded flag, so a kept maintain step reusing the dropped coder's
-# seat was refused outright ("legacy-shaped ... Compose the pipeline")
-# instead of running with the coder's arguments silently withheld, as a
-# full run of the same preset already does.
+# A coder that also sits the MAINTAIN seat keeps its own arguments on that
+# leg under --review-only, as in a full run of the same preset.
 cat > "$real_presets/ro-self-maintain.yaml" <<'EOF'
 agents:
   coder:

@@ -44,11 +44,6 @@ ordered step list:
     step <k> fix_network <value>        (empty value when unset)
     step <k> fix_args <value>           (the effective fix agent's, of its
                                           own harness kind; empty when unset)
-    step <k> self_coded 1               (read-only only: this step's agent
-                                          also sat a code step --drop-code
-                                          removed, so its own leg must not
-                                          pick up that dropped leg's
-                                          arguments)
     warn <message>                      (advisory; fork-sandbox.sh prints it)
 
 Step-indexed rather than the old tier names (review/maintain), since a
@@ -381,8 +376,6 @@ def main():
         # coding-only properties (repeat, refresh, endpoint) have nothing
         # left to apply to. Its extra arguments stay: a kept step's leg
         # honors them, as in a full run.
-        for s in steps:
-            s["self_coded"] = s["agent"] in dropped_code_agents
         seated_ro = {s["agent"] for s in steps}
         agents = {n: a for n, a in agents.items()
                   if n in seated_ro or n not in dropped_agents}
@@ -498,8 +491,6 @@ def main():
     for k, s in enumerate(steps, 1):
         out.append(f"step\t{k}\taction\t{s['action']}")
         out.append(f"step\t{k}\tagent\t{s['agent']}")
-        if read_only and s.get("self_coded"):
-            out.append(f"step\t{k}\tself_coded\t1")
         if s["action"] == "code":
             if s["repeat_eff"] != 1:
                 out.append(f"step\t{k}\trepeat\t{s['repeat_eff']}")

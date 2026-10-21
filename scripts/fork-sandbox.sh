@@ -194,7 +194,10 @@
 #                        r and m stages, e.g. ropus, rsonnet-mopus or
 #                        ropus-mopus-ropus, review --checkout once per
 #                        leg, each building on every earlier verdict.
-#                        See docs/presets.md.
+#                        Every r and m seat runs at high reasoning effort
+#                        (claude --effort high, codex -c
+#                        model_reasoning_effort=high); c seats and flag-only
+#                        runs are unchanged. See docs/presets.md.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -2404,7 +2407,6 @@ if [[ -n "$preset_name" ]]; then
     declare -a preset_step_fix_repeat=()
     declare -a preset_step_fix_network=()
     declare -a preset_step_fix_args=()
-    declare -a preset_step_self_coded=()
     preset_impl_agent=""
     preset_impl_refresh_at=""
     preset_impl_refresh_max=""
@@ -2496,7 +2498,6 @@ if [[ -n "$preset_name" ]]; then
                     fix_repeat) preset_step_fix_repeat[preset_step_k]="$preset_f4" ;;
                     fix_network) preset_step_fix_network[preset_step_k]="$preset_f4" ;;
                     fix_args) preset_step_fix_args[preset_step_k]="$preset_f4" ;;
-                    self_coded) preset_step_self_coded[preset_step_k]="$preset_f4" ;;
                 esac
                 ;;
             warn)
