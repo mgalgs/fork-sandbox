@@ -1,17 +1,33 @@
 #!/bin/bash
 # lane-mail.sh -- :approved: Agent mail between lane sessions
 #
-# Usage: lane-mail.sh register <lane>
+# Usage: lane-mail.sh register <lane> [--about "<text>"]
+#        lane-mail.sh describe <lane> "<text>"     ("" clears; "-" reads stdin)
 #        lane-mail.sh registration
 #        lane-mail.sh unregister
 #        lane-mail.sh send|reply|show|tree|list|inbox|seen [args...]
 #        lane-mail.sh send --to @lane:host ...     (another host, over ssh)
 #        lane-mail.sh lanes                        (the lanes there are)
 #
-# `lanes` prints one `<source><TAB><lane>` line per lane: `live` (some
-# session registered it -- registrations are never cleaned up, so the
-# session may be gone), `mailbox`, `remote` (`lane:host` that has written
-# here) and `peer` (a host). `list` lists messages, not lanes.
+# `lanes` prints one `<source><TAB><lane><TAB><description>` line per lane:
+# `live` (some session registered it -- registrations are never cleaned up,
+# so the session may be gone), `mailbox`, `remote` (`lane:host` that has
+# written here) and `peer` (a host). The third column is the lane's
+# description (below), empty when unset and always empty for `remote` and
+# `peer`; read the first two fields and ignore the rest if you do not want
+# it. `list` lists messages, not lanes.
+#
+# A lane may carry a one-line description of what it owns, so a name like
+# @alpha is not read as "anything alpha-related" when its owner means one
+# repo. `describe <lane> "<text>"` sets it (a leading @ on <lane> is
+# accepted; "" clears it; "-" reads the text from stdin, trailing newlines
+# dropped); `register <lane> --about "<text>"` does the same while
+# registering. Registering without --about leaves an existing description
+# alone. The text must be one line: a newline, tab or NUL is refused, as is
+# anything over 200 characters. It is stored with the lane's mailbox
+# (<root>/agents/<lane>/about), not with the session registration, so it
+# survives a handoff replacing the session. Only local lanes have one: a
+# `lane:host` is refused, and nothing is synced between hosts.
 #
 # The fork-sandbox mail store (fork-sandbox-mail.sh; format and semantics in
 # this repo's docs/agent-mail.md), pointed at a root reserved for
@@ -250,18 +266,96 @@ cross_host() {
     printf '%s\n' "$mid"
 }
 
+# Sets (or, with empty text, clears) the description of local lane $1 to $2.
+# Refuses anything that is not one line of at most 200 characters.
+set_description() {
+    local lane="${1#@}" text="$2" dir tmp
+    if [[ ! "$lane" =~ $LANE_MAIL_LANE_RE ]]; then
+        echo "lane-mail: bad lane name '$lane' (want $LANE_MAIL_LANE_RE; only local lanes have a description)" >&2
+        return 2
+    fi
+    if [[ "$text" == *$'\n'* || "$text" == *$'\t'* ]]; then
+        echo "lane-mail: a description is one line: no newline or tab" >&2
+        return 2
+    fi
+    if (( ${#text} > 200 )); then
+        echo "lane-mail: a description is at most 200 characters (got ${#text})" >&2
+        return 2
+    fi
+    dir="$LANE_MAIL_ROOT/agents/$lane"
+    if [[ -z "$text" ]]; then
+        rm -f -- "$dir/about"
+        echo "lane-mail: cleared the description of @$lane"
+        return 0
+    fi
+    mkdir -p -- "$dir"
+    tmp="$(mktemp "$dir/.about.XXXXXX")"
+    printf '%s\n' "$text" > "$tmp"
+    mv -f -- "$tmp" "$dir/about"
+    echo "lane-mail: @$lane described: $text"
+}
+
+# Reads a description from stdin ("-") into `desc_text`, trailing newlines
+# dropped. Returns 2 on a NUL byte (an argument can never carry one).
+read_description_stdin() {
+    local tmp bytes clean
+    tmp="$(mktemp)"
+    cat > "$tmp"
+    bytes="$(wc -c < "$tmp")"
+    clean="$(tr -d '\0' < "$tmp" | wc -c)"
+    if (( bytes != clean )); then
+        rm -f -- "$tmp"
+        echo "lane-mail: a description is one line: no NUL" >&2
+        return 2
+    fi
+    desc_text="$(cat -- "$tmp")"   # drops trailing newlines
+    rm -f -- "$tmp"
+}
+
 cmd="${1:-}"
 case "$cmd" in
+    describe)
+        (( $# == 3 )) || { echo 'Usage: lane-mail.sh describe <lane> "<text>"' >&2; exit 2; }
+        text="$3"
+        if [[ "$text" == - ]]; then
+            read_description_stdin || exit 2
+            text="$desc_text"
+        fi
+        set_description "$2" "$text"
+        ;;
     register)
-        lane="${2:?Usage: lane-mail.sh register <lane>}"
+        lane="" about="" have_about=0
+        shift
+        while (( $# )); do
+            case "$1" in
+                --about)
+                    (( $# >= 2 )) || { echo "lane-mail: --about needs a value" >&2; exit 2; }
+                    about="$2"; have_about=1; shift 2 ;;
+                *)
+                    [[ -z "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"]" >&2; exit 2; }
+                    lane="$1"; shift ;;
+            esac
+        done
+        [[ -n "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"]" >&2; exit 2; }
         if [[ ! "$lane" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
             echo "lane-mail: bad lane name '$lane' (want ^[a-z0-9][a-z0-9-]*$, no leading @)" >&2
             exit 2
         fi
         sid="${CLAUDE_CODE_SESSION_ID:?lane-mail: CLAUDE_CODE_SESSION_ID is not set; run from inside a Claude Code session}"
+        # Validate the description before registering, so a refusal changes nothing.
+        if (( have_about )) && [[ "$about" == - ]]; then
+            read_description_stdin || exit 2
+            about="$desc_text"
+        fi
+        if (( have_about )); then
+            if [[ "$about" == *$'\n'* || "$about" == *$'\t'* ]] || (( ${#about} > 200 )); then
+                set_description "$lane" "$about" || exit 2
+            fi
+        fi
         mkdir -p "$LANES_DIR"
         printf '%s\n' "$lane" > "$LANES_DIR/$sid"
         echo "lane-mail: session ${sid:0:8}... registered as @$lane"
+        if (( have_about )); then set_description "$lane" "$about"; fi
         # Registering arms no watch. Say how, here, where the caller acts.
         echo "lane-mail: to be woken when mail lands, run 'lane-mail-watch.sh $lane --wait'"
         echo "lane-mail: as a background command (not a Monitor, which expires); mark"

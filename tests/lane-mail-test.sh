@@ -19,7 +19,10 @@ no() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$
 
 sid="lane-mail-test-$$-$RANDOM"
 lanes_file="/tmp/claude-$(id -u)/lane-mail-lanes/$sid"
-trap 'rm -f -- "$lanes_file"' EXIT
+sid2="$sid-b"
+lanes_file2="/tmp/claude-$(id -u)/lane-mail-lanes/$sid2"
+scratch="$(mktemp -d)"
+trap 'rm -f -- "$lanes_file" "$lanes_file2"; rm -rf -- "$scratch"' EXIT
 
 printf '== register ==\n'
 
@@ -65,6 +68,104 @@ if grep -qx $'live\ttestlane' <<<"$lanes"; then
     ok "lanes lists a registered lane as live"
 else
     no "lanes lists a registered lane as live" "$lanes"
+fi
+
+printf '== descriptions ==\n'
+
+# Descriptions live under the fixed lane-mail root, so these run against a
+# scratch copy of the scripts with the root line pointed at a temp dir.
+cp -r "$repo_dir/scripts" "$scratch/scripts"
+mkdir -p "$scratch/mods/lane-complete" "$scratch/root"
+cp -r "$repo_dir/mods/lane-complete/bin" "$scratch/mods/lane-complete/bin"
+sed -i "s|^LANE_MAIL_ROOT=.*|LANE_MAIL_ROOT=$scratch/root|" "$scratch/scripts/lane-mail-lib.sh"
+sc="$scratch/scripts/lane-mail.sh"
+about_file="$scratch/root/agents/alpha/about"
+
+out="$("$sc" describe alpha "the alpha widget repo" 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$(cat "$about_file" 2>/dev/null)" == "the alpha widget repo" ]]; then
+    ok "describe stores the text with the lane's mailbox"
+else
+    no "describe stores the text with the lane's mailbox" "rc=$rc: $out"
+fi
+"$sc" describe @alpha "the alpha widget repo, v2" >/dev/null 2>&1
+if [[ "$(cat "$about_file" 2>/dev/null)" == "the alpha widget repo, v2" ]]; then
+    ok "describe accepts a leading @ and replaces the text"
+else
+    no "describe accepts a leading @ and replaces the text"
+fi
+
+# Registration is per session; the description must outlive it.
+CLAUDE_CODE_SESSION_ID="$sid" "$sc" register alpha >/dev/null 2>&1
+CLAUDE_CODE_SESSION_ID="$sid" "$sc" unregister >/dev/null 2>&1
+CLAUDE_CODE_SESSION_ID="$sid2" "$sc" register alpha >/dev/null 2>&1
+if [[ "$(cat "$about_file" 2>/dev/null)" == "the alpha widget repo, v2" ]]; then
+    ok "register without --about keeps the existing description"
+else
+    no "register without --about keeps the existing description"
+fi
+
+out="$(CLAUDE_CODE_SESSION_ID="$sid2" "$sc" register beta --about "the beta gadget repo" 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$(cat "$scratch/root/agents/beta/about" 2>/dev/null)" == "the beta gadget repo" ]] &&
+    [[ "$(CLAUDE_CODE_SESSION_ID="$sid2" "$sc" registration)" == beta ]]; then
+    ok "register --about registers and describes"
+else
+    no "register --about registers and describes" "rc=$rc: $out"
+fi
+CLAUDE_CODE_SESSION_ID="$sid2" "$sc" register --about "the beta gadget repo, again" beta >/dev/null 2>&1
+if [[ "$(cat "$scratch/root/agents/beta/about" 2>/dev/null)" == "the beta gadget repo, again" ]]; then
+    ok "register takes --about before the lane too"
+else
+    no "register takes --about before the lane too"
+fi
+
+"$sc" describe beta "" >/dev/null 2>&1
+if [[ ! -e "$scratch/root/agents/beta/about" ]]; then
+    ok "describe with empty text clears the description"
+else
+    no "describe with empty text clears the description"
+fi
+
+refuses() {  # refuses <label> <lane> <text>
+    local before
+    before="$(cat "$about_file" 2>/dev/null)"
+    if "$sc" describe "$2" "$3" >/dev/null 2>&1; then
+        no "$1" "was accepted"
+    elif [[ "$(cat "$about_file" 2>/dev/null)" != "$before" ]]; then
+        no "$1" "the stored text changed"
+    else
+        ok "$1"
+    fi
+}
+refuses "a newline in the text is refused" alpha $'one\ntwo'
+refuses "a tab in the text is refused" alpha $'one\ttwo'
+refuses "text over 200 characters is refused" alpha "$(printf 'x%.0s' {1..201})"
+refuses "a remote lane is refused" alpha:somehost "the far alpha"
+if "$sc" describe alpha "$(printf 'x%.0s' {1..200})" >/dev/null 2>&1; then
+    ok "text of exactly 200 characters is accepted"
+else
+    no "text of exactly 200 characters is accepted"
+fi
+if printf 'one\0two' | "$sc" describe alpha - >/dev/null 2>&1; then
+    no "a NUL in the text is refused" "was accepted"
+else
+    ok "a NUL in the text is refused"
+fi
+if printf 'from stdin\n' | "$sc" describe alpha - >/dev/null 2>&1 &&
+    [[ "$(cat "$about_file")" == "from stdin" ]]; then
+    ok "describe - reads one line from stdin"
+else
+    no "describe - reads one line from stdin"
+fi
+if printf 'a\nb\n' | "$sc" describe alpha - >/dev/null 2>&1; then
+    no "multi-line stdin is refused" "was accepted"
+else
+    ok "multi-line stdin is refused"
+fi
+out="$(CLAUDE_CODE_SESSION_ID="$sid2" "$sc" register gamma --about $'a\tb' 2>&1)"; rc=$?
+if (( rc != 0 )) && [[ "$(CLAUDE_CODE_SESSION_ID="$sid2" "$sc" registration)" == beta ]]; then
+    ok "register --about with bad text refuses before registering"
+else
+    no "register --about with bad text refuses before registering" "rc=$rc: $out"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
