@@ -380,8 +380,7 @@ def main():
         # code step is neither checked nor warned about, and a kept one's
         # coding-only properties (repeat, refresh, endpoint) have nothing
         # left to apply to. Its extra arguments stay: a kept step's leg
-        # honors them, unless the agent also sat the dropped code step
-        # (self_coded), whose arguments fork-sandbox.sh blanks.
+        # honors them, as in a full run.
         for s in steps:
             s["self_coded"] = s["agent"] in dropped_code_agents
         seated_ro = {s["agent"] for s in steps}

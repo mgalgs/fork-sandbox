@@ -163,9 +163,8 @@
 #                        repeat: N to run every coding leg as N passes --
 #                        both are preset-only, with no flag equivalent. An
 #                        agent's own claude-args/pi-args/codex-args key
-#                        reaches every leg that agent sits in a composed
-#                        pipeline -- only the implement seat's legs in a
-#                        legacy-shaped one. A preset value passes through
+#                        reaches every leg that agent sits, in a composed or
+#                        a legacy-shaped pipeline alike. A preset value passes
 #                        exactly the validation the equivalent flag would,
 #                        and an explicit flag overrides its preset
 #                        counterpart -- except against a composed
@@ -2697,26 +2696,15 @@ if [[ -n "$preset_name" ]]; then
     # its own legs, as a composed one does: the code seat's to the code and
     # fix legs, a review step's agent's to that step's review legs, a
     # maintain step's agent's to its maintainer legs. A read-only pipeline
-    # drops its code step, so the dropped coder's agent (self_coded) has its
-    # coding arguments blanked rather than handed to a review or maintain
-    # leg it also sits: a full run never gives its self-review leg its
-    # coding arguments either. A read-only maintain-only pipeline has no
-    # implement leg at all (phantom), so its first agent's arguments ride
-    # the maintainer leg alone and never the implement seat.
+    # drops its code step, but a dropped coder that also sits a kept review
+    # or maintain step keeps its arguments there, exactly as in a full run.
+    # A read-only maintain-only pipeline has no implement leg at all
+    # (phantom), so its first agent's arguments ride the maintainer leg
+    # alone and never the implement seat.
     if [[ "$preset_is_legacy_shaped" == true ]]; then
         preset_impl_seat_phantom=false
         [[ "$preset_read_only" == true && "$preset_ro_review" != true ]] \
             && preset_impl_seat_phantom=true
-        if [[ "$preset_read_only" == true ]]; then
-            for ((preset_sc_k = 1; preset_sc_k <= preset_step_count; preset_sc_k++)); do
-                if [[ "${preset_step_self_coded[$preset_sc_k]:-}" == "1" ]]; then
-                    preset_sc_agent="${preset_step_agent[$preset_sc_k]}"
-                    preset_agent_cargs[$preset_sc_agent]=""
-                    preset_agent_pargs[$preset_sc_agent]=""
-                    preset_agent_xargs[$preset_sc_agent]=""
-                fi
-            done
-        fi
     fi
 
     preset_seat_desc() {
@@ -3789,6 +3777,12 @@ if [[ "$k8s_mode" == true ]]; then
         echo "Error: --claude-args is not supported with --k8s. It passes flags" >&2
         echo "to the claude CLI, and the pod's own claude invocation (when" >&2
         echo "--harness claude) is fixed -- there is no flag yet to extend it." >&2
+        exit 1
+    fi
+    if [[ -n "$review_extra_args" || -n "$mnt_extra_args" ]]; then
+        echo "Error: a review or maintain agent's claude-args, pi-args or codex-args" >&2
+        echo "are not supported with --k8s. The pod's reviewer and maintainer" >&2
+        echo "invocations are fixed -- there is no flag yet to extend them." >&2
         exit 1
     fi
     if [[ -n "$clone_dir_flag" ]]; then

@@ -562,6 +562,25 @@ EOF
 refuses "a preset's compiled values meet the --k8s refusals like flags do" \
     "--claude-args is not supported with --k8s" \
     --preset cargs-legacy --k8s
+cat > "$presets_dir/rargs-legacy.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+  elder:
+    harness: claude
+    model: opus
+    claude-args: --effort high
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: elder
+EOF
+refuses "a legacy review agent's arguments are refused with --k8s, not dropped" \
+    "review or maintain agent's claude-args" \
+    --preset rargs-legacy --k8s
 refuses "--codex-args is refused with --k8s" \
     "--codex-args is not supported with --k8s" \
     --harness codex --codex-args '-c model_reasoning_effort=high' --k8s
@@ -3105,7 +3124,7 @@ if rd_ro_self="$(run_stubbed --preset ro-self --review-only \
     tmpdirs+=("$rd_ro_self")
     check "--review-only over ro-self runs its review and maintain once each" \
         "2" "$(cat "$count")"
-    lacks "the coder's self-review leg does not carry its own coding arguments" \
+    contains "the coder's self-review leg carries its own coding arguments, as in a full run" \
         "$(sed -n 1p "$argv_log")" "--effort"
 else
     no "--review-only over ro-self launches"
@@ -3154,7 +3173,7 @@ if rd_ro_self_mnt="$(run_stubbed --preset ro-self-maintain --review-only \
     tmpdirs+=("$rd_ro_self_mnt")
     check "--review-only over ro-self-maintain runs its review and maintain once each" \
         "2" "$(cat "$count")"
-    lacks "the coder's self-maintain leg does not carry its own coding arguments" \
+    contains "the coder's self-maintain leg carries its own coding arguments, as in a full run" \
         "$(sed -n 2p "$argv_log")" "--effort"
 else
     no "--review-only over ro-self-maintain launches"
