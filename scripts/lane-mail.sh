@@ -298,18 +298,19 @@ set_description() {
 # Reads a description from stdin ("-") into `desc_text`, trailing newlines
 # dropped. Returns 2 on a NUL byte (an argument can never carry one).
 read_description_stdin() {
-    local tmp bytes clean
-    tmp="$(mktemp)"
-    cat > "$tmp"
-    bytes="$(wc -c < "$tmp")"
-    clean="$(tr -d '\0' < "$tmp" | wc -c)"
+    local bytes clean
+    mkdir -p -- "$LANE_MAIL_ROOT"
+    desc_tmp="$(mktemp "$LANE_MAIL_ROOT/.about-stdin.XXXXXX")"
+    trap 'rm -f -- "$desc_tmp"' EXIT
+    trap 'exit 130' INT TERM
+    cat > "$desc_tmp"
+    bytes="$(wc -c < "$desc_tmp")"
+    clean="$(tr -d '\0' < "$desc_tmp" | wc -c)"
     if (( bytes != clean )); then
-        rm -f -- "$tmp"
         echo "lane-mail: a description is one line: no NUL" >&2
         return 2
     fi
-    desc_text="$(cat -- "$tmp")"   # drops trailing newlines
-    rm -f -- "$tmp"
+    desc_text="$(cat -- "$desc_tmp")"   # drops trailing newlines
 }
 
 cmd="${1:-}"

@@ -117,9 +117,16 @@ spelling needs its own rule.
 parameter, so no caller can point `send`, `reply`, `inbox`, `seen` or any
 other subcommand at a different store — the same separation that keeps this
 root from colliding with the unrelated fleet mail store. `register` and
-`unregister` only ever write the calling session's own
+`unregister` write the calling session's own
 `/tmp/claude-$UID/lane-mail-lanes/<session-id>` file, named from
 `$CLAUDE_CODE_SESSION_ID`, so one session cannot touch another's registration.
+The one write that is shared across sessions is a lane description:
+`register <lane> --about` and `describe <lane> "<text>"` write (or, with empty
+text, delete) `<root>/agents/<lane>/about` for any valid local lane name, with
+no check that the caller holds the lane. The lane-complete prompt hook shows
+that text to every session that mentions the lane, so under this approval one
+session can change what others are told a lane owns. That stays inside the
+fixed root, and mail is already a cross-session channel.
 
 That fixed root bounds where this writes, not what it reads. `send` and
 `reply` pass `"$@"` straight through to `fork-sandbox-mail.sh`, whose
