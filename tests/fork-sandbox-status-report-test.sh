@@ -1561,4 +1561,99 @@ out="$(K8S_PROBE_STUB_POD_JSON='{"items":[{"status":{"phase":"Running"}}]}' \
 [[ "$out" == "state:    orphaned"* ]] \
     || { echo "a released driver lock did not fall back to the orphan probe: $out"; exit 1; }
 
-echo "112 passed, 0 failed"
+# 37. A run whose own collect wrote exit-code but died before finishing
+# the reap that write obliged (DIR/.reap-pending still set, driver
+# confirmed dead) reads "orphaned", not "done"/"failed" -- the same word
+# already used above for a driver dead before exit-code ever existed, and
+# for the same reason: `fork-sandbox adopt` is what finishes either one.
+# No kubectl call is involved here at all (unlike 31-36 above): this is a
+# pure file-based check (exit-code, .reap-pending, k8s_client_pid), so no
+# k8s.env/stub is needed.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-reap-pending
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$dead_pid
+EOF
+printf '0\n' > "$rd_new/exit-code"
+: > "$rd_new/.reap-pending"
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    orphaned"* ]] \
+    || { echo "exit-code plus a pending reap behind a dead driver was not read as orphaned: $out"; exit 1; }
+[[ "$out" == *"fork-sandbox adopt $rd_new"* ]] \
+    || { echo "the pending-reap orphaned status did not name the adopt remedy: $out"; exit 1; }
+
+# 38. The same run dir, but with summary.json already written (collect
+# writes it before exit-code -- the ordinary shape by the time this state
+# is reached): --json must still read "orphaned", with a reason, rather
+# than reporting replied/failed off the summary's own exit_code the way
+# it does once a run has genuinely finished reaping.
+printf '{"exit_code":0,"branch":"test-k8s-reap-pending"}' > "$rd_new/summary.json"
+json="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "orphaned" ]] \
+    || { echo "json state wrong for a pending-reap run with summary.json already written: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .reason)" == "the host-side k8s client died before it could finish removing this run's cluster objects" ]] \
+    || { echo "json reason wrong for a pending-reap run: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r .exit_code)" == "0" ]] \
+    || { echo "a pending-reap run's json dropped summary.json's own fields: $json"; exit 1; }
+
+# 39. Clear the mark (as adopt itself does once it finishes the reap) and
+# the exact same run dir reads "done"/"replied" again -- the mark, not
+# exit-code or summary.json, is what toggled the state.
+rm -f -- "$rd_new/.reap-pending"
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    done"* ]] \
+    || { echo "clearing the reap-pending mark did not restore state:done: $out"; exit 1; }
+json="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "replied" ]] \
+    || { echo "clearing the reap-pending mark did not restore json state replied: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r 'has("reason")')" == "false" ]] \
+    || { echo "a finished run's json carried a reason it should not: $json"; exit 1; }
+
+# 40. A run dir without the mark at all is unchanged by any of this (the
+# ordinary case every run before this feature, and every run whose collect
+# never even reaches a reap-owing ending, already is): exit-code alone,
+# with a dead driver recorded, reads done/failed exactly as it always has.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-no-mark
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$dead_pid
+EOF
+printf '0\n' > "$rd_new/exit-code"
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    done"* ]] \
+    || { echo "a run dir with no reap-pending mark was not read as done: $out"; exit 1; }
+
+# 41. While the driver is ALIVE with the mark still set (collect is still
+# actively working through its own reap, right now), the run stays
+# "working"/"done" as today -- never orphaned. Only a CONFIRMED-dead
+# driver combined with the mark reads as orphaned.
+new_run_dir
+cat > "$rd_new/run.env" <<EOF
+version=1
+branch=test-k8s-reap-pending-alive
+origin_repo=/tmp/origin
+clone_dir=/work/clone
+started_at=$(( $(date +%s) - 300 ))
+network=cluster
+k8s_client_pid=$$
+EOF
+printf '0\n' > "$rd_new/exit-code"
+: > "$rd_new/.reap-pending"
+out="$("$status" "$rd_new" 2>&1)"
+[[ "$out" == "state:    done"* ]] \
+    || { echo "a live driver with the reap-pending mark set was wrongly read as orphaned: $out"; exit 1; }
+json="$("$status" --json "$rd_new")"
+[[ "$(printf '%s' "$json" | jq -r .state)" == "working" ]] \
+    || { echo "json state wrong for a live driver with the reap-pending mark set (no summary.json yet): $json"; exit 1; }
+
+echo "123 passed, 0 failed"

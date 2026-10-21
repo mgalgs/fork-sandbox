@@ -435,7 +435,7 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|tidy.json|.driver.lock|pipeline.json) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|tidy.json|.driver.lock|.reap-pending|pipeline.json) ;;
         step-[0-9]*-loop.json)
             [[ "$name" =~ ^step-[0-9]+-loop\.json$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         # One file per leg, named by the runner. The leg kinds are
@@ -959,6 +959,18 @@ k8s_orphan_probe() {
 run_state() {
     local rc pid
     if rc="$(run_file_read exit-code 2>/dev/null)"; then
+        # exit-code alone is not the whole story for a --k8s run: a driver
+        # that died after writing it but before finishing the reap it
+        # obliged (see k8s_reap_pending's own header) leaves this run's
+        # cluster objects -- its proxy and operator access token Secret
+        # among them -- possibly still live. Read as orphaned, the same
+        # word already used below for a driver that died before ever
+        # reaching exit-code, rather than done/failed: both cases are
+        # finished only once `fork-sandbox adopt` runs.
+        if [[ "$network" == "cluster" ]] && k8s_reap_pending && ! run_finalizer_alive; then
+            printf 'orphaned'
+            return
+        fi
         rc="${rc//[^0-9-]/}"
         if [[ "$rc" == "0" ]]; then
             printf 'done'
@@ -1103,6 +1115,20 @@ driver_lock_held() {
     flock -E 3 -n -s "$fd" || rc=$?
     exec {fd}<&-
     (( rc == 3 ))
+}
+
+# Whether DIR/.reap-pending exists: cmd_collect (fork-sandbox-k8s.sh) sets
+# this mark before it ever writes exit-code, on every ending that owes a
+# reap (the full by-branch rm, or at least this run's proxy/token teardown
+# under --keep, a zero-harvest run, or a failed evidence capture), and
+# clears it only once that reap actually ran. A run whose driver died
+# between those two writes leaves exit-code present with this mark still
+# set -- run_state() and the --json reader below both read that combination
+# as "orphaned", the same word they already use for a driver that died
+# before ever reaching exit-code, since in both cases `fork-sandbox adopt`
+# is what finishes the job.
+k8s_reap_pending() {
+    resolve_run_file .reap-pending 2>/dev/null
 }
 
 # end_reason: absent on every ordinary run (it ended on its own).
@@ -1428,13 +1454,25 @@ case "$mode" in
             if [[ "$network" == "cluster" ]] && run_finalizer_alive; then
                 finalizer_active=true
             fi
-            printf '%s' "$summary_json" | jq --arg reply_file "$reply_file_path" \
-                --argjson finalizer_active "$finalizer_active" \
-                '. + {state: (if $finalizer_active then "working"
-                              elif (.exit_code | type) != "number" then "failed"
-                              elif .exit_code == 0 then "replied"
-                              else "failed" end),
-                      reply_file: $reply_file}'
+            # A dead driver that left DIR/.reap-pending set: summary.json
+            # (and so exit_code) is already written, but the reap that
+            # write obliged -- this run's own proxy/token teardown, at
+            # least -- may never have run. Report orphaned, with a reason,
+            # rather than replied/failed: see k8s_reap_pending's own header.
+            if [[ "$finalizer_active" == false && "$network" == "cluster" ]] \
+                && k8s_reap_pending; then
+                printf '%s' "$summary_json" | jq --arg reply_file "$reply_file_path" \
+                    --arg reason "the host-side k8s client died before it could finish removing this run's cluster objects" \
+                    '. + {state: "orphaned", reply_file: $reply_file, reason: $reason}'
+            else
+                printf '%s' "$summary_json" | jq --arg reply_file "$reply_file_path" \
+                    --argjson finalizer_active "$finalizer_active" \
+                    '. + {state: (if $finalizer_active then "working"
+                                  elif (.exit_code | type) != "number" then "failed"
+                                  elif .exit_code == 0 then "replied"
+                                  else "failed" end),
+                          reply_file: $reply_file}'
+            fi
         else
             json_state="$(contract_state)"
             # A consumer polling this needs to tell "the agent failed" apart

@@ -419,6 +419,17 @@ untouched — an artifact failure never costs the branch — because a failed
 outbox pull is not evidence the run is broken, while a failed transcript
 pull usually is.
 
+What "kept" never means, on any of these three endings (a failed evidence
+pull-back, a zero-harvest run below, or a plain `--keep`), is that the
+run's **credentials** stay live too. The agent has already finished by the
+time `collect` runs any of them, so nothing left running still needs this
+run's per-run proxy or the Secret holding the operator's live access
+token — every one of these endings tears both down unconditionally, and
+says so, while still leaving the Job, the agent pod and the scripts
+ConfigMap in place for inspection (or, under plain `--keep`, leaving those
+three in place too). Only the fourth ending — nothing suspicious, evidence
+captured, no `--keep` — reaps everything, via `rm --branch`.
+
 **A pod that never got that far.** The evidence pull-back above only runs
 once `wait` sees the run finish — but a pod that dies before any leg (a
 Failed pod, or a Failed job condition) never reaches it: `wait` itself
@@ -847,10 +858,13 @@ per-run-shape knowledge of its own:
 - **Refuses outright on a run that is not `--k8s` at all** (no
   `network=cluster` in `run.env`) -- there is no pod to re-adopt.
 - **Is a no-op, exit 0, on a run whose directory already answers for
-  itself** (`DIR/exit-code` exists -- some earlier `wait` or `collect`
-  already reached a terminal outcome, adopted or not). Calling `adopt`
-  again on a run already collected must never re-run `collect` against a
-  pod that collect itself already reaped.
+  itself AND owes no pending reap** (`DIR/exit-code` exists and
+  `DIR/.reap-pending` does not -- some earlier `wait` or `collect` already
+  reached a terminal outcome *and finished reaping*, adopted or not).
+  Calling `adopt` again on a run already collected must never re-run
+  `collect` against a pod that collect itself already reaped. A run with
+  BOTH `exit-code` and `.reap-pending` is NOT this case -- see "A reap
+  `adopt` can finish" below.
 - **Takes the run's driver lock first, and refuses, exit 1, while another
   process holds it.** Every driver -- `run`, `resume` and `adopt` -- holds
   an exclusive `flock` on `DIR/.driver.lock` for its whole life; `run`
@@ -902,8 +916,93 @@ per-run-shape knowledge of its own:
   time. Neither is acceptable for the "call `adopt` on every startup for
   every in-flight run it knows" consumer this verb exists for, so `adopt`
   runs this same bounded, read-only probe itself, before it ever reaches
-  `resume`: on an unrecoverable run it reports the reason and stops;
+  `resume`: on an unrecoverable run it reports the reason and stops --
+  but not before dropping this run's own proxy and token Secret, if
+  either is still around (see "A reap `adopt` can finish" below for why
+  that drop is scoped by this run's own identity rather than by name);
   on a live pod it falls through into `resume` exactly as before.
+
+### A reap `adopt` can finish
+
+Everything above was true the day `orphaned` and `adopt` were added, for a
+driver that died *before* `collect` ever wrote `DIR/exit-code`. There is a
+second, narrower gap on the other side of that write: a driver that dies
+*after* `collect` decides how a run ends -- reaped outright, or kept with
+its proxy and token torn down (see "the reap rule on failure" and the
+zero-harvest rule above, both of which now tear credentials down
+unconditionally) -- but *before* that teardown or `rm` actually runs.
+Before the change described here, that window had no recovery at all: the
+run reads `done`/`failed` forever, `adopt` is already a no-op by the time
+`exit-code` exists, and the run's per-run proxy Pod and its token
+Secret -- holding the operator's live OAuth access token -- can stay in
+the cluster indefinitely.
+
+**Every per-run object carries its own identity.** Each `submit` mints a
+fresh, unique label value (`fork-sandbox/run`, a UUID) and renders it onto
+every object that submit creates: the Job and its pod template, the
+scripts ConfigMap, the grant NetworkPolicy (`--allow-namespace`), and, for
+whichever harness(es) the run uses, the per-run proxy
+Pod/Service/ConfigMap/NetworkPolicy and the token Secret. It is recorded
+in `run.env` as `run_token`. Unlike `fork-sandbox/branch` -- which a
+consumer that reuses one branch across many runs gives the SAME value,
+object name for object name, to every run on that branch -- `fork-sandbox/
+run` is unique per submit. `--dry-run` is the one exception: it creates no
+run.env and no cluster object, so there is nothing for a unique identity
+to ever distinguish, and it renders a fixed, UUID-shaped placeholder
+instead -- keeping two otherwise-identical `--dry-run` renders
+byte-for-byte reproducible, which this project's own flag-forwarding
+regression tests depend on. That is what makes a *by-run-label* delete safe
+in a way a by-branch delete (`rm --branch`, unchanged, still the
+operator's own tool) is not: if a later run on the same branch has already
+replaced these same-named objects with its own, a stale delete scoped to
+the OLD run's label matches nothing live and is a safe no-op, where a
+by-branch delete would take the new run down too.
+
+**Every per-run object is also owned by the Job.** Once the Job itself
+exists, `submit` patches an `ownerReference` (`batch/v1` Job, by name and
+uid) onto every other per-run object above. This is the consumer's main
+safety net, independent of anything below: deleting the Job alone now
+garbage-collects everything else this run created, so even a path that
+bypasses this script's own reap entirely still cannot orphan these
+objects forever. Best-effort and silent about it beyond one warning --
+submit does not fail if the patch fails, because the explicit reap below
+still applies regardless.
+
+**`collect` marks a run reap-pending before it writes `exit-code`.**
+Whichever of the four endings a `collect` is about to take -- the plain
+`rm --branch` reap, or at least a proxy/token teardown under `--keep`, a
+zero-harvest verdict, or a failed evidence capture -- it first touches
+`DIR/.reap-pending`, in the run's own directory. The mark is cleared only
+once that ending's own teardown (or the full `rm`) actually succeeds; a
+failed `rm` leaves it in place for the next attempt. A driver killed in
+the gap between the `exit-code` write and the reap it implied leaves
+`DIR/exit-code` present *and* `DIR/.reap-pending` still set.
+
+**`fork-sandbox-status.sh` reads that combination as `orphaned`, not
+`done`/`failed`.** Both `run_state()`'s plain-text answer and `--json`
+(whether or not `summary.json` has already been written -- it usually
+has, by this point) check for `.reap-pending` alongside a confirmed-dead
+driver (the same alive-check `adopt` itself uses) before trusting
+`exit-code` at face value. `--json` adds a `reason`
+(`"the host-side k8s client died before it could finish removing this
+run's cluster objects"`) so a polling consumer can tell this apart from an
+ordinary replied/failed run, the same way it already could for the
+pre-existing pod-vanished/pod-finished reasons. A run with the mark but no
+confirmed-dead driver (the ordinary case: `collect` is still running)
+reads exactly as it always has -- `working`, not `orphaned` -- since the
+mark alone, without a dead driver, says nothing is wrong.
+
+**`adopt` finishes exactly this reap, scoped to the run alone.** On a run
+whose directory has both `exit-code` and `.reap-pending`, `adopt` takes
+the driver lock (refusing exactly as it does for every other case: held,
+un-lockable, or the driver still alive), then deletes every object
+carrying this run's own `fork-sandbox/run` label -- Job, pod, Service,
+Secret, ConfigMap, NetworkPolicy, all in one call -- clears the mark, and
+exits 0 with a one-line message. It never falls into the unrecoverable
+probe or `resume`'s own wait/collect: those exist for a run that never
+reached `exit-code` at all, not this one. A run.env with no `run_token`
+(written before this feature existed) is treated exactly like the
+already-finished case: a no-op, exit 0, no cluster call.
 
 **The timing caveat.** Adoption is possible only while the pod is still
 alive -- `K8S_RUN_TTL` keeps ticking the whole time nobody is watching, and

@@ -65,6 +65,7 @@ metadata:
   namespace: __NAMESPACE__
   labels:
     fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/run: __RUN_TOKEN__
     __EXTRA_LABELS__: "true"
 data:
   nginx.conf: |
@@ -180,6 +181,7 @@ metadata:
   labels:
     app: fork-sandbox-proxy
     fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/run: __RUN_TOKEN__
     fork-sandbox/role: claude-proxy
     __EXTRA_LABELS__: "true"
 spec:
@@ -264,6 +266,7 @@ metadata:
   labels:
     app: fork-sandbox-proxy
     fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/run: __RUN_TOKEN__
     __EXTRA_LABELS__: "true"
 spec:
   selector:
@@ -281,6 +284,7 @@ metadata:
   namespace: __NAMESPACE__
   labels:
     fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/run: __RUN_TOKEN__
     __EXTRA_LABELS__: "true"
 spec:
   podSelector:

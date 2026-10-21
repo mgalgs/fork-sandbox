@@ -1237,6 +1237,37 @@ k8s_valid_label_key() {
     (( ${#key} <= 63 )) && [[ "$key" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
 }
 
+# A fresh identifier for ONE submit, unique across every run this script
+# will ever create: the fork-sandbox/run label value every per-run object
+# that submit renders carries (see cmd_submit's own run_token), recorded in
+# run.env and read back by adopt and the reap-by-run-label deletes it
+# drives. Prefers uuidgen, then the kernel's own generator, then Python's
+# uuid4 -- the same fallback order mail_new_uuid (fork-sandbox-mail.sh)
+# uses, for a tool this script cannot assume is installed. A UUID's own
+# shape (hex and hyphens, 36 characters) already satisfies
+# k8s_valid_label_value, so the check below is a defensive backstop, not
+# the normal path: it never fires in practice, but a label value this
+# script renders unchecked into a dozen manifests is not a place to trust
+# an external generator blindly.
+k8s_new_run_token() {
+    local tok=""
+    if command -v uuidgen >/dev/null 2>&1; then
+        tok="$(uuidgen 2>/dev/null)"
+    fi
+    if [[ -z "$tok" && -r /proc/sys/kernel/random/uuid ]]; then
+        tok="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+    fi
+    if [[ -z "$tok" ]]; then
+        tok="$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null)"
+    fi
+    tok="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+    k8s_valid_label_value "$tok" && [[ -n "$tok" ]] || {
+        echo "Error: could not generate a run identifier." >&2
+        exit 1
+    }
+    printf '%s' "$tok"
+}
+
 # Converts a <digits><unit> value in the K8S_PROXY_READ_TIMEOUT /
 # K8S_PI_IDLE_TIMEOUT shape (unit one of ms s m h d, already validated by the
 # caller) to a whole number of milliseconds, for PI_HTTP_IDLE_TIMEOUT_MS --
@@ -2107,21 +2138,24 @@ render_extra_labels_block() {
 # error: (1) a reserved key -- app and fork-sandbox/branch are the
 # NetworkPolicy selector keys that isolate one run's claude-proxy (and the
 # operator's real access token behind it) from another's, fork-sandbox/role
-# and fork-sandbox/owner are this script's own labels. The fixed
-# fork-sandbox.io/ prefix already makes a collision with any of these
-# impossible, but a caller who tries one gets a specific reason instead of a
-# generic shape error. (2) the key's shape, since it becomes
+# and fork-sandbox/owner are this script's own labels, and fork-sandbox/run
+# is this run's own unique identifier (see k8s_new_run_token), the label the
+# by-run-label reap (cmd_rm, adopt) and submit's own ownerReference patch key
+# off. The fixed fork-sandbox.io/ prefix already makes a collision with any
+# of these impossible, but a caller who tries one gets a specific reason
+# instead of a generic shape error. (2) the key's shape, since it becomes
 # fork-sandbox.io/$key. (3) the value's shape. $what names the caller's
 # source for the error message, e.g. "--label 'key=value'".
 k8s_validate_label_kv() {
     local key="$1" value="$2" what="$3"
     case "$key" in
-        app|fork-sandbox/branch|fork-sandbox/role|fork-sandbox/owner)
+        app|fork-sandbox/branch|fork-sandbox/role|fork-sandbox/owner|fork-sandbox/run)
             echo "Error: $what sets '$key', which is reserved -- this script" >&2
             echo "renders it itself (app and fork-sandbox/branch select which" >&2
             echo "pods may reach a run's claude-proxy and its operator access" >&2
             echo "token; fork-sandbox/role and fork-sandbox/owner are its own" >&2
-            echo "labels). Every free-form label already renders under" >&2
+            echo "labels, and fork-sandbox/run is this run's own unique" >&2
+            echo "identifier). Every free-form label already renders under" >&2
             echo "fork-sandbox.io/, so this can never collide in practice --" >&2
             echo "pick a different key." >&2
             return 1
@@ -6401,6 +6435,71 @@ k8s_job_quota_blocked() {
     [[ "$msgs" == *"exceeded quota"* ]]
 }
 
+# k8s_set_run_owner_refs <safe_name> <grant_name> <has_claude> <has_codex>
+#
+# Called once, from cmd_submit, right after the Job itself is applied (the
+# Job has to exist first -- its uid is what every other per-run object
+# below is owned BY). Sets an ownerReference to this run's own Job
+# (apiVersion batch/v1, kind Job, by name and uid; no blockOwnerDeletion,
+# not controller) on every other per-run object this submit rendered: the
+# scripts ConfigMap, the grant NetworkPolicy (when --allow-namespace was
+# given), and, for whichever harness(es) this run uses, the proxy
+# Pod/Service/ConfigMap/NetworkPolicy and the token Secret. Once that
+# reference is set, deleting the Job alone garbage-collects every one of
+# them -- the consumer's own main safety net against a leak this script's
+# own explicit reap (cmd_rm, cmd_collect, adopt) somehow never reaches, not
+# a replacement for any of those.
+#
+# Best-effort and silent about it beyond one combined warning: a failure
+# here (a read-only credential prefix, an API server momentarily
+# unreachable, a kubectl too old for --type=merge, anything) must never fail
+# submit itself -- the explicit reap this run still goes through covers the
+# ordinary case regardless of whether this ever ran at all. The patch names
+# no field but ownerReferences, so it cannot touch anything else -- in
+# particular, the token Secret's own later server-side re-apply (
+# k8s_push_claude_key/k8s_push_codex_key, from cmd_wait's keeper) never
+# mentions ownerReferences in ITS manifest either, so that re-apply can
+# never strip what this sets here.
+k8s_set_run_owner_refs() {
+    local safe_name="$1" grant_name="$2" has_claude="$3" has_codex="$4"
+    local job_uid
+    job_uid="$(kubectl get job "$safe_name" -o jsonpath='{.metadata.uid}' 2>/dev/null)" || job_uid=""
+    if [[ -z "$job_uid" ]]; then
+        echo "fork-sandbox-k8s: warning: could not read this run's Job uid;" >&2
+        echo "its other cluster objects will not be owned by it (the" >&2
+        echo "explicit reap on this run's own path still applies)." >&2
+        return 0
+    fi
+    local patch
+    patch="$(printf '{"metadata":{"ownerReferences":[{"apiVersion":"batch/v1","kind":"Job","name":"%s","uid":"%s"}]}}' \
+        "$safe_name" "$job_uid")"
+    local -a targets=("configmap/$safe_name-scripts")
+    [[ -n "$grant_name" ]] && targets+=("networkpolicy/$grant_name")
+    if [[ "$has_claude" == 1 ]]; then
+        targets+=(
+            "configmap/$safe_name-claude-proxy-conf" "pod/$safe_name-claude-proxy"
+            "service/$safe_name-claude-proxy" "networkpolicy/$safe_name-claude-proxy"
+            "secret/$safe_name-claude-token"
+        )
+    fi
+    if [[ "$has_codex" == 1 ]]; then
+        targets+=(
+            "configmap/$safe_name-codex-proxy-conf" "pod/$safe_name-codex-proxy"
+            "service/$safe_name-codex-proxy" "networkpolicy/$safe_name-codex-proxy"
+            "secret/$safe_name-codex-token"
+        )
+    fi
+    local target patch_failed=false
+    for target in "${targets[@]}"; do
+        kubectl patch "$target" --type=merge -p "$patch" >/dev/null 2>&1 || patch_failed=true
+    done
+    if [[ "$patch_failed" == true ]]; then
+        echo "fork-sandbox-k8s: warning: could not make this run's Job the owner" >&2
+        echo "of every one of its other cluster objects (the explicit reap on" >&2
+        echo "this run's own path still applies)." >&2
+    fi
+}
+
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
@@ -7407,6 +7506,28 @@ cmd_submit() {
     local safe_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
 
+    # This run's own identity, unique even across two runs that otherwise
+    # share every object name (the same branch, re-submitted after an
+    # earlier run on it finished) -- see k8s_new_run_token's own header.
+    # Recorded in run.env below and carried as the fork-sandbox/run label on
+    # every per-run object rendered past this point, which is what lets a
+    # dead driver's reap (adopt, below) and submit's own ownerReference
+    # patch (further down, once the Job exists) target exactly THIS run's
+    # objects, never a same-named run that has since replaced them.
+    #
+    # --dry-run is the one exception: it creates nothing (no run.env, no
+    # cluster object), so there is nothing for this identity to ever
+    # distinguish, and a fixed, UUID-shaped placeholder keeps every
+    # --dry-run render -- for the same branch and flags -- byte-for-byte
+    # reproducible, which the "X forwards unchanged" regression tests
+    # throughout this file depend on.
+    local run_token
+    if [[ "$dry_run" == true ]]; then
+        run_token="00000000-0000-4000-8000-000000000000"
+    else
+        run_token="$(k8s_new_run_token)"
+    fi
+
     # This run's own grant object, when --allow-namespace was given --
     # resolved here, before any cluster object exists, so a platform that
     # cannot render one refuses before anything is created. "-agent-grant"
@@ -7473,12 +7594,12 @@ cmd_submit() {
     extra_labels_4="$(render_extra_labels_indent 4)"
     extra_labels_8="$(render_extra_labels_indent 8)"
 
-    # Every per-run object's label set: branch, owner (if any), and the
-    # fork-sandbox.io/* pairs resolve_run_labels resolved above -- built
-    # once here so the grant below and, for --harness claude, this run's
-    # own token Secret (further down) read the identical set rather than
-    # two copies that could drift.
-    local -a run_label_pairs=("fork-sandbox/branch=$safe_name")
+    # Every per-run object's label set: branch, this run's own identity
+    # (run_token, above), owner (if any), and the fork-sandbox.io/* pairs
+    # resolve_run_labels resolved above -- built once here so the grant
+    # below and, for --harness claude, this run's own token Secret (further
+    # down) read the identical set rather than two copies that could drift.
+    local -a run_label_pairs=("fork-sandbox/branch=$safe_name" "fork-sandbox/run=$run_token")
     [[ -n "$run_owner" ]] && run_label_pairs+=("fork-sandbox/owner=$run_owner")
     local run_label_i
     for run_label_i in "${!RUN_LABEL_KEYS[@]}"; do
@@ -7536,6 +7657,7 @@ cmd_submit() {
         claude_proxy_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
             -e "s|__RUN_NAME__|$safe_name|g" \
+            -e "s|__RUN_TOKEN__|$run_token|g" \
             -e "s|__CLUSTER_DOMAIN__|$K8S_CLUSTER_DOMAIN|g" \
             "$claude_proxy_template")"$'\n'
         # A literal (non-regex) global replace, not another sed -- the
@@ -7574,6 +7696,7 @@ cmd_submit() {
         codex_proxy_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
             -e "s|__RUN_NAME__|$safe_name|g" \
+            -e "s|__RUN_TOKEN__|$run_token|g" \
             -e "s|__CLUSTER_DOMAIN__|$K8S_CLUSTER_DOMAIN|g" \
             "$codex_proxy_template")"$'\n'
         local codex_label_marker=$'    __EXTRA_LABELS__: "true"\n'
@@ -8297,7 +8420,8 @@ metadata:
   namespace: $K8S_NAMESPACE
   labels:
     app: fork-sandbox-agent
-    fork-sandbox/branch: $safe_name${extra_labels_4}
+    fork-sandbox/branch: $safe_name
+    fork-sandbox/run: $run_token${extra_labels_4}
 data:
   entrypoint.sh: |
 $(indent_block < "$entrypoint_sh")
@@ -8322,14 +8446,16 @@ metadata:
   namespace: $K8S_NAMESPACE
   labels:
     app: fork-sandbox-agent
-    fork-sandbox/branch: $safe_name${extra_labels_4}
+    fork-sandbox/branch: $safe_name
+    fork-sandbox/run: $run_token${extra_labels_4}
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
         app: fork-sandbox-agent
-        fork-sandbox/branch: $safe_name${extra_labels_8}
+        fork-sandbox/branch: $safe_name
+        fork-sandbox/run: $run_token${extra_labels_8}
     spec:
       restartPolicy: Never${priority_class_line}${host_aliases_yaml}${services_grace_env}
       automountServiceAccountToken: false
@@ -8586,6 +8712,15 @@ EOF
         # uses to find this run's objects), the one thing that actually
         # exists for an operator to look at.
         printf 'k8s_job_name=%s\n' "$safe_name"
+        # This run's own identity label (run_token, above): read back by
+        # cmd_collect's reap-pending mark and by adopt, for the by-run-label
+        # delete that finishes a reap a dead driver left pending, or drops
+        # this run's proxy/token on an unrecoverable run -- both scoped to
+        # THIS run alone, never the branch, so a later run reusing this
+        # same branch (and so the same object names) is never touched by
+        # either. Absent on a run.env predating this feature (adopt reads
+        # that as "nothing more to do", same as today).
+        printf 'run_token=%s\n' "$run_token"
         printf 'model=%s\n' "$model"
         printf 'image=%s\n' "$RUN_IMAGE"
         printf 'image_source=%s\n' "$RUN_IMAGE_SOURCE"
@@ -8913,6 +9048,12 @@ EOF
     # last-applied-configuration annotation, and the scripts ConfigMap
     # (every script plus the rendered handoff) outgrows its 256 KiB cap.
     printf '%s\n' "$job_rendered" | kubectl apply -f - --server-side
+
+    # Now that the Job exists, make it the owner of every other per-run
+    # object -- see k8s_set_run_owner_refs's own header.
+    k8s_set_run_owner_refs "$safe_name" "$grant_name" \
+        "$([[ "$harness" == claude || "$pipeline_has_claude" == 1 ]] && echo 1 || echo 0)" \
+        "$(( pipeline_has_codex ))"
 
     echo "fork-sandbox-k8s: waiting for pod (job $safe_name) to be ready" >&2
     # The Job controller creates the pod asynchronously, and `kubectl wait`
@@ -9969,6 +10110,58 @@ k8s_teardown_codex_proxy() {
         --ignore-not-found --wait=false >&2
 }
 
+# k8s_reap_proxy_credentials_by_run_token <safe_name> <run_token>
+#
+# cmd_adopt's own unrecoverable branch (the pod already exited or vanished,
+# with no exit-code ever written, so nothing else will ever reap this run's
+# proxy or token): drops exactly this run's per-run proxy
+# Pod/Service/ConfigMap/NetworkPolicy and token Secret, for whichever
+# harness(es) this run used, leaving the Job, agent pod and scripts
+# ConfigMap in place for inspection -- same split as every other
+# terminal-failure path in this file (k8s_teardown_claude_proxy/
+# k8s_teardown_codex_proxy above).
+#
+# Unlike those two, this checks each candidate's OWN current
+# fork-sandbox/run label before deleting it, rather than deleting by name
+# outright: on a branch the operator reuses, a later run can already have
+# overwritten one of these same-named objects with its own (different) run
+# token by the time this runs. Deleting by name alone would then delete
+# that LIVE run's proxy or token out from under it; deleting only what
+# still carries THIS run's own token leaves it alone -- the same
+# reused-branch safety the by-run-label reap (cmd_adopt's pending-reap
+# branch, and the run-label delete it drives) relies on. A candidate this
+# run never created (the other harness, or a pi run) simply never matches
+# and is skipped.
+#
+# Best-effort: a read or delete failure on one candidate warns once (not
+# per-candidate) and moves on to the next; the caller is already on its own
+# non-zero exit path and cannot do more about it than that.
+k8s_reap_proxy_credentials_by_run_token() {
+    local safe_name="$1" run_token="$2" cand label failed=false
+    [[ -n "$run_token" ]] || return 0
+    local -a candidates=(
+        "pod/$safe_name-claude-proxy" "service/$safe_name-claude-proxy"
+        "configmap/$safe_name-claude-proxy-conf" "networkpolicy/$safe_name-claude-proxy"
+        "secret/$safe_name-claude-token"
+        "pod/$safe_name-codex-proxy" "service/$safe_name-codex-proxy"
+        "configmap/$safe_name-codex-proxy-conf" "networkpolicy/$safe_name-codex-proxy"
+        "secret/$safe_name-codex-token"
+    )
+    for cand in "${candidates[@]}"; do
+        label="$(kubectl get "$cand" --ignore-not-found -o json 2>/dev/null \
+            | jq -r '.metadata.labels["fork-sandbox/run"] // ""' 2>/dev/null)" || label=""
+        [[ "$label" == "$run_token" ]] || continue
+        kubectl delete "$cand" --ignore-not-found >/dev/null 2>&1 || failed=true
+    done
+    if [[ "$failed" == true ]]; then
+        echo "fork-sandbox-k8s: warning: could not remove every leftover proxy" >&2
+        echo "object or token Secret for this run; some may still be live in" >&2
+        echo "the cluster." >&2
+        return 1
+    fi
+    return 0
+}
+
 # cmd_run's wait phase, standalone: poll the run's pod until its entrypoint
 # writes /work/.run-complete (which holds the agent's own exit code),
 # failing fast on a dead pod, a Failed job condition, a timeout or a
@@ -10461,6 +10654,22 @@ cmd_collect() {
     fi
 
     trap 'fs_collect_unexpected_failure "$?" "$run_dir"' ERR
+
+    # This collect is going to reap something before it returns -- the full
+    # by-branch rm below, or at least this run's proxy and token teardown on
+    # every one of the other three endings (zero-harvest, a failed evidence
+    # capture, or an explicit --keep) -- so mark the run reap-pending NOW,
+    # in its own run dir, BEFORE exit-code is ever written below. A driver
+    # killed after that write but before the reap it implies actually runs
+    # leaves this mark in place; adopt (see cmd_adopt) and
+    # fork-sandbox-status.sh's run_state()/--json both read it to tell that
+    # apart from an ordinary finished run, rather than reporting done/failed
+    # for a run whose credentials may still be live. Cleared only once the
+    # reap this collect owes actually happens -- see every exit path below.
+    # A standalone collect with no --run-dir has nowhere to write this and
+    # needs no adopt/status reconciliation anyway (there is no run.env for
+    # either to read), so it is skipped entirely in that case.
+    [[ -n "$run_dir" ]] && { : > "$run_dir/.reap-pending" 2>/dev/null || true; }
 
     # The review loop's outcome, when this run carried one. This is the
     # ONLY place a bad loop outcome ever surfaces: the agent's exit code
@@ -11747,27 +11956,47 @@ cmd_collect() {
         echo "fork-sandbox-k8s: *** KEPT for inspection rather than reaped, and this" >&2
         echo "fork-sandbox-k8s: *** run exits non-zero. The agent's own transcript, when" >&2
         echo "fork-sandbox-k8s: *** captured, explains the exit:" >&2
-        if [[ "$keep" != true ]]; then
-            echo "fork-sandbox-k8s: *** Proxy credentials were removed." >&2
-        fi
+        echo "fork-sandbox-k8s: *** Proxy credentials were removed." >&2
         echo "fork-sandbox-k8s: ***   $evidence_dir/events.jsonl" >&2
         echo "fork-sandbox-k8s: *** Clean up with:" >&2
         echo "fork-sandbox-k8s: ***   fork-sandbox-k8s.sh rm --branch $branch" >&2
         echo "fork-sandbox-k8s: ################################################" >&2
         # 3, distinct from the agent's exit code (0) and from the wait's
         # 1/2 codes: the agent's work exited 0; the RUN produced nothing.
-        [[ "$keep" == true ]] || {
-            k8s_teardown_claude_proxy "$safe_name" || true
-            k8s_teardown_codex_proxy "$safe_name" || true
-        }
+        # Unconditional, --keep included: the agent has already finished by
+        # the time collect runs, so nothing still needs this run's live
+        # proxy or its operator access token Secret -- a zero-harvest run
+        # KEEPS the Job/pod/scripts for inspection, but never its
+        # credentials. See the reap-pending mark set near the top of this
+        # function: the mark is cleared only once BOTH teardowns below
+        # actually succeed, same as every other branch below -- a failed
+        # one leaves it in place for adopt to retry, rather than silently
+        # swallowing the failure the way a bare `|| true` would.
+        local teardown_ok=true
+        k8s_teardown_claude_proxy "$safe_name" || teardown_ok=false
+        k8s_teardown_codex_proxy "$safe_name" || teardown_ok=false
+        [[ -n "$run_dir" && "$teardown_ok" == true ]] && rm -f -- "$run_dir/.reap-pending"
         exit 3
     fi
 
     if [[ "$keep" == true ]]; then
         echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
+        # Same reasoning as the zero-harvest branch above: the agent has
+        # already finished, so --keep (preserve the Job/pod/scripts for
+        # inspection) no longer also means "leave the live proxy and
+        # operator access token Secret running indefinitely" -- nothing
+        # left running needs either. The mark is cleared only once both
+        # teardowns succeed, same as the zero-harvest branch above.
+        echo "fork-sandbox-k8s: *** Proxy credentials were removed." >&2
+        local teardown_ok=true
+        k8s_teardown_claude_proxy "$safe_name" || teardown_ok=false
+        k8s_teardown_codex_proxy "$safe_name" || teardown_ok=false
+        [[ -n "$run_dir" && "$teardown_ok" == true ]] && rm -f -- "$run_dir/.reap-pending"
     elif [[ "$evidence_ok" == false ]]; then
-        k8s_teardown_claude_proxy "$safe_name" || true
-        k8s_teardown_codex_proxy "$safe_name" || true
+        local teardown_ok=true
+        k8s_teardown_claude_proxy "$safe_name" || teardown_ok=false
+        k8s_teardown_codex_proxy "$safe_name" || teardown_ok=false
+        [[ -n "$run_dir" && "$teardown_ok" == true ]] && rm -f -- "$run_dir/.reap-pending"
         # Not reaped: reaping now destroys the only record of what this
         # run did, and a rule that leaves resources behind must say so
         # and say how to remove them -- a namespaced pods limit turns an
@@ -11798,8 +12027,11 @@ cmd_collect() {
                     fi
                 fi
             fi
+            # The mark is left in place on a failed rm -- a future rm or
+            # adopt still has something to finish.
             exit "$rm_rc"
         fi
+        [[ -n "$run_dir" ]] && rm -f -- "$run_dir/.reap-pending"
     fi
     trap - ERR
 }
@@ -12088,10 +12320,16 @@ k8s_adopt_unrecoverable_reason() {
     return 1
 }
 
-# adopt's no-op: exit 0 when DIR/exit-code already answers for the run.
+# adopt's no-op: exit 0 when DIR/exit-code already answers for the run AND
+# the run owes no pending reap. A collect that reached exit-code but died
+# before finishing the proxy/token teardown that implies leaves
+# DIR/.reap-pending behind (see cmd_collect's own comment on it) -- a run
+# in exactly that shape is NOT nothing-to-do, so this returns without
+# exiting and lets cmd_adopt's own body (below) finish the reap instead.
 adopt_exit_if_finished() {
     local run_dir="$1"
     [[ -f "$run_dir/exit-code" ]] || return 0
+    [[ -f "$run_dir/.reap-pending" ]] && return 0
     echo "fork-sandbox-k8s: adopt: $run_dir already finished (exit" \
         "$(tr -dc '0-9-' < "$run_dir/exit-code" 2>/dev/null)); nothing to do." >&2
     exit 0
@@ -12113,10 +12351,16 @@ adopt_exit_if_finished() {
 #
 #   - refuses outright on a run.env whose network is not "cluster" (not a
 #     --k8s run at all -- there is no pod to re-adopt);
-#   - is a no-op, exit 0, on a run DIR/exit-code already answers for (some
-#     wait or collect already reached a terminal outcome, adopted or not --
-#     calling adopt again must never re-run collect against a pod that is
-#     already gone because a prior collect already reaped it);
+#   - is a no-op, exit 0, on a run DIR/exit-code already answers for AND
+#     that owes no pending reap (DIR/.reap-pending absent): some wait or
+#     collect already reached a terminal outcome and finished reaping,
+#     adopted or not -- calling adopt again must never re-run collect
+#     against a pod that is already gone because a prior collect already
+#     reaped it. A run with BOTH exit-code and .reap-pending -- a driver
+#     that died after writing the first but before finishing what that
+#     implied -- is NOT this case: see the pending-reap branch in the body
+#     below, which finishes exactly that instead of falling through to
+#     resume;
 #   - takes DIR/.driver.lock (k8s_take_driver_lock, the lock every driver
 #     holds) before any of the checks below, so they are all read under it;
 #     while another driver holds it, adopt exits 1. This is what rules out
@@ -12150,7 +12394,10 @@ adopt_exit_if_finished() {
 #     appending another run_end row to the durable run log -- a real cost
 #     for the "call adopt on every startup for every in-flight run"
 #     consumer this verb exists for, since none of that is a no-op the way
-#     the already-finished check above is.
+#     the already-finished check above is. Before that exit, this run's own
+#     proxy and token Secret are dropped too (by run label, never by name --
+#     see k8s_reap_proxy_credentials_by_run_token), since nothing else will
+#     ever reap them once the pod that held them is confirmed gone.
 #
 # Everything past those checks is resume's own body, so adopt's exit codes
 # past this point are resume's: the agent's own exit code on an ordinary
@@ -12170,14 +12417,18 @@ Re-adopt a --k8s run whose own host-side driver died while its pod kept
 working, doing from that point on exactly what the dead driver would have:
 wait for the agent, collect (evidence, outbox, the branch fetch, and
 session state for a --resume run), record the exit code, summary.json and
-the run-log line, and reap.
+the run-log line, and reap. On a run whose driver instead died AFTER
+writing the exit code but BEFORE finishing the reap that implied, this
+finishes just that reap (this run's own cluster objects, by its own run
+identity -- never the branch) instead.
 
 Safe to call blindly, on every startup, for every in-flight run: a no-op,
-exit 0, on a run that already finished; a refusal, exit 1, on a run that
-is not a --k8s run, is still starting, or whose driver is still alive; a
-non-zero exit, with the reason, on a run that can no longer be recovered.
-See "Re-adopting a run whose host-side driver died" in
-docs/kubernetes-runs.md.
+exit 0, on a run that already finished with nothing left to reap; a
+refusal, exit 1, on a run that is not a --k8s run, is still starting, or
+whose driver is still alive; a non-zero exit, with the reason, on a run
+that can no longer be recovered (its proxy and token Secret, if either is
+still live, are dropped first). See "Re-adopting a run whose host-side
+driver died" in docs/kubernetes-runs.md.
 EOF
                 exit 0
                 ;;
@@ -12254,6 +12505,38 @@ EOF
         exit 1
     fi
 
+    # A pending reap: adopt_exit_if_finished (above, twice) only let an
+    # exit-code-bearing run through to here when DIR/.reap-pending is also
+    # set -- the driver wrote exit-code, confirmed above to be dead, but
+    # died before finishing the proxy/token teardown (or the full by-branch
+    # rm) that write obliged it to. Finish exactly that, scoped to this
+    # run's own fork-sandbox/run label, never the branch: a reused branch
+    # can already have a newer, live run sitting under these same object
+    # names, and a by-branch delete here would take it down too. No
+    # unrecoverable probe, no cmd_resume -- those assume no exit-code was
+    # ever written, which is not this case.
+    if [[ -f "$run_dir/exit-code" ]]; then
+        local adopt_run_token
+        adopt_run_token="$(read_env_value "$env_file" run_token || true)"
+        if [[ -z "$adopt_run_token" ]]; then
+            # An older run.env, from before run_token existed: the same
+            # no-op as today, no cluster call.
+            echo "fork-sandbox-k8s: adopt: $run_dir already finished (exit" \
+                "$(tr -dc '0-9-' < "$run_dir/exit-code" 2>/dev/null)); nothing to do." >&2
+            exit 0
+        fi
+        if kubectl delete job,pod,service,secret,configmap,networkpolicy \
+            -l fork-sandbox/run="$adopt_run_token" --ignore-not-found >&2; then
+            rm -f -- "$run_dir/.reap-pending"
+            echo "fork-sandbox-k8s: adopt: $run_dir's driver died before" \
+                "finishing its reap; finished it." >&2
+            exit 0
+        fi
+        echo "Error: adopt: could not finish $run_dir's pending reap; its" >&2
+        echo "mark is left in place for a future adopt to retry." >&2
+        exit 1
+    fi
+
     # Unrecoverable (pod already exited or gone): say so with the same
     # reason status --json already carries for this case, and stop here --
     # never fall into resume's own wait/collect, which would re-run the
@@ -12270,6 +12553,18 @@ EOF
             || unrecoverable_reason=""
     fi
     if [[ -n "$unrecoverable_reason" ]]; then
+        # Drops this run's proxy and token Secret, if either is still
+        # around, before this exits non-zero -- nothing else will ever
+        # reap them once the pod they served is confirmed gone. See
+        # k8s_reap_proxy_credentials_by_run_token's own header for why this
+        # is scoped by run label rather than by name.
+        local adopt_run_token
+        adopt_run_token="$(read_env_value "$env_file" run_token || true)"
+        if [[ -n "$adopt_run_token" ]]; then
+            k8s_reap_proxy_credentials_by_run_token \
+                "$(k8s_safe_name fork-sandbox-agent "$branch_for_probe")" \
+                "$adopt_run_token" || true
+        fi
         echo "Error: adopt: $run_dir cannot be recovered: $unrecoverable_reason." >&2
         echo "The pod held the only copy of this run's clone, so there is" >&2
         echo "nothing left to re-adopt." >&2
