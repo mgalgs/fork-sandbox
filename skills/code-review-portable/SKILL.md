@@ -60,6 +60,25 @@ a guard the change made unreachable, an assumption the change quietly voided.
 Read the commits one at a time when the history matters. A commit that adds a
 guard and a later one that drops it both look fine in the combined diff.
 
+### 1b. Follow the edges out of the diff
+
+The diff shows one side of every contract it touches. Read the other side,
+one hop out at `high`, two at `xhigh` and `max`:
+
+- **Callers.** For each function, script, flag, exit code, output line or
+  file format the change adds or alters, search the repository for what uses
+  it — code, tests, docs and skills that invoke it — and read those uses.
+  Does each one still get what it expects?
+- **Callees.** For each function, command or tool the new code relies on,
+  read it, and check it does what the new code assumes: its return values,
+  its error cases, what it does on empty input.
+- **Shared state.** For each file, directory, environment variable, config
+  key or lock the change reads or writes, find the other readers and
+  writers. Can they now see a state they never saw before?
+
+Say in the report which callers and callees you read. A review that names
+none has not done this step.
+
 ### 2. Hunt
 
 Look for two kinds of thing, in this order.
@@ -74,6 +93,8 @@ Look for two kinds of thing, in this order.
   picks a "best" value is invisible to test with one input — reason about **at
   least two candidates that differ along the axis the code varies.**
 - Concurrency: shared state, races, a check separated from the act it guards.
+- Options and modes: run each new flag or argument through every mode the
+  parser accepts it in, not only the mode it was written for.
 - Encoding, escaping, and types: a value that changes type, a string built
   where a list was meant, a number parsed from untrusted text.
 - Security, which no other pass may own: a secret committed in the diff; a
