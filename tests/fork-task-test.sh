@@ -360,5 +360,63 @@ else
         "occurrences=$occurrences registry session_id='$reg_id': $(cat "$err")"
 fi
 
+printf '\n== fork-task.sh --ack: launch handshake ==\n'
+
+# Without --ack the prompt header and output are exactly what they were.
+: > "$tmux_log"
+out_plain="$(FORK_TASK_REGISTRY="$tmp/reg-ack0.jsonl" "$launcher" "$lineage_project" "$lineage_handoff" 2>&1)"
+prompt_plain="$(grep -o '[^ ]*fork-prompt-[^ ]*\.md' "$tmux_log" | head -1 | tr -d "\\\\")"
+expected_header="$(printf 'Your handoff doc is below, and it lives at %s\non disk. Keep that path: the session that launched you can\nstill edit it, and may tell you it has been updated and ask\nyou to read it again.\n\n---\n' "$lineage_handoff")"
+if [[ -f "$prompt_plain" && "$(head -n 7 "$prompt_plain")" == "$expected_header" ]]; then
+    ok "no --ack: prompt header is unchanged"
+else
+    no "no --ack: prompt header is unchanged" "$(head -n 8 "$prompt_plain" 2>&1)"
+fi
+case "$out_plain" in
+    *"Ack token"*) no "no --ack: output has no ack token" "$out_plain" ;;
+    *) ok "no --ack: output has no ack token" ;;
+esac
+
+ack_tokens=()
+ack_cleanup() { local t; for t in "${ack_tokens[@]-}"; do [[ -n "$t" ]] && rm -f -- "/var/tmp/claude-scratch/forks/acks/$t"; done; }
+trap 'ack_cleanup; cleanup' EXIT
+
+for h in claude codex; do
+    : > "$tmux_log"; : > "$claude_argv_log"; : > "$codex_argv_log"
+    out_ack="$(FORK_TASK_REGISTRY="$tmp/reg-ack-$h.jsonl" "$launcher" --ack --harness "$h" "$lineage_project" "$lineage_handoff" 2>&1)"
+    tok="$(sed -n 's/^Ack token: //p' <<<"$out_ack")"
+    ack_tokens+=("$tok")
+    if [[ "$tok" =~ ^ack-[0-9a-f]{24}$ && -f "/var/tmp/claude-scratch/forks/acks/$tok" ]]; then
+        ok "--ack ($h) prints a token and creates a pending ack file"
+    else
+        no "--ack ($h) prints a token and creates a pending ack file" "$out_ack"
+    fi
+    if [[ "$h" == claude ]]; then
+        # shellcheck disable=SC2016  # literal backticks in the expected text
+        ack_line="run \`fork-task-ack.sh $tok\`"
+        pf="$(grep -o '[^ ]*fork-prompt-[^ ]*\.md' "$tmux_log" | head -1 | tr -d "\\\\")"
+        # The prompt temp file is consumed by the stub claude's stdin; the
+        # file itself remains on disk.
+        if [[ -f "$pf" ]] && grep -qF "$ack_line" "$pf" && grep -q '^Your handoff doc is below' "$pf"; then
+            ok "--ack (claude) puts the ack instruction in the prompt header"
+        else
+            no "--ack (claude) puts the ack instruction in the prompt header" "pf=$pf"
+        fi
+    elif grep -qF "fork-task-ack.sh $tok" "$codex_argv_log"; then
+        ok "--ack (codex) puts the ack instruction in the prompt argument"
+    else
+        no "--ack (codex) puts the ack instruction in the prompt argument" "$(cat "$codex_argv_log")"
+    fi
+done
+
+: > "$tmux_log"
+if "$launcher" --ack --sandboxed "$lineage_project" "$lineage_handoff" >/dev/null 2>"$err"; then
+    no "--ack --sandboxed is refused"
+elif [[ -s "$tmux_log" ]] || ! grep -q -- '--ack' "$err"; then
+    no "--ack --sandboxed is refused" "$(cat "$err")"
+else
+    ok "--ack --sandboxed is refused"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

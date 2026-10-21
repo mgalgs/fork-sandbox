@@ -53,6 +53,14 @@
 #                         should not be attributed back to this launcher.
 # --sandbox-args "...":   extra arguments passed to claude-sandboxed itself
 #                         (e.g. --unpin-egress)
+# --ack:                  opt in to a launch handshake (non-sandboxed only).
+#                         Creates a unique token and a pending ack file under
+#                         /var/tmp/claude-scratch/forks/acks/, tells the new
+#                         session (in the prompt header) to run
+#                         `fork-task-ack.sh <token>` before anything else, and
+#                         prints `Ack token: <token>`. The launcher then
+#                         blocks on `fork-task-ack.sh --wait <token>`. Works
+#                         for both harnesses. Without --ack nothing changes.
 # -h, --help:             print this header and exit.
 #
 # Sandboxed mode trades isolation for silence: the session never asks for
@@ -182,6 +190,7 @@ sandbox_extra_argv=()
 permission_mode=""
 claude_config_dir=""
 sandboxed=false
+ack=false
 sandbox_args=""
 branch=""
 purpose=""
@@ -278,6 +287,10 @@ while [[ "${1:-}" == -* ]]; do
             sandboxed=true
             shift
             ;;
+        --ack)
+            ack=true
+            shift
+            ;;
         --sandbox-args)
             sandbox_args="${2:?--sandbox-args requires a value}"
             shift 2
@@ -315,6 +328,12 @@ done
 
 project_path="${1:?Usage: fork-task.sh [options] <project-path> <handoff-file>}"
 handoff_file="${2:?Usage: fork-task.sh [options] <project-path> <handoff-file>}"
+
+if $ack && $sandboxed; then
+    echo "Error: --ack cannot be combined with --sandboxed; the sandbox mounts" >&2
+    echo "none of the host's files, so the child could not write the ack." >&2
+    exit 1
+fi
 
 if ! $sandboxed && [[ -n "$sandbox_args" || -n "$branch" ]]; then
     echo "Error: --sandbox-args and --branch require --sandboxed" >&2
@@ -619,13 +638,26 @@ fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$origin_repo" 
 # path would be a promise the session cannot keep — it would go looking,
 # find nothing, and be worse off than not being told.
 prompt_file="$handoff_file"
+ack_token=""
+if $ack; then
+    ack_dir="/var/tmp/claude-scratch/forks/acks"
+    mkdir -p "$ack_dir"
+    ack_token="ack-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+    printf 'pending\n' > "$ack_dir/$ack_token"
+fi
 if ! $sandboxed; then
     prompt_file="$(mktemp "${TMPDIR:-/tmp}/fork-prompt-XXXXXX.md")"
     {
         printf 'Your handoff doc is below, and it lives at %s\n' "$handoff_file"
         printf 'on disk. Keep that path: the session that launched you can\n'
         printf 'still edit it, and may tell you it has been updated and ask\n'
-        printf 'you to read it again.\n\n---\n\n'
+        printf 'you to read it again.\n\n'
+        if [[ -n "$ack_token" ]]; then
+            # shellcheck disable=SC2016  # literal backticks
+            printf 'Before doing anything else, run `fork-task-ack.sh %s` so the\n' "$ack_token"
+            printf 'session that launched you knows you are up.\n\n'
+        fi
+        printf -- '---\n\n'
         cat "$handoff_file"
     } > "$prompt_file"
 fi
@@ -683,6 +715,7 @@ if ! $sandboxed && [[ -n "${new_pane:-}" ]]; then
         >> "$registry"
     echo "Session name: $session_name (use SendMessage to reach it)"
     echo "Pane: $new_pane"
+    [[ -n "$ack_token" ]] && echo "Ack token: $ack_token"
     [[ -n "$claude_config_dir" ]] && echo "Claude config dir: $claude_config_dir"
 fi
 
