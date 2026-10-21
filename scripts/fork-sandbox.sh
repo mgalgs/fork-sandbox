@@ -1885,6 +1885,10 @@ mntfix_model=""
 mntfix_repeat=1
 mntfix_network=""
 mntfix_extra_args=""
+# The review / maintain seats' own agent's extra arguments (a preset's
+# claude-args/pi-args/codex-args on that agent), empty on a flag-only run.
+review_extra_args=""
+mnt_extra_args=""
 code_repeat=1
 review_only=false
 mode=run
@@ -2689,13 +2693,16 @@ if [[ -n "$preset_name" ]]; then
         done
     fi
 
-    # A legacy-shaped pipeline routes extra arguments to its code seat's
-    # agent only, so any other agent's are refused rather than dropped. A
-    # read-only review step rides the implement role and keeps its own
-    # arguments, unless --review-only dropped a code step sat by that same
-    # agent (self_coded): a full run never gives its self-review leg its
-    # coding arguments either. A read-only maintain step has no implement
-    # leg at all (phantom), so every agent's arguments are refused there.
+    # A legacy-shaped pipeline routes each agent's own extra arguments to
+    # its own legs, as a composed one does: the code seat's to the code and
+    # fix legs, a review step's agent's to that step's review legs, a
+    # maintain step's agent's to its maintainer legs. A read-only pipeline
+    # drops its code step, so the dropped coder's agent (self_coded) has its
+    # coding arguments blanked rather than handed to a review or maintain
+    # leg it also sits: a full run never gives its self-review leg its
+    # coding arguments either. A read-only maintain-only pipeline has no
+    # implement leg at all (phantom), so its first agent's arguments ride
+    # the maintainer leg alone and never the implement seat.
     if [[ "$preset_is_legacy_shaped" == true ]]; then
         preset_impl_seat_phantom=false
         [[ "$preset_read_only" == true && "$preset_ro_review" != true ]] \
@@ -2710,24 +2717,6 @@ if [[ -n "$preset_name" ]]; then
                 fi
             done
         fi
-        for preset_args_agent in "${!preset_agent_harness[@]}"; do
-            if [[ -z "${preset_agent_cargs[$preset_args_agent]:-}" \
-                && -z "${preset_agent_pargs[$preset_args_agent]:-}" \
-                && -z "${preset_agent_xargs[$preset_args_agent]:-}" ]]; then
-                continue
-            fi
-            if [[ "$preset_impl_seat_phantom" == true ]] \
-                || [[ "$preset_args_agent" != "$preset_impl_agent" ]]; then
-                echo "Error: preset '$preset_name': agent '$preset_args_agent' sets" >&2
-                echo "claude-args, pi-args or codex-args, but this pipeline is" >&2
-                echo "legacy-shaped (one code step, then at most one review step," >&2
-                echo "then at most one maintain step) -- only its code seat's agent" >&2
-                echo "routes arguments to a leg there. Compose the pipeline (add" >&2
-                echo "another step, or reorder it) to route this agent's own" >&2
-                echo "arguments to its own leg, or drop them." >&2
-                exit 1
-            fi
-        done
     fi
 
     preset_seat_desc() {
@@ -2837,21 +2826,23 @@ if [[ -n "$preset_name" ]]; then
                 network_arg="${preset_agent_network[$preset_impl_agent]}"
             fi
         fi
-        if [[ -n "${preset_agent_cargs[$preset_impl_agent]}" ]]; then
+        if [[ "$preset_impl_seat_phantom" == true ]]; then
+            : # nothing runs on the implement seat; its agent's arguments ride the maintainer leg
+        elif [[ -n "${preset_agent_cargs[$preset_impl_agent]}" ]]; then
             if [[ -n "$claude_extra_args" ]]; then
                 preset_note "--claude-args overrides the code seat's claude-args"
             else
                 claude_extra_args="${preset_agent_cargs[$preset_impl_agent]}"
             fi
         fi
-        if [[ -n "${preset_agent_pargs[$preset_impl_agent]}" ]]; then
+        if [[ "$preset_impl_seat_phantom" != true && -n "${preset_agent_pargs[$preset_impl_agent]}" ]]; then
             if [[ -n "$pi_extra_args" ]]; then
                 preset_note "--pi-args overrides the code seat's pi-args"
             else
                 pi_extra_args="${preset_agent_pargs[$preset_impl_agent]}"
             fi
         fi
-        if [[ -n "${preset_agent_xargs[$preset_impl_agent]}" ]]; then
+        if [[ "$preset_impl_seat_phantom" != true && -n "${preset_agent_xargs[$preset_impl_agent]}" ]]; then
             if [[ -n "$codex_extra_args" ]]; then
                 preset_note "--codex-args overrides the code seat's codex-args"
             else
@@ -2912,7 +2903,7 @@ if [[ -n "$preset_name" ]]; then
             review_loop_arg="$preset_review_max"
         fi
         if [[ "$review_harness_given" == true ]]; then
-            preset_note "--review-harness overrides the review seat; the preset's reviewer model is not applied"
+            preset_note "--review-harness overrides the review seat; the preset's reviewer model and arguments are not applied"
         else
             review_harness_spec="${preset_agent_harness[$preset_review_agent]}"
             review_harness_given=true
@@ -2928,6 +2919,7 @@ if [[ -n "$preset_name" ]]; then
             if [[ -n "${preset_agent_network[$preset_review_agent]}" ]]; then
                 review_network="${preset_agent_network[$preset_review_agent]}"
             fi
+            review_extra_args="$(preset_agent_args "$preset_review_agent")"
         fi
         # This loop's fix seat. An explicit fix_agent is always honored as
         # the preset defines it -- no flag names a fix seat, so nothing
@@ -2969,7 +2961,7 @@ if [[ -n "$preset_name" ]]; then
             maintainer_loop_arg="$preset_maintain_max"
         fi
         if [[ "$maintainer_harness_given" == true ]]; then
-            preset_note "--maintainer-harness overrides the maintain seat; the preset's maintainer model is not applied"
+            preset_note "--maintainer-harness overrides the maintain seat; the preset's maintainer model and arguments are not applied"
         else
             maintainer_harness_spec="${preset_agent_harness[$preset_maintain_agent]}"
             maintainer_harness_given=true
@@ -2984,6 +2976,7 @@ if [[ -n "$preset_name" ]]; then
             # preset's key always takes effect here.
             preset_mnt_nw="${preset_agent_network[$preset_maintain_agent]}"
             [[ -n "$preset_mnt_nw" ]] && maintainer_network="$preset_mnt_nw"
+            mnt_extra_args="$(preset_agent_args "$preset_maintain_agent")"
         fi
         # The maintain loop's fix seat, same rules as the review loop's.
         if [[ "$preset_maintain_fix_default" == "1" ]]; then
@@ -5721,16 +5714,18 @@ fi
 # expensive) coding leg, then die at the very first review leg with
 # nothing to show for it -- precisely the failure "fail before the clone"
 # exists to prevent for the implement harness alone.
-# The legacy seats' extra arguments. A named fix seat's arguments are
-# non-empty only when its agent is the code seat's own (any other agent's
-# are refused above), so it follows the code seat's effective value, a
-# --claude-args/--pi-args/--codex-args override included -- unless --harness
-# overrode the code seat, which leaves the fix seat the preset's. --pi-args
-# also reaches every separately built pi seat that has none of its own: it
-# always has, unlike --claude-args/--codex-args.
+# The legacy seats' extra arguments. A named fix seat whose agent is the
+# code seat's own follows the code seat's effective value, a --claude-args/
+# --pi-args/--codex-args override included -- unless --harness overrode the
+# code seat, which leaves the fix seat the preset's. Any other seat carries
+# its own agent's arguments as the preset gave them. --pi-args also reaches
+# every separately built pi seat that has none of its own: it always has,
+# unlike --claude-args/--codex-args.
 fs_legacy_seat_args() {
-    local seat_harness="$1" seat_args="$2"
-    if [[ -n "$seat_args" && "$seat_harness" == "$harness" \
+    local seat_harness="$1" seat_args="$2" seat_agent="${3:-}"
+    if [[ -n "$seat_args" && -n "$seat_agent" \
+        && "$seat_agent" == "${preset_impl_agent:-}" \
+        && "$seat_harness" == "$harness" \
         && "${preset_impl_overridden:-false}" != true ]]; then
         printf '%s' "${impl_extra_args_in:-}"
     elif [[ -z "$seat_args" && "$seat_harness" == pi ]]; then
@@ -5741,15 +5736,15 @@ fs_legacy_seat_args() {
 }
 if [[ -n "$fix_harness" ]]; then
     fs_resolve_harness "$fix_harness" "$fix_model" fxr "$fix_network" \
-        "$(fs_legacy_seat_args "$fix_harness" "$fix_extra_args")"
+        "$(fs_legacy_seat_args "$fix_harness" "$fix_extra_args" "${preset_review_fix_name:-}")"
 fi
 if [[ -n "$mntfix_harness" ]]; then
     fs_resolve_harness "$mntfix_harness" "$mntfix_model" fxm "$mntfix_network" \
-        "$(fs_legacy_seat_args "$mntfix_harness" "$mntfix_extra_args")"
+        "$(fs_legacy_seat_args "$mntfix_harness" "$mntfix_extra_args" "${preset_maintain_fix_name:-}")"
 fi
 if [[ "$review_harness_given" == true ]]; then
     fs_resolve_harness "$review_harness" "$review_model" rev "$review_network" \
-        "$(fs_legacy_seat_args "$review_harness" "")"
+        "$(fs_legacy_seat_args "$review_harness" "$review_extra_args")"
 fi
 
 # Same for the maintainer harness when --maintainer-harness named one.
@@ -5757,7 +5752,7 @@ fi
 # model, so this always has a model to resolve with.)
 if [[ "$maintainer_harness_given" == true ]]; then
     fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt "$maintainer_network" \
-        "$(fs_legacy_seat_args "$maintainer_harness" "")"
+        "$(fs_legacy_seat_args "$maintainer_harness" "$mnt_extra_args")"
 fi
 
 # run.env/summary.json's flat harness/harness_version/model fields, read by

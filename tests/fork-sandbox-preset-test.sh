@@ -1164,8 +1164,7 @@ pipeline:
     agent: reviewer
 EOF
 
-bad "args on an agent off the code seat of a legacy-shaped pipeline are refused" \
-    "legacy-shaped" <<'EOF'
+cat > "$presets_dir/legacy-fixer-args.yaml" <<'EOF'
 agents:
   coder:
     harness: claude
@@ -1181,6 +1180,8 @@ pipeline:
     agent: coder
     fix_agent: fixer
 EOF
+accepts "a legacy-shaped pipeline's fix seat agent may carry its own arguments" \
+    --preset legacy-fixer-args
 
 bad "refresh keys on an agent off the first code seat are refused" \
     "there is no per-seat refresh plumbing" <<'EOF'
@@ -4766,9 +4767,65 @@ else
     no "legacy-args-self-fix launch succeeds"
 fi
 
-# An agent whose arguments have no route in a legacy-shaped pipeline (here,
-# the review seat's own agent) is refused at launch, naming the shape.
-cat > "$presets_dir/legacy-args-bad-review.yaml" <<'EOF'
+# A legacy-shaped pipeline routes each agent's own arguments to its own legs:
+# a review step's agent's reach that step's review legs and a maintain
+# step's agent's reach its maintainer legs, while the code seat's reach the
+# code leg only -- none leak across seats, in either direction.
+cat > "$real_presets/legacy-args-routed.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    claude-args: --effort low
+  reviewer:
+    harness: claude
+    model: opus
+    claude-args: --effort high
+  maintainer:
+    harness: claude
+    model: haiku
+    claude-args: --effort medium
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: maintainer
+EOF
+prep_stub $'commit\napproved\napproved'
+if rd_legacy_routed="$(run_stubbed --preset legacy-args-routed \
+    --branch "sandbox-test-legacy-routed-$$")"; then
+    tmpdirs+=("$rd_legacy_routed")
+    # code, review verdict, then the maintain step's two legs (verdict + pass).
+    check "every leg of the legacy code+review+maintain pipeline ran" "4" "$(cat "$count")"
+    contains "the code leg carries the code seat's arguments" \
+        "$(sed -n 1p "$argv_log")" "--effort low"
+    lacks "the code leg does not carry the reviewer's" \
+        "$(sed -n 1p "$argv_log")" "--effort high"
+    lacks "the code leg does not carry the maintainer's" \
+        "$(sed -n 1p "$argv_log")" "--effort medium"
+    contains "the review leg carries its own agent's arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort high"
+    lacks "the review leg does not carry the code seat's" \
+        "$(sed -n 2p "$argv_log")" "--effort low"
+    contains "the maintainer leg carries its own agent's arguments" \
+        "$(sed -n 3p "$argv_log")" "--effort medium"
+    lacks "the maintainer leg does not carry the code seat's" \
+        "$(sed -n 3p "$argv_log")" "--effort low"
+    lacks "the maintainer leg does not carry the reviewer's" \
+        "$(sed -n 3p "$argv_log")" "--effort high"
+    contains "every maintainer leg carries its own agent's arguments" \
+        "$(sed -n 4p "$argv_log")" "--effort medium"
+else
+    no "legacy-args-routed launch succeeds"
+fi
+
+# A reviewer whose arguments are set while the code seat has none: the
+# review leg gets them and the code leg stays bare.
+cat > "$real_presets/legacy-args-review-only-args.yaml" <<'EOF'
 agents:
   coder:
     harness: claude
@@ -4784,13 +4841,69 @@ pipeline:
     repeat: 1
     agent: reviewer
 EOF
-refuses "a legacy-shaped review seat's own arguments are refused" \
-    "legacy-shaped" --preset legacy-args-bad-review
+prep_stub $'commit\napproved'
+if rd_legacy_rev="$(run_stubbed --preset legacy-args-review-only-args \
+    --branch "sandbox-test-legacy-rev-$$")"; then
+    tmpdirs+=("$rd_legacy_rev")
+    lacks "a bare code leg stays argument-free" "$(sed -n 1p "$argv_log")" "--effort"
+    contains "the reviewer's own arguments reach its review leg" \
+        "$(sed -n 2p "$argv_log")" "--effort high"
+else
+    no "legacy-args-review-only-args launch succeeds"
+fi
 
-# A read-only, maintain-only pipeline has no real implement leg at all (the
+# --review-harness replaces the review seat, so the preset reviewer's
+# arguments (tuned to the agent it named) are not applied to it.
+prep_stub $'commit\napproved'
+if rd_legacy_revflag="$(run_stubbed --preset legacy-args-review-only-args \
+    --review-harness claude --review-model haiku \
+    --branch "sandbox-test-legacy-revflag-$$")"; then
+    tmpdirs+=("$rd_legacy_revflag")
+    lacks "--review-harness orphans the preset reviewer's arguments" \
+        "$(sed -n 2p "$argv_log")" "--effort"
+else
+    no "legacy review-harness override launch succeeds"
+fi
+
+# A named fix seat of a different agent carries that agent's own arguments,
+# not the code seat's.
+cat > "$real_presets/legacy-args-fixer.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    claude-args: --effort low
+  reviewer:
+    harness: claude
+    model: opus
+  fixer:
+    harness: claude
+    model: haiku
+    claude-args: --effort high
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: fixer
+EOF
+prep_stub $'commit\nfindings\ncommit'
+if rd_legacy_fixer="$(run_stubbed --preset legacy-args-fixer \
+    --branch "sandbox-test-legacy-fixer-$$")"; then
+    tmpdirs+=("$rd_legacy_fixer")
+    contains "the fix leg carries the fixer agent's own arguments" \
+        "$(sed -n 3p "$argv_log")" "--effort high"
+    lacks "the fix leg does not carry the code seat's" \
+        "$(sed -n 3p "$argv_log")" "--effort low"
+else
+    no "legacy-args-fixer launch succeeds"
+fi
+
+# A read-only, maintain-only pipeline has no real implement leg (the
 # maintainer runs on the maintainer role, not the phantom implement seat),
-# so its own arguments are refused too, not applied to a leg that never runs.
-cat > "$presets_dir/legacy-args-bad-maintain-only.yaml" <<'EOF'
+# so its agent's arguments ride the maintainer leg alone.
+cat > "$real_presets/legacy-args-maintain-only.yaml" <<'EOF'
 agents:
   maintainer:
     harness: claude
@@ -4801,8 +4914,21 @@ pipeline:
     repeat: 1
     agent: maintainer
 EOF
-refuses "a read-only maintain-only preset's own arguments are refused" \
-    "legacy-shaped" --preset legacy-args-bad-maintain-only
+git -C "$proj" branch -q "ro-mo-target-$$"
+git -C "$proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit -q --allow-empty -m "work under maintenance"
+git -C "$proj" branch -q -f "ro-mo-target-$$" HEAD
+git -C "$proj" reset -q --hard "$ro_base"
+prep_stub 'approved'
+if rd_mo="$(run_stubbed --preset legacy-args-maintain-only \
+    --checkout "ro-mo-target-$$" --review-base "$ro_base" \
+    --branch "sandbox-test-ro-mo-$$")"; then
+    tmpdirs+=("$rd_mo")
+    contains "a read-only maintain-only preset's arguments reach its maintainer leg" \
+        "$(sed -n 1p "$argv_log")" "--effort high"
+else
+    no "read-only maintain-only args launch succeeds"
+fi
 
 # A natively-authored read-only preset (no code step at all, never run
 # through --review-only/--drop-code) seats its one agent on the implement
