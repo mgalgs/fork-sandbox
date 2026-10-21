@@ -132,6 +132,21 @@ question. Spend more refutation passes on a finding the higher the level.
 Never report a finding whose failure you could not trace. A plausible-but-wrong
 finding costs the reader more than a missed nit.
 
+**Then have someone else try.** At `high` and above, if your harness can
+start a subagent (Claude Code's Agent tool, for one), give each surviving
+finding to a fresh one, in parallel, one finding each. Hand it the file and
+line, the triggering input and the claimed failure, and none of your
+reasoning. Ask it only to confirm or refute that claim from the code, not to
+look for other problems. Then:
+
+- it traced the same failure: the finding is **confirmed**;
+- it could neither confirm nor refute: the finding is **plausible**;
+- it found the guard, caller or invariant that rules it out, and you agree
+  on reading it: drop the finding.
+
+Without subagents, your own refutation above is the check; say so in the
+report.
+
 ### 4. Rank and report
 
 Order findings **worst first**. Each one needs, without exception:
@@ -140,6 +155,7 @@ Order findings **worst first**. Each one needs, without exception:
 - The **input or state** that triggers it.
 - **What goes wrong** as a result.
 - **What to do** about it.
+- **Confirmed or plausible**, when a second check ran.
 
 If you cannot state a finding that concretely, it is not ready — drop it or ask
 it as a question.
