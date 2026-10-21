@@ -37,6 +37,7 @@ set -euo pipefail
 
 session=reaped
 grace=86400
+grace_set=
 term_wait=30
 mode=reap
 
@@ -53,11 +54,18 @@ while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --sweep) mode=sweep; shift ;;
-        --grace) num --grace "${2:-}"; grace="$2"; shift 2 ;;
+        --grace) num --grace "${2:-}"; grace="$2"; grace_set=1; shift 2 ;;
         --term-wait) num --term-wait "${2:-}"; term_wait="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# A reap's own sweep runs inside the session being reaped: a short grace
+# there would SIGTERM the caller itself.
+if [[ "$mode" == reap && -n "$grace_set" ]]; then
+    echo "Error: --grace applies to --sweep only" >&2
+    exit 1
+fi
 
 # Session name of a pane id, empty if the pane is gone. (display-message -t
 # on a vanished id falls back to some current pane, so look the id up.)

@@ -116,6 +116,10 @@ sleep 1
 exists "$stubborn" && no "a SIGTERM-ignoring pane is closed by kill-pane" || ok "a SIGTERM-ignoring pane is closed by kill-pane"
 
 "$reap" --bogus >/dev/null 2>&1 && no "unknown option refused" || ok "unknown option refused"
+self="$(tmux new-window -d -t main: -P -F '#{pane_id}' "sleep 609")"
+TMUX_PANE="$self" "$reap" --grace 0 >/dev/null 2>&1 && no "--grace without --sweep refused" || ok "--grace without --sweep refused"
+[[ "$(tmux display-message -p -t "$self" '#{session_name}')" == main ]] \
+    && ok "a refused reap leaves the pane where it was" || no "a refused reap leaves the pane where it was"
 env -u TMUX_PANE "$reap" >/dev/null 2>&1 && no "reap without TMUX_PANE refused" || ok "reap without TMUX_PANE refused"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
