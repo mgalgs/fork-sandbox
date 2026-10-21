@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { MARK, finish, matchLanes, mentions, parseLanes, plain, shown, step } from '../hooks/lanes'
+import { MARK, finish, matchLanes, mentionContext, mentions, parseLanes, plain, shown, step } from '../hooks/lanes'
 import type { Edit, Lane } from '../hooks/lanes'
 import type { LanePicker } from '../types'
 
@@ -251,6 +251,27 @@ test('the submit context names a mentioned lane and the text is untouched', asyn
 
   const plain = await $.prompt.submit({ text: 'no lanes here, mail me@alpha.example', wait: false, origin: { kind: 'composer' } })
   expect(plain.context).toBeUndefined()
+})
+
+test('a described lane adds its description to the submit context; an undescribed one adds nothing', async ($, on) => {
+  await started($, on, 'live\talpha\tthe alpha widget repo\nmailbox\tbeta\t\npeer\thostone\t\n')
+  const submit = (text: string) => $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  const both = await submit('ask @alpha and @beta')
+  expect(both.context).toHaveLength(1)
+  expect(both.context?.[0]).toContain('@alpha owns: the alpha widget repo')
+  expect(both.context?.[0]).not.toContain('@beta owns')
+  const bare = await submit('ask @beta')
+  expect(bare.context?.[0]).toBe(mentionContext(['@beta']))
+  expect(bare.context?.[0]).not.toContain('owns')
+})
+
+test('parseLanes reads the description column and tolerates its absence', () => {
+  const out = parseLanes('live\talpha\tthe alpha widget repo\nmailbox\tbeta\t\nremote\tr:hostb\t\npeer\thostone\t\nmailbox\tgamma\n')
+  expect(out.find(l => l.address === '@alpha')?.description).toBe('the alpha widget repo')
+  expect(out.find(l => l.address === '@beta')?.description).toBeUndefined()
+  expect(out.find(l => l.address === '@gamma')?.description).toBeUndefined()
+  expect(out.find(l => l.address === '@alpha:hostone')?.description).toBeUndefined()
+  expect(out.map(l => l.address)).toEqual(['@alpha', '@beta', '@gamma', '@r:hostb', '@alpha:hostone', '@beta:hostone', '@gamma:hostone'])
 })
 
 test('the band lists the matches for the typed filter, best first', async ($, on) => {

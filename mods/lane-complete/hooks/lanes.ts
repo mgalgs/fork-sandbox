@@ -9,6 +9,8 @@ export type Lane = {
   /** The lane-mail address as it is typed: `@lane` or `@lane:host`. */
   address: string
   source: 'live' | 'mailbox' | 'remote' | 'peer'
+  /** What the lane owns, one line (`lane-mail.sh describe`); local lanes only. */
+  description?: string
 }
 
 /** The part of a prompt.edit input the picker reads. */
@@ -38,7 +40,7 @@ const REMOTE = /^[a-z0-9][a-z0-9-]*:[a-z0-9][a-z0-9.-]*$/
 const FILTER_CHARS = /^[A-Za-z0-9:.-]+$/
 
 /**
- * Parses list-lanes.sh output (`<source>\t<name>` lines) into addresses:
+ * Parses list-lanes.sh output (`<source>\t<name>[\t<description>]` lines) into addresses:
  * live lanes, then mailbox-only lanes, then remote lanes that have written
  * here (`lane:host`), then each local lane qualified with each peer host (the
  * peers file names hosts, not their lanes, and a lane is usually run on both
@@ -49,14 +51,18 @@ export function parseLanes(stdout: string): Lane[] {
   const mailbox: string[] = []
   const remote: string[] = []
   const peers: string[] = []
+  const described = new Map<string, string>()
   for (const line of stdout.split('\n')) {
-    const [source, name] = line.split('\t')
+    const [source, name, description] = line.split('\t')
     if (name === undefined) continue
     if (source === 'remote') {
       if (REMOTE.test(name)) remote.push(name)
       continue
     }
     if (!NAME.test(name)) continue
+    if ((source === 'live' || source === 'mailbox') && description && !described.has(name)) {
+      described.set(name, description)
+    }
     if (source === 'live') live.push(name)
     else if (source === 'mailbox') mailbox.push(name)
     else if (source === 'peer') peers.push(name)
@@ -66,7 +72,8 @@ export function parseLanes(stdout: string): Lane[] {
   const add = (address: string, source: Lane['source']) => {
     if (seen.has(address)) return
     seen.add(address)
-    lanes.push({ address, source })
+    const description = source === 'live' || source === 'mailbox' ? described.get(address.slice(1)) : undefined
+    lanes.push(description === undefined ? { address, source } : { address, source, description })
   }
   for (const name of live) add(`@${name}`, 'live')
   for (const name of mailbox) add(`@${name}`, 'mailbox')
@@ -254,8 +261,13 @@ export function mentions(text: string, lanes: readonly Lane[]): string[] {
 }
 
 /** The note the model reads beside a prompt that mentions lanes. */
-export function mentionContext(addresses: readonly string[]): string {
+export function mentionContext(addresses: readonly string[], lanes: readonly Lane[] = []): string {
   const list = addresses.join(', ')
+  // A lane's name invites a guess at what it owns; its description says.
+  const owns = addresses.flatMap(a => {
+    const description = lanes.find(l => l.address === a)?.description
+    return description === undefined ? [] : [`${a} owns: ${description}`]
+  })
   return [
     `The operator's prompt mentions lane-mail ${addresses.length === 1 ? 'lane' : 'lanes'}: ${list}.`,
     'Those are lane-mail addresses (an agent session\'s mailbox), not files or agents.',
@@ -263,5 +275,6 @@ export function mentionContext(addresses: readonly string[]): string {
     '  lane-mail.sh send --from @<your own lane> --to @<lane> --subject ... --body -',
     '(message body on stdin; `lane-mail.sh registration` prints your own lane; `@lane:host` is a lane on another host).',
     'Decide from the prompt\'s wording whether the operator wants a message sent or is only referring to the lane; send nothing unless they asked.',
+    ...owns,
   ].join('\n')
 }

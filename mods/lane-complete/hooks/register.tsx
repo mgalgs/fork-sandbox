@@ -83,7 +83,7 @@ export const register: Register = on => {
     const named = mentions(e.text, lanes)
     if (named.length === 0) return next(e)
 
-    return next({ ...e, context: [...(e.context ?? []), mentionContext(named)] })
+    return next({ ...e, context: [...(e.context ?? []), mentionContext(named, lanes)] })
   }).catch(($, e, next) => next(e)) // a failed note never costs the operator the prompt
 
   on('prompt.change', async ($, e, next) => {
