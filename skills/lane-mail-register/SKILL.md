@@ -32,6 +32,12 @@ absolute project directory:
 2. **Register:** `lane-mail.sh register <lane>`. It replaces any lane this
    session already held.
 
+   If the lane has no description yet (the third column of
+   `lane-mail.sh lanes`), ask the user what it owns, or infer it from
+   context, and register with `--about "<one line>"` (or run
+   `lane-mail.sh describe <lane> "<one line>"` afterwards). Never replace an
+   existing description unasked.
+
 3. **Remember it.** If the lane differs from the file's entry for the key,
    or there was none, write the updated object back (Write the whole file;
    create it if missing). Leave other keys untouched.
@@ -57,7 +63,8 @@ absolute project directory:
 
 ## Finding lanes
 
-`lane-mail.sh lanes` lists them, one `<source><TAB><lane>` line each:
+`lane-mail.sh lanes` lists them, one `<source><TAB><lane><TAB><description>` line each (the description
+is empty when unset, and always for `remote` and `peer`):
 
 | source | meaning |
 |---|---|

@@ -33,7 +33,10 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
   the model is attached saying it is a lane-mail address and how to message it
   (`lane-mail.sh send --from @<own lane> --to @<lane> --subject ... --body -`).
   Whether to send, or only to refer to the lane, is Claude's call from your
-  wording. The mod never sends anything itself.
+  wording. The mod never sends anything itself. A mentioned lane that has a
+  description (`lane-mail.sh describe`) also gets a line in that note,
+  `@lane owns: <description>`, so the model does not guess its scope from the
+  name; a lane without one adds nothing.
 
 ## Remote lanes that have written here
 

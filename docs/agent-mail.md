@@ -381,8 +381,20 @@ Handle the mail, mark it `lane-mail.sh seen <lane> <id>...`, then launch
 messages.
 
 `lane-mail.sh lanes` lists the lanes there are: registered, mailbox-only,
-remote ones that have written here, and peer hosts. The
-`lane-mail-register` skill wraps registration and explains the listing.
+remote ones that have written here, and peer hosts, as
+`<source><TAB><lane><TAB><description>` lines. The `lane-mail-register`
+skill wraps registration and explains the listing.
+
+A lane can carry a one-line description of what it owns, so a name like
+`@alpha` is not taken to mean "anything alpha-related" when its owner means
+one repo. Set it with `lane-mail.sh describe <lane> "<text>"` (`""` clears
+it) or `lane-mail.sh register <lane> --about "<text>"`; registering without
+`--about` keeps what is there. One line, at most 200 characters. It is
+stored with the lane's mailbox (`agents/<lane>/about`), not with the session
+registration, so it survives a handoff. It is the third `lanes` column
+(empty when unset, and always empty for remote lanes and peers; descriptions
+are not synced between hosts), and the lane-complete mod's prompt note
+repeats it for each described lane a prompt mentions.
 
 ### Lane mail between hosts
 
