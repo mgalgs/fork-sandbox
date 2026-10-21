@@ -56,9 +56,9 @@ mkdir -p "$scratch/root/agents/alpha" "$scratch/root/agents/beta" "$scratch/root
 printf '# peers\nhostone ssh.example.test\nselfhost ssh.example.test\nBAD host\n' \
     > "$scratch/config/lane-mail-peers"
 
-want="live${tab}alpha
-mailbox${tab}beta
-peer${tab}hostone"
+want="live${tab}alpha${tab}
+mailbox${tab}beta${tab}
+peer${tab}hostone${tab}"
 check "live first, then mailbox-only, then peers; deduped; invalid and self dropped" \
     "$want" "$(list)"
 
@@ -119,19 +119,19 @@ From: @second:hosttwo
 Subject: another sender
 
 EOF
-want="live${tab}alpha
-mailbox${tab}beta
-remote${tab}builder:hostb
-remote${tab}second:hosttwo
-peer${tab}hostone"
+want="live${tab}alpha${tab}
+mailbox${tab}beta${tab}
+remote${tab}builder:hostb${tab}
+remote${tab}second:hosttwo${tab}
+peer${tab}hostone${tab}"
 check "remote lanes: From: headers only; own host, dups, malformed, To, Cc, body excluded" \
     "$want" "$(list)"
 printf 'From: @notamsg:hostz\n' > "$scratch/root/threads/t5/note.txt"
 check "non-message files in the store are ignored" "$want" "$(list)"
 rm -rf "$scratch/root/threads"
-check "no thread store: only the original sources" "live${tab}alpha
-mailbox${tab}beta
-peer${tab}hostone" "$(list)"
+check "no thread store: only the original sources" "live${tab}alpha${tab}
+mailbox${tab}beta${tab}
+peer${tab}hostone${tab}" "$(list)"
 
 check "--help prints the header" "list-lanes.sh -- Print the lane-mail lanes the lane-complete mod can offer" \
     "$(list --help | head -1)"
@@ -143,6 +143,26 @@ cp "$repo_dir/mods/lane-complete/bin/list-lanes.sh" "$scratch/lone/mods/lane-com
 err="$(PATH=/usr/bin:/bin "$scratch/lone/mods/lane-complete/bin/list-lanes.sh" 2>&1 >/dev/null)"
 check "missing scripts exits 1" "1" "$?"
 case "$err" in *"lane-mail scripts not found"*) ok "missing scripts says so" ;; *) no "missing scripts says so" "$err" ;; esac
+
+# Descriptions: the third column, from <root>/agents/<lane>/about.
+printf 'the alpha widget repo\n' > "$scratch/root/agents/alpha/about"
+printf 'beta tab\there\r\nsecond line\n' > "$scratch/root/agents/beta/about"
+printf 'orphan\n' > "$scratch/root/agents/-bad/about"
+want="live${tab}alpha${tab}the alpha widget repo
+mailbox${tab}beta${tab}beta tab here
+peer${tab}hostone${tab}"
+check "a described lane carries its first line as the third column; tabs flattened" \
+    "$want" "$(list)"
+check "the first two fields are unchanged by descriptions" \
+    "live${tab}alpha
+mailbox${tab}beta
+peer${tab}hostone" "$(list | cut -f1,2)"
+mkdir -p "$scratch/root/agents/alpha" "$scratch/root/agents/gamma"
+printf 'gamma\n' > "$reg_dir/sess-4"
+check "a live lane's description survives its session being replaced" \
+    "the alpha widget repo" "$(rm -f "$reg_dir/sess-1" "$reg_dir/sess-2"; printf 'alpha\n' > "$reg_dir/sess-9"; list | awk -F'\t' '$2 == "alpha" { print $3 }')"
+check "an undescribed lane has an empty third column" \
+    "live${tab}gamma${tab}" "$(list | grep -P '\tgamma\t')"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

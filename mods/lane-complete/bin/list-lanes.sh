@@ -3,13 +3,18 @@
 #
 # Usage: list-lanes.sh        (the mod runs it on a timer; --help prints this)
 #
-# One `<source><TAB><name>` line per candidate, most relevant source first:
+# One `<source><TAB><name><TAB><description>` line per candidate, most relevant source first:
 #
 #   live     a lane some session registered (`lane-mail.sh register`)
 #   mailbox  a lane that only has a mailbox under the lane-mail root
 #   remote   a lane on another host that has written to this one: the `From:`
 #            address (`@lane:host`) of a message in the local thread store
 #   peer     a peer host from the peers file (a lane on it is `@lane:<peer>`)
+#
+# The third column is the lane's description (`lane-mail.sh describe`, stored
+# at <root>/agents/<lane>/about): its first line, empty when unset, and always
+# empty for `remote` and `peer` rows. A consumer that reads two fields is
+# unaffected.
 #
 # Every path comes from the lane-mail scripts themselves, so this never holds
 # a second copy of them: the root, the peers file and the name patterns from
@@ -60,6 +65,17 @@ if [[ "$line" =~ ^LANES_DIR=\"/tmp/claude-\$\(id\ -u\)/[a-z0-9-]+\"$ ]]; then
     eval "$line"
 fi
 
+# The description of a local lane: first line of its `about` file, tabs made
+# spaces and carriage returns dropped so the column format holds.
+describe_of() {
+    local line=""
+    case "$1" in live|mailbox) ;; *) return 0 ;; esac
+    [[ -f "$LANE_MAIL_ROOT/agents/$2/about" ]] || return 0
+    IFS= read -r line < "$LANE_MAIL_ROOT/agents/$2/about" || true
+    line="${line//$'\t'/ }"
+    printf '%s' "${line//$'\r'/}"
+}
+
 # A lane is listed once, under its most relevant source (live beats mailbox).
 declare -A seen=()
 emit() {
@@ -67,7 +83,7 @@ emit() {
     [[ "$source" == peer ]] || key="lane:$2"
     [[ -n "${seen[$key]:-}" ]] && return 0
     seen[$key]=1
-    printf '%s\t%s\n' "$source" "$name"
+    printf '%s\t%s\t%s\n' "$source" "$name" "$(describe_of "$source" "$name")"
 }
 
 if [[ -n "$LANES_DIR" && -d "$LANES_DIR" ]]; then

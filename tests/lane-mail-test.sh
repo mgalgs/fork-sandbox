@@ -64,7 +64,7 @@ printf '== lanes ==\n'
 lanes="$("$lane_mail" lanes 2>&1)"
 rc=$?
 if (( rc == 0 )); then ok "lanes succeeds"; else no "lanes succeeds" "rc=$rc: $lanes"; fi
-if grep -qx $'live\ttestlane' <<<"$lanes"; then
+if grep -qx $'live\ttestlane\t' <<<"$lanes"; then
     ok "lanes lists a registered lane as live"
 else
     no "lanes lists a registered lane as live" "$lanes"
@@ -102,6 +102,13 @@ if [[ "$(cat "$about_file" 2>/dev/null)" == "the alpha widget repo, v2" ]]; then
     ok "register without --about keeps the existing description"
 else
     no "register without --about keeps the existing description"
+fi
+
+lanes="$("$sc" lanes 2>&1)"
+if grep -qx $'live\talpha\tthe alpha widget repo, v2' <<<"$lanes"; then
+    ok "lanes shows the description, and it outlived the first session"
+else
+    no "lanes shows the description, and it outlived the first session" "$lanes"
 fi
 
 out="$(CLAUDE_CODE_SESSION_ID="$sid2" "$sc" register beta --about "the beta gadget repo" 2>&1)"; rc=$?
