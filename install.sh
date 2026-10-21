@@ -309,6 +309,7 @@ PORCELAIN=(
     fork-sandbox-status.sh
     fork-sandbox-stop.sh
     fork-sandbox.sh
+    fork-task-ack.sh
     fork-task.sh
     lane-mail-hook.sh         # Stop/UserPromptSubmit hook command: settings.json invokes it by bare name
     lane-mail-peer            # operator command; edits authorized_keys, so never allowlisted; the peer runs its half at this exact link path
@@ -318,6 +319,7 @@ PORCELAIN=(
     pi-sandboxed
     sandbox-run-log.py        # fork-sandbox.sh looks it up on PATH before falling back to this hardcoded path
     statusline-stash.sh       # statusLine command: settings.json invokes it by bare name
+    tmux-reap.sh
 )
 
 PLUMBING=(

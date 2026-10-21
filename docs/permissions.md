@@ -292,6 +292,15 @@ unlike checking on a run that is already sandboxed and already committed to
 a branch, starting a brand-new session with its own fresh set of permissions
 is exactly the moment a human should look at what is about to run.
 
+`fork-task-ack.sh` and `tmux-reap.sh` are the two halves of a refresh that
+cleans up after itself: `fork-task.sh --ack` prints a token, the new session
+runs `fork-task-ack.sh <token>` first thing, and the old session waits with
+`fork-task-ack.sh --wait <token>`, then parks its pane with `tmux-reap.sh`
+(into the `reaped` tmux session; panes there are closed after a 24h grace).
+`fork-task-ack.sh` takes arguments only and validates its token, so it is
+safe to allowlist. `tmux-reap.sh` signals processes, but only in panes it
+stamped itself inside session `reaped`.
+
 ## The part no rule can give you
 
 Everything above is about not being interrupted. It is not a claim that the
