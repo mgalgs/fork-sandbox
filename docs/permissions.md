@@ -299,7 +299,11 @@ runs `fork-task-ack.sh <token>` first thing, and the old session waits with
 (into the `reaped` tmux session; panes there are closed after a 24h grace).
 `fork-task-ack.sh` takes arguments only and validates its token, so it is
 safe to allowlist. `tmux-reap.sh` signals processes, but only in panes it
-stamped itself inside session `reaped`.
+stamped itself inside session `reaped`. The ack file lives under
+`/var/tmp/claude-scratch/forks/acks/`; a codex child runs in codex's own
+sandbox, which by default only writes to its workspace and temp dirs, so
+unless that path is made writable for it the codex ack fails and `--wait`
+times out. Treat `--ack` as claude-only until that is verified.
 
 ## The part no rule can give you
 

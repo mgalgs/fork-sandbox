@@ -95,6 +95,18 @@ for p in "$unstamped" "$bystander" "$outside"; do
         && ok "--grace 0 still leaves $p alone" || no "--grace 0 still leaves $p alone"
 done
 
+# The signal goes to the pane's foreground job, not just the pane's shell:
+# an interactive shell whose child traps TERM while the shell itself does not.
+fg_marker="$tmp/fg-term"
+fgjob="$(tmux new-window -d -t main: -P -F '#{pane_id}' \
+    "bash -ic 'bash -c \"trap \\\"echo got > $fg_marker; exit 0\\\" TERM; sleep 607 & wait\"; sleep 608'")"
+tmux break-pane -d -s "$fgjob" -t =reaped:
+tmux set-option -p -t "$fgjob" @reaped_at 1
+sleep 1
+"$reap" --sweep >/dev/null 2>&1
+[[ -s "$fg_marker" ]] && ok "the foreground job under an interactive shell got SIGTERM" \
+    || no "the foreground job under an interactive shell got SIGTERM"
+
 # A process that ignores SIGTERM is closed by kill-pane after --term-wait.
 stubborn="$(tmux new-window -d -t main: -P -F '#{pane_id}' "bash -c 'trap \"\" TERM; sleep 606; sleep 606'")"
 tmux break-pane -d -s "$stubborn" -t =reaped:

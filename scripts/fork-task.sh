@@ -58,9 +58,13 @@
 #                         /var/tmp/claude-scratch/forks/acks/, tells the new
 #                         session (in the prompt header) to run
 #                         `fork-task-ack.sh <token>` before anything else, and
-#                         prints `Ack token: <token>`. The launcher then
-#                         blocks on `fork-task-ack.sh --wait <token>`. Works
-#                         for both harnesses. Without --ack nothing changes.
+#                         prints `Ack token: <token>`. fork-task.sh does not
+#                         wait: the calling session runs
+#                         `fork-task-ack.sh --wait <token>` itself. Written for
+#                         both harnesses, but a codex child runs in codex's own
+#                         sandbox, which may not let it write under /var/tmp;
+#                         unless the operator allows that, expect --wait to
+#                         time out for codex. Without --ack nothing changes.
 # -h, --help:             print this header and exit.
 #
 # Sandboxed mode trades isolation for silence: the session never asks for
