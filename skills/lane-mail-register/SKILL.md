@@ -1,6 +1,6 @@
 ---
 name: lane-mail-register
-description: Register this session in lane mail, reusing the lane name last used for this project directory or inventing one from the session's context; and find which lanes exist and which session holds one. Use when the user says "register in lane mail", "take a lane", "join lane mail", names a lane to take, asks to "list lanes", or you need to address another lane.
+description: Register this session in lane mail, reusing the lane name last used for this project directory or inventing one from the session's context, and name its tmux window after the lane; and find which lanes exist and which session holds one. Use when the user says "register in lane mail", "take a lane", "join lane mail", names a lane to take, asks to "list lanes", or you need to address another lane.
 argument-hint: "[lane] — optional lane name; guessed when omitted"
 ---
 
@@ -35,6 +35,11 @@ absolute project directory:
 3. **Remember it.** If the lane differs from the file's entry for the key,
    or there was none, write the updated object back (Write the whole file;
    create it if missing). Leave other keys untouched.
+
+   **Name the window.** When `$TMUX` is set, run
+   `tmux rename-window -t "$TMUX_PANE" <lane>`, so the operator can tell
+   from the status bar which window holds which lane. `-t "$TMUX_PANE"`
+   targets this session's own window, not whichever one has focus.
 
 4. **Catch up and arm the watch.** Run `lane-mail.sh inbox <lane>` and
    handle anything unread, marking it `seen`. Then start
