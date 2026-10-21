@@ -33,10 +33,17 @@ stage's first segment names its agent the plain way ("coder", "reviewer",
 numbers it from there ("reviewer2", "reviewer3", ...) -- deterministic on
 the spec's own segment order, not on the model or harness a segment names.
 
+Review and maintain seats reason harder than the rest: every r and m
+segment's agent carries `claude-args: --effort high` on claude and
+`codex-args: -c model_reasoning_effort=high` on codex (codex parses a -c
+value as TOML and falls back to a plain string, so it needs no quoting).
+Those arguments reach that agent's own legs only. A pi seat gets none, and
+code and plan seats get none. The effort is not selectable in the spec.
+
 Fix legs ride the first code seat: no step names a fix_agent, so the
 preset parser's default applies. Anything the
-grammar cannot say (fix_agent, per-seat arguments on another seat, network)
-stays a preset file.
+grammar cannot say (fix_agent, other per-seat arguments, network) stays a
+preset file.
 
 The document is printed on stdout as YAML, and fork-sandbox.sh hands it
 to fork-sandbox-preset-parse.py like any preset file, so every schema and
@@ -84,6 +91,13 @@ HARNESSES = ("claude", "codex", "pi")
 STAGES = {"c": "code", "r": "review", "m": "maintain", "p": "plan"}
 
 AGENT_NAMES = {"c": "coder", "r": "reviewer", "m": "maintainer", "p": "planner"}
+
+# Review and maintain seats run at high reasoning effort: harness -> the
+# preset key and value that asks for it. A harness not listed (pi) gets none.
+HIGH_EFFORT = {
+    "claude": ("claude-args", "--effort high"),
+    "codex": ("codex-args", "-c model_reasoning_effort=high"),
+}
 
 
 def fail(spec, msg):
@@ -156,6 +170,9 @@ def compile_spec(spec):
                   f"    model: {model_id}"]
         if stage == "c" and repeat != 1:
             lines.append(f"    repeat: {repeat}")
+        if stage in ("r", "m") and harness in HIGH_EFFORT:
+            key, value = HIGH_EFFORT[harness]
+            lines.append(f"    {key}: {value}")
     lines.append("pipeline:")
     for stage, _, _, repeat, agent in seats:
         lines += [f"  - action: {STAGES[stage]}",

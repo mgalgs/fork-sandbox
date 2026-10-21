@@ -1757,9 +1757,11 @@ agents:
   sol:
     harness: codex
     model: sol
+    codex-args: -c model_reasoning_effort=high
   maintainer:
     harness: claude
     model: opus
+    claude-args: --effort high
 pipeline:
   - action: code
     agent: coder
@@ -1856,7 +1858,7 @@ python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
         "step	3	agent	reviewer"
 out="$(run --pipeline csonnet2-ropus-rsonnet-mopus-msonnet 2>"$err")"
 check "repeated review/maintain stages compile" \
-    $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=sonnet' \
+    $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=sonnet\ns2_claude_args=--effort high\ns3_claude_args=--effort high\ns4_claude_args=--effort high\ns5_claude_args=--effort high' \
     "$out"
 contains "a composed --pipeline spec with repeated stages announces its step count" \
     "$(cat "$err")" \
@@ -1871,6 +1873,21 @@ python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
         "pipeline	steps	5" \
         "step	2	agent	reviewer" "step	3	agent	reviewer2" \
         "step	4	agent	maintainer" "step	5	agent	maintainer2"
+# Review and maintain seats get high effort by default: claude
+# `--effort high`, codex `-c model_reasoning_effort=high`. Code and plan
+# seats get nothing, and neither does a pi seat.
+spec_yaml="$(python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
+    pfable-csonnet1-ropus1-mastra1)"
+check "an inline spec gives the reviewer claude --effort high" \
+    "1" "$(grep -c '^    claude-args: --effort high$' <<< "$spec_yaml")"
+check "an inline spec gives the codex maintainer its high reasoning effort" \
+    "1" "$(grep -c '^    codex-args: -c model_reasoning_effort=high$' <<< "$spec_yaml")"
+check "an inline spec gives the code and plan seats no arguments" \
+    "2" "$(grep -c 'args:' <<< "$spec_yaml")"
+contains "the reviewer's arguments sit on the reviewer agent" \
+    "$(grep -A3 '^  reviewer:' <<< "$spec_yaml")" "claude-args: --effort high"
+contains "the maintainer's arguments sit on the maintainer agent" \
+    "$(grep -A3 '^  maintainer:' <<< "$spec_yaml")" "codex-args: -c model_reasoning_effort=high"
 # A codeless spec compiles to a read-only pipeline: any number of review
 # and maintain stages in any order, each run once.
 for ro_spec in r-r r-r-m r-m-r m-m; do
@@ -4928,6 +4945,20 @@ if rd_mo="$(run_stubbed --preset legacy-args-maintain-only \
         "$(sed -n 1p "$argv_log")" "--effort high"
 else
     no "read-only maintain-only args launch succeeds"
+fi
+
+# --pipeline csonnet-ropus launches its review leg with --effort high and its
+# code leg without.
+prep_stub $'commit\napproved'
+if rd_pipe_effort="$(run_stubbed --pipeline csonnet-ropus \
+    --branch "sandbox-test-pipe-effort-$$")"; then
+    tmpdirs+=("$rd_pipe_effort")
+    lacks "an inline spec's code leg carries no effort argument" \
+        "$(sed -n 1p "$argv_log")" "--effort"
+    contains "an inline spec's review leg runs at high effort" \
+        "$(sed -n 2p "$argv_log")" "--effort high"
+else
+    no "--pipeline csonnet-ropus launches"
 fi
 
 # A natively-authored read-only preset (no code step at all, never run
