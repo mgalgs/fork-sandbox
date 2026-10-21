@@ -99,7 +99,7 @@ An agent is a named seat: who types, on what, and how. Names match
 | `harness` | required — `claude`, `pi` or `codex`. The combined `harness/model` form the flags accept works here too, split at the first slash for the same reason (an OpenRouter model id carries its own slash). |
 | `network` | `pinned` (the default) or `sealed`, the same axis as `--network`: whether this seat's harness reaches the network at all. `sealed` requires `harness: pi` — `claude` and `codex` have no self-hosted-endpoint path, and `{harness: claude, network: sealed}` is refused at load time. Otherwise independent of `harness` — `{harness: pi, network: sealed}` is `--harness pi --network sealed`. |
 | `model` | the seat's model or model alias. Optional where the flag is optional, required where it is required (`pi` needs one, on any seat, unless `network: sealed`); conflicts with a combined `harness` form, exactly as `--model` conflicts with `--harness pi/x`. |
-| `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. Reaches every leg this agent sits in a composed pipeline; in a legacy-shaped pipeline (see "Composed runs" below), the implement seat's legs only. |
+| `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. Reaches every leg this agent sits, in a legacy-shaped or a composed pipeline (see "Composed runs" below): a review step's agent's reach that step's review legs, a maintain step's agent's its maintainer legs. |
 | `pi-args` | extra arguments for pi — e.g. `--thinking low`. Same reach as `claude-args`. |
 | `codex-args` | extra arguments for `codex exec` — e.g. `-c model_reasoning_effort="high"`. Same reach as `claude-args`. |
 | `repeat` | run every coding leg this agent sits — a code step, or a loop's fix legs — as N passes on the same prompt. See "Repeat passes" below. A code step may set its own `repeat` (below) to override this agent-level default for that step only. |
@@ -119,10 +119,13 @@ code step in pipeline order (the run has one proxy base URL for the whole
 run) and without `--k8s` (it names a cluster proxy path and means nothing
 there).
 
-`claude-args`/`pi-args`/`codex-args` reach every leg the agent sits in a
-composed pipeline (see "Composed runs" below) — only in a legacy-shaped
-pipeline are they narrower, reaching the implement seat's legs alone. The
-key must match the agent's own harness (`claude-args` on a `claude` seat,
+`claude-args`/`pi-args`/`codex-args` reach every leg the agent sits, in a
+legacy-shaped or a composed pipeline (see "Composed runs" below): the code
+seat's reach its code and fix legs, a review step's agent's reach that
+step's review legs, a maintain step's agent's reach its maintainer legs,
+and none leak from one seat's agent to another's. A `--review-harness` or
+`--maintainer-harness` flag replaces its seat, so the preset agent's
+arguments are not applied to it. The key must match the agent's own harness (`claude-args` on a `claude` seat,
 `pi-args` on `pi`/`pi-local`, `codex-args` on `codex`); a mismatch, or an
 agent that carries arguments but sits no seat at all, is refused at load
 time rather than silently dropped.
@@ -387,17 +390,24 @@ numbers it from there (`reviewer2`, `reviewer3`, …) — deterministic on
 the spec's own segment order, not on the model or harness a segment
 names.
 
+Review and maintain seats run at high reasoning effort by default: every
+`r` and `m` segment's agent carries `claude-args: --effort high` on a
+claude harness and `codex-args: -c model_reasoning_effort=high` on a codex
+one, reaching that agent's own legs only. Code and plan seats, and any pi
+seat, get no arguments, and the spec has no syntax for choosing the
+effort — a preset file does.
+
 The spec compiles to the preset document a hand-written preset with the
 same shape would be, and from there runs the `--preset` path unchanged:
 the same parser, the same rules, the same flag overrides — for a
-legacy-shaped spec, `--claude-args` reaches the code seat as it does over
+legacy-shaped spec, `--claude-args` reaches the code seat alone as it does over
 a legacy-shaped preset file; a composed spec (more than one review or
 maintain segment, say) refuses the flag the same way a composed preset
 file does. Fix legs ride the code seat. `--dry-run` prints the compiled
 seats, and the run records the spec in `preset.json` as `pipeline`, with
 the spec as its `name`.
 
-What the grammar cannot say — a `fix_agent`, per-seat arguments, a
+What the grammar cannot say — a `fix_agent`, other per-seat arguments, a
 network — stays a preset file. `--pipeline` and `--preset` are mutually
 exclusive, but `--preset <name>` falls back to `--pipeline <name>` when no
 file has that name and the name parses as a spec, so a composition name
@@ -570,10 +580,8 @@ pipeline:
     agent: coder
 ```
 
-This is a legacy-shaped pipeline (one code step, then one review step), so
-`claude-args` reaches only the code seat's legs: the self-review loop runs
-without `--effort high`. Add another step (making the
-pipeline composed) to route the coder's own arguments to its review leg too.
+The coder also sits the review step, so `claude-args` reaches its code
+legs and its self-review loop alike.
 
 **free-typing** — a self-hosted model types for free while a paid model
 reviews, the coder-mode economics as one word:
