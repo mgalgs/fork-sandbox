@@ -8714,7 +8714,11 @@ adopt_rd_reuse_b="$(resume_submit "$adopt_reuse_branch")"
 adopt_token_a="$(sed -n 's/^run_token=//p' "$adopt_rd_reuse_a/run.env")"
 adopt_token_b="$(sed -n 's/^run_token=//p' "$adopt_rd_reuse_b/run.env")"
 printf '0\n' > "$adopt_rd_reuse_a/exit-code"
-: > "$adopt_rd_reuse_a/.reap-pending"
+# "full": this is testing the ending that owes the whole run (the plain
+# `rm --branch` collect would have promoted to), not just its credentials
+# -- see the mark-content tests alongside cmd_collect's own reap-pending
+# tests for where that promotion happens.
+printf 'full\n' > "$adopt_rd_reuse_a/.reap-pending"
 adopt_log_reuse="$(newdir)/kubectl.log"; adopt_out_reuse="$(dirname "$adopt_log_reuse")/out.txt"
 tmpdirs+=("$(dirname "$adopt_log_reuse")")
 rc=0
@@ -8729,6 +8733,39 @@ if (( rc == 0 )) && [[ -n "$adopt_token_a" && -n "$adopt_token_b" && "$adopt_tok
 else
     no "adopt finishes a pending reap by this run's own label, leaving a reused branch's newer run alone" \
         "rc=$rc token_a=$adopt_token_a token_b=$adopt_token_b mark=$([[ -e "$adopt_rd_reuse_a/.reap-pending" ]] && echo present || echo absent) log=$(cat "$adopt_log_reuse") out=$(cat "$adopt_out_reuse")"
+fi
+
+# A pending reap marked "credentials": the dead driver owed only the
+# proxy/token teardown (--keep, zero-harvest, or a failed evidence capture
+# -- collect never promotes the mark to "full" on any of those endings),
+# so finishing it must never touch the Job, the agent pod or the scripts
+# ConfigMap -- it is finished the same bounded way adopt's own
+# unrecoverable branch already is (k8s_reap_proxy_credentials_by_run_token,
+# by this run's own token, never a blanket `-l fork-sandbox/run=` delete).
+adopt_creds_branch=fs-k8s-test-adopt-pending-reap-credentials
+adopt_creds_safe_name="$(k8s_safe_name fork-sandbox-agent "$adopt_creds_branch")"
+adopt_rd_creds="$(resume_submit "$adopt_creds_branch")"
+adopt_token_creds="$(sed -n 's/^run_token=//p' "$adopt_rd_creds/run.env")"
+printf '0\n' > "$adopt_rd_creds/exit-code"
+printf 'credentials\n' > "$adopt_rd_creds/.reap-pending"
+adopt_log_creds="$(newdir)/kubectl.log"; adopt_out_creds="$(dirname "$adopt_log_creds")/out.txt"
+tmpdirs+=("$(dirname "$adopt_log_creds")")
+rc=0
+K8S_STUB_PROXY_LABEL_SELF="{\"metadata\":{\"labels\":{\"fork-sandbox/run\":\"$adopt_token_creds\"}}}" \
+    runstub_verb "$adopt_log_creds" "$adopt_out_creds" adopt --run-dir "$adopt_rd_creds" || rc=$?
+if (( rc == 0 )) && [[ ! -e "$adopt_rd_creds/.reap-pending" ]] \
+    && grep -q "delete pod/$adopt_creds_safe_name-claude-proxy" "$adopt_log_creds" \
+    && grep -q "delete service/$adopt_creds_safe_name-claude-proxy" "$adopt_log_creds" \
+    && grep -q "delete configmap/$adopt_creds_safe_name-claude-proxy-conf" "$adopt_log_creds" \
+    && grep -q "delete networkpolicy/$adopt_creds_safe_name-claude-proxy" "$adopt_log_creds" \
+    && grep -q "delete secret/$adopt_creds_safe_name-claude-token" "$adopt_log_creds" \
+    && ! grep -q "delete .*codex" "$adopt_log_creds" \
+    && ! grep -q 'delete job' "$adopt_log_creds" \
+    && ! grep -q -- '-l fork-sandbox/run=' "$adopt_log_creds"; then
+    ok "adopt finishes a credentials-only pending reap without touching the Job, agent pod or scripts"
+else
+    no "adopt finishes a credentials-only pending reap without touching the Job, agent pod or scripts" \
+        "rc=$rc mark=$([[ -e "$adopt_rd_creds/.reap-pending" ]] && echo present || echo absent) log=$(cat "$adopt_log_creds") out=$(cat "$adopt_out_creds")"
 fi
 
 # A run.env predating run_token (no key at all): the same no-op as today,
@@ -8773,7 +8810,11 @@ fi
 # future adopt to retry, and reports non-zero.
 adopt_rd_reuse_fail="$(resume_submit fs-k8s-test-adopt-pending-reap-fail)"
 printf '0\n' > "$adopt_rd_reuse_fail/exit-code"
-: > "$adopt_rd_reuse_fail/.reap-pending"
+# "full": K8S_STUB_DELETE_RC below fails the by-run-label delete this
+# scope takes; the credentials-only scope's own failure path is a
+# different call (k8s_reap_proxy_credentials_by_run_token) and is not
+# this test's concern.
+printf 'full\n' > "$adopt_rd_reuse_fail/.reap-pending"
 adopt_log_reuse_fail="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$adopt_log_reuse_fail")")
 rc=0
 K8S_STUB_DELETE_RC=1 runstub_verb "$adopt_log_reuse_fail" "$adopt_rd_reuse_fail/adopt.out" \
@@ -9119,6 +9160,68 @@ if K8S_STUB_JOB_UID="" runstub_run "$runstub_log_own_nouid" "$runstub_out_own_no
 else
     no "an unreadable Job uid skips the patch loop entirely and still warns" \
         "run exited nonzero: $(cat "$runstub_out_own_nouid")"
+fi
+
+# The same ownerReference patch loop, this time on a --harness claude run:
+# k8s_set_run_owner_refs's target list is not just the scripts ConfigMap
+# for this harness -- it is the claude-proxy ConfigMap/Pod/Service/
+# NetworkPolicy and the claude-token Secret too. A target silently dropped
+# from that list (or a future proxy object nobody added to it) would leave
+# this run's live token Secret with no ownerReference at all -- the
+# consumer's main safety net against a Job deleted on its own, from a path
+# other than this script's own reap -- so each one is checked by name here
+# rather than only asserting the loop ran at all.
+runstub_own_claude_home="$(newdir)"; tmpdirs+=("$runstub_own_claude_home")
+mkdir -p "$runstub_own_claude_home/.claude"
+runstub_own_claude_future_ms=$(( ($(date +%s) + 7200) * 1000 ))
+cat > "$runstub_own_claude_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-ownerrefs-token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $runstub_own_claude_future_ms, "scopes": ["user:inference"]}}
+JSON
+runstub_own_claude_branch=fs-k8s-test-run-ownerrefs-claude
+runstub_log_own_claude="$(newdir)/kubectl.log"; runstub_out_own_claude="$(newdir)/out-own-claude.txt"
+tmpdirs+=("$(dirname "$runstub_log_own_claude")" "$(dirname "$runstub_out_own_claude")")
+# USER='': this run's label call (checked below too) must not pick up
+# whichever fork-sandbox/owner value this machine's own ambient $USER
+# happens to render -- see "the fork-sandbox/owner label is omitted when
+# neither K8S_RUN_OWNER nor $USER yields a value" elsewhere in this file.
+if USER='' HOME="$runstub_own_claude_home" runstub_run "$runstub_log_own_claude" "$runstub_out_own_claude" \
+    --branch "$runstub_own_claude_branch" --harness claude --model claude-sonnet-5 \
+    --outbox-dir "$(newdir)/outbox-own-claude" \
+    "$proj_dir" "$handoff_file"; then
+    # k8s_safe_name, not a hand-built string: this branch name combined
+    # with the longest suffix below (-claude-proxy-conf) is long enough to
+    # exercise that function's own 63-character hash-and-truncate path, so
+    # a literal concatenation here would silently stop matching the real
+    # rendered names the moment the branch name's length crosses that
+    # line.
+    own_claude_name="$(k8s_safe_name fork-sandbox-agent "$runstub_own_claude_branch")"
+    if grep -q "patch configmap/$own_claude_name-scripts --type=merge" "$runstub_log_own_claude" \
+        && grep -q "patch configmap/$own_claude_name-claude-proxy-conf --type=merge" "$runstub_log_own_claude" \
+        && grep -q "patch pod/$own_claude_name-claude-proxy --type=merge" "$runstub_log_own_claude" \
+        && grep -q "patch service/$own_claude_name-claude-proxy --type=merge" "$runstub_log_own_claude" \
+        && grep -q "patch networkpolicy/$own_claude_name-claude-proxy --type=merge" "$runstub_log_own_claude" \
+        && grep -q "patch secret/$own_claude_name-claude-token --type=merge" "$runstub_log_own_claude"; then
+        ok "submit patches an ownerReference onto every claude-proxy object and the claude-token Secret"
+    else
+        no "submit patches an ownerReference onto every claude-proxy object and the claude-token Secret" \
+            "log=$(grep patch "$runstub_log_own_claude")"
+    fi
+else
+    no "submit patches an ownerReference onto every claude-proxy object and the claude-token Secret" \
+        "run exited nonzero: $(cat "$runstub_out_own_claude")"
+fi
+# The same run's claude-token Secret label call (a separate command from
+# the patch above, run right after the Secret's own create -- see
+# cmd_submit) carries this run's fork-sandbox/run identity, not just
+# fork-sandbox/branch: the run-label render tests elsewhere in this file
+# only ever look at a --dry-run stream, which never reaches this real
+# `kubectl label` call at all.
+if grep -qE "label secret $own_claude_name-claude-token fork-sandbox/branch=$own_claude_name fork-sandbox/run=[0-9a-f-]+ --overwrite" \
+    "$runstub_log_own_claude"; then
+    ok "the claude-token Secret's own label call carries this run's fork-sandbox/run identity"
+else
+    no "the claude-token Secret's own label call carries this run's fork-sandbox/run identity" \
+        "log=$(grep 'label secret' "$runstub_log_own_claude")"
 fi
 
 # A failed evidence read exits from collect with code 3.
@@ -9997,6 +10100,19 @@ if grep -qE -- 'apply -f - --server-side --field-manager=fork-sandbox-k8s-claude
 else
     no "the keeper's own Secret re-apply carries --server-side and its field manager too" \
         "$(cat "$keeper_log")"
+fi
+# k8s_set_run_owner_refs patches an ownerReference onto this same Secret
+# once, at submit time. This re-apply names no field but the token data,
+# so a manifest that also named ownerReferences here would let a later
+# server-side apply fight over (and on a conflict, with --force-conflicts,
+# overwrite) the very reference the consumer's Job-deletion safety net
+# depends on -- confirm the payload this keeper actually sends carries no
+# such key at all.
+if jq -e '.metadata.ownerReferences' "$keeper_apply_capture" >/dev/null 2>&1; then
+    no "the keeper's Secret re-apply never names ownerReferences (so it can't strip them)" \
+        "$(cat "$keeper_apply_capture" 2>/dev/null)"
+else
+    ok "the keeper's Secret re-apply never names ownerReferences (so it can't strip them)"
 fi
 sleep 3
 keeper_exec_calls_2="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
@@ -10927,6 +11043,27 @@ else
         "collect exited nonzero: $(cat "$rp_out_keep")"
 fi
 
+# 17c2. The mark's CONTENT while --keep is still in flight: "credentials",
+# never "full" -- this ending (like zero-harvest and a failed evidence
+# capture) keeps the Job and agent pod, so adopt must never be told it can
+# delete them if a driver dies here. Frozen by a failed teardown (same
+# K8S_STUB_DELETE_RC the full-rm failure test below uses) so the content
+# can be read before anything would clear it.
+rp_rd_keep_fail="$(mk_reap_pending_run_dir)"
+rp_log_keep_fail="$(newdir)/kubectl.log"; rp_out_keep_fail="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$rp_log_keep_fail")" "$(dirname "$rp_out_keep_fail")")
+rc=0
+K8S_STUB_DELETE_RC=1 collectstub_collect "$rp_log_keep_fail" "$rp_out_keep_fail" \
+    --branch fs-k8s-test-reap-pending-keep-fail --outbox-dir "$(newdir)/outbox-rp-keep-fail" \
+    --run-dir "$rp_rd_keep_fail" --keep "$proj_dir" || rc=$?
+if [[ -e "$rp_rd_keep_fail/.reap-pending" ]] \
+    && [[ "$(cat "$rp_rd_keep_fail/.reap-pending")" == credentials ]]; then
+    ok "--keep's reap-pending mark reads 'credentials', never 'full', while its teardown is outstanding"
+else
+    no "--keep's reap-pending mark reads 'credentials', never 'full', while its teardown is outstanding" \
+        "rc=$rc mark=$(cat "$rp_rd_keep_fail/.reap-pending" 2>/dev/null || echo absent)"
+fi
+
 # 17d. A zero-harvest run clears the mark too (the proxy/token teardown it
 # always does now, --keep or not -- see test 17 above for rc and the
 # kept Job).
@@ -10976,6 +11113,17 @@ if (( rc != 0 )) && [[ -e "$rp_rd_fail/.reap-pending" ]]; then
 else
     no "a failed rm leaves the reap-pending mark in place" \
         "rc=$rc mark=$([[ -e "$rp_rd_fail/.reap-pending" ]] && echo present || echo absent)"
+fi
+# Its CONTENT is "full": this is the one ending that also owes the Job and
+# agent pod, promoted from the conservative "credentials" written at the
+# top of collect right before this rm was attempted -- adopt (see its own
+# tests) reads exactly this value to know it is safe to delete the whole
+# run, not just its credentials.
+if [[ "$(cat "$rp_rd_fail/.reap-pending" 2>/dev/null)" == full ]]; then
+    ok "a failed rm's reap-pending mark reads 'full'"
+else
+    no "a failed rm's reap-pending mark reads 'full'" \
+        "mark=$(cat "$rp_rd_fail/.reap-pending" 2>/dev/null || echo absent)"
 fi
 
 # 18. A pod spec that is not readable JSON: the per-container log capture

@@ -968,15 +968,35 @@ objects forever. Best-effort and silent about it beyond one warning --
 submit does not fail if the patch fails, because the explicit reap below
 still applies regardless.
 
-**`collect` marks a run reap-pending before it writes `exit-code`.**
-Whichever of the four endings a `collect` is about to take -- the plain
-`rm --branch` reap, or at least a proxy/token teardown under `--keep`, a
-zero-harvest verdict, or a failed evidence capture -- it first touches
-`DIR/.reap-pending`, in the run's own directory. The mark is cleared only
-once that ending's own teardown (or the full `rm`) actually succeeds; a
-failed `rm` leaves it in place for the next attempt. A driver killed in
-the gap between the `exit-code` write and the reap it implied leaves
-`DIR/exit-code` present *and* `DIR/.reap-pending` still set.
+**`collect` marks a run reap-pending before it writes `exit-code`, and the
+mark says how much is owed.** Whichever of the four endings a `collect` is
+about to take -- the plain `rm --branch` reap, or at least a proxy/token
+teardown under `--keep`, a zero-harvest verdict, or a failed evidence
+capture -- it first touches `DIR/.reap-pending`, in the run's own
+directory, with the conservative value `credentials`: only the proxy and
+token teardown is owed yet, because which of the four endings this
+`collect` actually reaches is not known until after the branch fetch and
+outbox read run. Only once it is certain to take the full `rm --branch`
+ending does it rewrite the mark to `full`, immediately before starting
+that `rm`. The mark is cleared only once the ending actually in progress
+(the teardown, or the full `rm`) succeeds; a failure leaves it in place
+for the next attempt, at whichever scope was last written. A driver
+killed in the gap between the `exit-code` write and the reap it implied
+leaves `DIR/exit-code` present *and* `DIR/.reap-pending` still set, at
+whatever scope had been decided by the time it died -- `credentials` for
+a kill anywhere before the full-`rm` ending starts (including mid-fetch,
+or a crash inside `collect` itself), `full` only once that ending is
+underway.
+
+**The same self-healing applies to the two runner-dead endings outside
+`collect`.** A composed (`--pipeline`, runner mode) run's `submit` and
+`wait` both poll the runner pod directly and can declare it dead before
+the agent ever starts -- before `collect` has any part to play. Each of
+these endings writes `exit-code 2` and then reaps this run outright (by
+branch, the same as `collect`'s own full `rm`), so each marks
+`DIR/.reap-pending` as `full` first, for the same reason and with the
+same self-healing: a driver killed between that write and the reap
+finishing leaves the mark in place for `adopt` to finish.
 
 **`fork-sandbox-status.sh` reads that combination as `orphaned`, not
 `done`/`failed`.** Both `run_state()`'s plain-text answer and `--json`
@@ -992,17 +1012,26 @@ confirmed-dead driver (the ordinary case: `collect` is still running)
 reads exactly as it always has -- `working`, not `orphaned` -- since the
 mark alone, without a dead driver, says nothing is wrong.
 
-**`adopt` finishes exactly this reap, scoped to the run alone.** On a run
-whose directory has both `exit-code` and `.reap-pending`, `adopt` takes
-the driver lock (refusing exactly as it does for every other case: held,
-un-lockable, or the driver still alive), then deletes every object
-carrying this run's own `fork-sandbox/run` label -- Job, pod, Service,
-Secret, ConfigMap, NetworkPolicy, all in one call -- clears the mark, and
-exits 0 with a one-line message. It never falls into the unrecoverable
-probe or `resume`'s own wait/collect: those exist for a run that never
-reached `exit-code` at all, not this one. A run.env with no `run_token`
-(written before this feature existed) is treated exactly like the
-already-finished case: a no-op, exit 0, no cluster call.
+**`adopt` finishes exactly this reap, scoped to the run alone and to what
+the mark says is owed.** On a run whose directory has both `exit-code`
+and `.reap-pending`, `adopt` takes the driver lock (refusing exactly as it
+does for every other case: held, un-lockable, or the driver still alive),
+then reads the mark's content. `full` deletes every object carrying this
+run's own `fork-sandbox/run` label -- Job, pod, Service, Secret,
+ConfigMap, NetworkPolicy, all in one call. Anything else -- `credentials`,
+or an older mark with no content at all -- deletes only this run's proxy
+and token Secret (by run label, the same scoped helper the unrecoverable
+branch below uses), leaving the Job, agent pod and scripts ConfigMap in
+place: exactly what a driver killed before `collect` ever committed to the
+full `rm` actually owed, so an interrupted `--keep`, a zero-harvest
+verdict, or a failed evidence capture is finished the same way `collect`
+itself would have finished it, not upgraded into deleting evidence nobody
+asked to discard. Either way `adopt` clears the mark on success and exits
+0 with a one-line message. It never falls into the unrecoverable probe or
+`resume`'s own wait/collect: those exist for a run that never reached
+`exit-code` at all, not this one. A run.env with no `run_token` (written
+before this feature existed) is treated exactly like the already-finished
+case: a no-op, exit 0, no cluster call.
 
 **The timing caveat.** Adoption is possible only while the pod is still
 alive -- `K8S_RUN_TTL` keeps ticking the whole time nobody is watching, and

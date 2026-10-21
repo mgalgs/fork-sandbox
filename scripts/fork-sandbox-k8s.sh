@@ -8958,14 +8958,20 @@ EOF
     # plus the claude-token Secret's own by-name delete, since that Secret
     # can be left unlabeled by a failure between its create and its label
     # call); for the pi harness, this is the trap that stays live for the
-    # rest of this function.
+    # rest of this function. K8S_SUBMIT_RUN_DIR is a third: once the
+    # runner-mode runner-dead ending below marks DIR/.reap-pending ahead of
+    # its own exit-code write, this trap's delete is what pays that mark
+    # off, so it clears the mark too (harmless no-op the rest of the time,
+    # when the mark was never set).
     K8S_SUBMIT_SAFE_NAME="$safe_name"
     K8S_SUBMIT_BRANCH="$branch"
+    K8S_SUBMIT_RUN_DIR="$run_dir_flag"
     trap '
         rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}" "${K8S_SUBMIT_RUN_DIR_TAR:-}"
         kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-codex-token" --ignore-not-found >&2
         kubectl delete job,pod,service,secret,configmap,networkpolicy \
             -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
+        [[ -n "${K8S_SUBMIT_RUN_DIR:-}" ]] && rm -f -- "$K8S_SUBMIT_RUN_DIR/.reap-pending"
         echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster" >&2
         echo "objects, if any were created (branch $K8S_SUBMIT_BRANCH)." >&2
     ' EXIT
@@ -9006,6 +9012,7 @@ EOF
             kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-codex-token" --ignore-not-found >&2
             kubectl delete job,pod,service,secret,configmap,networkpolicy \
                 -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
+            [[ -n "${K8S_SUBMIT_RUN_DIR:-}" ]] && rm -f -- "$K8S_SUBMIT_RUN_DIR/.reap-pending"
             echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster objects, if any were created (branch $K8S_SUBMIT_BRANCH)." >&2
         ' EXIT
         printf '%s' "$claude_access_token" \
@@ -9114,6 +9121,14 @@ EOF
                 k8s_save_terminal_status "$run_dir" "$runner_status"
                 k8s_report_unready_pod "$pod_name" "$services_ready_checks" true
                 k8s_capture_failed_agent_log "$pod_name" "$run_dir" false
+                # Marked BEFORE exit-code, same discipline as cmd_collect's
+                # own mark: this ending's cleanup is the EXIT trap's
+                # by-branch delete below, which a SIGKILL between this write
+                # and that trap running would skip entirely, leaving the Job
+                # and this run's proxy/token live with nothing left to tell
+                # adopt a reap is owed. "full": this ending owes the whole
+                # run, not just its credentials.
+                printf 'full\n' > "$run_dir/.reap-pending" 2>/dev/null || true
                 printf '2\n' > "$run_dir/exit-code"
                 fs_record_run_log "$run_dir"
                 exit 2
@@ -10383,8 +10398,21 @@ cmd_wait() {
                 if [[ "$probe" != true ]]; then
                     k8s_report_unready_pod "$pod_name" "" true
                     k8s_capture_failed_agent_log "$pod_name" "$run_dir" false
+                    # Marked BEFORE exit-code, same discipline as
+                    # cmd_collect's own mark: a SIGKILL between this write
+                    # and cmd_rm finishing below (or a failed cmd_rm) would
+                    # otherwise leave exit-code written with the Job and
+                    # this run's proxy/token still live, and nothing to
+                    # tell adopt a reap is owed. "full": this ending owes
+                    # the whole run, not just its credentials.
+                    [[ -n "$run_dir" ]] \
+                        && { printf 'full\n' > "$run_dir/.reap-pending" 2>/dev/null || true; }
                     printf '2\n' > "$run_dir/exit-code"
-                    cmd_rm --branch "$branch" || true
+                    local runner_dead_rm_rc=0
+                    cmd_rm --branch "$branch" || runner_dead_rm_rc=$?
+                    if (( runner_dead_rm_rc == 0 )); then
+                        [[ -n "$run_dir" ]] && rm -f -- "$run_dir/.reap-pending"
+                    fi
                     wait_terminal_teardown=true
                 fi
                 exit 2
@@ -10669,7 +10697,22 @@ cmd_collect() {
     # A standalone collect with no --run-dir has nowhere to write this and
     # needs no adopt/status reconciliation anyway (there is no run.env for
     # either to read), so it is skipped entirely in that case.
-    [[ -n "$run_dir" ]] && { : > "$run_dir/.reap-pending" 2>/dev/null || true; }
+    #
+    # The mark's content is the SCOPE of the reap it is standing in for,
+    # not just a bit: "credentials" (this run's proxy and token only, Job/
+    # pod/scripts kept for inspection) or "full" (the by-branch rm, which
+    # also removes the Job and agent pod). Which ending this collect takes
+    # is only known once the fetch and outbox read below have run, so the
+    # conservative "credentials" is written now and only promoted to
+    # "full" right before the one ending that owes it (the plain `cmd_rm
+    # --branch` below) actually starts it -- a driver killed any time
+    # before that promotion, including mid-fetch or in
+    # fs_collect_unexpected_failure's ERR trap, must read back as owing
+    # only its credentials, the same as it would have before this mark
+    # existed (a crashed collect left the Job and pod in place, read
+    # `failed`). adopt (cmd_adopt's pending-reap branch) reads this value
+    # to decide how much of the run it is safe to delete by run label.
+    [[ -n "$run_dir" ]] && { printf 'credentials\n' > "$run_dir/.reap-pending" 2>/dev/null || true; }
 
     # The review loop's outcome, when this run carried one. This is the
     # ONLY place a bad loop outcome ever surfaces: the agent's exit code
@@ -12013,6 +12056,13 @@ cmd_collect() {
         echo "fork-sandbox-k8s: ################################################" >&2
         exit 3
     else
+        # The only ending that owes the FULL reap (Job and agent pod
+        # included, not just the proxy and token) -- promote the mark from
+        # the conservative "credentials" written at the top of this
+        # function before starting it, so a driver killed mid-rm (or a
+        # failed rm below) leaves adopt a mark that says the whole run is
+        # owed, not just its credentials.
+        [[ -n "$run_dir" ]] && { printf 'full\n' > "$run_dir/.reap-pending" 2>/dev/null || true; }
         local rm_rc=0
         cmd_rm --branch "$branch" || rm_rc=$?
         if (( rm_rc != 0 )); then
@@ -12419,8 +12469,12 @@ wait for the agent, collect (evidence, outbox, the branch fetch, and
 session state for a --resume run), record the exit code, summary.json and
 the run-log line, and reap. On a run whose driver instead died AFTER
 writing the exit code but BEFORE finishing the reap that implied, this
-finishes just that reap (this run's own cluster objects, by its own run
-identity -- never the branch) instead.
+finishes just that reap, by its own run identity -- never the branch --
+scoped to what was actually owed: the whole run (Job and agent pod
+included) on an ordinary finish, or only this run's proxy and token
+Secret when the ending was --keep, a zero-harvest run, or evidence that
+could not be captured in full, all of which keep the Job, agent pod and
+scripts for inspection.
 
 Safe to call blindly, on every startup, for every in-flight run: a no-op,
 exit 0, on a run that already finished with nothing left to reap; a
@@ -12525,12 +12579,40 @@ EOF
                 "$(tr -dc '0-9-' < "$run_dir/exit-code" 2>/dev/null)); nothing to do." >&2
             exit 0
         fi
-        if kubectl delete job,pod,service,secret,configmap,networkpolicy \
-            -l fork-sandbox/run="$adopt_run_token" --ignore-not-found >&2; then
-            rm -f -- "$run_dir/.reap-pending"
-            echo "fork-sandbox-k8s: adopt: $run_dir's driver died before" \
-                "finishing its reap; finished it." >&2
-            exit 0
+        # The mark's content says how much the dead driver actually owed.
+        # "full" is the only scope that also removes the Job and agent pod
+        # (collect's plain `cmd_rm --branch` ending, or a runner-dead
+        # wait/submit ending, both of which promote/write "full" before
+        # taking that path). Every other content -- an older mark with
+        # none, "credentials", or anything unrecognized -- reads as
+        # credentials-only, the conservative choice: a driver killed
+        # before collect ever reached that full-rm ending must not cost an
+        # operator their --keep, their zero-harvest evidence, or their only
+        # record of a failed evidence capture (see collect's own comments
+        # on each of those three endings).
+        local adopt_reap_scope
+        adopt_reap_scope="$(tr -d '[:space:]' < "$run_dir/.reap-pending" 2>/dev/null)"
+        if [[ "$adopt_reap_scope" == full ]]; then
+            if kubectl delete job,pod,service,secret,configmap,networkpolicy \
+                -l fork-sandbox/run="$adopt_run_token" --ignore-not-found >&2; then
+                rm -f -- "$run_dir/.reap-pending"
+                echo "fork-sandbox-k8s: adopt: $run_dir's driver died before" \
+                    "finishing its reap; finished it." >&2
+                exit 0
+            fi
+        else
+            local adopt_branch_for_scope
+            adopt_branch_for_scope="$(read_env_value "$env_file" BRANCH || true)"
+            if [[ -n "$adopt_branch_for_scope" ]] \
+                && k8s_reap_proxy_credentials_by_run_token \
+                    "$(k8s_safe_name fork-sandbox-agent "$adopt_branch_for_scope")" \
+                    "$adopt_run_token"; then
+                rm -f -- "$run_dir/.reap-pending"
+                echo "fork-sandbox-k8s: adopt: $run_dir's driver died before" \
+                    "finishing its reap; removed its proxy and token" \
+                    "(Job, agent pod and scripts kept for inspection)." >&2
+                exit 0
+            fi
         fi
         echo "Error: adopt: could not finish $run_dir's pending reap; its" >&2
         echo "mark is left in place for a future adopt to retry." >&2
