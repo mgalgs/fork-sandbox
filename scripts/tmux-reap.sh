@@ -4,10 +4,17 @@
 #
 # Usage:
 #   tmux-reap.sh                          reap $TMUX_PANE, then sweep
+#   tmux-reap.sh --delay SECS             same, after a visible countdown
 #   tmux-reap.sh --sweep [--grace SECS]   sweep only
 #   tmux-reap.sh -h | --help
 #
 # Options:
+#   --delay SECS      reap after SECS instead of now, so the pane's last
+#                     words stay readable. Returns at once; a detached
+#                     timer prefixes the pane's window name with the time
+#                     left (`⏳1:45 name`), restores the name, then reaps.
+#                     Moving the pane to another window, or closing it,
+#                     cancels the reap.
 #   --grace SECS      for --sweep: close panes reaped at least SECS ago
 #                     (default 86400, 24h).
 #   --term-wait SECS  for --sweep: how long to wait after SIGTERM before
@@ -40,6 +47,8 @@ grace=86400
 grace_set=
 term_wait=30
 mode=reap
+delay=0
+countdown=
 
 usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^$/d'; }
 
@@ -56,6 +65,9 @@ while (( $# )); do
         --sweep) mode=sweep; shift ;;
         --grace) num --grace "${2:-}"; grace="$2"; grace_set=1; shift 2 ;;
         --term-wait) num --term-wait "${2:-}"; term_wait="$2"; shift 2 ;;
+        --delay) num --delay "${2:-}"; delay="$2"; shift 2 ;;
+        # Internal: the detached timer --delay starts.
+        --countdown) num --countdown "${2:-}"; countdown="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -66,6 +78,10 @@ if [[ "$mode" == reap && -n "$grace_set" ]]; then
     echo "Error: --grace applies to --sweep only" >&2
     exit 1
 fi
+if [[ "$mode" == sweep && ( "$delay" != 0 || -n "$countdown" ) ]]; then
+    echo "Error: --delay applies to a reap, not --sweep" >&2
+    exit 1
+fi
 
 # Session name of a pane id, empty if the pane is gone. (display-message -t
 # on a vanished id falls back to some current pane, so look the id up.)
@@ -74,12 +90,48 @@ pane_session() {
         awk -v p="$1" '$1 == p { print $2; exit }'
 }
 
-reap() {
+pane_window() {
+    tmux list-panes -a -F '#{pane_id} #{window_id}' 2>/dev/null |
+        awk -v p="$1" '$1 == p { print $2; exit }'
+}
+
+caller_pane() {
     local pane="${TMUX_PANE:?TMUX_PANE must be set: this reaps the calling pane}"
     if [[ ! "$pane" =~ ^%[0-9]+$ ]]; then
         echo "Error: unexpected TMUX_PANE '$pane'" >&2
         exit 1
     fi
+    printf '%s\n' "$pane"
+}
+
+# Counts down in the window name for $2 seconds, then restores it. Returns
+# 1 when the pane closed or left its window meanwhile: that cancels the reap.
+count_down() {
+    local pane="$1" left="$2" win name auto rc=0
+    win="$(pane_window "$pane")"
+    [[ -n "$win" ]] || return 1
+    name="$(tmux display-message -p -t "$win" '#{window_name}')"
+    # rename-window turns automatic-rename off; put back whatever was set.
+    auto="$(tmux show-options -w -v -t "$win" automatic-rename 2>/dev/null || true)"
+    while (( left > 0 )); do
+        if [[ "$(pane_window "$pane")" != "$win" ]]; then rc=1; break; fi
+        tmux rename-window -t "$win" "⏳$(( left / 60 )):$(printf '%02d' $(( left % 60 ))) $name"
+        sleep 1
+        left=$(( left - 1 ))
+    done
+    tmux rename-window -t "$win" "$name" 2>/dev/null || true
+    if [[ -z "$auto" ]]; then
+        tmux set-option -w -u -t "$win" automatic-rename 2>/dev/null || true
+    else
+        tmux set-option -w -t "$win" automatic-rename "$auto" 2>/dev/null || true
+    fi
+    if [[ "$(pane_window "$pane")" != "$win" ]]; then rc=1; fi
+    return "$rc"
+}
+
+reap() {
+    local pane
+    pane="$(caller_pane)"
     if [[ "$(pane_session "$pane")" != "$session" ]]; then
         local placeholder=""
         if ! tmux has-session -t "=$session" 2>/dev/null; then
@@ -118,6 +170,18 @@ sweep() {
     done < <(tmux list-panes -s -t "=$session" -F '#{pane_id} #{pane_pid} #{@reaped_at}' 2>/dev/null)
     (( closed > 0 )) || echo "Nothing to close in session $session."
 }
+
+if [[ "$mode" == reap && "$delay" != 0 ]]; then
+    pane="$(caller_pane)"
+    # setsid -f: the timer must outlive the caller's shell and its process
+    # group, which a harness may kill as soon as this command returns.
+    setsid -f "${BASH_SOURCE[0]}" --countdown "$delay" </dev/null >/dev/null 2>&1
+    echo "Reaping $pane in ${delay}s; its window name counts down. Move the pane to another window to keep it."
+    exit 0
+fi
+if [[ -n "$countdown" ]]; then
+    count_down "$(caller_pane)" "$countdown" || exit 0
+fi
 
 [[ "$mode" == sweep ]] || reap
 sweep

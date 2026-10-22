@@ -132,9 +132,12 @@ writing a detailed handoff so nothing gets dropped.
    - **Exit 0, and nothing here is left for the user:** no result you
      have not reported, no question awaiting their answer, no task you
      own still running. Say in one line that this pane is retiring, then
-     run `tmux-reap.sh`. It moves this pane into the tmux session
-     `reaped`; a later reap closes it with SIGTERM once it is 24 hours
-     old, and the transcript is kept. To keep a pane, move its window
-     out of `reaped` before then.
+     run `tmux-reap.sh --delay 120`. The two minutes leave your closing
+     words on screen for the user, with the time left counting down in
+     the window name; then the pane moves into the tmux session
+     `reaped`, and a later reap closes it with SIGTERM once it is 24
+     hours old, keeping the transcript. To keep the pane, move it to
+     another window during the countdown, or move its window out of
+     `reaped` before the 24 hours are up.
    - **Exit 0, but something remains:** stay. When the last of it is
-     done and reported, run `tmux-reap.sh` then.
+     done and reported, run `tmux-reap.sh --delay 120` then.
