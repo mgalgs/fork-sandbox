@@ -269,6 +269,57 @@ else
     no "a malformed lanes.json is refused and left byte-identical" "rc=$rc: $out"
 fi
 
+printf '== lanes.json: register --dir failure handling ==\n'
+
+# A flock that fails (e.g. an incompatible one earlier on PATH) must stop
+# the update cold -- not fall through to an unlocked read-modify-write that
+# exits 0 as if nothing were wrong.
+fake_bin="$(mktemp -d)"
+dir_homes+=("$fake_bin")
+cat > "$fake_bin/flock" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$fake_bin/flock"
+
+flock_fail_home="$(mktemp -d)"
+dir_homes+=("$flock_fail_home")
+flock_fail_json="$flock_fail_home/.local/state/fork-sandbox/lanes.json"
+dir_sids+=("$sid-dir6")
+out="$(PATH="$fake_bin:$PATH" HOME="$flock_fail_home" CLAUDE_CODE_SESSION_ID="$sid-dir6" \
+    "$lane_mail" register ff --dir /tmp/lane-mail-test-proj/f 2>&1)"; rc=$?
+if (( rc != 0 )) && ! json_value "$flock_fail_json" /tmp/lane-mail-test-proj/f >/dev/null 2>&1; then
+    ok "a flock failure refuses the write instead of racing unlocked"
+else
+    no "a flock failure refuses the write instead of racing unlocked" "rc=$rc out=$out"
+fi
+
+# A failing rename (e.g. the target filesystem is full or read-only) must
+# also be reported, not silently swallowed with the entry never recorded
+# and a stray temp file left behind.
+fake_bin2="$(mktemp -d)"
+dir_homes+=("$fake_bin2")
+cat > "$fake_bin2/mv" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$fake_bin2/mv"
+
+mv_fail_home="$(mktemp -d)"
+dir_homes+=("$mv_fail_home")
+mv_fail_json="$mv_fail_home/.local/state/fork-sandbox/lanes.json"
+mv_fail_dir="$mv_fail_home/.local/state/fork-sandbox"
+dir_sids+=("$sid-dir7")
+out="$(PATH="$fake_bin2:$PATH" HOME="$mv_fail_home" CLAUDE_CODE_SESSION_ID="$sid-dir7" \
+    "$lane_mail" register gg --dir /tmp/lane-mail-test-proj/g 2>&1)"; rc=$?
+leftover="$(find "$mv_fail_dir" -maxdepth 1 -name '.lanes.json.*' 2>/dev/null)"
+if (( rc != 0 )) && ! json_value "$mv_fail_json" /tmp/lane-mail-test-proj/g >/dev/null 2>&1 &&
+    [[ -z "$leftover" ]]; then
+    ok "a failing rename refuses the write and leaves no temp file behind"
+else
+    no "a failing rename refuses the write and leaves no temp file behind" "rc=$rc out=$out leftover=$leftover"
+fi
+
 printf '== lanes.json: register --dir concurrency ==\n'
 
 conc_home="$(mktemp -d)"

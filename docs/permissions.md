@@ -128,6 +128,13 @@ that text to every session that mentions the lane, so under this approval one
 session can change what others are told a lane owns. That stays inside the
 fixed root, and mail is already a cross-session channel.
 
+Another write is shared across sessions and lies outside that fixed root:
+`register <lane> --dir <abs-path>` records `<abs-path> -> <lane>` in
+`~/.local/state/fork-sandbox/lanes.json` (and a lock/temp file beside it).
+Any session can pass any absolute path, so this approval lets one session
+repoint another directory's remembered lane, the same way the `--about`
+write above lets one session redescribe another's.
+
 That fixed root bounds where this writes, not what it reads. `send` and
 `reply` pass `"$@"` straight through to `fork-sandbox-mail.sh`, whose
 `--body <file>` and `--attach <file>` read any path the caller can already

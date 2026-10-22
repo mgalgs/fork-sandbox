@@ -352,7 +352,11 @@ lanes_json_set() {
     lanes_dir="$(dirname -- "$LANES_JSON")"
     mkdir -p -- "$lanes_dir"
     exec {lock_fd}>"$LANES_JSON.lock"
-    flock -x "$lock_fd"
+    if ! flock -x "$lock_fd"; then
+        echo "lane-mail: could not lock $LANES_JSON.lock" >&2
+        exec {lock_fd}>&- 2>/dev/null || true
+        return 1
+    fi
     tmp="$(mktemp "$lanes_dir/.lanes.json.XXXXXX")"
     python3 - "$LANES_JSON" "$dir" "$lane" "$tmp" <<'PY' || rc=$?
 import json
@@ -386,7 +390,12 @@ PY
         exec {lock_fd}>&- 2>/dev/null || true
         return "$rc"
     fi
-    mv -f -- "$tmp" "$LANES_JSON"
+    if ! mv -f -- "$tmp" "$LANES_JSON"; then
+        rm -f -- "$tmp"
+        flock -u "$lock_fd" 2>/dev/null || true
+        exec {lock_fd}>&- 2>/dev/null || true
+        return 1
+    fi
     flock -u "$lock_fd" 2>/dev/null || true
     exec {lock_fd}>&- 2>/dev/null || true
 }
