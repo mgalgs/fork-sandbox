@@ -126,51 +126,32 @@ printf '== --delay ==\n'
 
 "$reap" --sweep --delay 5 >/dev/null 2>&1 && no "--delay with --sweep refused" || ok "--delay with --sweep refused"
 
-# A split window, so the window outlives the reaped pane and its name can
-# be checked after the countdown hands it back.
-win="$(tmux new-window -d -t main: -n keepname -P -F '#{window_id}' "sleep 610")"
-delayed="$(tmux split-window -d -t "$win" -P -F '#{pane_id}' "sleep 611")"
-auto_before="$(tmux show-options -w -v -t "$win" automatic-rename 2>/dev/null)"
+# --delay blocks for the delay with the pane left where it is, then reaps.
+delayed="$(tmux new-window -d -t main: -P -F '#{pane_id}' "sleep 610")"
 start=$(date +%s)
-out="$(TMUX_PANE="$delayed" "$reap" --delay 3 2>&1)"; rc=$?
-[[ $rc == 0 && $(( $(date +%s) - start )) -le 1 ]] && ok "--delay returns at once" || no "--delay returns at once" "rc=$rc"
-[[ "$out" == *"Reaping $delayed in 3s"* ]] && ok "--delay says when it will reap" || no "--delay says when it will reap" "$out"
+TMUX_PANE="$delayed" "$reap" --delay 2 >/dev/null 2>&1 &
+bg=$!
 sleep 1
-[[ "$(tmux display-message -p -t "$win" '#{window_name}')" == "⏳"*" keepname" ]] \
-    && ok "the window name counts down" || no "the window name counts down" "$(tmux display-message -p -t "$win" '#{window_name}')"
 [[ "$(tmux display-message -p -t "$delayed" '#{session_name}')" == main ]] \
-    && ok "the pane stays put during the countdown" || no "the pane stays put during the countdown"
-sleep 4
+    && ok "the pane stays put during the delay" || no "the pane stays put during the delay"
+wait "$bg"; rc=$?
+elapsed=$(( $(date +%s) - start ))
+[[ $rc == 0 && $elapsed -ge 2 ]] && ok "--delay blocks for the delay" || no "--delay blocks for the delay" "rc=$rc elapsed=${elapsed}s"
 [[ "$(tmux display-message -p -t "$delayed" '#{session_name}')" == reaped ]] \
-    && ok "the pane is reaped when the countdown ends" || no "the pane is reaped when the countdown ends"
-[[ "$(tmux display-message -p -t "$win" '#{window_name}')" == keepname ]] \
-    && ok "the window name is restored" || no "the window name is restored" "$(tmux display-message -p -t "$win" '#{window_name}')"
-[[ "$(tmux show-options -w -v -t "$win" automatic-rename 2>/dev/null)" == "$auto_before" ]] \
-    && ok "automatic-rename is put back as it was" || no "automatic-rename is put back as it was"
+    && ok "the pane is reaped after the delay" || no "the pane is reaped after the delay"
 
-# A window with automatic-rename inherited (not set on the window) gets it
-# back inherited, not pinned off by the countdown's renames.
-win3="$(tmux new-window -d -t main: -P -F '#{window_id}' "sleep 614")"
-tmux set-option -w -u -t "$win3" automatic-rename
-auto_pane="$(tmux split-window -d -t "$win3" -P -F '#{pane_id}' "sleep 615")"
-TMUX_PANE="$auto_pane" "$reap" --delay 1 >/dev/null 2>&1
-sleep 3
-[[ -z "$(tmux show-options -w -v -t "$win3" automatic-rename 2>/dev/null)" ]] \
-    && ok "an inherited automatic-rename stays inherited" || no "an inherited automatic-rename stays inherited"
-
-# Moving the pane to another window during the countdown keeps it.
-win2="$(tmux new-window -d -t main: -n stayname -P -F '#{window_id}' "sleep 612")"
-kept="$(tmux split-window -d -t "$win2" -P -F '#{pane_id}' "sleep 613")"
-TMUX_PANE="$kept" "$reap" --delay 3 >/dev/null 2>&1
+# Killing the waiting command cancels the reap.
+kept="$(tmux new-window -d -t main: -P -F '#{pane_id}' "sleep 611")"
+TMUX_PANE="$kept" "$reap" --delay 5 >/dev/null 2>&1 &
+bg=$!
 sleep 1
-tmux break-pane -d -s "$kept" -t main:
-sleep 4
+kill -TERM "$bg"
+wait "$bg" 2>/dev/null
+sleep 5
 [[ "$(tmux display-message -p -t "$kept" '#{session_name}')" == main ]] \
-    && ok "moving the pane out of its window cancels the reap" || no "moving the pane out of its window cancels the reap"
+    && ok "killing the wait cancels the reap" || no "killing the wait cancels the reap"
 [[ -z "$(tmux display-message -p -t "$kept" '#{@reaped_at}')" ]] \
     && ok "a cancelled reap stamps nothing" || no "a cancelled reap stamps nothing"
-[[ "$(tmux display-message -p -t "$win2" '#{window_name}')" == stayname ]] \
-    && ok "a cancelled countdown restores the window name" || no "a cancelled countdown restores the window name" "$(tmux display-message -p -t "$win2" '#{window_name}')"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
