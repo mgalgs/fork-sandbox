@@ -385,6 +385,16 @@ remote ones that have written here, and peer hosts, as
 `<source><TAB><lane><TAB><description>` lines. The `lane-mail-register`
 skill wraps registration and explains the listing.
 
+`register <lane> --dir <abs-path>` also remembers `<lane>` as the lane for
+that project directory, and `lane-mail.sh lane-for <abs-path>` reads it
+back. It prints nothing and exits 1 when no lane is remembered. The table
+lives in `~/.local/state/fork-sandbox/lanes.json`, a flat JSON object keyed
+by directory. `lane-mail.sh` writes it under a lock with an atomic rename,
+so two sessions registering at once both land. Go through the two verbs,
+never the file: a hand edit is a read-modify-write that can drop another
+session's entry. The caller passes the directory because only the caller
+knows its primary working directory. `$PWD` drifts.
+
 A lane can carry a one-line description of what it owns, so a name like
 `@alpha` is not taken to mean "anything alpha-related" when its owner means
 one repo. Set it with `lane-mail.sh describe <lane> "<text>"` (`""` clears

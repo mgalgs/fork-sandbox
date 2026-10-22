@@ -10,39 +10,37 @@ Lane mail itself (`lane-mail.sh`, `lane-mail-watch.sh`, the hooks) is
 documented in this repo's `docs/agent-mail.md`. This skill picks a lane
 name, runs the registration, and says how to find other lanes.
 
-Directory→lane choices are remembered in
-`~/.local/state/fork-sandbox/lanes.json`, a flat JSON object keyed by
-absolute project directory:
+`lane-mail.sh` remembers the lane last used in each project directory. It
+owns that table: look it up with `lane-mail.sh lane-for <dir>` and record
+it with `register --dir`. Never read or write the file behind it
+yourself. A hand edit there can silently drop another session's entry.
 
-```json
-{"/home/user/src/frontend": "fe", "/home/user/src/backend": "be"}
-```
+Throughout, `<dir>` is this session's **primary working directory**, as
+an absolute path from the environment block, not wherever the Bash cwd
+has drifted to.
 
 ## Steps
 
-1. **Pick the lane.** The key is this session's primary working directory
-   (from the environment block), not wherever the Bash cwd has drifted to.
+1. **Pick the lane.**
    - An argument was given: use it, minus any leading `@`.
-   - Otherwise Read `lanes.json` and use the entry for the key. A missing
-     file or key just means no entry.
+   - Otherwise run `lane-mail.sh lane-for <dir>`. It prints the lane
+     remembered for this directory, or prints nothing and exits 1 when
+     there is none.
    - Otherwise invent one from the session's context: what this session is
      orchestrating, else the project's name. Keep it short (2–6 chars, like
      `fe` or `infra`) and matching `^[a-z0-9][a-z0-9-]*$`.
 
-2. **Register:** `lane-mail.sh register <lane>`. It replaces any lane this
-   session already held.
+2. **Register and remember:** `lane-mail.sh register <lane> --dir <dir>`.
+   It replaces any lane this session already held, and records `<lane>`
+   as the one this directory uses next time.
 
    If the lane has no description yet (the third column of
    `lane-mail.sh lanes`), ask the user what it owns, or infer it from
-   context, and register with `--about "<one line>"` (or run
+   context, and add `--about "<one line>"` (or run
    `lane-mail.sh describe <lane> "<one line>"` afterwards). Never replace an
    existing description unasked.
 
-3. **Remember it.** If the lane differs from the file's entry for the key,
-   or there was none, write the updated object back (Write the whole file;
-   create it if missing). Leave other keys untouched.
-
-   **Name the window.** When `$TMUX` is set, run
+3. **Name the window.** When `$TMUX` is set, run
    `tmux rename-window -t "$TMUX_PANE" <lane>`, so the operator can tell
    from the status bar which window holds which lane. `-t "$TMUX_PANE"`
    targets this session's own window, not whichever one has focus.
@@ -58,7 +56,7 @@ absolute project directory:
    no watch running means the lane goes deaf.
 
 5. **Report in one line** — the lane and where the name came from:
-   `Registered as @fe (from lanes.json)` / `(as asked)` /
+   `Registered as @fe (remembered for this directory)` / `(as asked)` /
    `(guessed from context — say if you want another)`.
 
 ## Finding lanes
@@ -73,8 +71,8 @@ is empty when unset, and always for `remote` and `peer`):
 | `remote` | `lane:host`, a lane on another host that has written here |
 | `peer` | a host from the peers file; its lanes are `@<lane>:<peer>` |
 
-`lane-mail.sh list` lists *messages*, not lanes. There is no other lane
-subcommand, so do not guess one, and do not read the registry or the
+`lane-mail.sh list` lists *messages*, not lanes. There is no other way to
+list lanes, so do not guess a subcommand, and do not read the registry or the
 mail root by hand.
 
 To reach the session behind a lane **now**, use `ListAgents`: session
