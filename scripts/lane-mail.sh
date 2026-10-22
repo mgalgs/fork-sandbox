@@ -481,11 +481,13 @@ case "$cmd" in
                 set_description "$lane" "$about" || exit 2
             fi
         fi
+        # First of the writes: a malformed lanes.json refuses before the
+        # session is registered, so the refusal changes nothing.
+        if (( have_dir )); then lanes_json_set "$dir" "$lane" || exit $?; fi
         mkdir -p "$LANES_DIR"
         printf '%s\n' "$lane" > "$LANES_DIR/$sid"
         echo "lane-mail: session ${sid:0:8}... registered as @$lane"
         if (( have_about )); then set_description "$lane" "$about"; fi
-        if (( have_dir )); then lanes_json_set "$dir" "$lane" || exit $?; fi
         # Registering arms no watch. Say how, here, where the caller acts.
         echo "lane-mail: to be woken when mail lands, run 'lane-mail-watch.sh $lane --wait'"
         echo "lane-mail: as a background command (not a Monitor, which expires); mark"

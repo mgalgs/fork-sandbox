@@ -268,6 +268,11 @@ if (( rc != 0 )) && cmp -s -- "$malformed_json" "$malformed_json.bak" && [[ "$ou
 else
     no "a malformed lanes.json is refused and left byte-identical" "rc=$rc: $out"
 fi
+if [[ ! -e "/tmp/claude-$(id -u)/lane-mail-lanes/$sid-dir5" ]]; then
+    ok "a malformed lanes.json refuses before the session is registered"
+else
+    no "a malformed lanes.json refuses before the session is registered" "registration written"
+fi
 
 printf '== lanes.json: register --dir failure handling ==\n'
 
