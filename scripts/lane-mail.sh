@@ -1,7 +1,7 @@
 #!/bin/bash
 # lane-mail.sh -- :approved: Agent mail between lane sessions
 #
-# Usage: lane-mail.sh register <lane> [--about "<text>"]
+# Usage: lane-mail.sh register <lane> [--about "<text>"] [--dir <abs-path>]
 #        lane-mail.sh describe <lane> "<text>"     ("" clears; "-" reads stdin)
 #        lane-mail.sh registration
 #        lane-mail.sh unregister
@@ -29,6 +29,17 @@
 # survives a handoff replacing the session. Only local lanes have one: a
 # `lane:host` is refused, and nothing is synced between hosts.
 #
+# `~/.local/state/fork-sandbox/lanes.json` remembers, per project directory,
+# the lane last used there: a flat JSON object mapping an absolute directory
+# to a lane name. `register <lane> --dir <abs-path>` records that mapping
+# (the directory is given by the caller, since neither this script nor $PWD
+# reliably knows a session's primary working directory). A trailing slash is
+# not part of the key ("/a/b/" and "/a/b" are the same entry; "/" stays "/"),
+# and the path is not resolved through symlinks. This is the only code that
+# writes that file: callers go through this verb, never a direct Read/Write
+# of the JSON, so a lock and an atomic rename -- not "last writer wins" --
+# settle two sessions registering a directory at nearly the same moment.
+#
 # The fork-sandbox mail store (fork-sandbox-mail.sh; format and semantics in
 # this repo's docs/agent-mail.md), pointed at a root reserved for
 # lane-to-lane mail:
@@ -49,8 +60,9 @@
 # never pass it, so the approved invocation surface cannot be pointed at
 # another store, and no env-var prefix (which would defeat allowlist
 # matching) is ever needed. Writes are bounded to the mail root (including
-# the scratch files of an in-flight cross-host send, under it) and the
-# per-user lane registry below.
+# the scratch files of an in-flight cross-host send, under it), the
+# per-user lane registry below, and the directory->lane table (lanes.json,
+# above).
 #
 # Other hosts. An address `@lane:host` names a lane on a peer host; a bare
 # `@lane` is this host. `send`/`reply` with such a recipient (for a reply,
@@ -100,6 +112,7 @@ source "$script_dir/lane-mail-lib.sh"
 mail_bin="$script_dir/fork-sandbox-mail.sh"
 
 LANES_DIR="/tmp/claude-$(id -u)/lane-mail-lanes"
+LANES_JSON="$HOME/.local/state/fork-sandbox/lanes.json"
 work=""    # scratch dir of an in-flight cross-host send; removed on exit
 
 usage() {
@@ -313,6 +326,69 @@ read_description_stdin() {
     desc_text="$(cat -- "$desc_tmp")"   # drops trailing newlines
 }
 
+# Drops one trailing slash from a directory key ("/a/b/" -> "/a/b"; the root
+# "/" is left alone). Does not resolve symlinks: the key must match what the
+# caller later looks up with, not what the path resolves to.
+normalize_lane_dir() {
+    local d="$1"
+    if [[ "$d" == / ]]; then
+        printf '%s' "$d"
+    else
+        printf '%s' "${d%/}"
+    fi
+}
+
+# Sets lanes.json's entry for directory $1 to lane $2, under an exclusive
+# lock: read the object, set the one key, write a temp file in the same
+# directory, rename it into place, release. A missing file or parent
+# directory is created. A file that exists but is not a JSON object is left
+# untouched; its path is named on stderr and this returns non-zero.
+lanes_json_set() {
+    local dir lane lanes_dir lock_fd tmp rc=0
+    dir="$(normalize_lane_dir "$1")"
+    lane="$2"
+    lanes_dir="$(dirname -- "$LANES_JSON")"
+    mkdir -p -- "$lanes_dir"
+    exec {lock_fd}>"$LANES_JSON.lock"
+    flock -x "$lock_fd"
+    tmp="$(mktemp "$lanes_dir/.lanes.json.XXXXXX")"
+    python3 - "$LANES_JSON" "$dir" "$lane" "$tmp" <<'PY' || rc=$?
+import json
+import sys
+
+path, dirkey, lane, tmp = sys.argv[1:5]
+try:
+    with open(path) as f:
+        text = f.read()
+except FileNotFoundError:
+    text = ""
+
+data = {}
+if text.strip():
+    try:
+        data = json.loads(text)
+    except ValueError:
+        sys.stderr.write("lane-mail: %s is not valid JSON; left untouched\n" % path)
+        sys.exit(1)
+    if not isinstance(data, dict):
+        sys.stderr.write("lane-mail: %s is not a JSON object; left untouched\n" % path)
+        sys.exit(1)
+
+data[dirkey] = lane
+with open(tmp, "w") as f:
+    json.dump(data, f)
+PY
+    if (( rc != 0 )); then
+        rm -f -- "$tmp"
+        flock -u "$lock_fd" 2>/dev/null || true
+        exec {lock_fd}>&- 2>/dev/null || true
+        return "$rc"
+    fi
+    mv -f -- "$tmp" "$LANES_JSON"
+    flock -u "$lock_fd" 2>/dev/null || true
+    exec {lock_fd}>&- 2>/dev/null || true
+}
+
 cmd="${1:-}"
 case "$cmd" in
     describe)
@@ -325,21 +401,29 @@ case "$cmd" in
         set_description "$2" "$text"
         ;;
     register)
-        lane="" about="" have_about=0
+        lane="" about="" have_about=0 dir="" have_dir=0
         shift
         while (( $# )); do
             case "$1" in
                 --about)
                     (( $# >= 2 )) || { echo "lane-mail: --about needs a value" >&2; exit 2; }
                     about="$2"; have_about=1; shift 2 ;;
+                --dir)
+                    (( $# >= 2 )) || { echo "lane-mail: --dir needs a value" >&2; exit 2; }
+                    dir="$2"; have_dir=1; shift 2 ;;
                 *)
-                    [[ -z "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"]" >&2; exit 2; }
+                    [[ -z "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"] [--dir <abs-path>]" >&2; exit 2; }
                     lane="$1"; shift ;;
             esac
         done
-        [[ -n "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"]" >&2; exit 2; }
+        [[ -n "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"] [--dir <abs-path>]" >&2; exit 2; }
         if [[ ! "$lane" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
             echo "lane-mail: bad lane name '$lane' (want ^[a-z0-9][a-z0-9-]*$, no leading @)" >&2
+            exit 2
+        fi
+        # Validate --dir before anything is written, same as --about below.
+        if (( have_dir )) && [[ "$dir" != /* ]]; then
+            echo "lane-mail: --dir must be an absolute path (got '$dir')" >&2
             exit 2
         fi
         sid="${CLAUDE_CODE_SESSION_ID:?lane-mail: CLAUDE_CODE_SESSION_ID is not set; run from inside a Claude Code session}"
@@ -357,6 +441,7 @@ case "$cmd" in
         printf '%s\n' "$lane" > "$LANES_DIR/$sid"
         echo "lane-mail: session ${sid:0:8}... registered as @$lane"
         if (( have_about )); then set_description "$lane" "$about"; fi
+        if (( have_dir )); then lanes_json_set "$dir" "$lane" || exit $?; fi
         # Registering arms no watch. Say how, here, where the caller acts.
         echo "lane-mail: to be woken when mail lands, run 'lane-mail-watch.sh $lane --wait'"
         echo "lane-mail: as a background command (not a Monitor, which expires); mark"

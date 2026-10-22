@@ -17,12 +17,41 @@ fail=0
 ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
 no() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; fail=$(( fail + 1 )); }
 
+# Reads lanes.json directly, never through lane-mail.sh.
+json_value() {  # json_value <file> <key>
+    python3 -c '
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(3)
+if not isinstance(data, dict) or key not in data:
+    sys.exit(1)
+print(data[key])
+' "$1" "$2"
+}
+
 sid="lane-mail-test-$$-$RANDOM"
 lanes_file="/tmp/claude-$(id -u)/lane-mail-lanes/$sid"
 sid2="$sid-b"
 lanes_file2="/tmp/claude-$(id -u)/lane-mail-lanes/$sid2"
 scratch="$(mktemp -d)"
-trap 'rm -f -- "$lanes_file" "$lanes_file2"; rm -rf -- "$scratch"' EXIT
+dir_sids=()   # extra session ids used by the lanes.json tests below
+dir_homes=()  # scratch $HOME dirs used by the lanes.json tests below
+cleanup() {
+    rm -f -- "$lanes_file" "$lanes_file2"
+    rm -rf -- "$scratch"
+    local s h
+    for s in "${dir_sids[@]:-}"; do
+        [[ -n "$s" ]] && rm -f -- "/tmp/claude-$(id -u)/lane-mail-lanes/$s"
+    done
+    for h in "${dir_homes[@]:-}"; do
+        [[ -n "$h" ]] && rm -rf -- "$h"
+    done
+}
+trap cleanup EXIT
 
 printf '== register ==\n'
 
@@ -173,6 +202,95 @@ if (( rc != 0 )) && [[ "$(CLAUDE_CODE_SESSION_ID="$sid2" "$sc" registration)" ==
     ok "register --about with bad text refuses before registering"
 else
     no "register --about with bad text refuses before registering" "rc=$rc: $out"
+fi
+
+printf '== lanes.json: register --dir (write path) ==\n'
+
+lanes_home="$(mktemp -d)"
+dir_homes+=("$lanes_home")
+lanes_json="$lanes_home/.local/state/fork-sandbox/lanes.json"
+
+dir_sids+=("$sid-dir1")
+out="$(HOME="$lanes_home" CLAUDE_CODE_SESSION_ID="$sid-dir1" "$lane_mail" register fe --dir /tmp/lane-mail-test-proj/a 2>&1)"; rc=$?
+got="$(json_value "$lanes_json" /tmp/lane-mail-test-proj/a 2>&1)"
+if (( rc == 0 )) && [[ "$got" == fe ]]; then
+    ok "register --dir creates the file and parent directory and records the entry"
+else
+    no "register --dir creates the file and parent directory and records the entry" "rc=$rc out=$out got=$got"
+fi
+
+dir_sids+=("$sid-dir2")
+HOME="$lanes_home" CLAUDE_CODE_SESSION_ID="$sid-dir2" "$lane_mail" register be --dir /tmp/lane-mail-test-proj/b >/dev/null 2>&1
+got_a="$(json_value "$lanes_json" /tmp/lane-mail-test-proj/a 2>&1)"
+got_b="$(json_value "$lanes_json" /tmp/lane-mail-test-proj/b 2>&1)"
+if [[ "$got_a" == fe && "$got_b" == be ]]; then
+    ok "registering a second directory leaves the first entry intact"
+else
+    no "registering a second directory leaves the first entry intact" "a=$got_a b=$got_b"
+fi
+
+# A trailing slash is not part of the key: "/c/" and "/c" write the same entry.
+dir_sids+=("$sid-dir3")
+HOME="$lanes_home" CLAUDE_CODE_SESSION_ID="$sid-dir3" "$lane_mail" register ce --dir /tmp/lane-mail-test-proj/c/ >/dev/null 2>&1
+got="$(json_value "$lanes_json" /tmp/lane-mail-test-proj/c 2>&1)"
+if [[ "$got" == ce ]] && ! grep -q '/c/"' "$lanes_json"; then
+    ok "a trailing slash is dropped from the key on write"
+else
+    no "a trailing slash is dropped from the key on write" "got=$got"
+fi
+
+# A relative --dir is refused before anything -- the session registration
+# included -- is written.
+cp -- "$lanes_json" "$lanes_json.bak"
+dir_sids+=("$sid-dir4")
+out="$(HOME="$lanes_home" CLAUDE_CODE_SESSION_ID="$sid-dir4" "$lane_mail" register de --dir relative/path 2>&1)"; rc=$?
+if (( rc != 0 )) && cmp -s -- "$lanes_json" "$lanes_json.bak" &&
+    ! HOME="$lanes_home" CLAUDE_CODE_SESSION_ID="$sid-dir4" "$lane_mail" registration >/dev/null 2>&1; then
+    ok "a relative --dir is refused, with lanes.json and the session unchanged"
+else
+    no "a relative --dir is refused, with lanes.json and the session unchanged" "rc=$rc: $out"
+fi
+
+# A malformed lanes.json is refused and left byte-identical. Uses its own
+# scratch $HOME, not $lanes_home, since this deliberately corrupts the file.
+malformed_home="$(mktemp -d)"
+dir_homes+=("$malformed_home")
+malformed_json="$malformed_home/.local/state/fork-sandbox/lanes.json"
+mkdir -p -- "$(dirname -- "$malformed_json")"
+printf 'not json' > "$malformed_json"
+cp -- "$malformed_json" "$malformed_json.bak"
+dir_sids+=("$sid-dir5")
+out="$(HOME="$malformed_home" CLAUDE_CODE_SESSION_ID="$sid-dir5" "$lane_mail" register ee --dir /tmp/lane-mail-test-proj/e 2>&1)"; rc=$?
+if (( rc != 0 )) && cmp -s -- "$malformed_json" "$malformed_json.bak" && [[ "$out" == *lanes.json* ]]; then
+    ok "a malformed lanes.json is refused and left byte-identical"
+else
+    no "a malformed lanes.json is refused and left byte-identical" "rc=$rc: $out"
+fi
+
+printf '== lanes.json: register --dir concurrency ==\n'
+
+conc_home="$(mktemp -d)"
+dir_homes+=("$conc_home")
+conc_json="$conc_home/.local/state/fork-sandbox/lanes.json"
+n=24
+conc_pids=()
+for i in $(seq 1 "$n"); do
+    dir_sids+=("$sid-conc-$i")
+    ( HOME="$conc_home" CLAUDE_CODE_SESSION_ID="$sid-conc-$i" \
+        "$lane_mail" register "lane$i" --dir "/tmp/lane-mail-test-proj/conc/$i" >/dev/null 2>&1 ) &
+    conc_pids+=("$!")
+done
+for pid in "${conc_pids[@]}"; do wait "$pid" || true; done
+
+missing=0
+for i in $(seq 1 "$n"); do
+    got="$(json_value "$conc_json" "/tmp/lane-mail-test-proj/conc/$i" 2>/dev/null)"
+    [[ "$got" == "lane$i" ]] || missing=$(( missing + 1 ))
+done
+if (( missing == 0 )); then
+    ok "$n parallel register --dir calls (distinct directories) all land in lanes.json"
+else
+    no "$n parallel register --dir calls (distinct directories) all land in lanes.json" "$missing of $n missing or wrong"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
