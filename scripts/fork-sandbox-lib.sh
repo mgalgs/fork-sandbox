@@ -2830,6 +2830,10 @@ FS_BROWSER_TRUSTED_PREFIXES=("/usr/" "/opt/" "/nix/store/")
 #
 #   FS_BROWSER_CHROMIUM     resolved path to a system chromium
 #   FS_BROWSER_PLAYWRIGHT   $HOME/.cache/ms-playwright, when that dir exists
+#   FS_BROWSER_FONT_CACHE_MISSING
+#                           1 when a browser was found but fs_cache_binds has
+#                           no populated FS_FONT_CACHE_DIR to bind; a one-line
+#                           warning goes to stderr too
 #
 # Both are forced empty when the backend's toolchain is not `host`: an image
 # toolchain's userland is the image's, not the host's, and the default image
@@ -2841,6 +2845,7 @@ FS_BROWSER_TRUSTED_PREFIXES=("/usr/" "/opt/" "/nix/store/")
 fs_detect_browser() {
     FS_BROWSER_CHROMIUM=""
     FS_BROWSER_PLAYWRIGHT=""
+    FS_BROWSER_FONT_CACHE_MISSING=""
 
     case "${FORK_SANDBOX_BROWSER:-auto}" in
     0 | none) return 0 ;;
@@ -2868,6 +2873,14 @@ fs_detect_browser() {
         # shellcheck disable=SC2034  # read by the sourcing scripts
         FS_BROWSER_PLAYWRIGHT="$pw_root"
     fi
+
+    if [[ -n "$FS_BROWSER_CHROMIUM" || -n "$FS_BROWSER_PLAYWRIGHT" ]] &&
+        ! { [[ -d "$FS_FONT_CACHE_DIR" ]] &&
+            compgen -G "$FS_FONT_CACHE_DIR/*" >/dev/null; }; then
+        # shellcheck disable=SC2034  # read by fs_emit_browser_section
+        FS_BROWSER_FONT_CACHE_MISSING=1
+        echo "Warning: no fontconfig cache at $FS_FONT_CACHE_DIR to bind; generic font families (sans-serif, serif, monospace) may render blank in Chromium." >&2
+    fi
     return 0
 }
 
@@ -2883,6 +2896,7 @@ fs_detect_browser() {
 # where these are already in scope):
 #   FS_BROWSER_CHROMIUM           set by fs_detect_browser
 #   FS_BROWSER_PLAYWRIGHT         set by fs_detect_browser
+#   FS_BROWSER_FONT_CACHE_MISSING set by fs_detect_browser; may be unset
 #   FS_BACKEND_CHROMIUM_OWN_SANDBOX  set by fs_backend_capabilities
 fs_emit_browser_section() {
     if [[ "${FS_BROWSER_DEFER_TO_POD:-}" == 1 ]]; then
@@ -2944,6 +2958,15 @@ $no_sandbox_line
 Write screenshots into the clone or the outbox. If you can Read
 images, read the PNG to check the render; otherwise save it to the
 outbox for the orchestrator to judge.
+EOF
+        fi
+        if [[ "${FS_BROWSER_FONT_CACHE_MISSING:-}" == 1 ]]; then
+            cat <<EOF
+
+This sandbox has no fontconfig cache, and Chromium's bundled fontconfig
+finds no fonts from a cold one: text in generic families (sans-serif,
+serif, monospace) renders blank. Run \`fc-cache\` once before your first
+browser launch to build the cache it needs.
 EOF
         fi
     else

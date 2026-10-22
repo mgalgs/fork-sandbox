@@ -26,6 +26,9 @@
 #     fork-sandbox.sh run, which cannot make FS_BROWSER_CHROMIUM
 #     deterministic from outside (it depends on what is actually installed
 #     on the host running the test)
+#   - the font-cache guarantee: a browser announced without a populated
+#     FS_FONT_CACHE_DIR warns on stderr and adds an fc-cache paragraph to
+#     the "## Browser" text; a bound cache leaves that text unchanged
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -91,12 +94,21 @@ real_home="$HOME"
 real_path="$PATH"
 real_prefixes=("${FS_BROWSER_TRUSTED_PREFIXES[@]}")
 real_candidates=("${FS_BROWSER_CHROMIUM_CANDIDATES[@]}")
+real_font_cache="$FS_FONT_CACHE_DIR"
+
+# A populated fake font cache, so detection never depends on (or warns
+# about) the test host's own /var/cache/fontconfig.
+fake_font_cache="$scratch/fontconfig"
+mkdir -p "$fake_font_cache"
+: > "$fake_font_cache/fake-le64.cache-9"
+FS_FONT_CACHE_DIR="$fake_font_cache"
 
 restore_env() {
     HOME="$real_home"
     PATH="$real_path"
     FS_BROWSER_TRUSTED_PREFIXES=("${real_prefixes[@]}")
     FS_BROWSER_CHROMIUM_CANDIDATES=("${real_candidates[@]}")
+    FS_FONT_CACHE_DIR="$real_font_cache"
     unset FORK_SANDBOX_BROWSER
 }
 
@@ -192,6 +204,46 @@ fs_detect_browser
 check "image toolchain forces chromium absent" "" "$FS_BROWSER_CHROMIUM"
 check "image toolchain forces playwright absent, cache dir notwithstanding" \
     "" "$FS_BROWSER_PLAYWRIGHT"
+
+# The font cache: fs_cache_binds binds it read-only when present, and the
+# launcher says so when a browser is announced without one.
+FS_BACKEND_TOOLCHAIN=host
+err="$(fs_detect_browser 2>&1 >/dev/null)"
+check "populated font cache: no warning" "" "$err"
+fs_detect_browser 2>/dev/null
+check "populated font cache: not flagged missing" "" "$FS_BROWSER_FONT_CACHE_MISSING"
+
+empty_font_cache="$scratch/fontconfig-empty"
+mkdir -p "$empty_font_cache"
+for font_cache in "$scratch/fontconfig-absent" "$empty_font_cache"; do
+    FS_FONT_CACHE_DIR="$font_cache"
+    what="${font_cache##*-}"
+    err="$(fs_detect_browser 2>&1 >/dev/null)"
+    case "$err" in
+    *"Warning: "*"generic font families"*"may render blank in Chromium"*)
+        ok "$what font cache with a browser: warns on stderr" ;;
+    *) no "$what font cache with a browser: warns on stderr" "got '$err'" ;;
+    esac
+    check "$what font cache with a browser: one warning line" "1" \
+        "$(printf '%s\n' "$err" | wc -l | tr -d ' ')"
+    fs_detect_browser 2>/dev/null
+    check "$what font cache with a browser: flagged missing" "1" \
+        "$FS_BROWSER_FONT_CACHE_MISSING"
+done
+
+FS_FONT_CACHE_DIR="$scratch/fontconfig-absent"
+FORK_SANDBOX_BROWSER=0
+err="$(fs_detect_browser 2>&1 >/dev/null)"
+check "absent font cache, no browser: no warning" "" "$err"
+fs_detect_browser 2>/dev/null
+check "absent font cache, no browser: not flagged" "" "$FS_BROWSER_FONT_CACHE_MISSING"
+unset FORK_SANDBOX_BROWSER
+
+FS_BACKEND_TOOLCHAIN=image
+err="$(fs_detect_browser 2>&1 >/dev/null)"
+check "absent font cache, image toolchain: no warning" "" "$err"
+FS_BACKEND_TOOLCHAIN=host
+FS_FONT_CACHE_DIR="$fake_font_cache"
 
 restore_env
 
@@ -311,7 +363,36 @@ out="$(fs_emit_browser_section)"
 contains "playwright-only, own sandbox broken: pass-no-sandbox line" "$out" \
     "Chromium's own sandbox does not work here; pass --no-sandbox."
 
+# A missing font cache adds one paragraph to a browser-present section and
+# changes nothing else; a bound cache (flag empty or unset) renders as before.
+font_note="Run \`fc-cache\` once before your first"
+for FS_BROWSER_CHROMIUM in "$fake_usr/bin/chromium" ""; do
+    what="${FS_BROWSER_CHROMIUM:+chromium}"
+    what="${what:-playwright-only}"
+    unset FS_BROWSER_FONT_CACHE_MISSING
+    unset_out="$(fs_emit_browser_section)"
+    FS_BROWSER_FONT_CACHE_MISSING=""
+    bound="$(fs_emit_browser_section)"
+    check "$what, font cache bound: unchanged whether the flag is empty or unset" \
+        "$unset_out" "$bound"
+    lacks "$what, font cache bound: no fc-cache paragraph" "$bound" "fc-cache"
+    FS_BROWSER_FONT_CACHE_MISSING=1
+    out="$(fs_emit_browser_section)"
+    contains "$what, font cache missing: says to run fc-cache first" "$out" "$font_note"
+    contains "$what, font cache missing: says why" "$out" \
+        "generic families (sans-serif,"
+    contains "$what, font cache missing: keeps the bound-case text" "$out" "$bound"
+done
+FS_BROWSER_CHROMIUM=""
+FS_BROWSER_PLAYWRIGHT=""
+FS_BROWSER_FONT_CACHE_MISSING=""
+bound="$(fs_emit_browser_section)"
+FS_BROWSER_FONT_CACHE_MISSING=1
+out="$(fs_emit_browser_section)"
+check "no browser: a missing font cache changes nothing" "$bound" "$out"
+
 unset FS_BROWSER_CHROMIUM FS_BROWSER_PLAYWRIGHT FS_BACKEND_CHROMIUM_OWN_SANDBOX
+unset FS_BROWSER_FONT_CACHE_MISSING
 
 echo "== pod browser prompt expansion =="
 pod_bin="$scratch/pod-bin"
