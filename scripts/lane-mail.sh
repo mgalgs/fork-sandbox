@@ -5,6 +5,7 @@
 #        lane-mail.sh describe <lane> "<text>"     ("" clears; "-" reads stdin)
 #        lane-mail.sh registration
 #        lane-mail.sh unregister
+#        lane-mail.sh lane-for <abs-path>           (the directory->lane table)
 #        lane-mail.sh send|reply|show|tree|list|inbox|seen [args...]
 #        lane-mail.sh send --to @lane:host ...     (another host, over ssh)
 #        lane-mail.sh lanes                        (the lanes there are)
@@ -33,10 +34,11 @@
 # the lane last used there: a flat JSON object mapping an absolute directory
 # to a lane name. `register <lane> --dir <abs-path>` records that mapping
 # (the directory is given by the caller, since neither this script nor $PWD
-# reliably knows a session's primary working directory). A trailing slash is
-# not part of the key ("/a/b/" and "/a/b" are the same entry; "/" stays "/"),
-# and the path is not resolved through symlinks. This is the only code that
-# writes that file: callers go through this verb, never a direct Read/Write
+# reliably knows a session's primary working directory); `lane-for
+# <abs-path>` reads it back. Both treat a trailing slash as not part of the
+# key ("/a/b/" and "/a/b" are the same entry; "/" stays "/"), and neither
+# resolves symlinks. This is the only code that touches that file: callers
+# that want the mapping go through these two verbs, never a direct Read/Write
 # of the JSON, so a lock and an atomic rename -- not "last writer wins" --
 # settle two sessions registering a directory at nearly the same moment.
 #
@@ -389,6 +391,39 @@ PY
     exec {lock_fd}>&- 2>/dev/null || true
 }
 
+# Prints the lane recorded for directory $1 and exits 0; exits 1 printing
+# nothing when the file or the key is missing. Takes no lock: the rename in
+# lanes_json_set already rules out a torn read.
+lanes_json_get() {
+    local dir
+    dir="$(normalize_lane_dir "$1")"
+    [[ -f "$LANES_JSON" ]] || return 1
+    python3 - "$LANES_JSON" "$dir" <<'PY'
+import json
+import sys
+
+path, dirkey = sys.argv[1:3]
+with open(path) as f:
+    text = f.read()
+
+data = {}
+if text.strip():
+    try:
+        data = json.loads(text)
+    except ValueError:
+        sys.stderr.write("lane-mail: %s is not valid JSON\n" % path)
+        sys.exit(2)
+    if not isinstance(data, dict):
+        sys.stderr.write("lane-mail: %s is not a JSON object\n" % path)
+        sys.exit(2)
+
+lane = data.get(dirkey)
+if lane is None:
+    sys.exit(1)
+print(lane)
+PY
+}
+
 cmd="${1:-}"
 case "$cmd" in
     describe)
@@ -446,6 +481,10 @@ case "$cmd" in
         echo "lane-mail: to be woken when mail lands, run 'lane-mail-watch.sh $lane --wait'"
         echo "lane-mail: as a background command (not a Monitor, which expires); mark"
         echo "lane-mail: handled mail seen before relaunching it."
+        ;;
+    lane-for)
+        (( $# == 2 )) || { echo 'Usage: lane-mail.sh lane-for <abs-path>' >&2; exit 2; }
+        lanes_json_get "$2"
         ;;
     registration)
         sid="${CLAUDE_CODE_SESSION_ID:-}"

@@ -17,7 +17,8 @@ fail=0
 ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
 no() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; fail=$(( fail + 1 )); }
 
-# Reads lanes.json directly, never through lane-mail.sh.
+# Reads lanes.json directly (never through lane-mail.sh), so write-path
+# assertions do not depend on the lane-for lookup verb being present.
 json_value() {  # json_value <file> <key>
     python3 -c '
 import json, sys
@@ -252,7 +253,8 @@ else
 fi
 
 # A malformed lanes.json is refused and left byte-identical. Uses its own
-# scratch $HOME, not $lanes_home, since this deliberately corrupts the file.
+# scratch $HOME (not $lanes_home, which the lane-for tests below still need
+# intact) since this deliberately corrupts the file.
 malformed_home="$(mktemp -d)"
 dir_homes+=("$malformed_home")
 malformed_json="$malformed_home/.local/state/fork-sandbox/lanes.json"
@@ -291,6 +293,54 @@ if (( missing == 0 )); then
     ok "$n parallel register --dir calls (distinct directories) all land in lanes.json"
 else
     no "$n parallel register --dir calls (distinct directories) all land in lanes.json" "$missing of $n missing or wrong"
+fi
+
+printf '== lanes.json: lane-for (lookup verb) ==\n'
+
+got="$(HOME="$lanes_home" "$lane_mail" lane-for /tmp/lane-mail-test-proj/a 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$got" == fe ]]; then
+    ok "lane-for hits a known directory"
+else
+    no "lane-for hits a known directory" "rc=$rc: $got"
+fi
+
+# The lookup side normalizes a trailing slash too, independent of the write
+# side's own normalization (exercised above with a different directory).
+got="$(HOME="$lanes_home" "$lane_mail" lane-for /tmp/lane-mail-test-proj/a/ 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$got" == fe ]]; then
+    ok "a trailing slash is dropped from the key on lookup"
+else
+    no "a trailing slash is dropped from the key on lookup" "rc=$rc: $got"
+fi
+
+out="$(HOME="$lanes_home" "$lane_mail" lane-for /tmp/lane-mail-test-proj/nope 2>&1)"; rc=$?
+if (( rc == 1 )) && [[ -z "$out" ]]; then
+    ok "lane-for misses an unknown directory with exit 1 and no output"
+else
+    no "lane-for misses an unknown directory with exit 1 and no output" "rc=$rc: $out"
+fi
+
+empty_home="$(mktemp -d)"
+dir_homes+=("$empty_home")
+out="$(HOME="$empty_home" "$lane_mail" lane-for /tmp/lane-mail-test-proj/a 2>&1)"; rc=$?
+if (( rc == 1 )) && [[ -z "$out" ]]; then
+    ok "lane-for with no lanes.json yet exits 1 with no output"
+else
+    no "lane-for with no lanes.json yet exits 1 with no output" "rc=$rc: $out"
+fi
+
+out="$(HOME="$lanes_home" "$lane_mail" lane-for 2>&1)"; rc=$?
+if (( rc == 2 )); then
+    ok "lane-for with no argument is a usage error"
+else
+    no "lane-for with no argument is a usage error" "rc=$rc: $out"
+fi
+
+out="$(HOME="$malformed_home" "$lane_mail" lane-for /tmp/lane-mail-test-proj/a 2>&1)"; rc=$?
+if (( rc != 0 )) && [[ -n "$out" ]]; then
+    ok "lane-for on a malformed lanes.json is an error on stderr, non-zero"
+else
+    no "lane-for on a malformed lanes.json is an error on stderr, non-zero" "rc=$rc: $out"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
