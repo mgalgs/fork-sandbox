@@ -2763,8 +2763,22 @@ fs_balance_claude_credential() {
 # directions, so a run cannot poison a browser the host later launches.
 # Chromium's own inner sandbox keeps working: bwrap leaves nested user
 # namespaces available, so callers need no --no-sandbox.
+#
+# The system fontconfig cache:
+#
+# The sandbox sees the host's fonts through /usr and /etc but not /var, so it
+# starts with no fontconfig cache. Playwright's Chromium ships its own
+# fontconfig, and from a cold cache it finds no usable fonts, so generic
+# families (sans-serif, serif, monospace) render blank. Binding the host's
+# cache read-only fixes that; it holds no secrets, and read-only keeps a run
+# from poisoning it. Host-toolchain only, like the Playwright bind: an image's
+# own /usr fonts are not what the host's cache describes.
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_CACHE_FLAGS=()
+
+# The host's system fontconfig cache. A variable, not a literal, so a test can
+# point it at a temp dir.
+FS_FONT_CACHE_DIR=/var/cache/fontconfig
 
 fs_cache_binds() {
     local hf_root="$HOME/.cache/huggingface" pw_root="$HOME/.cache/ms-playwright"
@@ -2784,6 +2798,9 @@ fs_cache_binds() {
     # needs a browser has to carry its own.
     if [[ -d "$pw_root" && "$FS_BACKEND_TOOLCHAIN" == host ]]; then
         FS_CACHE_FLAGS+=(--bind-ro "$pw_root")
+    fi
+    if [[ -d "$FS_FONT_CACHE_DIR" && "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        FS_CACHE_FLAGS+=(--bind-ro "$FS_FONT_CACHE_DIR")
     fi
     return 0
 }

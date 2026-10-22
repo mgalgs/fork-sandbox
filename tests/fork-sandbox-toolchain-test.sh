@@ -483,6 +483,25 @@ contains "image mode still binds the model cache" "huggingface/hub" "${FS_CACHE_
 lacks "image mode does not bind the browser cache" "ms-playwright" "${FS_CACHE_FLAGS[*]}"
 contains "image mode keeps HF_HUB_OFFLINE with the cache" "HF_HUB_OFFLINE=1" "${FS_CACHE_FLAGS[*]}"
 
+# The system font cache follows the browser cache: host userland only, and
+# only when the host has one.
+real_font_cache="$FS_FONT_CACHE_DIR"
+FS_FONT_CACHE_DIR="$scratch/fontconfig"
+mkdir -p "$FS_FONT_CACHE_DIR"
+FS_BACKEND_TOOLCHAIN=host
+fs_cache_binds
+contains "host mode binds the font cache read-only" "--bind-ro $FS_FONT_CACHE_DIR" "${FS_CACHE_FLAGS[*]}"
+
+FS_BACKEND_TOOLCHAIN=image
+fs_cache_binds
+lacks "image mode does not bind the font cache" "$FS_FONT_CACHE_DIR" "${FS_CACHE_FLAGS[*]}"
+
+rmdir "$FS_FONT_CACHE_DIR"
+FS_BACKEND_TOOLCHAIN=host
+fs_cache_binds
+lacks "host mode binds no font cache the host lacks" "$FS_FONT_CACHE_DIR" "${FS_CACHE_FLAGS[*]}"
+FS_FONT_CACHE_DIR="$real_font_cache"
+
 HOME="$real_home"
 
 echo ""
