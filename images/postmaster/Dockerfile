@@ -53,6 +53,17 @@ RUN set -eu; \
     echo "${sha256}  /usr/local/bin/kubectl" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/kubectl
 
+# lkml-render.py (github.com/mgalgs/lkml-review), for postmaster hooks that
+# publish a rendered review thread. Stdlib-only single file; pinned and
+# checksummed like kubectl. Bump the SHA and the checksum together.
+ARG LKML_REVIEW_SHA=604180a2ab6c6061110aff44ce25779297e31255
+ARG LKML_RENDER_SHA256=1f0cbed92e91d26a3b6658e78f216cbae81550967a889478f9d5980341ac06c0
+RUN set -eu; \
+    curl -fsSLo /usr/local/bin/lkml-render.py \
+        "https://raw.githubusercontent.com/mgalgs/lkml-review/${LKML_REVIEW_SHA}/scripts/lkml-render.py"; \
+    echo "${LKML_RENDER_SHA256}  /usr/local/bin/lkml-render.py" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/lkml-render.py
+
 # The scripts, their share/ data and the manifest templates travel together,
 # in the same layout as the checkout: fork-sandbox-k8s.sh locates
 # manifests/k8s as a sibling of its own directory (dirname "$script_dir"),
