@@ -188,7 +188,7 @@
 #                        csonnet2-rsol2-mopus2. Each model runs on its
 #                        native harness; N defaults to 1. It compiles to a
 #                        preset and runs exactly as --preset would, fix legs
-#                        riding the code seat. Refused with --preset, which
+#                        riding the last code seat. Refused with --preset, which
 #                        falls back to this when no preset file has the
 #                        name. With no c stage it is read-only: any number of
 #                        r and m stages, e.g. ropus, rsonnet-mopus or
@@ -2402,6 +2402,7 @@ if [[ -n "$preset_name" ]]; then
     declare -a preset_step_max=()
     declare -a preset_step_fix_default=()
     declare -a preset_step_fix_agent=()
+    declare -a preset_step_fix_seat=()
     declare -a preset_step_fix_harness=()
     declare -a preset_step_fix_model=()
     declare -a preset_step_fix_repeat=()
@@ -2493,6 +2494,7 @@ if [[ -n "$preset_name" ]]; then
                     max) preset_step_max[preset_step_k]="$preset_f4" ;;
                     fix_default) preset_step_fix_default[preset_step_k]="$preset_f4" ;;
                     fix_agent) preset_step_fix_agent[preset_step_k]="$preset_f4" ;;
+                    fix_seat) preset_step_fix_seat[preset_step_k]="$preset_f4" ;;
                     fix_harness) preset_step_fix_harness[preset_step_k]="$preset_f4" ;;
                     fix_model) preset_step_fix_model[preset_step_k]="$preset_f4" ;;
                     fix_repeat) preset_step_fix_repeat[preset_step_k]="$preset_f4" ;;
@@ -4670,6 +4672,10 @@ if [[ "$dry_run" == true ]]; then
             if [[ "${preset_step_action[$preset_k]}" != code \
                 && "${preset_step_action[$preset_k]}" != plan \
                 && "$preset_ro_multi" != true ]]; then
+                # Which agent runs this step's fix legs, so a defaulted
+                # seat (the last code step's agent) reads resolved.
+                printf 's%sfix_agent=%s\n' "$preset_k" \
+                    "${preset_step_fix_seat[$preset_k]}"
                 preset_k_fix_args="${preset_step_fix_args[$preset_k]:-}"
                 if [[ -n "$preset_k_fix_args" ]]; then
                     printf 's%sfix_%s=%s\n' "$preset_k" \
@@ -6229,9 +6235,10 @@ if [[ "$prompt_overlay_matched" == true ]]; then
 fi
 # pipeline.json: the ordered, resolved step array for a preset run, legacy-
 # shaped or composed -- action, seat harness/model, repeat, network (only
-# when sealed), and the fix seat (harness/model/repeat) when it differs from
-# the default. Nothing reads this file yet; a later step's ledger keys off
-# it, so the content has to be right now even without a reader. Steps are
+# when sealed), and the fix seat (harness/model/repeat) unless it is the
+# first code step's own seat with no repeat. Nothing reads this file yet; a
+# later step's ledger keys off it, so the content has to be right now even
+# without a reader. Steps are
 # appended 0-indexed (JSON convention) from the 1-indexed run_step_* arrays
 # the compile point above built -- the pi-local model-discovery backfill
 # below has to agree with that indexing when it patches step 0's model in
@@ -6247,6 +6254,17 @@ fs_write_pipeline_json() {
     local pipeline_json_out="$1"
     if [[ -n "$preset_name" ]]; then
     pipeline_steps_json="[]"
+    # A null "fix" means "the first code step's seat" to every reader
+    # (fork-sandbox-k8s.sh's timeout budget falls back to the implement
+    # harness), so a defaulted fix seat is written out whenever the default
+    # -- the LAST code step's agent -- is not that first code step's.
+    pipeline_first_code_agent=""
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        if [[ "${preset_step_action[$preset_k]}" == code ]]; then
+            pipeline_first_code_agent="${preset_step_agent[$preset_k]}"
+            break
+        fi
+    done
     for ((preset_k = 1; preset_k <= run_step_count; preset_k++)); do
         case "${run_step_kind[$preset_k]}" in
             code) pipeline_action="code" ;;
@@ -6277,6 +6295,7 @@ fs_write_pipeline_json() {
                 && "${run_step_kind[$preset_k]}" != plan \
                 && "$preset_ro_multi" != true ]] \
                 && { [[ "${preset_step_fix_default[$preset_k]:-}" != "1" ]] \
+                    || [[ "${preset_step_fix_seat[$preset_k]:-}" != "$pipeline_first_code_agent" ]] \
                     || [[ "${preset_step_fix_repeat[$preset_k]:-1}" != "1" ]]; }; then
                 pipeline_fix_model_var="s${preset_k}fix_model"
                 pipeline_fix_harness="${preset_step_fix_harness[$preset_k]}"

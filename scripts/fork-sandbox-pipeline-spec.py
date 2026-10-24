@@ -40,8 +40,8 @@ value as TOML and falls back to a plain string, so it needs no quoting).
 Those arguments reach that agent's own legs only. A pi seat gets none, and
 code and plan seats get none. The effort is not selectable in the spec.
 
-Fix legs ride the first code seat: no step names a fix_agent, so the
-preset parser's default applies. Anything the
+Fix legs ride the last code seat: no step names a fix_agent, so the
+preset parser's default (the last code step's agent) applies. Anything the
 grammar cannot say (fix_agent, other per-seat arguments, network) stays a
 preset file.
 

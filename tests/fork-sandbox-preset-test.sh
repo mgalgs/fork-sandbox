@@ -896,7 +896,7 @@ pipeline:
 EOF
 out="$(run --preset composed-reviewfirst-codex 2>"$err")"
 check "a composed pipeline's --dry-run harness/model name step 1's own seat, not the phantom code seat" \
-    $'preset=composed-reviewfirst-codex\nharness=codex\nmodel=gpt-5.6-sol' "$out"
+    $'preset=composed-reviewfirst-codex\nharness=codex\nmodel=gpt-5.6-sol\ns1fix_agent=coder' "$out"
 
 # A legacy-shaped pipeline (code first, review/maintain at most once each,
 # in that order) never runs the composed step-1 seat lookup above -- its
@@ -1860,15 +1860,78 @@ refuses "a plan stage with no code stage is refused" \
 refuses "a plan stage's repeat above 1 is refused" \
     "the repeat count on a plan segment must be 1 for now" --pipeline pfable2-csonnet
 # Two code stages, each on its own agent and harness; fix legs default to
-# the first code step's agent, since the compiler names no fix_agent.
+# the LAST code step's agent, since the compiler names no fix_agent.
 python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
     csonnet-csol-ropus-rsol-mopus-mastra | \
     parses "a spec with two of every stage parses to 6 distinct steps" \
         "pipeline	steps	6" \
         "step	1	agent	coder" "step	2	agent	coder2" \
         "step	3	agent	reviewer" "step	3	fix_default	1" \
+        "step	3	fix_seat	coder2" "step	5	fix_seat	coder2" \
         "step	4	agent	reviewer2" \
         "step	5	agent	maintainer" "step	6	agent	maintainer2"
+# Draft cheap, polish strong, then review: the review's findings go to the
+# polisher, the seat that owns the final code, not the drafter.
+python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" csonnet-copus-ropus | \
+    parses "csonnet-copus-ropus defaults the review's fix seat to the last coder" \
+        "step	3	fix_default	1" "step	3	fix_seat	coder2" \
+        "step	3	fix_model	opus"
+# One code step: first and last are the same agent, so nothing moves.
+python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" copus-ropus | \
+    parses "copus-ropus still defaults the fix seat to its one coder" \
+        "step	2	fix_default	1" "step	2	fix_seat	coder" \
+        "step	2	fix_model	opus"
+# An explicit fix_agent naming the FIRST coder still wins over the default.
+parses "an explicit fix_agent naming the first coder still wins" \
+    "step	3	fix_agent	drafter" "step	3	fix_seat	drafter" \
+    "step	3	fix_model	sonnet" <<'EOF'
+agents:
+  drafter:
+    harness: claude
+    model: sonnet
+  polisher:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: drafter
+  - action: code
+    agent: polisher
+  - action: review
+    repeat: 2
+    agent: polisher
+    fix_agent: drafter
+EOF
+# A maintain step follows the same default, and so does a review step that
+# sits between the two code steps: the last coder in pipeline order.
+parses "a maintain step's fix seat defaults to the last coder too" \
+    "step	2	fix_seat	polisher" "step	4	fix_default	1" \
+    "step	4	fix_seat	polisher" "step	4	fix_model	opus" <<'EOF'
+agents:
+  drafter:
+    harness: claude
+    model: sonnet
+  polisher:
+    harness: claude
+    model: opus
+  maintainer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: drafter
+  - action: review
+    repeat: 1
+    agent: maintainer
+  - action: code
+    agent: polisher
+  - action: maintain
+    repeat: 1
+    agent: maintainer
+EOF
+out="$(run --pipeline csonnet-copus-ropus 2>/dev/null)"
+contains "--dry-run names the agent the defaulted fix legs run on" \
+    "$out" "s3fix_agent=coder2"
 python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
     mopus-csonnet-rsol | \
     parses "a spec that maintains before it codes keeps its order" \
@@ -1877,7 +1940,7 @@ python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
         "step	3	agent	reviewer"
 out="$(run --pipeline csonnet2-ropus-rsonnet-mopus-msonnet 2>"$err")"
 check "repeated review/maintain stages compile" \
-    $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=sonnet\ns2_claude_args=--effort high\ns3_claude_args=--effort high\ns4_claude_args=--effort high\ns5_claude_args=--effort high' \
+    $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=sonnet\ns2_claude_args=--effort high\ns2fix_agent=coder\ns3_claude_args=--effort high\ns3fix_agent=coder\ns4_claude_args=--effort high\ns4fix_agent=coder\ns5_claude_args=--effort high\ns5fix_agent=coder' \
     "$out"
 contains "a composed --pipeline spec with repeated stages announces its step count" \
     "$(cat "$err")" \
@@ -3360,6 +3423,23 @@ if rd_composed="$(run_stubbed --preset composed --branch "sandbox-test-composed-
         "$(cat "$rd_composed/s2-fix-prompt-1.md")" "Ignore this operational note"
 else
     no "composed walk launch succeeds"
+fi
+
+# Draft-then-polish end to end: the review's fix leg runs on the polisher's
+# model, and pipeline.json records that fix seat, since it is not the first
+# code step's (a null fix there reads as "the implement seat").
+prep_stub $'commit\ncommit\nfindings\ncommit'
+if rd_polish="$(run_stubbed --pipeline csonnet-copus-ropus \
+    --branch "sandbox-test-polish-fix-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_polish")
+    check "draft, polish, review and one fix leg ran" "4" "$(cat "$count")"
+    contains "the drafter's leg runs on sonnet" "$(sed -n 1p "$argv_log")" "--model sonnet"
+    contains "the review's fix leg runs on the polisher's model" \
+        "$(sed -n 4p "$argv_log")" "--model opus"
+    check "pipeline.json records the review's fix seat as the polisher's" "claude opus" \
+        "$(jq -r '.steps[2].fix | "\(.harness) \(.model)"' "$rd_polish/pipeline.json")"
+else
+    no "draft-then-polish launch succeeds"
 fi
 
 # The test-run ledger across a composed pipeline: the code leg commits and

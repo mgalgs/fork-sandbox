@@ -151,7 +151,7 @@ omitted, it defaults to the agent's `repeat` property.
 |---|---|
 | `agent` | who reads and writes the verdict. |
 | `repeat` | required — the loop cap: how many verdict-then-fix rounds may run. |
-| `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it defaults to the first code step's agent in pipeline order, riding the implement command exactly as fix legs always have. A pipeline with no code step has no such default: with no `fix_agent` anywhere it is read-only (below), and otherwise every `review`/`maintain` step needs one. |
+| `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it defaults to the **last** code step's agent in pipeline order — the seat that owns the final code, so in a draft-then-polish pipeline (`csonnet-copus-ropus`) the polisher applies the review's findings, not the drafter. With one code step that is the implement seat, riding the implement command exactly as fix legs always have; with more, it is that last agent's own seat, on its own harness, model, arguments and `repeat`. Only the fix default moves: the endpoint rule, the refresh keys and `--session-state` stay on the first code step. `--dry-run` prints the resolved seat as `s<K>fix_agent=<name>` on a composed pipeline. A pipeline with no code step has no such default: with no `fix_agent` anywhere it is read-only (below), and otherwise every `review`/`maintain` step needs one. |
 
 Today's local run engine walks arbitrary linear pipelines. Kubernetes still
 accepts only a **legacy-shaped** pipeline — one code step, then at most one
@@ -356,7 +356,8 @@ The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
 - **stage** is `c` (code), `r` (review), `m` (maintain) or `p` (plan), in
   any order and any count, as a preset file's `pipeline` allows:
   `csonnet-csol-ropus-rsol-mopus-mastra` is two code steps, two review
-  steps and two maintain steps. Fix legs ride the first code step's agent.
+  steps and two maintain steps. Fix legs default to the last code step's
+  agent (`coder2` there), as a preset file's omitted `fix_agent` does.
   A `p` segment carries the same rule its preset form does: it must come
   before the spec's first `c` segment, and a spec with `p` and no `c` is
   refused. The other exception is a spec with no `c` at all: it compiles
@@ -403,7 +404,7 @@ the same parser, the same rules, the same flag overrides — for a
 legacy-shaped spec, `--claude-args` reaches the code seat alone as it does over
 a legacy-shaped preset file; a composed spec (more than one review or
 maintain segment, say) refuses the flag the same way a composed preset
-file does. Fix legs ride the code seat. `--dry-run` prints the compiled
+file does. Fix legs default to the last code segment's seat. `--dry-run` prints the compiled
 seats, and the run records the spec in `preset.json` as `pipeline`, with
 the spec as its `name`.
 

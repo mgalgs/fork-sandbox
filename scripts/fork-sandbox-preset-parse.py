@@ -38,6 +38,10 @@ ordered step list:
     step <k> max <n>                    (review/maintain: the loop cap)
     step <k> fix_default 1              (review/maintain, fix_agent omitted)
     step <k> fix_agent <name>           (review/maintain, fix_agent given)
+    step <k> fix_seat <name>            (review/maintain: the effective fix
+                                          agent, given or defaulted -- the
+                                          default is the LAST code step's
+                                          agent, in pipeline order)
     step <k> fix_harness <value>        (the effective fix agent's, resolved)
     step <k> fix_model <value>
     step <k> fix_repeat <n>
@@ -385,17 +389,18 @@ def main():
                              endpoint="")
 
     # ---- pipeline: pass 2, seat resolution ----
-    # Fix seats default to the first code step's agent, in pipeline order,
-    # regardless of where the review/maintain step needing one sits --
-    # a review-first pipeline is well-defined (it reviews the branch as it
-    # stands) and its fix seat still defaults to the coder that follows it.
-    first_code_agent = ""
-    first_code_index = None
-    for s in steps:
-        if s["action"] == "code":
-            first_code_agent = s["agent"]
-            first_code_index = s["index"]
-            break
+    # Fix seats default to the LAST code step's agent, in pipeline order,
+    # regardless of where the review/maintain step needing one sits: that
+    # seat owns the final code, so a draft-then-polish pipeline's findings
+    # go to the polisher, not the drafter. A review-first pipeline is
+    # well-defined (it reviews the branch as it stands) and its fix seat
+    # still defaults to the last coder that follows it. With one code step,
+    # first and last are the same agent. Everything else tied to a code
+    # seat -- refresh keys, endpoint -- stays on the FIRST code step.
+    code_steps = [s for s in steps if s["action"] == "code"]
+    first_code_agent = code_steps[0]["agent"] if code_steps else ""
+    first_code_index = code_steps[0]["index"] if code_steps else None
+    last_code_agent = code_steps[-1]["agent"] if code_steps else ""
 
     for s in steps:
         if s["action"] == "code":
@@ -407,11 +412,11 @@ def main():
             s["fix_resolved"] = None
         else:
             if s["fix_ref"] is None:
-                if not first_code_agent:
+                if not last_code_agent:
                     fail(f"pipeline[{s['index']}]: the {s['action']} step "
                          f"needs 'fix_agent' -- this pipeline has no code "
                          f"step, so there is no default fix seat")
-                s["fix_resolved"] = first_code_agent
+                s["fix_resolved"] = last_code_agent
                 s["fix_default"] = True
             else:
                 s["fix_resolved"] = s["fix_ref"]
@@ -511,6 +516,7 @@ def main():
                 out.append(f"step\t{k}\tfix_default\t1")
             else:
                 out.append(f"step\t{k}\tfix_agent\t{s['fix_resolved']}")
+            out.append(f"step\t{k}\tfix_seat\t{s['fix_resolved']}")
             out.append(f"step\t{k}\tfix_harness\t{fixer['harness']}")
             out.append(f"step\t{k}\tfix_model\t{fixer['model']}")
             out.append(f"step\t{k}\tfix_repeat\t{fixer['repeat']}")
