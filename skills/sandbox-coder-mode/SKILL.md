@@ -129,11 +129,11 @@ describes the mode; this section describes what running long demands.
   and a spot-check of what executes on the host — integrates, and owns all
   host-side git (see **What stays in this session**). It writes no project
   code.
-- **Tier 2 — implementer.** In the sandbox, it types. On a floor round it
-  runs on this session's own harness and model; once a round adds legs,
-  it moves to the cheapest capable code seat — `--harness claude --model
-  sonnet` as shipped, or a `pi` / sealed-`pi` harness — per **Choosing a
-  harness and a model**.
+- **Tier 2 — implementer.** In the sandbox, it types. On a small round
+  it runs on this session's own harness and model, whether or not routing
+  adds a review leg; a large round puts a cheap draft seat (`--model
+  sonnet` as shipped) ahead of it, and only a mechanical sweep runs on
+  the cheapest seat alone — per **Routing a round**.
 - **Tier 3 — in-sandbox reviewer.** Added by routing, not by default:
   `--review-model opus --review-loop 1` when the round changes the default
   path of existing code or touches security, data that can be lost or
@@ -689,9 +689,10 @@ fork-sandbox log list --days 14
 
 There is no default composition: **Routing a round** decides which legs a
 round gets. This section decides which seat each leg sits in. The shipped
-seats are a `--harness claude --model sonnet` code leg (on a round with
-more than the floor's one leg), an `--review-model opus` reviewer and an
-opus maintainer.
+seats are a `--harness claude --model sonnet` code leg (the draft seat
+of a large round, or a sweep's only one; a small round codes on this
+session's own model), an
+`--review-model opus` reviewer and an opus maintainer.
 
 They are overridable per machine, never per repo: if
 `~/.config/fork-sandbox/coder-mode.env` exists, its keys replace the
@@ -864,9 +865,19 @@ An addition behind a flag, arm name or config key does not trigger the
 third row, however central the file it lands in. The floor's code leg runs
 on this session's own harness and model (fork-sandbox skill, "Small
 tasks"): every extra leg is a fresh agent rereading the repo and rerunning
-the suite, which costs more than the cheaper model saves. Once a round
-adds legs, the code leg moves to the cheapest capable code seat, since
-the legs after it check its work.
+the suite, which costs more than the cheaper model saves.
+
+**The code seat follows the round's size, not its leg count.** A small
+round — under ~300 production lines, not a sweep — keeps the code leg on
+this session's own model even when routing adds a review leg: the code
+leg is a minor share of such a round's cost, and a stronger coder avoids
+a fix round that costs more than the difference. A large round — past
+~300 production lines, or heavy on boilerplate — chains two code seats,
+a cheap draft then a strong polish (`csonnet-copus-ropus`): the draft
+saves the strong model the typing, and the polish leg owns the result.
+Only a pure mechanical sweep runs on the cheapest seat alone, as does any
+round where the quota projection says the strong model's window will run
+out before it resets.
 
 **Estimate the completion time before launching**, and let it decide
 between compositions that would all do the job. A round takes roughly the
