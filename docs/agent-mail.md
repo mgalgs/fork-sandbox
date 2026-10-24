@@ -1632,6 +1632,9 @@ printed. This works the same on a laptop postmaster and a
 cluster one; see [docs/cluster-postmaster.md](cluster-postmaster.md) for
 how the cluster one gets its hooks.
 
+For auxiliary Kubernetes Jobs launched from hooks, one generic launcher
+reads a registry instead of a hook per task; see [docs/aux-jobs.md](aux-jobs.md).
+
 #### The environment a hook gets
 
 A hook inherits the postmaster's own environment, plus:
