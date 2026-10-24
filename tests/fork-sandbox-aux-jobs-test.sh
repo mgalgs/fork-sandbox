@@ -32,6 +32,7 @@ mkdir -p "$bin"
 # carries the headers in $FAKE_HEADERS (JSON array of [name, value]).
 cat > "$bin/fork-sandbox" <<'FAKE'
 #!/usr/bin/env bash
+printf '%s\n' "${FORK_SANDBOX_MAIL_ROOT-<unset>}" > "$FAKE_MAIL_ROOT_SEEN"
 if [[ -n "${FAKE_ROOT_ERROR:-}" ]]; then
     printf '{"messages":[{"seq":1,"error":"parse","file":"x"},{"seq":2,"headers":[["X-Preview-Repo","example-org/example-repo"],["X-Preview-PR","9"]]}]}\n'
     exit 0
@@ -52,6 +53,7 @@ FAKE
 chmod +x "$bin/fork-sandbox" "$bin/kubectl"
 export PATH="$bin:$PATH"
 export FAKE_KUBECTL_LOG="$tmp/kubectl.log" FAKE_KUBECTL_ARGS="$tmp/kubectl.args"
+export FAKE_MAIL_ROOT_SEEN="$tmp/mail-root-seen"
 
 SHA=0123456789abcdef0123456789abcdef01234567
 DIG=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -77,6 +79,11 @@ entry() { # name [extra yaml lines]
 echo "-- help / args"
 "$aux" --help > "$tmp/help"; check "--help prints the header" grep -q 'Usage: fork-sandbox-aux-jobs' "$tmp/help"
 if python3 -I "$aux" >/dev/null 2>&1; then no "--registry required"; else ok "--registry required"; fi
+
+echo "-- mail export reads the hook's store"
+run "$(entry a '  gates: {requires_pr: true}')" FS_HOOK_MAIL_ROOT=/srv/example-mail
+check "FS_HOOK_MAIL_ROOT reaches mail export as FORK_SANDBOX_MAIL_ROOT" \
+    grep -qx /srv/example-mail "$FAKE_MAIL_ROOT_SEEN"
 
 echo "-- absent registry"
 out="$(env FS_HOOK_EVENT=on-target FS_HOOK_THREAD=$TID python3 -I "$aux" --registry "$tmp/nope.yaml" 2>/dev/null)"; rc=$?

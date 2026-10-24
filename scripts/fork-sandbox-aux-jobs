@@ -191,15 +191,21 @@ def load_registry(path):
 class Thread:
     """The thread root's headers, read lazily through `mail export`."""
 
-    def __init__(self, tid):
+    def __init__(self, tid, mail_root=""):
         self.tid = tid
+        self.mail_root = mail_root
         self._headers = None
 
     def headers(self):
         if self._headers is None:
+            # The hook names its store in FS_HOOK_MAIL_ROOT; `mail export`
+            # reads FORK_SANDBOX_MAIL_ROOT, and its default may be another store.
+            env = dict(os.environ)
+            if self.mail_root:
+                env["FORK_SANDBOX_MAIL_ROOT"] = self.mail_root
             out = subprocess.run(["fork-sandbox", "mail", "export", self.tid, "--json"],
                                  capture_output=True, text=True, timeout=KUBECTL_TIMEOUT,
-                                 check=True).stdout
+                                 env=env, check=True).stdout
             msgs = json.loads(out).get("messages", [])
             # The root is the lowest seq even when it failed to parse; then it
             # carries no headers, and a reply must never stand in for it.
@@ -319,7 +325,7 @@ def main(argv=None, environ=None):
         log("FS_HOOK_THREAD is not set")
         return 1
     version = environ.get("FS_TARGET_VERSION", "")
-    thread = Thread(tid)
+    thread = Thread(tid, environ.get("FS_HOOK_MAIL_ROOT", ""))
     manifests, failures = [], []
     for e in todo:
         try:

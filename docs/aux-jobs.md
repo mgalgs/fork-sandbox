@@ -19,7 +19,8 @@ exec fork-sandbox-aux-jobs --registry "$(dirname "$0")/aux-jobs.yaml"
 ```
 
 `--registry` is required; there is no default path. The launcher reads
-`FS_HOOK_EVENT`, `FS_HOOK_THREAD` and `FS_TARGET_*` from the hook env.
+`FS_HOOK_EVENT`, `FS_HOOK_THREAD`, `FS_HOOK_MAIL_ROOT` and `FS_TARGET_*`
+from the hook env.
 `--dry-run` prints the Job manifests as JSON and calls no kubectl.
 
 ## The registry
