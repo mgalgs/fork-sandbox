@@ -31,7 +31,8 @@ override it, and unknown entry fields are refused. Jobs are created in
 kubectl's current namespace with `kubectl create -f -`. Each entry
 launches independently; if any create fails the rest still launch and the
 exit status is non-zero at the end. Nothing retries: an operator re-fires
-with `hook fire`. The Job's own name dedupes it.
+with `hook fire`; each fire creates a new Job (the task running in the
+Job dedupes itself).
 
 --dry-run prints the Job manifests as one JSON array and calls no kubectl.
 """
@@ -39,6 +40,7 @@ with `hook fire`. The Job's own name dedupes it.
 import argparse
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -85,6 +87,8 @@ def validate_entry(i, e):
             bad(k, "unknown field")
     if not isinstance(e.get("name"), str) or not NAME_RE.match(e["name"]):
         bad("name", "must match %s" % NAME_RE.pattern)
+    if e["name"].startswith("fork-sandbox"):
+        bad("name", "the fork-sandbox prefix is reserved (cleanup and policy selectors)")
     if e.get("event") not in EVENTS:
         bad("event", "must be one of %s" % ", ".join(EVENTS))
     if not isinstance(e.get("image"), str) or not IMAGE_RE.match(e["image"]):
@@ -136,6 +140,7 @@ def validate_entry(i, e):
     secrets = e.get("secrets", [])
     if not isinstance(secrets, list):
         bad("secrets", "must be a list")
+    seen_paths = set()
     for s in secrets:
         if (not isinstance(s, dict) or set(s) != {"secret", "key", "path"}
                 or not all(isinstance(s[k], str) and s[k] for k in s)
@@ -143,6 +148,12 @@ def validate_entry(i, e):
                 or not re.match(r"^[A-Za-z0-9._-]+$", s["key"])
                 or not s["path"].startswith("/") or ".." in s["path"].split("/")):
             bad("secrets", "each item needs secret, key, path (absolute)")
+        path = posixpath.normpath(s["path"])
+        if path == "/work" or path.startswith("/work/"):
+            bad("secrets", "path %s collides with the fixed /work mount" % s["path"])
+        if path in seen_paths:
+            bad("secrets", "duplicate path %s" % s["path"])
+        seen_paths.add(path)
 
     res = e.get("resources", {})
     if not isinstance(res, dict) or set(res) - {"requests", "limits"} \
@@ -189,10 +200,12 @@ class Thread:
             out = subprocess.run(["fork-sandbox", "mail", "export", self.tid, "--json"],
                                  capture_output=True, text=True, timeout=KUBECTL_TIMEOUT,
                                  check=True).stdout
-            msgs = [m for m in json.loads(out).get("messages", []) if "headers" in m]
-            root = min(msgs, key=lambda m: m["seq"]) if msgs else {"headers": []}
+            msgs = json.loads(out).get("messages", [])
+            # The root is the lowest seq even when it failed to parse; then it
+            # carries no headers, and a reply must never stand in for it.
+            root = min(msgs, key=lambda m: m["seq"]) if msgs else {}
             self._headers = {}
-            for name, value in root["headers"]:
+            for name, value in root.get("headers", []):
                 self._headers.setdefault(name.lower(), value.strip())
         return self._headers
 

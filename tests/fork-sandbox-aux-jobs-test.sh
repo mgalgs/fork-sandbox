@@ -32,6 +32,10 @@ mkdir -p "$bin"
 # carries the headers in $FAKE_HEADERS (JSON array of [name, value]).
 cat > "$bin/fork-sandbox" <<'FAKE'
 #!/usr/bin/env bash
+if [[ -n "${FAKE_ROOT_ERROR:-}" ]]; then
+    printf '{"messages":[{"seq":1,"error":"parse","file":"x"},{"seq":2,"headers":[["X-Preview-Repo","example-org/example-repo"],["X-Preview-PR","9"]]}]}\n'
+    exit 0
+fi
 printf '{"messages":[{"seq":2,"headers":[["X-Preview-Repo","other/reply"]]},{"seq":1,"headers":%s}]}\n' "${FAKE_HEADERS:-[]}"
 FAKE
 # Fake kubectl: records stdin per call; fails when FAKE_KUBECTL_FAIL matches
@@ -120,6 +124,19 @@ $(entry a)"
 check "duplicate name refused" test "$rc" -ne 0
 run "$(entry a '  securityContext: {privileged: true}')"
 check "spec override field refused" test "$rc" -ne 0
+run "$(entry fork-sandbox-agent)"
+check "reserved fork-sandbox name refused" test "$rc" -ne 0
+run "$(entry a '  secrets:
+    - {secret: s, key: k, path: /work}')"
+check "secret at /work refused" test "$rc" -ne 0
+run "$(entry a '  secrets:
+    - {secret: s, key: k, path: /work/x}')"
+check "secret under /work refused" test "$rc" -ne 0
+run "$(entry a '  secrets:
+    - {secret: s, key: k, path: /run/t}
+    - {secret: s2, key: k2, path: /run/t/}')"
+check "duplicate secret path refused" test "$rc" -ne 0
+check "duplicate secret path launches nothing" test ! -s "$FAKE_KUBECTL_LOG"
 run "$(entry a '  run_as: {uid: 0}')"
 check "uid 0 refused" test "$rc" -ne 0
 run "{}"
@@ -151,6 +168,9 @@ check "requires_pr passes with header" test "$(grep -c . "$FAKE_KUBECTL_LOG")" -
 FAKE_HEADERS='[["X-Preview-Repo","example-org/example-repo"]]' run "$(entry a '  gates: {requires_pr: true}')"
 check "requires_pr skips without header" test ! -s "$FAKE_KUBECTL_LOG"
 check "reply headers never count (root only)" test "$rc" -eq 0
+
+FAKE_ROOT_ERROR=1 run "$(entry a '  gates: {repo: [example-org/example-repo], requires_pr: true}')"
+check "unparseable root: reply never stands in" test ! -s "$FAKE_KUBECTL_LOG"
 
 echo "-- env sources"
 printf '%s\n' "$(entry a '  env:
