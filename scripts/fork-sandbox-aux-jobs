@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""fork-sandbox-aux-jobs -- launch auxiliary Kubernetes Jobs from a
+postmaster hook, one per registry entry that matches the event.
+
+Usage: fork-sandbox-aux-jobs --registry PATH [--dry-run]
+       fork-sandbox-aux-jobs --help
+
+A deployment's hook (on-harvest.*, on-target.*, on-quiescent.*) is one line:
+
+    exec fork-sandbox-aux-jobs --registry "$(dirname "$0")/aux-jobs.yaml"
+
+The event and thread come from the hook environment (FS_HOOK_EVENT,
+FS_HOOK_THREAD, FS_TARGET_*; see docs/agent-mail.md). The registry is a
+YAML list of entries; docs/aux-jobs.md has the format. The file ships in
+the hooks ConfigMap, which carries only executable files, so a deployment
+gives it mode 0755; this script does not look at the mode. --registry is
+required and there is no default path.
+
+The whole registry is validated before anything launches: one invalid
+entry exits non-zero naming the entry and field, and launches nothing. An
+absent registry file exits 0 and launches nothing.
+
+Gates come only from what the thread carries: the thread root's headers,
+read through `fork-sandbox mail export <thread> --json`. This script makes
+no GitHub or other network read. An entry whose gate fails, or whose
+header-sourced env has no header and no default, is logged and skipped.
+
+The Job spec is fixed and hardened here (PodSecurity "restricted", no
+service-account token, no retries, an emptyDir at /work); entries cannot
+override it, and unknown entry fields are refused. Jobs are created in
+kubectl's current namespace with `kubectl create -f -`. Each entry
+launches independently; if any create fails the rest still launch and the
+exit status is non-zero at the end. Nothing retries: an operator re-fires
+with `hook fire`. The Job's own name dedupes it.
+
+--dry-run prints the Job manifests as one JSON array and calls no kubectl.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+
+import yaml
+
+EVENTS = ("on-harvest", "on-target", "on-quiescent")
+NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+IMAGE_RE = re.compile(r"^\S+(:sha-[0-9a-f]{40}|@sha256:[0-9a-f]{64})$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+HEADER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
+K8S_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+KEYS = {"name", "event", "image", "gates", "env", "secrets", "resources",
+        "active_deadline_seconds", "ttl_seconds_after_finished", "run_as",
+        "repo_default"}
+KUBECTL_TIMEOUT = 60
+
+
+def log(msg):
+    print("fork-sandbox-aux-jobs: " + msg, file=sys.stderr)
+
+
+class Invalid(Exception):
+    pass
+
+
+def is_int(v, minimum):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= minimum
+
+
+def validate_entry(i, e):
+    label = "entry %d" % (i + 1)
+    if not isinstance(e, dict):
+        raise Invalid("%s: not a mapping" % label)
+    if isinstance(e.get("name"), str):
+        label = "entry %r" % e["name"]
+
+    def bad(field, why):
+        raise Invalid("%s: field %s: %s" % (label, field, why))
+
+    for k in e:
+        if k not in KEYS:
+            bad(k, "unknown field")
+    if not isinstance(e.get("name"), str) or not NAME_RE.match(e["name"]):
+        bad("name", "must match %s" % NAME_RE.pattern)
+    if e.get("event") not in EVENTS:
+        bad("event", "must be one of %s" % ", ".join(EVENTS))
+    if not isinstance(e.get("image"), str) or not IMAGE_RE.match(e["image"]):
+        bad("image", "must be pinned (:sha-<40 hex> or @sha256:<64 hex>)")
+    if not is_int(e.get("active_deadline_seconds"), 1):
+        bad("active_deadline_seconds", "required positive integer")
+    if "ttl_seconds_after_finished" in e and not is_int(e["ttl_seconds_after_finished"], 0):
+        bad("ttl_seconds_after_finished", "must be a non-negative integer")
+
+    gates = e.get("gates", {})
+    if not isinstance(gates, dict):
+        bad("gates", "must be a mapping")
+    for k in gates:
+        if k not in ("repo", "requires_pr"):
+            bad("gates", "unknown gate %r" % k)
+    if "repo" in gates and (not isinstance(gates["repo"], list) or not gates["repo"]
+                            or not all(isinstance(r, str) and r for r in gates["repo"])):
+        bad("gates.repo", "must be a non-empty list of strings")
+    if "requires_pr" in gates and not isinstance(gates["requires_pr"], bool):
+        bad("gates.requires_pr", "must be true or false")
+    if "repo_default" in e and (not isinstance(e["repo_default"], str) or not e["repo_default"]):
+        bad("repo_default", "must be a non-empty string")
+    if "repo_default" in e and "repo" not in gates:
+        bad("repo_default", "only meaningful with gates.repo")
+
+    env = e.get("env", {})
+    if not isinstance(env, dict):
+        bad("env", "must be a mapping")
+    for n, src in env.items():
+        if not isinstance(n, str) or not ENV_NAME_RE.match(n):
+            bad("env", "bad variable name %r" % (n,))
+        if not isinstance(src, dict):
+            bad("env.%s" % n, "must be a mapping")
+        kinds = [k for k in ("value", "header", "hook_env") if k in src]
+        extra = set(src) - {"value", "header", "hook_env", "default"}
+        if len(kinds) != 1 or extra or ("default" in src and kinds != ["header"]):
+            bad("env.%s" % n, "needs exactly one of value, header (+default), hook_env")
+        if kinds[0] == "value" and not isinstance(src["value"], str):
+            bad("env.%s.value" % n, "must be a string")
+        if kinds[0] == "header" and (not isinstance(src["header"], str)
+                                     or not HEADER_RE.match(src["header"])):
+            bad("env.%s.header" % n, "bad header name")
+        if "default" in src and not isinstance(src["default"], str):
+            bad("env.%s.default" % n, "must be a string")
+        if kinds[0] == "hook_env" and (not isinstance(src["hook_env"], str)
+                                       or not re.match(r"^FS_[A-Z0-9_]+$", src["hook_env"])):
+            bad("env.%s.hook_env" % n, "must be an FS_* name")
+
+    secrets = e.get("secrets", [])
+    if not isinstance(secrets, list):
+        bad("secrets", "must be a list")
+    for s in secrets:
+        if (not isinstance(s, dict) or set(s) != {"secret", "key", "path"}
+                or not all(isinstance(s[k], str) and s[k] for k in s)
+                or not K8S_NAME_RE.match(s["secret"])
+                or not re.match(r"^[A-Za-z0-9._-]+$", s["key"])
+                or not s["path"].startswith("/") or ".." in s["path"].split("/")):
+            bad("secrets", "each item needs secret, key, path (absolute)")
+
+    res = e.get("resources", {})
+    if not isinstance(res, dict) or set(res) - {"requests", "limits"} \
+            or not all(isinstance(v, dict) for v in res.values()):
+        bad("resources", "only requests/limits mappings")
+
+    run_as = e.get("run_as", {})
+    if not isinstance(run_as, dict) or set(run_as) - {"uid", "gid"} \
+            or not all(is_int(v, 1) for v in run_as.values()):
+        bad("run_as", "only uid/gid, positive integers (non-root)")
+
+
+def load_registry(path):
+    """Return the validated entry list; None when the file is absent."""
+    try:
+        with open(path) as fh:
+            data = yaml.safe_load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, yaml.YAMLError) as exc:
+        raise Invalid("registry %s: %s" % (path, exc))
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise Invalid("registry %s: top level must be a list of entries" % path)
+    seen = set()
+    for i, e in enumerate(data):
+        validate_entry(i, e)
+        if e["name"] in seen:
+            raise Invalid("entry %r: field name: duplicate" % e["name"])
+        seen.add(e["name"])
+    return data
+
+
+class Thread:
+    """The thread root's headers, read lazily through `mail export`."""
+
+    def __init__(self, tid):
+        self.tid = tid
+        self._headers = None
+
+    def headers(self):
+        if self._headers is None:
+            out = subprocess.run(["fork-sandbox", "mail", "export", self.tid, "--json"],
+                                 capture_output=True, text=True, timeout=KUBECTL_TIMEOUT,
+                                 check=True).stdout
+            msgs = [m for m in json.loads(out).get("messages", []) if "headers" in m]
+            root = min(msgs, key=lambda m: m["seq"]) if msgs else {"headers": []}
+            self._headers = {}
+            for name, value in root["headers"]:
+                self._headers.setdefault(name.lower(), value.strip())
+        return self._headers
+
+    def header(self, name):
+        v = self.headers().get(name.lower())
+        return v if v else None
+
+
+def resolve(entry, thread, environ):
+    """Return (env list, None) or (None, reason it does not launch)."""
+    gates = entry.get("gates", {})
+    if "repo" in gates:
+        repo = thread.header("X-Preview-Repo") or entry.get("repo_default")
+        if repo not in gates["repo"]:
+            return None, "repo gate: %r not allowed" % repo
+    if gates.get("requires_pr") and not thread.header("X-Preview-PR"):
+        return None, "requires_pr gate: no X-Preview-PR header"
+    env = []
+    for n, src in entry.get("env", {}).items():
+        if "value" in src:
+            v = src["value"]
+        elif "hook_env" in src:
+            v = environ.get(src["hook_env"], "")
+        else:
+            v = thread.header(src["header"])
+            if v is None:
+                v = src.get("default")
+            if v is None:
+                return None, "header %s absent and env %s has no default" % (src["header"], n)
+        env.append({"name": n, "value": v})
+    return env, None
+
+
+def job_name(name, tid, version, event):
+    short = re.sub(r"[^a-z0-9]", "", tid.lower())[:8] or "x"
+    suffix = uuid.uuid4().hex[:5]
+    room = 63 - len(name) - len(short) - len(suffix) - 3
+    mid = re.sub(r"[^a-z0-9-]", "-", (version or event).lower())[:max(room, 1)].strip("-") or "x"
+    return "%s-%s-%s-%s" % (name, short, mid, suffix)
+
+
+def build_job(entry, env, tid, version, event):
+    name = entry["name"]
+    run_as = entry.get("run_as", {})
+    uid, gid = run_as.get("uid", 1000), run_as.get("gid", 1000)
+    volumes = [{"name": "work", "emptyDir": {}}]
+    mounts = [{"name": "work", "mountPath": "/work"}]
+    for i, s in enumerate(entry.get("secrets", [])):
+        vol = "secret-%d" % i
+        volumes.append({"name": vol, "secret": {
+            "secretName": s["secret"], "defaultMode": 0o444,
+            "items": [{"key": s["key"], "path": s["key"], "mode": 0o444}]}})
+        mounts.append({"name": vol, "mountPath": s["path"],
+                       "subPath": s["key"], "readOnly": True})
+    container = {
+        "name": name, "image": entry["image"], "env": env,
+        "volumeMounts": mounts,
+        "securityContext": {"allowPrivilegeEscalation": False,
+                            "capabilities": {"drop": ["ALL"]}},
+    }
+    if entry.get("resources"):
+        container["resources"] = entry["resources"]
+    labels = {"app": name, "aux-job": name}
+    return {
+        "apiVersion": "batch/v1", "kind": "Job",
+        "metadata": {"name": job_name(name, tid, version, event), "labels": labels},
+        "spec": {
+            "backoffLimit": 0,
+            "activeDeadlineSeconds": entry["active_deadline_seconds"],
+            "ttlSecondsAfterFinished": entry.get("ttl_seconds_after_finished", 86400),
+            "template": {
+                "metadata": {"labels": dict(labels)},
+                "spec": {
+                    "restartPolicy": "Never",
+                    "automountServiceAccountToken": False,
+                    "securityContext": {
+                        "runAsNonRoot": True, "runAsUser": uid, "runAsGroup": gid,
+                        "seccompProfile": {"type": "RuntimeDefault"}},
+                    "containers": [container],
+                    "volumes": volumes,
+                },
+            },
+        },
+    }
+
+
+def main(argv=None, environ=None):
+    environ = os.environ if environ is None else environ
+    ap = argparse.ArgumentParser(prog="fork-sandbox-aux-jobs",
+                                 description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--registry", required=True, metavar="PATH")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the Job manifests as JSON; call no kubectl")
+    args = ap.parse_args(argv)
+
+    try:
+        entries = load_registry(args.registry)
+    except Invalid as exc:
+        log(str(exc))
+        return 1
+    if entries is None:
+        log("registry %s absent; nothing to launch" % args.registry)
+        return 0
+
+    event, tid = environ.get("FS_HOOK_EVENT", ""), environ.get("FS_HOOK_THREAD", "")
+    todo = [e for e in entries if e["event"] == event]
+    if not todo:
+        return 0
+    if not tid:
+        log("FS_HOOK_THREAD is not set")
+        return 1
+    version = environ.get("FS_TARGET_VERSION", "")
+    thread = Thread(tid)
+    manifests, failures = [], []
+    for e in todo:
+        try:
+            env, why = resolve(e, thread, environ)
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError) as exc:
+            failures.append(e["name"])
+            log("%s: cannot read thread headers: %s" % (e["name"], exc))
+            continue
+        if env is None:
+            log("%s: skipped: %s" % (e["name"], why))
+            continue
+        manifests.append((e["name"], build_job(e, env, tid, version, event)))
+
+    if args.dry_run:
+        print(json.dumps([m for _, m in manifests], indent=2))
+    else:
+        for name, m in manifests:
+            try:
+                r = subprocess.run(["kubectl", "create", "-f", "-"], input=json.dumps(m),
+                                   capture_output=True, text=True, timeout=KUBECTL_TIMEOUT)
+            except (subprocess.SubprocessError, OSError) as exc:
+                failures.append(name)
+                log("%s: kubectl create failed: %s" % (name, exc))
+                continue
+            if r.returncode != 0:
+                failures.append(name)
+                log("%s: kubectl create failed: %s" % (name, r.stderr.strip()))
+            else:
+                log("%s: created %s" % (name, m["metadata"]["name"]))
+    if failures:
+        log("failed: " + ", ".join(failures))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
