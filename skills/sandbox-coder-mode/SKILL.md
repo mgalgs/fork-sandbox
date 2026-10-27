@@ -1005,6 +1005,10 @@ something the sandbox does not have:
   question mid-run, or watch a UI. That is `fork-task`, not `fork-sandbox`.
 - **A change small enough to prove by reading**, per the threshold above.
 
+Another repo the task needs, a private one included, is **not** on this
+list, even for a sealed run: stage it read-only (fork-sandbox skill, "Other
+repos, private ones included"). Check that before dropping out.
+
 Say which of these applies, do the work here, and go back to delegating.
 
 ## Leaving the mode

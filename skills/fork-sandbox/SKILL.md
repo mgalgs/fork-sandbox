@@ -24,7 +24,8 @@ you want an interactive session someone will sit with.
 Do **not** use it when the task needs uncommitted state, an `.env` file,
 ssh keys, a push, the tailnet, or the user's global `~/.claude`. None of
 those reach the sandbox. (`node_modules` and the project's pinned node DO
-reach it — see "What it gives up".)
+reach it — see "What it gives up". So can other repos, private ones
+included, staged read-only — see "Other repos, private ones included".)
 
 ## Instructions
 
@@ -720,6 +721,30 @@ Say this to the user when you launch one:
   key the run needs to exist at all.)
 - **No tailnet and no VPN.** The internet and the local LAN stay reachable.
 - **No tmux.** It cannot split panes or fork further tasks.
+
+## Other repos, private ones included
+
+A task that needs a second repo (a library it builds against, a tool it
+runs, a private repo with no public mirror) still belongs in a sandbox,
+sealed ones included. The sandbox never fetches it. You stage a copy on
+the host and bind it in read-only:
+
+1. Clone it locally, which needs no credential:
+   `git clone --quiet <repo> /var/tmp/claude-scratch/<task>-attach/<name>`.
+   Put any model files or data it needs beside it.
+2. Launch with `--attach-dir /var/tmp/claude-scratch/<task>-attach`. It
+   shows up read-only at `/attachments`, on a local run and on `--k8s`.
+3. Say in the handoff where it is and how to use it, e.g.
+   `PYTHONPATH=/attachments/<name>`.
+
+Only the project's branch comes back. `fork-sandbox run` stages read-only;
+the layer below (`claude-sandboxed --bind-rw`) can bind read-write, but
+`run` does not pass that through. So when the run must change the staged
+repo, it copies it somewhere writable, commits there, and writes a
+`git format-patch` series or a bundle to its outbox. This session applies
+that on the host. "Cannot reach Forgejo or GitHub" above means "cannot
+authenticate to them". It is never a reason to skip the sandbox for a repo
+you can stage.
 
 ## Why the clone
 
