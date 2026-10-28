@@ -848,12 +848,18 @@
 # wake that posts a reply clears it, the same way a clean exit clears a
 # wake-exit flag (see pm_wake_exit_clear). `on-silence: retry` does the
 # same and, when a clean wake wrote reply files and EVERY one was discarded,
-# re-wakes the seat once on the same trigger (pm_retry_malformed_schedule):
-# no retry for a no-file wake, a newer pending message, a closed thread, or
+# re-wakes the seat once on the same trigger (pm_retry_malformed_schedule).
+# A clean wake with NO reply file is retried the same way only when the run
+# recorded a review target and the seat has posted no reply on that target
+# yet (pm_seat_replied_on_target): it owes a verdict there, and nothing else
+# would wake it again. A seat that already replied on the target may stay
+# silent on a follow-up, so that one is flagged only. No retry for a newer
+# pending message, a closed thread, or
 # a trigger that already had its one such retry (the marker
 # discards/<tid>/<agent>.spent holds the trigger id). It rides the
 # retries/ machinery with REASON=malformed but spends no crash-retry budget;
-# its handoff quotes the discard reasons kept in discards/<tid>/<agent>.
+# its handoff quotes the discard reasons kept in discards/<tid>/<agent> (a
+# no-file retry says so in one line instead).
 # The seat's crash-retry record is set aside in discards/<tid>/<agent>.prior
 # while the malformed schedule is pending, and put back when the schedule
 # ends any way: it fires, a newer message supersedes it, or the thread closes
@@ -1346,8 +1352,9 @@ HANDLER_OUTBOX="$STATE/handler-outbox"
 # in-place edit -- see pm_retry_fails_set.
 RETRIES="$STATE/retries"
 # The reasons a `retry` seat's replies were discarded, one line per
-# discarded file: $DISCARDS/<thread-id>/<agent>. Written at harvest, read
-# into the retry wake's handoff and removed there. It lives apart from
+# discarded file (or one no-reply-file sentinel line for a no-file wake):
+# $DISCARDS/<thread-id>/<agent>. Written at harvest, read into the retry
+# wake's handoff and removed there. It lives apart from
 # $RETRIES and from the held / fetch-wait records (which carry only the
 # retry's kind) so the reasons survive every detour a retry can take
 # before it spawns.
@@ -3068,18 +3075,27 @@ pm_write_handoff() {
         printf 'The triggering message for this wake is: %s\n\n' "$trigger_mid"
         if [[ "$is_retry" == malformed ]]; then
             local discard_line
-            printf '## Your previous reply was discarded\n\n'
-            printf 'Your previous wake for this same message exited cleanly, but the\n'
-            printf 'postmaster could not post the reply file(s) it wrote, so nothing from\n'
-            printf 'them reached the thread. Its reason for each discarded file:\n\n'
-            if [[ -f "$DISCARDS/$tid/$agent" ]]; then
-                while IFS= read -r discard_line; do
-                    printf -- '- %s\n' "$discard_line"
-                done < "$DISCARDS/$tid/$agent"
+            if [[ "$(cat -- "$DISCARDS/$tid/$agent" 2>/dev/null || true)" == "$PM_NO_REPLY_FILE_REASON" ]]; then
+                printf '## Your previous wake posted no reply\n\n'
+                printf 'Your previous wake for this same message exited cleanly without\n'
+                printf 'writing a reply file, and you have not yet replied on this review\n'
+                printf 'target. A verdict is owed: write one as a new mail-*.md file in your\n'
+                printf 'outbox (see "Replying" below for the format).\n'
+                printf 'This is the only retry: a second silent wake is not retried.\n\n'
+            else
+                printf '## Your previous reply was discarded\n\n'
+                printf 'Your previous wake for this same message exited cleanly, but the\n'
+                printf 'postmaster could not post the reply file(s) it wrote, so nothing from\n'
+                printf 'them reached the thread. Its reason for each discarded file:\n\n'
+                if [[ -f "$DISCARDS/$tid/$agent" ]]; then
+                    while IFS= read -r discard_line; do
+                        printf -- '- %s\n' "$discard_line"
+                    done < "$DISCARDS/$tid/$agent"
+                fi
+                printf '\nFix what the reasons name and write the reply again, as a new\n'
+                printf 'mail-*.md file in your outbox (see "Replying" below for the format).\n'
+                printf 'This is the only retry: a second discarded reply is not retried.\n\n'
             fi
-            printf '\nFix what the reasons name and write the reply again, as a new\n'
-            printf 'mail-*.md file in your outbox (see "Replying" below for the format).\n'
-            printf 'This is the only retry: a second discarded reply is not retried.\n\n'
         elif [[ "$is_retry" == 1 ]]; then
             printf '## This is a retry\n\n'
             printf 'Your previous wake for this same message did not finish cleanly (it\n'
@@ -5795,16 +5811,41 @@ pm_harvest_record() {
     pm_run_env_set "$f" OUTCOME "$outcome"
 }
 
+# The one line stored in place of discard reasons when the retried wake wrote
+# no reply file at all; the handoff words that case itself.
+PM_NO_REPLY_FILE_REASON="no-reply-file"
+
+# Succeeds when <agent> has posted a reply (a harvested run with REPLIES > 0)
+# on <tid> at review target <sha> -- the seat has weighed in on that version.
+pm_seat_replied_on_target() {
+    local tid="$1" agent="$2" sha="$3" rid f n
+    [[ -f "$SEQ/$tid" ]] || return 1
+    while IFS= read -r rid; do
+        f="$RUNS/$rid.env"
+        [[ -n "$rid" && -f "$f" ]] || continue
+        [[ "$(fs_pm_env_get "$f" AGENT)" == "$agent" \
+            && "$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)" == "$sha" ]] || continue
+        n="$(fs_pm_env_get "$f" REPLIES)"
+        [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n > 0 )) && return 0
+    done < "$SEQ/$tid"
+    return 1
+}
+
 # Schedules the one re-wake of an `on-silence: retry` seat whose reply files
-# were all discarded: the discard reasons are stored for the retry's handoff
-# and a due-now schedule goes in the seat's retries record (REASON=malformed,
-# see pm_retry_raw_write), which the next pm_retry_pass fires.
+# were all discarded, or that wrote none while owing its first reply on the
+# run's review target: the discard reasons (or PM_NO_REPLY_FILE_REASON) are
+# stored for the retry's handoff and a due-now schedule goes in the seat's
+# retries record (REASON=malformed, see pm_retry_raw_write), which the next
+# pm_retry_pass fires.
 # $1 = thread, $2 = agent, $3 = trigger message id, $4 = the harvested run.
 pm_retry_malformed_schedule() {
     local tid="$1" agent="$2" trigger="$3" rid="$4"
-    (( ${#PM_HARVEST_DISCARDS[@]} )) || return 0
     mkdir -p -- "$DISCARDS/$tid"
-    printf '%s\n' "${PM_HARVEST_DISCARDS[@]}" > "$DISCARDS/$tid/$agent"
+    if (( ${#PM_HARVEST_DISCARDS[@]} )); then
+        printf '%s\n' "${PM_HARVEST_DISCARDS[@]}" > "$DISCARDS/$tid/$agent"
+    else
+        printf '%s\n' "$PM_NO_REPLY_FILE_REASON" > "$DISCARDS/$tid/$agent"
+    fi
     # The trigger's one malformed retry is spent from here on, whatever the
     # retry's own wake does (a crash retry in between must not reopen it).
     printf '%s\n' "$trigger" > "$DISCARDS/$tid/$agent.spent"
@@ -6144,11 +6185,15 @@ pm_harvest_run() {
         if [[ "$backend" == k8s && "$(fs_pm_env_get "$RETRIES/$tid/$agent" STATE)" != exhausted ]]; then
             pm_k8s_streak_exhausted "$tid" "$agent" "$trigger" || true
         fi
-    elif (( clean_exit && reply_files > 0 && replies == 0 )) \
+    elif (( clean_exit && replies == 0 )) \
         && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == retry \
               && "$(cat -- "$DISCARDS/$tid/$agent.spent" 2>/dev/null || true)" != "$trigger" ]] \
+        && { (( reply_files > 0 )) \
+             || { [[ -n "$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)" ]] \
+                  && ! pm_seat_replied_on_target "$tid" "$agent" "$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)"; }; } \
         && ! pm_upstream_closed "$tid"; then
-        # Every reply file was discarded and no newer message is pending
+        # Every reply file was discarded, or none was written by a seat with
+        # no reply yet on its review target, and no newer message is pending
         # (the branch above): re-wake once on the same trigger.
         pm_retry_malformed_schedule "$tid" "$agent" "$trigger" "$rid"
     fi

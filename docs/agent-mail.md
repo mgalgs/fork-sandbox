@@ -2095,9 +2095,13 @@ newest reason left standing, or removed when none is.
 clean wake that wrote at least one reply file, every one of which the
 postmaster discarded (`reply_files > 0` and `replies == 0`), is re-woken
 once on the same trigger message. A wake that wrote no reply file at all is
-not retried (personas are told to end a wake silently when it brings
-nothing for their lane, and a retry would be a wasted spawn); it is flagged
-exactly as under `flag`. The retry is dropped, not scheduled, when the seat
+flagged exactly as under `flag`, and is retried once only when the run has a
+review target and the seat has posted no reply yet on that target: it owes
+a verdict on every version, and nothing else would wake it again, so the
+panel could never converge. A seat that already replied on the target may
+legitimately stay silent on a follow-up (personas are told to end a wake
+silently when it brings nothing for their lane), so that is not retried.
+A seat with no review target is never retried for silence. The retry is dropped, not scheduled, when the seat
 already has a newer message pending (that wake renders the whole thread
 anyway) or the thread's upstream state is closed, and a retry whose own
 wake discards everything again, or posts nothing, gets no further retry: it
@@ -2110,7 +2114,8 @@ of the crash-retry budget: it never touches `ATTEMPT`, `MAX`, `FAILS` or
 `exhausted`. Its handoff has a section headed `## Your previous reply was
 discarded` quoting, one bullet per discarded file, the same reason text the
 `malformed reply file <name>: ...` flag carries; it does not carry the
-crash retry's "This is a retry" text. The reasons are kept under
+crash retry's "This is a retry" text. A no-file retry has instead a
+section headed `## Your previous wake posted no reply`. The reasons are kept under
 `discards/<thread-id>/<agent>` until that handoff is written, so a retry
 that is held for a grant or waits on a fetch still has them. The run
 record of the retry wake has `RETRY_KIND=malformed` and `RETRY_OF=<run id>`. The single malformed retry is per (seat, trigger): it is recorded in
@@ -2207,7 +2212,7 @@ an exhausted one from a recovered one, not just see fields disappear:
 | `MAX` | the retry cap (`$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`'s length) in effect when `STATE` was last set to `pending` or `exhausted` |
 | `LAST_FAILED_RUN` | the run id of the wake whose failure produced the current `pending` or `exhausted` state |
 | `RECOVERED_AT` | epoch seconds a `recovered` state was reached |
-| `REASON` | why the retry exists: `failed` (the wake crashed or was killed) or `malformed` (the wake exited cleanly but every reply file was discarded; `on-silence: retry`). Present whenever `TRIGGER` or `STATE` is. A `malformed` record is `pending` with `ATTEMPT=0`, no `MAX`, and `NOT_BEFORE` now; when it fires, is superseded by a newer message, or the thread closes, it is replaced by the seat's set-aside crash record (for example `STATE=recovered`, `REASON=failed`), or removed if the seat had none; it is never counted. `status --json` retries[] reports it as `reason`, `failed` for a record that predates the field |
+| `REASON` | why the retry exists: `failed` (the wake crashed or was killed) or `malformed` (the wake exited cleanly but every reply file was discarded, or it wrote none while owing its first reply on its review target; `on-silence: retry`). Present whenever `TRIGGER` or `STATE` is. A `malformed` record is `pending` with `ATTEMPT=0`, no `MAX`, and `NOT_BEFORE` now; when it fires, is superseded by a newer message, or the thread closes, it is replaced by the seat's set-aside crash record (for example `STATE=recovered`, `REASON=failed`), or removed if the seat had none; it is never counted. `status --json` retries[] reports it as `reason`, `failed` for a record that predates the field |
 
 A `recovered` record is written the first time a pair with an actual
 retry history (`STATE` `pending` or `exhausted`) harvests exit-0 clean:
@@ -2294,7 +2299,7 @@ own thread scans never see it:
 | `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
-| `discards/<thread-id>/<agent>` | one line per reply file of a clean wake that the postmaster discarded, kept for the `on-silence: retry` handoff and removed when that handoff is written |
+| `discards/<thread-id>/<agent>` | one line per reply file of a clean wake that the postmaster discarded (or the single `no-reply-file` sentinel line for a wake that wrote none), kept for the `on-silence: retry` handoff and removed when that handoff is written |
 | `discards/<thread-id>/<agent>.spent` | the trigger message id whose one malformed retry has been scheduled; never reopened by a crash retry |
 | `discards/<thread-id>/<agent>.prior` | the seat's crash-retry record set aside while a malformed schedule is pending; put back when that schedule ends |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT/REASON fields (see "Retrying a dead wake" above) — one file, two independent purposes |

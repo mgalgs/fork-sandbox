@@ -14,10 +14,10 @@ set -uo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 # rita retries a discarded reply; wanda is gated by wake-when: gate.
-for ps_seat in rita wanda; do
+for ps_seat in rita wanda rhea fay; do
     printf 'Panel fixture seat.\n' > "$FORK_SANDBOX_PERSONAS_DIR/$ps_seat.md"
 done
-sed -i 's/^agents:$/agents:\n  rita:\n    on-silence: retry\n  wanda:\n    wake-when: gate/' "$FORK_SANDBOX_FLEET_FILE"
+sed -i 's/^agents:$/agents:\n  rita:\n    on-silence: retry\n  wanda:\n    wake-when: gate\n  rhea:\n    on-silence: retry\n    review-target: follow\n  fay:\n    on-silence: flag\n    review-target: follow/' "$FORK_SANDBOX_FLEET_FILE"
 "$FLEET" check >/dev/null 2>&1 || { echo "FATAL: panel fixture fleet fails check" >&2; exit 1; }
 
 ps_store() {
@@ -100,6 +100,111 @@ once
 check "retry: a no-file wake spawns nothing more" 1 "$(ps_spawns rita)"
 check "retry: a no-file wake is flagged as on-silence: flag is" \
     "wake for rita posted no reply (run $ps_rid1)" "$(cat "$PM_STATE_DIR/needs-operator/$ps_tid")"
+
+printf '\n== on-silence: retry: a review-target seat with no reply on the target is re-woken once ==\n'
+# ps_target_thread <seat>: a thread opened to <seat> with a review target.
+ps_target_thread() {
+    ps_store
+    k8s_rt1_seed
+    printf 'kick off review\n' > "$work/body.tmp"
+    ps_mid="$("$MAIL" send --from '@alice' --to "@$1" --subject "target topic $1" \
+        --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+    ps_tid="$(thread_of "$ps_mid")"; ps_short="${ps_tid:0:8}"
+}
+ps_flag() { cat "$PM_STATE_DIR/needs-operator/$ps_tid" 2>/dev/null || true; }
+ps_reply_file() {
+    local rd
+    rd="$(sed -n 's/^RUN_DIR=//p' "$(live_env_for_agent "$1")")"
+    mkdir -p -- "$rd/outbox"
+    printf 'Subject: verdict\n\nlooks fine\n' > "$rd/outbox/mail-1.md"
+    printf '0\n' > "$rd/exit-code"
+    printf '{}\n' > "$rd/summary.json"
+}
+
+ps_target_thread rhea
+once
+ps_rid1="$(basename "$(live_env_for_agent rhea)" .env)"
+finish_run rhea 0
+once
+check "silent retry: the first silent wake flags as ever" \
+    "wake for rhea posted no reply (run $ps_rid1)" "$(ps_flag)"
+check "silent retry: and schedules a retry on the same trigger" malformed \
+    "$(env_val "$(ps_retry_file rhea)" REASON)"
+check "silent retry: with the trigger the silent wake answered" "$ps_mid" \
+    "$(env_val "$(ps_retry_file rhea)" TRIGGER)"
+once
+check "silent retry: the next pass re-wakes the seat" 2 "$(ps_spawns rhea)"
+ps_env2="$(live_env_for_agent rhea)"
+check "silent retry: on the same trigger" "$ps_mid" "$(env_val "$ps_env2" TRIGGER)"
+check "silent retry: the run record carries the kind" malformed "$(env_val "$ps_env2" RETRY_KIND)"
+ps_ho="$(ps_handoff "$ps_env2")"
+contains "silent retry: handoff names the silence" "$ps_ho" "## Your previous wake posted no reply"
+not_contains "silent retry: handoff does not claim a discard" "$ps_ho" "## Your previous reply was discarded"
+ps_rid2="$(basename "$ps_env2" .env)"
+finish_run rhea 0
+once
+once
+check "silent retry: a second silence on the trigger is not retried" 2 "$(ps_spawns rhea)"
+check "silent retry: and leaves no retry file" 0 "$([[ -e "$(ps_retry_file rhea)" ]] && echo 1 || echo 0)"
+check "silent retry: the flag stands, naming the newest silent run" \
+    "wake for rhea posted no reply (run $ps_rid2)" "$(ps_flag)"
+
+printf '\n== on-silence: retry: a retried wake that replies clears the silent-wake flag ==\n'
+ps_target_thread rhea
+once
+finish_run rhea 0
+once
+once
+ps_reply_file rhea
+once
+check "silent retry: the reply from the retried wake clears the flag" "" "$(ps_flag)"
+check "silent retry: and no third wake" 2 "$(ps_spawns rhea)"
+
+printf '\n== on-silence: retry: a seat that already replied on the target is not retried ==\n'
+ps_target_thread rhea
+once
+ps_reply_file rhea
+once
+reply_msg '@alice' "$ps_mid" 'follow-up, nothing for you' --to '@rhea' >/dev/null
+once
+check "silent retry: the follow-up woke the seat" 2 "$(ps_spawns rhea)"
+ps_rid2="$(basename "$(live_env_for_agent rhea)" .env)"
+finish_run rhea 0
+once
+once
+check "silent retry: a later silence after a reply is not retried" 2 "$(ps_spawns rhea)"
+check "silent retry: and leaves no retry file" 0 "$([[ -e "$(ps_retry_file rhea)" ]] && echo 1 || echo 0)"
+check "silent retry: it is flagged as before" \
+    "wake for rhea posted no reply (run $ps_rid2)" "$(ps_flag)"
+
+printf '\n== on-silence: retry: a reply on an earlier target does not excuse a silent first wake on the new one ==\n'
+ps_target_thread rhea
+once
+ps_reply_file rhea
+once
+ps_rt2="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree "$rt1_tree" -p "$rt1_sha" -m 'review target commit 2')"
+git -C "$PROJECT_DIR" update-ref "refs/heads/$rt1_branch" "$ps_rt2"
+printf 'BRANCH=%s\nSHA=%s\nVERSION=2\nSET_BY=@carol\nSET_AT=2026-01-01T00:00:00Z\n' \
+    "$rt1_branch" "$ps_rt2" > "$PM_STATE_DIR/review-target/$ps_tid.env"
+reply_msg '@alice' "$ps_mid" 'version 2' --to '@rhea' >/dev/null
+once
+check "silent retry: the new version woke the seat" 2 "$(ps_spawns rhea)"
+finish_run rhea 0
+once
+once
+check "silent retry: a silent first wake on the new target is retried" 3 "$(ps_spawns rhea)"
+
+printf '\n== on-silence: flag with a review target, and retry without one: not retried ==\n'
+ps_target_thread fay
+once
+ps_rid1="$(basename "$(live_env_for_agent fay)" .env)"
+finish_run fay 0
+once
+once
+check "silent retry: an on-silence: flag seat spawns nothing more" 1 "$(ps_spawns fay)"
+check "silent retry: and is flagged" "wake for fay posted no reply (run $ps_rid1)" "$(ps_flag)"
+# (rita, on-silence: retry with no review target, is covered above.)
 
 printf '\n== on-silence: retry: no retry when a newer message is pending ==\n'
 ps_store

@@ -75,7 +75,8 @@ gate guards a spawn, whatever the seat is.
 `on-silence` is fleet.yaml-only and LLM-only. `flag` has the postmaster
 flag the thread when a wake of the seat exits 0 having posted nothing;
 `retry` does the same and also re-wakes the seat once when every reply
-file it wrote was discarded as malformed (see docs/agent-mail.md). Leave
+file it wrote was discarded as malformed, or when it wrote none and has no
+reply yet on its review target (see docs/agent-mail.md). Leave
 it unset on a seat whose protocol allows a silent wake.
 
 `review-target` is fleet.yaml-only too, same reason as `backend`: a seat
