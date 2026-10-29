@@ -965,9 +965,10 @@ drain_setup() {
     printf '%s\n' "$DR_HOOK_PID" > "$DR_HOOK_REC/pid"
 }
 
-# Starts the loop, waits for its first pass, then sends SIGTERM.
+# Starts the loop (pass interval $DR_INTERVAL, default 1), waits for its
+# first pass, then sends SIGTERM.
 drain_start_and_term() {
-    FORK_SANDBOX_POSTMASTER_INTERVAL=1 FORK_SANDBOX_POSTMASTER_DRAIN_POLL=0.2 \
+    FORK_SANDBOX_POSTMASTER_INTERVAL="${DR_INTERVAL:-1}" FORK_SANDBOX_POSTMASTER_DRAIN_POLL=0.2 \
         "$postmaster" deliver --project "$PROJECT_DIR" > "$DR_LOG" 2>&1 &
     DR_PID=$!
     for _ in $(seq 1 100); do [[ -e "$PM_STATE_DIR/project" ]] && break; sleep 0.1; done
@@ -1011,6 +1012,114 @@ contains "drain timeout: pm drain done names what was cut off" "$(cat "$DR_LOG")
 check "drain timeout: a wake cut off mid-submit is not marked handed-off" 0 \
     "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
 kill "$DR_WAKE_PID" 2>/dev/null; wait "$DR_WAKE_PID" 2>/dev/null
+
+# Kills the wake and hook drain_setup left running.
+drain_cleanup() {
+    kill "$DR_WAKE_PID" "${DR_HOOK_PID:-}" 2>/dev/null
+    wait "$DR_WAKE_PID" "${DR_HOOK_PID:-}" 2>/dev/null
+    DR_HOOK_PID=""
+}
+
+# Runs "$@" with the postmaster sourced, as the drain would (events on).
+dr_call() {
+    (
+        # shellcheck disable=SC1090
+        source "$postmaster"
+        # shellcheck disable=SC2034  # read by the sourced functions
+        PM_EVENTS_ENABLED=1
+        "$@"
+    )
+}
+
+# Hand off first: the kubelet SIGKILLs pid 1 once the grace period is spent,
+# and a drain still waiting then must already have marked every live wake
+# past submit, or the next postmaster spends an adoption on each.
+drain_setup
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=60 drain_start_and_term
+check "drain mark-first: still waiting on the running hook" 1 "$(drain_alive_after 20)"
+kill -KILL "$DR_PID" 2>/dev/null; wait "$DR_PID" 2>/dev/null
+check "drain mark-first: SIGKILL mid-wait leaves handed-off on the live wake past submit" 1 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+contains "drain mark-first: pm handed-off event before the wait ended" "$(cat "$DR_LOG")" \
+    "pm handed-off thread="
+drain_cleanup
+
+# A wake that finishes submitting during the drain is marked when the wait
+# ends.
+drain_setup
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=60 drain_start_and_term
+check "drain re-mark: waiting on the submitting wake" 1 "$(drain_alive_after 20)"
+check "drain re-mark: a wake still submitting is not marked at drain start" 0 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+kill "$DR_HOOK_PID" 2>/dev/null; wait "$DR_HOOK_PID" 2>/dev/null
+check "drain re-mark: exits once nothing is busy" 0 "$(drain_alive_after 50)"
+wait "$DR_PID" 2>/dev/null || true
+check "drain re-mark: the wake that finished submitting mid-drain is marked" 1 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+check "drain re-mark: ...with one handed-off event" 1 "$(grep -c '^pm handed-off thread=' "$DR_LOG")"
+drain_cleanup
+
+# The second hypothesis behind a missing mark: a wake that was itself
+# adopted (pid file dropped by pm_try_adopt, rewritten by the adopting
+# wrapper, no k8s-run-dir until it finishes) must still read as live and
+# past submit at the next drain.
+adopt_drain_case() {
+    local mid env rid wake_dir k8s_run_dir bg _
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    mid="$(send_msg '@carol' '@karen' 'drain topic: adopted' 'first' 8)"
+    STUB_K8S_NO_REPLY=1 once
+    env="$(latest_env_for_agent karen)"
+    rid="$(basename "$env" .env)"
+    wake_dir="$(env_val "$env" RUN_DIR)"
+    k8s_run_dir="$(sed -n 's/^  run dir:  *//p' "$wake_dir/launch.log" | head -n1)"
+    printf 'INPUTS_PUSH_EXPECTED=true\nINPUTS_PUSH_COMPLETE=true\n' > "$k8s_run_dir/run.env"
+    rm -f -- "$PM_STATE_DIR/harvested/$rid" "$wake_dir/summary.json" "$wake_dir/exit-code" \
+        "$wake_dir/k8s-run-dir" "$wake_dir/k8s-timeout" "$wake_dir/pid-identity"
+    dead_pid_of > "$wake_dir/pid"
+    printf '1\n' > "$K8S_WAKE_BIN/probe-rc"
+    rm -f -- "$K8S_WAKE_BIN/resume-calls.log"
+    : > "$K8S_WAKE_BIN/resume-hold"
+    FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once &
+    bg=$!
+    for _ in $(seq 1 100); do [[ -s "$K8S_WAKE_BIN/resume-calls.log" ]] && break; sleep 0.1; done
+    check "drain adopted: the adopting wrapper is running" 1 \
+        "$(wc -l < "$K8S_WAKE_BIN/resume-calls.log" 2>/dev/null || echo 0)"
+    check "drain adopted: one adoption spent" 1 "$(cat "$wake_dir/adopt-count" 2>/dev/null)"
+    FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=5 dr_call pm_drain > "$work/adopt-drain.out" 2>&1
+    check "drain adopted: the adopted live wake is marked handed-off at the next drain" 1 \
+        "$( [[ -e "$wake_dir/handed-off" ]] && echo 1 || echo 0 )"
+    contains "drain adopted: pm handed-off event names the run" "$(cat "$work/adopt-drain.out")" \
+        "agent=karen run=$rid"
+    rm -f -- "$K8S_WAKE_BIN/resume-hold" "$K8S_WAKE_BIN/probe-rc"
+    wait "$bg" 2>/dev/null
+}
+adopt_drain_case
+
+# The drain's bound counts from SIGTERM, not from the drain's own start, so
+# the pass in progress when it arrived comes out of the same budget.
+drain_setup nohook
+dr_start=$(( $(date +%s) - 4 ))
+SECONDS=0
+PM_TERM_AT="$dr_start" FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=5 FORK_SANDBOX_POSTMASTER_DRAIN_POLL=0.2 \
+    dr_call pm_drain > "$work/term-drain.out" 2>&1
+check "drain from SIGTERM: 4s already spent of a 5s bound leaves at most ~1s to wait" 1 \
+    "$(( SECONDS <= 2 ))"
+contains "drain from SIGTERM: still cut off the submitting wake" "$(cat "$work/term-drain.out")" \
+    "pm drain done busy=1"
+drain_cleanup
+
+# ...and SIGTERM during the loop's sleep between passes is acted on at once,
+# not when the sleep would have ended.
+drain_setup nohook
+DR_INTERVAL=30 FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=2 drain_start_and_term
+check "drain from SIGTERM: exits within the bound though the pass interval is longer" 0 \
+    "$(drain_alive_after 50)"
+wait "$DR_PID" 2>/dev/null || true
+drain_cleanup
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
