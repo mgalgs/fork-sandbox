@@ -67,12 +67,15 @@ count_refresh_scratch_dirs() {
 #
 # One executable, two personalities, picked by which env vars the caller
 # sets:
-#   - STUB_MODE=success|blank|failexit|noop|sleep -- a simple, unconditional
-#     refresh outcome, for fs_claude_refresh_if_needed's own tests, which
-#     only ever invoke it as `claude mcp list`. `sleep` (for
+#   - STUB_MODE=success|blank|failexit|noop|sleep|hang -- a simple,
+#     unconditional refresh outcome, for fs_claude_refresh_if_needed's own
+#     tests, which only ever invoke it as `claude mcp list`. `sleep` (for
 #     STUB_SLEEP_SECS, default 20s) never returns on its own within a test's
 #     timescale, so a SIGTERM sent to the caller while it is still running
-#     exercises the interrupted-refresh path below.
+#     exercises the interrupted-refresh path below. `hang` is a claude that
+#     outlives SIGTERM: it ignores it and keeps running for STUB_HANG_SECS
+#     (default 120s), appending its PID to STUB_HANG_PIDFILE so a test can
+#     always kill it in the end.
 #   - PROBE_BREAK_CHECK=<name>, or neither set -- a small, faithful model of
 #     claude's real OAuth-refresh contract (startup refresh on an expired
 #     token, the 401 handler's forced refresh, honouring a live lock,
@@ -152,6 +155,12 @@ if [[ -n "${STUB_MODE:-}" ]]; then
         blank) blank ;;
         failexit) exit 1 ;;
         noop) : ;;
+        hang)
+            [[ -n "${STUB_HANG_PIDFILE:-}" ]] && printf '%s\n' "$$" >> "$STUB_HANG_PIDFILE"
+            trap '' TERM
+            hang_end=$(( SECONDS + ${STUB_HANG_SECS:-120} ))
+            while (( SECONDS < hang_end )); do sleep 1; done
+            ;;
         sleep)
             sleep "${STUB_SLEEP_SECS:-20}"
             [[ -n "${STUB_SLEEP_THEN_SUCCEED:-}" ]] && succeed
@@ -796,6 +805,145 @@ else
         "$foreign_lock2 was removed"
 fi
 rmdir "$foreign_lock1" "$foreign_lock2" 2>/dev/null || true
+
+printf '\n== a due refresh whose claude outlives SIGTERM: the loop reports it and keeps syncing ==\n'
+# The incident this reproduces: the host token dropped below the 120-minute
+# threshold while the live-sync loop was running, the sandbox's own claude
+# blanked its copy, and from then on nothing -- no refresh line, no lock
+# line, no failure warning, and no further sync either, until the sandbox's
+# token expired and the run died with it.
+#
+# Every path through a due fs_claude_refresh_if_needed call prints a line,
+# so a loop that is still ticking cannot be that quiet: it has to have been
+# stuck. The one place it can stick for good is its `wait` on the refresh's
+# `timeout 40 claude mcp list` child -- timeout sends SIGTERM at 40s and,
+# with no --kill-after, then waits for as long as claude takes to act on it.
+# A claude that outlives SIGTERM therefore wedges the loop silently and
+# indefinitely, and the sandbox copy is never repaired again.
+#
+# Staged exactly that way: a token with hours left at launch (so the
+# pre-step does not refresh), pushed below the threshold mid-run, a stub
+# claude that ignores SIGTERM, and the sandbox copy blanked once the
+# refresh is under way. The loop must say what became of the refresh within
+# 50s of it starting (comfortably past the old 40s SIGTERM, so a claude
+# that merely took its time is not what fails this) and must repair the
+# blanked copy. The FS_CLAUDE_* knobs below only shorten the waits.
+wedge_work="$work/wedge"
+mkdir -p "$wedge_work/bin" "$wedge_work/home" "$wedge_work/wd" "$wedge_work/watch" "$wedge_work/contract"
+cat > "$wedge_work/bin/sandbox-backend-test" <<'BACKEND'
+#!/usr/bin/env bash
+if [[ "${1-}" == --capabilities ]]; then
+    printf 'toolchain=host\n'
+    exit 0
+fi
+for ((i = 1; i <= $#; i++)); do
+    if [[ "${!i}" == --bind-rw-at ]]; then
+        j=$((i + 1)); k=$((i + 2))
+        if [[ "${!k}" == */.claude ]]; then
+            printf '%s' "${!j}" > "$SYNC_WATCH_DIR/src-path"
+        fi
+    fi
+done
+while [[ ! -e "$SYNC_RELEASE" ]] && (( SECONDS < 240 )); do
+    sleep 0.2
+done
+exit 0
+BACKEND
+chmod +x "$wedge_work/bin/sandbox-backend-test"
+cp "$stub" "$wedge_work/bin/claude"
+# The stub's version already has a passing contract verdict, so the
+# pre-step never runs the probe against a claude that hangs.
+: > "$wedge_work/contract/$("$stub" --version).ok"
+wedge_cred="$wedge_work/host-credentials.json"
+write_cred "$wedge_cred" 240
+wedge_pids="$wedge_work/hang-pids"
+: > "$wedge_pids"
+: > "$wedge_work/calls"
+
+PATH="$wedge_work/bin:$PATH" FORK_SANDBOX_BACKEND=test HOME="$wedge_work/home" \
+    FS_CLAUDE_TOKEN_CONTRACT_DIR="$wedge_work/contract" \
+    SYNC_WATCH_DIR="$wedge_work/watch" SYNC_RELEASE="$wedge_work/release" \
+    STUB_MODE=hang STUB_HANG_SECS=180 STUB_HANG_PIDFILE="$wedge_pids" \
+    STUB_CALL_LOG="$wedge_work/calls" \
+    FS_CLAUDE_SYNC_REFRESH_TICKS=2 FS_CLAUDE_REFRESH_TIMEOUT_SEC=2 FS_CLAUDE_REFRESH_KILL_AFTER_SEC=2 \
+    "$repo_dir/scripts/claude-sandboxed" --claude-credentials "$wedge_cred" "$wedge_work/wd" --print hello \
+        > "$wedge_work/run.out" 2>&1 &
+wedge_run=$!
+
+waited=0
+while [[ ! -f "$wedge_work/watch/src-path" && $waited -lt 80 ]]; do
+    sleep 0.25
+    waited=$(( waited + 1 ))
+done
+wedge_src="$(cat "$wedge_work/watch/src-path" 2>/dev/null || true)"
+
+if [[ -z "$wedge_src" ]]; then
+    no "claude-sandboxed reaches the backend for the wedge reproduction" "$(cat "$wedge_work/run.out" 2>/dev/null)"
+else
+    # Below the threshold, same tokens: only the clock moved.
+    tmp="$(mktemp "$wedge_work/host-credentials.json.XXXXXX")"
+    jq --argjson exp "$(( ($(date +%s) + 119 * 60) * 1000 ))" '.claudeAiOauth.expiresAt = $exp' \
+        "$wedge_cred" > "$tmp"
+    mv "$tmp" "$wedge_cred"
+
+    # The old loop only refreshes every 30th tick, so allow for that.
+    waited=0
+    while ! grep -qs '^mcp list' "$wedge_work/calls" && (( waited < 90 )); do
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    if grep -qs '^mcp list' "$wedge_work/calls"; then
+        ok "the live-sync loop starts a host refresh once the token is due"
+    else
+        no "the live-sync loop starts a host refresh once the token is due" "$(cat "$wedge_work/run.out")"
+    fi
+
+    jq '.claudeAiOauth.accessToken = "" | .claudeAiOauth.refreshToken = "" | .claudeAiOauth.expiresAt = 0' \
+        "$wedge_src/.credentials.json" > "$wedge_src/.credentials.json.tmp" 2>/dev/null \
+        && mv "$wedge_src/.credentials.json.tmp" "$wedge_src/.credentials.json"
+
+    reported=0
+    repaired=0
+    for _ in $(seq 1 50); do
+        grep -qs 'could not refresh' "$wedge_work/run.out" && reported=1
+        grep -qsF '"orig-access-token"' "$wedge_src/.credentials.json" && repaired=1
+        (( reported && repaired )) && break
+        sleep 1
+    done
+    if (( reported )); then
+        ok "a due refresh whose claude outlives SIGTERM still reports its outcome"
+    else
+        no "a due refresh whose claude outlives SIGTERM still reports its outcome" \
+            "nothing within 50s; run output: $(cat "$wedge_work/run.out")"
+    fi
+    if (( repaired )); then
+        ok "the loop survives it: a blanked sandbox copy is still repaired"
+    else
+        no "the loop survives it: a blanked sandbox copy is still repaired" \
+            "$(cat "$wedge_src/.credentials.json" 2>/dev/null)"
+    fi
+fi
+
+# Never leave a hung stub behind, whatever the outcome above.
+: > "$wedge_work/release"
+while read -r p; do
+    [[ -n "$p" ]] && kill -KILL "$p" 2>/dev/null
+done < "$wedge_pids"
+wait "$wedge_run" 2>/dev/null
+while read -r p; do
+    [[ -n "$p" ]] && kill -KILL "$p" 2>/dev/null
+done < "$wedge_pids"
+
+if grep -qE 'orig-(access|refresh)-token|stub-new-' "$wedge_work/run.out"; then
+    no "no token appears in the run's output" "$(grep -E 'orig-|stub-new-' "$wedge_work/run.out")"
+else
+    ok "no token appears in the run's output"
+fi
+if [[ ! -d "$wedge_work/.oauth_refresh.lock" && ! -d "$(realpath -m "$wedge_work").lock" ]]; then
+    ok "both host lock dirs are released once the run is over"
+else
+    no "both host lock dirs are released once the run is over" "a lock dir is still present"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
