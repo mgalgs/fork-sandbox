@@ -750,15 +750,22 @@
 # in its k8s run.env -- cannot be adopted (resume deletes the half-built
 # Job), and a hook killed mid-run is `lost`. So when the deliver loop stops
 # on SIGTERM/SIGINT it launches nothing more and waits until no wake is
-# submitting and no hook is running, at most
+# submitting and no hook is running, until
 # $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT seconds (default 150; 0 skips the
-# wait). The pod's terminationGracePeriodSeconds must exceed it, and it
+# wait) after the signal arrived -- the pass in progress then, finished
+# first, comes out of the same budget. The loop's sleep between passes
+# yields to the signal at once; a command a pass is running when it lands
+# delays the trap (and so the recorded time) until that command returns.
+# The pod's terminationGracePeriodSeconds must exceed the timeout, and it
 # should stay under the mail client's retry budget, since the mail API is
 # down for the whole shutdown. A non-numeric value refuses `deliver`.
-# Last, every live k8s wake past submit gets a `handed-off` file in its wake
-# dir: the next postmaster's adoption of it spends no `adopt-count` and
-# removes the file. Without this, a run outliving two rollouts would be
-# declared dead while its Job still ran, and its seat woken a second time.
+# Every live k8s wake past submit gets a `handed-off` file in its wake dir
+# as the drain STARTS, before any waiting, and again when the wait ends (a
+# wake that finished submitting meanwhile): the next postmaster's adoption
+# of it spends no `adopt-count` and removes the file. Marking first means a
+# SIGKILL at the end of the grace period still leaves the marks. Without
+# them, a run outliving two rollouts would be declared dead while its Job
+# still ran, and its seat woken a second time.
 #
 # DEAD-SEAT TEARDOWN. Once a k8s run is declared dead -- no summary.json
 # and a dead wrapper, then the probe says failed or gone (exit 2),
@@ -6420,11 +6427,15 @@ pm_wake_submitting() {
 
 # How many detached children a restart would cut off right now: k8s wakes
 # still submitting (pm_wake_submitting) plus hooks still running.
+#
+# Runs on every drain poll over every run record -- thousands on a
+# long-lived store, nearly all harvested -- so the per-record work before
+# the harvested check is fork-free.
 pm_drain_busy() {
     local n=0 f rid rec
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
+        rid="${f##*/}"; rid="${rid%.env}"
         [[ -e "$HARVESTED/$rid" ]] && continue
         pm_wake_submitting "$f" && n=$((n + 1))
     done
@@ -6441,37 +6452,48 @@ pm_drain_busy() {
 # more and waits, at most $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT seconds,
 # for pm_drain_busy to reach 0. In a pod this process is pid 1, so its exit
 # kills every detached wake and hook with it.
+#
+# The wake marks come FIRST (pm_mark_handed_off), before any waiting: the
+# kubelet SIGKILLs this pid once the grace period is spent, and a mark left
+# for after the wait would be lost with it. The mark runs again once the
+# wait ends, for a wake that finished submitting meanwhile. The wait's
+# bound counts from $PM_TERM_AT (cmd_deliver's trap; now when unset), so
+# the pass in progress at SIGTERM plus this drain stay within the timeout.
 pm_drain() {
-    local timeout="${FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT:-150}" start busy
+    local timeout="${FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT:-150}" start term_at busy
     start="$(date +%s)"
+    term_at="${PM_TERM_AT:-$start}"
     busy="$(pm_drain_busy)"
+    (( busy > 0 )) && pm_event "drain busy=$busy timeout=${timeout}s"
+    pm_mark_handed_off
     if (( busy > 0 )); then
-        pm_event "drain busy=$busy timeout=${timeout}s"
-        while (( busy > 0 && $(date +%s) - start < timeout )); do
+        while (( busy > 0 && $(date +%s) - term_at < timeout )); do
             sleep "${FORK_SANDBOX_POSTMASTER_DRAIN_POLL:-2}" || true
             busy="$(pm_drain_busy)"
         done
         pm_event "drain done busy=$busy waited=$(( $(date +%s) - start ))s"
+        pm_mark_handed_off
     fi
-    pm_mark_handed_off
 }
 
 # Marks every k8s wake this exit is about to orphan with its inputs in hand
 # (wrapper alive, past submit, no summary.json) `handed-off` in its wake dir,
 # so the next postmaster adopts it without spending one of its adoptions: a
 # rollout is not a failure of the wake. A wake cut off mid-submit is not
-# marked; resume refuses it whatever the count says.
+# marked; resume refuses it whatever the count says. Idempotent: a wake
+# already marked is left as is, with no second event.
 pm_mark_handed_off() {
     local f rid run_dir
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
+        rid="${f##*/}"; rid="${rid%.env}"   # fork-free, as in pm_drain_busy
         [[ -e "$HARVESTED/$rid" ]] && continue
         [[ "$(fs_pm_env_get "$f" BACKEND)" == k8s ]] || continue
         run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
         [[ -d "$run_dir" && ! -f "$run_dir/summary.json" ]] || continue
         pm_wake_is_dead "$run_dir" "$f" && continue
         pm_wake_submitting "$f" && continue
+        [[ -e "$run_dir/handed-off" ]] && continue
         : > "$run_dir/handed-off"
         pm_event "handed-off thread=$(fs_pm_env_get "$f" THREAD | cut -c1-8) agent=$(fs_pm_env_get "$f" AGENT) run=$rid"
     done
@@ -6968,21 +6990,32 @@ cmd_deliver() {
         return 0
     fi
 
-    local stop=0
-    trap 'stop=1; PM_STOP_REQUESTED=1' TERM INT
+    # PM_TERM_AT: when the first TERM/INT arrived, pm_drain's zero point.
+    # The sleep between passes runs in the background under `wait`, which a
+    # trapped signal interrupts at once; a foreground sleep would hold the
+    # trap (and that time) until it ended, up to a whole interval late.
+    local stop=0 sleep_pid
+    PM_TERM_AT=""
+    trap 'stop=1; PM_STOP_REQUESTED=1; [[ -n "$PM_TERM_AT" ]] || PM_TERM_AT="$(date +%s)"' TERM INT
+    # A signal also ends the pass in progress at the next stage boundary:
+    # each stage is whole on its own and the next process runs them all
+    # again, while the drain's marks must land inside the grace period.
     while (( ! stop )); do
         pm_hook_reap
         pm_route_pass "$project"
-        pm_held_pass "$project"
-        pm_fetch_wait_pass "$project"
-        pm_retry_pass "$project"
-        pm_harvest_pass "$project"
-        pm_k8s_dead_reap_pass
-        pm_k8s_retention_pass
-        pm_deferral_pass
-        pm_hook_pass "$project"
+        (( stop )) || pm_held_pass "$project"
+        (( stop )) || pm_fetch_wait_pass "$project"
+        (( stop )) || pm_retry_pass "$project"
+        (( stop )) || pm_harvest_pass "$project"
+        (( stop )) || pm_k8s_dead_reap_pass
+        (( stop )) || pm_k8s_retention_pass
+        (( stop )) || pm_deferral_pass
+        (( stop )) || pm_hook_pass "$project"
         (( stop )) && break
-        sleep "${FORK_SANDBOX_POSTMASTER_INTERVAL:-15}" || true
+        sleep "${FORK_SANDBOX_POSTMASTER_INTERVAL:-15}" &
+        sleep_pid=$!
+        wait "$sleep_pid" || true
+        kill "$sleep_pid" 2>/dev/null || true
     done
     pm_drain
     pm_lock_release

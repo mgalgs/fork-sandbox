@@ -1121,6 +1121,21 @@ check "drain from SIGTERM: exits within the bound though the pass interval is lo
 wait "$DR_PID" 2>/dev/null || true
 drain_cleanup
 
+# A long-lived store holds thousands of run records, nearly all harvested;
+# the drain walks them on every poll, so that walk must stay cheap.
+drain_setup nohook
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+for dr_i in $(seq 1 5000); do
+    : > "$PM_STATE_DIR/runs/old-$dr_i.env"
+    : > "$PM_STATE_DIR/harvested/old-$dr_i"
+done
+SECONDS=0
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=0 dr_call pm_drain > "$work/many-drain.out" 2>&1
+check "drain over 5000 harvested records: done within 2s" 1 "$(( SECONDS <= 2 ))"
+check "drain over 5000 harvested records: the live wake is still marked" 1 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+drain_cleanup
+
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=soon refuses \
