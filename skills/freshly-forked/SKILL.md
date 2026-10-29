@@ -131,7 +131,11 @@ writing a detailed handoff so nothing gets dropped.
      stay where you are.
    - **Exit 0, and nothing here is left for the user:** no result you
      have not reported, no question awaiting their answer, no task you
-     own still running. Say in one line that this pane is retiring, then
+     own still running. Say in one line that this pane is retiring, and
+     give the current time in that line, in the user's own time zone
+     (run `date '+%-I:%M %p %Z'` first; the machine's clock is set to
+     their zone), so whoever later finds the pane in `reaped` can tell
+     when it retired. Then
      run `tmux-reap.sh --delay 120` as a foreground Bash call with a
      timeout of 180000 ms (the default timeout is exactly two minutes).
      It blocks for two minutes so your closing words stay on screen, and
@@ -141,4 +145,5 @@ writing a detailed handoff so nothing gets dropped.
      hours old, keeping the transcript. To keep it after that, move its
      window out of `reaped` before the 24 hours are up.
    - **Exit 0, but something remains:** stay. When the last of it is
-     done and reported, run `tmux-reap.sh --delay 120` then.
+     done and reported, give the retiring line with the time as above,
+     and run `tmux-reap.sh --delay 120` then.
