@@ -2163,6 +2163,20 @@ _FS_CLAUDE_REFRESH_CHILD_PID=""
 _FS_CLAUDE_REFRESH_CRED=""
 _FS_CLAUDE_REFRESH_OLD_TOKEN=""
 _FS_CLAUDE_REFRESH_MINS_LEFT=""
+# The refresh child's exit status once it has been waited for (empty while
+# it runs, or when there was none), so _fs_claude_refresh_finish can say why
+# a refresh came back empty-handed: 124 and 137 are timeout's own.
+_FS_CLAUDE_REFRESH_CHILD_RC=""
+
+# Prints one line to stderr, prefixed with the local time and its UTC
+# offset. Every line the host refresh and claude-sandboxed's live-sync loop
+# print goes through this: the loop runs for hours, unattended, and "when"
+# is the first thing anyone reading its log afterwards needs. None of these
+# lines may ever carry a token -- see fs_claude_refresh_if_needed's
+# SECURITY INVARIANT.
+fs_claude_log() {
+    printf '%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" >&2
+}
 
 # Set to a non-empty value for exactly as long as fs_claude_refresh_if_needed
 # actually holds the correspondingly-named lock directory, so
@@ -2190,7 +2204,7 @@ _fs_claude_do_refresh() {
     dir="$(dirname -- "$cred_file")"
     scratch="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-token-refresh.XXXXXX)"
     if [[ -z "$scratch" || ! -d "$scratch" ]]; then
-        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
+        fs_claude_log "Warning: could not refresh the Claude access token on the host (no scratch dir under /var/tmp/claude-scratch/forks); log in with claude on the host if this persists."
         return 0
     fi
     chmod 700 "$scratch"
@@ -2213,7 +2227,18 @@ _fs_claude_do_refresh() {
     # rather than run synchronously: a signal interrupts the `wait` but not
     # the child, and a tracked PID is one _fs_claude_refresh_emergency_cleanup
     # can wait on again and then merge -- see its own comment and the global
-    # above. `exec` makes the recorded PID timeout's own.
+    # above.
+    #
+    # Neither wait on it redirects stderr. A signal that lands during a
+    # `wait 2>/dev/null` runs the EXIT trap with that redirection still in
+    # place, so everything the emergency cleanup said went to /dev/null with
+    # it. The redirection was there to hide bash's "Killed (...)" job notice,
+    # an untimestamped line printed whenever a waited-for child dies of a
+    # signal. Instead, timeout is not exec'd and the subshell ends with an
+    # explicit `exit`: the child then always exits normally, with timeout's
+    # own status (124, or 137 after the SIGKILL), and bash has nothing to
+    # announce. The subshell's own notice about timeout, if any, goes where
+    # the subshell's stderr does: /dev/null.
     #
     # SIGTERM after FS_CLAUDE_REFRESH_TIMEOUT_SEC (default 40), then SIGKILL
     # after a further FS_CLAUDE_REFRESH_KILL_AFTER_SEC (default 20); both are
@@ -2229,13 +2254,14 @@ _fs_claude_do_refresh() {
     [[ "$kill_after" =~ ^[1-9][0-9]*$ ]] || kill_after=20
     touch "$dir/.oauth_refresh.lock" "$("$FS_REALPATH" -m "$dir").lock" 2>/dev/null || true
     ( cd "$scratch" && CLAUDE_CONFIG_DIR="$scratch" \
-        exec "$FS_TIMEOUT" --kill-after="$kill_after" "$term_after" "$claude_bin" mcp list \
-        </dev/null >/dev/null 2>&1 ) &
+        "$FS_TIMEOUT" --kill-after="$kill_after" "$term_after" "$claude_bin" mcp list
+        exit $? ) </dev/null >/dev/null 2>&1 &
     _FS_CLAUDE_REFRESH_CHILD_PID=$!
     _FS_CLAUDE_REFRESH_CRED="$cred_file"
     _FS_CLAUDE_REFRESH_OLD_TOKEN="$old_token"
     _FS_CLAUDE_REFRESH_MINS_LEFT="$mins_left"
-    wait "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null || true
+    _FS_CLAUDE_REFRESH_CHILD_RC=0
+    wait "$_FS_CLAUDE_REFRESH_CHILD_PID" || _FS_CLAUDE_REFRESH_CHILD_RC=$?
     _FS_CLAUDE_REFRESH_CHILD_PID=""
     _fs_claude_refresh_finish
 }
@@ -2267,7 +2293,14 @@ _fs_claude_refresh_finish() {
 
     if [[ -z "$new_token" || "$new_token" == "$old_token" || -z "$new_refresh" ]] \
         || (( new_expires <= now_ms + 60000 )); then
-        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
+        local why
+        case "$_FS_CLAUDE_REFRESH_CHILD_RC" in
+            124) why="claude did not finish in time and was stopped" ;;
+            137) why="claude did not finish in time, ignored SIGTERM and was killed" ;;
+            0|"") why="claude left no new token behind" ;;
+            *) why="claude exited with status $_FS_CLAUDE_REFRESH_CHILD_RC and left no new token behind" ;;
+        esac
+        fs_claude_log "Warning: could not refresh the Claude access token on the host ($why; ${mins_left}m left); log in with claude on the host if this persists."
         rm -rf "$scratch"
         _FS_CLAUDE_REFRESH_SCRATCH=""
         return 0
@@ -2285,7 +2318,7 @@ _fs_claude_refresh_finish() {
     if [[ -z "$tmp" ]] || ! jq --slurpfile new "$scratch/.credentials.json" \
         '.claudeAiOauth = $new[0].claudeAiOauth' "$cred_file" > "$tmp"; then
         [[ -n "$tmp" ]] && rm -f "$tmp"
-        echo "Warning: claude refreshed the host's Claude token but it could not be written to $cred_file. The new credential is in $scratch/.credentials.json; copy its claudeAiOauth into $cred_file, or log in with claude on the host." >&2
+        fs_claude_log "Warning: claude refreshed the host's Claude token but it could not be written to $cred_file. The new credential is in $scratch/.credentials.json; copy its claudeAiOauth into $cred_file, or log in with claude on the host."
         _FS_CLAUDE_REFRESH_SCRATCH=""
         return 0
     fi
@@ -2295,8 +2328,8 @@ _fs_claude_refresh_finish() {
     _FS_CLAUDE_REFRESH_SCRATCH=""
 
     local left_min=$(( new_expires / 60000 - $(date +%s) / 60 ))
-    printf 'claude-sandboxed: refreshed the host'"'"'s Claude access token (%dm left; now %dh%02dm)\n' \
-        "$mins_left" $(( left_min / 60 )) $(( left_min % 60 )) >&2
+    fs_claude_log "$(printf 'claude-sandboxed: refreshed the host'"'"'s Claude access token (%dm left; now %dh%02dm)' \
+        "$mins_left" $(( left_min / 60 )) $(( left_min % 60 )))"
     return 0
 }
 
@@ -2335,15 +2368,23 @@ _fs_claude_refresh_emergency_cleanup() {
     # skipped the merge of a token claude may just have rotated, the lock
     # release and the scratch-dir removal. This only ever runs in a process
     # that is already exiting, so dropping errexit for good costs nothing.
+    # Likewise SIGPIPE: the lines below go to whatever stderr is left, and a
+    # reader that is already gone must cost a line, not the cleanup itself.
     set +e
+    trap '' PIPE
     # Wait, never kill: the child may already have rotated the single-use
     # refresh token, and killing it can lose the only live copy. timeout's
     # own --kill-after bounds the wait (see _fs_claude_do_refresh).
     if [[ -n "$_FS_CLAUDE_REFRESH_CHILD_PID" ]]; then
-        wait "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null
+        fs_claude_log "claude-sandboxed: stopping with a host token refresh still running; waiting for it to finish first."
+        _FS_CLAUDE_REFRESH_CHILD_RC=0
+        wait "$_FS_CLAUDE_REFRESH_CHILD_PID" || _FS_CLAUDE_REFRESH_CHILD_RC=$?
         _FS_CLAUDE_REFRESH_CHILD_PID=""
     fi
-    _fs_claude_refresh_finish 2>/dev/null || true
+    # Not silenced: a refresh that lands here is as real as any other, and
+    # one that landed with no line at all looks, in the log, exactly like a
+    # refresh done by something outside this run.
+    _fs_claude_refresh_finish || true
     [[ -n "$_FS_CLAUDE_REFRESH_SCRATCH" ]] && rm -rf "$_FS_CLAUDE_REFRESH_SCRATCH" 2>/dev/null
     if [[ -n "$_FS_CLAUDE_REFRESH_LOCK2_HELD" ]]; then
         rmdir "$lock2" 2>/dev/null
@@ -2365,18 +2406,27 @@ _fs_claude_refresh_emergency_cleanup() {
 #
 # Applies only to a file: <credential-file> must be the path
 # fs_claude_credential_file resolved (the caller decides that; this function
-# takes it as given), and <claude-bin> must be a host claude binary. Either
-# missing (a Keychain source, or no claude found) is a silent no-op, exactly
-# like "nothing to refresh here" -- there is no error case in that gap, only
-# "this machine cannot do it".
+# takes it as given), and <claude-bin> must be a host claude binary. An empty
+# <credential-file> (a Keychain source) is a silent no-op.
+#
+# Silence means exactly one thing: not due yet. Once fewer than the
+# threshold's minutes are left, every way out of this function prints one
+# timestamped line (fs_claude_log) saying what became of the refresh --
+# refreshed, skipped because a lock is held, skipped for another reason (no
+# host claude, the file is gone, someone else refreshed it while we waited),
+# or failed and why. That holds on every tick of claude-sandboxed's live-
+# sync loop, so a due refresh can never pass unseen in a run's log, at the
+# price of one line a minute for as long as it stays due and keeps failing.
+# A not-due tick prints nothing: one line every 60s for hours would bury
+# the lines that matter.
 #
 # SECURITY INVARIANT: the real refresh token never leaves this function's own
 # scratch directory, which lives under /var/tmp/claude-scratch/forks/ (never
 # a run's own STATE_DIR or clone), is mode 700, and is removed before this
 # function returns on every path that returns normally. It is never passed as
 # an argument -- only ever read and written as file content -- so it is never
-# visible in `ps` or in a log line. The functions below print exactly one
-# line on success or failure, and neither line contains a token.
+# visible in `ps` or in a log line. No line this function or the ones it
+# calls print contains a token, access or refresh.
 #
 # This function (and _fs_claude_do_refresh, which it calls) can spend up to
 # a minute (see _fs_claude_do_refresh's timeout) blocked inside a `claude
@@ -2423,13 +2473,24 @@ _fs_claude_refresh_emergency_cleanup() {
 # result.
 fs_claude_refresh_if_needed() {
     local cred_file="$1" claude_bin="${2:-}"
-    [[ -n "$claude_bin" ]] || return 0
-    [[ -f "$cred_file" ]] || return 0
+    [[ -n "$cred_file" ]] || return 0
 
     local before_min="${FS_CLAUDE_REFRESH_BEFORE_MIN:-120}"
     local mins_left
+    # A missing or unreadable file counts as due (see _fs_claude_mins_left),
+    # so it is reported below rather than passed over in silence.
     mins_left="$(_fs_claude_mins_left "$cred_file")"
     (( mins_left >= before_min )) && return 0
+
+    # Due from here on: every return below says so.
+    if [[ ! -f "$cred_file" ]]; then
+        fs_claude_log "claude-sandboxed: the host's Claude token is due for a refresh, but $cred_file is missing; skipping the host token refresh this time."
+        return 0
+    fi
+    if [[ -z "$claude_bin" ]]; then
+        fs_claude_log "claude-sandboxed: the host's Claude token is due for a refresh (${mins_left}m left), but no host claude binary was found to do it with; skipping the host token refresh this time."
+        return 0
+    fi
 
     local dir lock1 lock2 budget
     dir="$(dirname -- "$cred_file")"
@@ -2438,14 +2499,14 @@ fs_claude_refresh_if_needed() {
     budget="${FS_CLAUDE_REFRESH_LOCK_BUDGET_SEC:-30}"
 
     if ! _fs_claude_take_lock "$lock1" "$budget"; then
-        echo "claude-sandboxed: could not acquire $lock1 within ${budget}s (another process appears to be refreshing); skipping the host token refresh this time." >&2
+        fs_claude_log "claude-sandboxed: could not acquire $lock1 within ${budget}s (another process appears to be refreshing; ${mins_left}m left); skipping the host token refresh this time."
         return 0
     fi
     _FS_CLAUDE_REFRESH_LOCK1_HELD=1
     if ! _fs_claude_take_lock "$lock2" "$budget"; then
         rmdir "$lock1" 2>/dev/null || true
         _FS_CLAUDE_REFRESH_LOCK1_HELD=""
-        echo "claude-sandboxed: could not acquire $lock2 within ${budget}s (another process appears to be refreshing); skipping the host token refresh this time." >&2
+        fs_claude_log "claude-sandboxed: could not acquire $lock2 within ${budget}s (another process appears to be refreshing; ${mins_left}m left); skipping the host token refresh this time."
         return 0
     fi
     _FS_CLAUDE_REFRESH_LOCK2_HELD=1
@@ -2460,6 +2521,8 @@ fs_claude_refresh_if_needed() {
         # script's `set -e` right here, skipping the rmdir cleanup below and
         # leaking both locks.
         _fs_claude_do_refresh "$cred_file" "$claude_bin" "$mins_left" || true
+    else
+        fs_claude_log "claude-sandboxed: the host's Claude token was refreshed by another process while this one waited for the lock (now ${mins_left}m left); skipping the host token refresh."
     fi
 
     rmdir "$lock2" 2>/dev/null || true

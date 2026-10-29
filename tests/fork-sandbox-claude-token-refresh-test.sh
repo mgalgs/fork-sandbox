@@ -431,6 +431,99 @@ for mode in blank failexit; do
     fi
 done
 
+echo
+echo '=== fs_claude_refresh_if_needed: a due refresh always says what became of it ==='
+
+# The shape every line from the refresh path and the live-sync loop has: a
+# local timestamp with its UTC offset, then the message.
+ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4} '
+
+# expect_one_line LABEL OUTPUT PATTERN: OUTPUT is exactly one timestamped
+# line, containing PATTERN, and no token.
+expect_one_line() {
+    local label="$1" out="$2" pat="$3" n
+    n="$(grep -c . <<<"$out")"
+    if [[ "$n" == 1 && "$out" =~ $ts_re && "$out" == *"$pat"* ]]; then
+        ok "$label"
+    else
+        no "$label" "expected one timestamped line containing '$pat'; got $n: $out"
+    fi
+    if [[ "$out" =~ orig-(access|refresh)-token|stub-new- ]]; then
+        no "$label: no token in the line" "$out"
+    fi
+}
+
+printf '\n== not due: nothing at all ==\n'
+quiet_cred="$work/quiet-credentials.json"
+write_cred "$quiet_cred" 150
+quiet_out="$(STUB_MODE=success fs_claude_refresh_if_needed "$quiet_cred" "$stub" 2>&1)"
+if [[ -z "$quiet_out" ]]; then
+    ok "a tick that is not due prints nothing"
+else
+    no "a tick that is not due prints nothing" "$quiet_out"
+fi
+quiet_out="$(fs_claude_refresh_if_needed "" "$stub" 2>&1)"
+if [[ -z "$quiet_out" ]]; then
+    ok "no credential file at all (a Keychain source) prints nothing"
+else
+    no "no credential file at all (a Keychain source) prints nothing" "$quiet_out"
+fi
+
+printf '\n== due: one timestamped line per outcome ==\n'
+out_cred="$work/outcome-credentials.json"
+write_cred "$out_cred" 30
+expect_one_line "a successful refresh says so" \
+    "$(STUB_MODE=success fs_claude_refresh_if_needed "$out_cred" "$stub" 2>&1)" "refreshed the host's Claude access token"
+
+write_cred "$out_cred" 30
+expect_one_line "a due refresh with no host claude says it was skipped, and why" \
+    "$(fs_claude_refresh_if_needed "$out_cred" "" 2>&1)" "no host claude binary was found"
+
+expect_one_line "a due refresh whose credential file is gone says it was skipped, and why" \
+    "$(fs_claude_refresh_if_needed "$work/no-such-credentials.json" "$stub" 2>&1)" "is missing"
+
+mkdir "$work/.oauth_refresh.lock"
+expect_one_line "a due refresh blocked by a live lock says it was skipped, and why" \
+    "$(FS_CLAUDE_REFRESH_LOCK_BUDGET_SEC=1 fs_claude_refresh_if_needed "$out_cred" "$stub" 2>&1)" "could not acquire"
+rmdir "$work/.oauth_refresh.lock"
+
+expect_one_line "a refresh whose claude exits non-zero names the exit status" \
+    "$(STUB_MODE=failexit fs_claude_refresh_if_needed "$out_cred" "$stub" 2>&1)" "exited with status 1"
+
+expect_one_line "a refresh whose claude leaves nothing new says so" \
+    "$(STUB_MODE=noop fs_claude_refresh_if_needed "$out_cred" "$stub" 2>&1)" "left no new token behind"
+
+: > "$work/outcome-hang-pids"
+hang_start=$SECONDS
+hang_out="$(STUB_MODE=hang STUB_HANG_SECS=60 STUB_HANG_PIDFILE="$work/outcome-hang-pids" \
+    FS_CLAUDE_REFRESH_TIMEOUT_SEC=1 FS_CLAUDE_REFRESH_KILL_AFTER_SEC=1 \
+    fs_claude_refresh_if_needed "$out_cred" "$stub" 2>&1)"
+hang_secs=$(( SECONDS - hang_start ))
+expect_one_line "a refresh whose claude ignores SIGTERM says it was killed" "$hang_out" "ignored SIGTERM and was killed"
+if (( hang_secs < 15 )); then
+    ok "a claude that ignores SIGTERM is killed, not waited on (${hang_secs}s)"
+else
+    no "a claude that ignores SIGTERM is killed, not waited on" "took ${hang_secs}s"
+fi
+while read -r p; do [[ -n "$p" ]] && kill -KILL "$p" 2>/dev/null; done < "$work/outcome-hang-pids"
+
+race2_cred="$work/race2-credentials.json"
+write_cred "$race2_cred" 20
+race2_lock1="$work/.oauth_refresh.lock"
+(
+    mkdir "$race2_lock1"
+    sleep 1.5
+    tmp="$(mktemp "$work/race2-credentials.json.XXXXXX")"
+    jq --argjson exp "$(( ($(date +%s) + 9000) * 1000 ))" '.claudeAiOauth.expiresAt = $exp' "$race2_cred" > "$tmp"
+    mv "$tmp" "$race2_cred"
+    rmdir "$race2_lock1"
+) &
+race2_bg=$!
+race2_out="$(FS_CLAUDE_REFRESH_LOCK_BUDGET_SEC=10 fs_claude_refresh_if_needed "$race2_cred" "$stub" 2>&1)"
+wait "$race2_bg"
+expect_one_line "a refresh someone else did while we waited for the lock says so" "$race2_out" \
+    "refreshed by another process"
+
 printf '\n== a SIGTERM mid-refresh waits for the claude child and merges its result ==\n'
 # A SIGTERM landing on the caller while it waits on `claude mcp list`
 # (exactly what claude-sandboxed's cleanup trap sends the live-sync loop)
@@ -510,7 +603,7 @@ before_scratch="$(count_refresh_scratch_dirs)"
     trap '_fs_claude_refresh_emergency_cleanup "$sigexit_lock1" "$sigexit_lock2"' EXIT
     STUB_MODE=sleep STUB_SLEEP_SECS=4 STUB_SLEEP_THEN_SUCCEED=1 STUB_SLEEP_EXIT=1 \
         fs_claude_refresh_if_needed "$sigexit_cred" "$stub"
-) 2>/dev/null &
+) 2>"$work/sigexit.err" &
 sigexit_pid=$!
 sleep 2
 kill -TERM "$sigexit_pid" 2>/dev/null
@@ -520,6 +613,14 @@ if [[ "$(jq -r '.claudeAiOauth.accessToken' "$sigexit_cred" 2>/dev/null)" == stu
 else
     no "an interrupted refresh whose claude exits non-zero still merges the refreshed token" \
         "accessToken is '$(jq -r '.claudeAiOauth.accessToken' "$sigexit_cred" 2>/dev/null)'"
+fi
+# A refresh merged on the way out used to be merged with stderr discarded,
+# which in a run's log looks exactly like a refresh by something else.
+if grep -qE "${ts_re}claude-sandboxed: refreshed the host's Claude access token" "$work/sigexit.err" \
+    && grep -qE "${ts_re}claude-sandboxed: stopping with a host token refresh still running" "$work/sigexit.err"; then
+    ok "a refresh merged on the way out is logged, with timestamps"
+else
+    no "a refresh merged on the way out is logged, with timestamps" "$(cat "$work/sigexit.err")"
 fi
 if [[ ! -d "$sigexit_lock1" && ! -d "$sigexit_lock2" ]]; then
     ok "an interrupted refresh whose claude exits non-zero still releases both lock dirs"
@@ -991,6 +1092,92 @@ if [[ ! -d "$wedge_work/.oauth_refresh.lock" && ! -d "$(realpath -m "$wedge_work
     ok "both host lock dirs are released once the run is over"
 else
     no "both host lock dirs are released once the run is over" "a lock dir is still present"
+fi
+loop_lines="$(grep -E 'sandbox copy|could not refresh|host token refresh|refreshed the host' "$wedge_work/run.out" || true)"
+untimed="$(grep -vE "$ts_re" <<<"$loop_lines" | grep . || true)"
+if [[ -n "$loop_lines" && -z "$untimed" ]]; then
+    ok "every line the live-sync loop and its refresh print is timestamped"
+else
+    no "every line the live-sync loop and its refresh print is timestamped" "${untimed:-no loop lines at all}"
+fi
+
+printf '\n== the live-sync loop never stops unseen ==\n'
+# start_loop_run TAG: a claude-sandboxed run whose backend holds until
+# $death_work/TAG.release exists, with a token far from due. Sets run_pid
+# and loop_pid (the forked subshell that is the loop: the run's only child
+# besides the backend, and the one still running claude-sandboxed itself).
+death_work="$work/death"
+mkdir -p "$death_work/bin" "$death_work/home" "$death_work/wd" "$death_work/contract"
+cp "$wedge_work/bin/sandbox-backend-test" "$death_work/bin/sandbox-backend-test"
+cp "$stub" "$death_work/bin/claude"
+: > "$death_work/contract/$("$stub" --version).ok"
+start_loop_run() {
+    local tag="$1" i
+    mkdir -p "$death_work/$tag-watch"
+    write_cred "$death_work/$tag-credentials.json" 240
+    PATH="$death_work/bin:$PATH" FORK_SANDBOX_BACKEND=test HOME="$death_work/home" \
+        FS_CLAUDE_TOKEN_CONTRACT_DIR="$death_work/contract" \
+        SYNC_WATCH_DIR="$death_work/$tag-watch" SYNC_RELEASE="$death_work/$tag.release" \
+        "$repo_dir/scripts/claude-sandboxed" --claude-credentials "$death_work/$tag-credentials.json" \
+            "$death_work/wd" --print hello > "$death_work/$tag.out" 2>&1 &
+    run_pid=$!
+    loop_pid=""
+    for (( i = 0; i < 80; i++ )); do
+        if [[ -f "$death_work/$tag-watch/src-path" ]]; then
+            loop_pid="$(ps -o pid=,args= --ppid "$run_pid" 2>/dev/null \
+                | awk '/claude-sandboxed/ { print $1; exit }')"
+            [[ -n "$loop_pid" ]] && break
+        fi
+        sleep 0.25
+    done
+}
+
+start_loop_run term
+if [[ -n "$loop_pid" ]]; then
+    kill -TERM "$loop_pid"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        grep -qs 'live-sync loop stopped' "$death_work/term.out" && break
+        sleep 0.5
+    done
+    term_line="$(grep 'live-sync loop stopped' "$death_work/term.out" || true)"
+    if [[ "$term_line" =~ $ts_re && "$term_line" == *"exit status 143"* && "$term_line" == *"still going"* ]]; then
+        ok "a loop killed by a stray SIGTERM says so, with its exit status, while the run goes on"
+    else
+        no "a loop killed by a stray SIGTERM says so, with its exit status, while the run goes on" \
+            "$(cat "$death_work/term.out")"
+    fi
+else
+    no "a loop killed by a stray SIGTERM says so, with its exit status, while the run goes on" \
+        "could not find the loop's pid; $(cat "$death_work/term.out")"
+fi
+: > "$death_work/term.release"
+wait "$run_pid" 2>/dev/null
+
+start_loop_run kill
+if [[ -n "$loop_pid" ]]; then
+    kill -KILL "$loop_pid"
+    sleep 1
+    : > "$death_work/kill.release"
+    wait "$run_pid" 2>/dev/null
+    kill_line="$(grep 'live-sync loop had already stopped' "$death_work/kill.out" || true)"
+    if [[ "$kill_line" =~ $ts_re && "$kill_line" == *"exit status 137"* ]]; then
+        ok "a loop SIGKILLed mid-run, which cannot report itself, is reported when the run ends"
+    else
+        no "a loop SIGKILLed mid-run, which cannot report itself, is reported when the run ends" \
+            "$(cat "$death_work/kill.out")"
+    fi
+else
+    : > "$death_work/kill.release"
+    wait "$run_pid" 2>/dev/null
+    no "a loop SIGKILLed mid-run, which cannot report itself, is reported when the run ends" \
+        "could not find the loop's pid; $(cat "$death_work/kill.out")"
+fi
+
+if ! grep -qs 'live-sync loop' "$sync_work/run.out" "$foreign_work/run.out" "$wedge_work/run.out"; then
+    ok "a run whose loop is stopped the normal way says nothing about it"
+else
+    no "a run whose loop is stopped the normal way says nothing about it" \
+        "$(grep -h 'live-sync loop' "$sync_work/run.out" "$foreign_work/run.out" "$wedge_work/run.out")"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

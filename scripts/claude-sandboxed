@@ -550,9 +550,21 @@ cleanup() {
     # that check only runs once every 2s, and a normal exit should not leave
     # it spinning even that briefly against a STATE_DIR this handler is about
     # to remove.
+    #
+    # The stop marker tells the loop this kill is the expected one, so it
+    # leaves no "stopped while the run is still going" line behind. A loop
+    # that is already gone by now died on its own -- possibly hours ago, of a
+    # SIGKILL it could not report itself -- so say that here instead: it is
+    # the moment the sandbox's credential stopped following the host's.
     if [[ -n "$SYNC_LOOP_PID" ]]; then
-        kill "$SYNC_LOOP_PID" 2>/dev/null
-        wait "$SYNC_LOOP_PID" 2>/dev/null
+        if kill -0 "$SYNC_LOOP_PID" 2>/dev/null; then
+            : > "$STATE_DIR/sync-loop.stop" 2>/dev/null
+            kill "$SYNC_LOOP_PID" 2>/dev/null
+            wait "$SYNC_LOOP_PID" 2>/dev/null
+        else
+            wait "$SYNC_LOOP_PID" 2>/dev/null
+            fs_claude_log "claude-sandboxed: the live-sync loop had already stopped before this run ended (exit status $?); the sandbox's Claude credential stopped following the host's when it did."
+        fi
     fi
     # There is no transcript in --exec mode: that directory is claude's.
     if (( ! EXEC_MODE )) \
@@ -718,10 +730,43 @@ if (( ! EXEC_MODE )); then
             # trap is what still releases and removes them when that happens
             # instead of at the loop's own next normal statement, which a
             # kill never lets it reach.
+            #
+            # The same trap is also what keeps the loop from ever stopping
+            # unseen. It inherits this script's `set -e`, so any command that
+            # fails outside a tested context ends it, and a signal can too;
+            # either way the sync and the refresh just stop, and the run goes
+            # on without them until its token runs out. Unless cleanup's own
+            # stop marker says this exit is the expected one, the trap says
+            # the loop stopped, with its exit status and, via the ERR trap
+            # below (errtrace, so it fires inside functions too), the command
+            # that failed. $BASH_COMMAND is the command's source text, before
+            # expansion, so it never carries a token's value.
             cred_dir="$(dirname -- "$CRED_FILE")"
             sync_lock1="$cred_dir/.oauth_refresh.lock"
             sync_lock2="$("$FS_REALPATH" -m "$cred_dir").lock"
-            trap '_fs_claude_refresh_emergency_cleanup "$sync_lock1" "$sync_lock2"' EXIT
+            sync_err=""
+            # shellcheck disable=SC2329  # invoked by the EXIT trap below
+            sync_loop_exit() {
+                local rc="$1" why
+                _fs_claude_refresh_emergency_cleanup "$sync_lock1" "$sync_lock2"
+                [[ -e "$STATE_DIR/sync-loop.stop" ]] && return 0
+                why="exit status $rc"
+                [[ -n "$sync_err" ]] && why="$why, after \`$sync_err\` failed"
+                if kill -0 "$parent_pid" 2>/dev/null; then
+                    fs_claude_log "claude-sandboxed: the live-sync loop stopped ($why) while the run is still going; from here on the sandbox's Claude credential no longer follows the host's, and this run no longer refreshes the host's token."
+                else
+                    fs_claude_log "claude-sandboxed: the live-sync loop is stopping because claude-sandboxed (pid $parent_pid) is gone."
+                fi
+            }
+            # A signal with no trap of its own reaches the EXIT trap with $?
+            # still holding the last command's status, so name the usual
+            # three here: the exit status then says which one it was.
+            set -o errtrace
+            trap 'sync_err="$BASH_COMMAND (line $LINENO)"' ERR
+            trap 'exit 129' HUP
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            trap 'sync_loop_exit "$?"' EXIT
             while kill -0 "$parent_pid" 2>/dev/null; do
                 # A no-op when HOST_CLAUDE_BIN is empty (see
                 # fs_claude_refresh_if_needed); the loop still runs, and the
@@ -758,8 +803,8 @@ if (( ! EXEC_MODE )); then
                                 new_exp_ms="$(jq -r '.exp // 0' <<<"$exp_key" 2>/dev/null)" || new_exp_ms=0
                                 [[ "$new_exp_ms" =~ ^[0-9]+$ ]] || new_exp_ms=0
                                 left_min=$(( new_exp_ms / 60000 - $(date +%s) / 60 ))
-                                printf 'claude-sandboxed: %s; updated the sandbox copy (now %dh%02dm)\n' \
-                                    "$kind" $(( left_min / 60 )) $(( left_min % 60 )) >&2
+                                fs_claude_log "$(printf 'claude-sandboxed: %s; updated the sandbox copy (now %dh%02dm)' \
+                                    "$kind" $(( left_min / 60 )) $(( left_min % 60 )))"
                             fi
                         fi
                     fi

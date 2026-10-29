@@ -79,7 +79,15 @@ dies at token expiry.
   whenever less than 2h remain on it (`FS_CLAUDE_REFRESH_BEFORE_MIN`),
   before a step starts and roughly every 60s while it runs -- so an
   unattended fleet with no interactive host session still keeps a live
-  token.
+  token. The claude it refreshes with gets SIGTERM after 40s and SIGKILL
+  20s later, so a claude that hangs cannot stall the loop.
+- **What the log says.** Every line the loop and the refresh print starts
+  with a local timestamp. Once a refresh is due, every tick logs exactly one
+  line saying what happened to it: refreshed, skipped because a lock is
+  held, skipped for another reason, or failed and why. Silence only ever
+  means "not due yet". If the loop stops while the run is still going, it
+  logs that, with its exit status and the command that failed. If it was
+  killed too hard to report itself, claude-sandboxed logs it at exit.
 - **Locking.** The refresh takes claude's own two locks, in claude's own
   order (`.oauth_refresh.lock`, then the legacy `<dir>.lock`), so a host-side
   refresh here and one claude itself might attempt never race.
