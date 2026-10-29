@@ -184,12 +184,18 @@
 #   k8s-dead-reap-refused run=<run id>, branch=<branch> -- under --cluster,
 #                a marked run whose RUN_DIR is not a wake dir this
 #                postmaster made with that branch; nothing was removed.
-#   drain        busy=<n>, timeout=<s>; then busy=<n>, waited=<s> -- the
-#                loop stopped on SIGTERM/SIGINT with <n> wakes still
-#                submitting or collecting, or hooks still running, and
-#                deliver waited for them before exiting; see SHUTDOWN
-#                DRAIN below. A final busy above 0 means the timeout cut
-#                them off.
+#   drain        busy=<n>, timeout=<s>, since_term=<s>; then busy=<n>,
+#                waited=<s> -- the loop stopped on SIGTERM/SIGINT with <n>
+#                wakes still submitting or collecting, or hooks still
+#                running, and deliver waited for them before exiting; see
+#                SHUTDOWN DRAIN below. A final busy above 0 means the
+#                timeout cut them off.
+#   last-drain   <time> <event> -- at startup of the deliver loop, one per
+#                line of the previous process's last drain record; see
+#                SHUTDOWN DRAIN below.
+#   last-drain-unfinished -- that drain has no `drain done` line: the
+#                process died (SIGKILL at the end of the grace period,
+#                say) before the drain finished.
 #   external-mail thread -- `deliver --cluster` only: a non-fleet sender
 #                that is not on the operator list ($FORK_SANDBOX_OPERATORS)
 #                posted to this thread; it routes like fleet mail and
@@ -770,6 +776,11 @@
 # the marks. Without them, a run outliving two rollouts would be declared
 # dead while its Job still ran, and its seat woken a second time. A wake
 # the timeout cuts off mid-collect is left unmarked, to the dead-seat path.
+# The drain's events (`drain` start, each `handed-off`, `drain done`) are
+# also appended, UTC-stamped, to $STATE/drain-record on the store, which
+# keeps the last 5 drains; the next deliver loop logs the last one at
+# startup as `last-drain` events, and `last-drain-unfinished` when it has
+# no done line.
 #
 # DEAD-SEAT TEARDOWN. Once a k8s run is declared dead -- no summary.json
 # and a dead wrapper, then the probe says failed or gone (exit 2),
@@ -1366,6 +1377,11 @@ ROUTE_PENDING="$STATE/route-pending"
 # Set by cmd_deliver's TERM/INT trap: the route pass hands nothing more to
 # pm_wake_or_pend once it is set, and leaves the rest to the next process.
 PM_STOP_REQUESTED=0
+# The shutdown drain's own events, kept on the store past the pod's stdout:
+# see SHUTDOWN DRAIN in the header, and pm_drain_record.
+DRAIN_RECORD="$STATE/drain-record"
+# How many drains DRAIN_RECORD keeps, the newest included.
+PM_DRAIN_RECORD_KEEP=5
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
 # same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
@@ -6497,16 +6513,61 @@ pm_drain() {
     start="$(date +%s)"
     term_at="${PM_TERM_AT:-$start}"
     busy="$(pm_drain_busy)"
-    (( busy > 0 )) && pm_event "drain busy=$busy timeout=${timeout}s"
+    pm_drain_record_trim
+    pm_drain_record "drain busy=$busy timeout=${timeout}s since_term=$(( start - term_at ))s"
     pm_mark_handed_off
     if (( busy > 0 )); then
         while (( busy > 0 && $(date +%s) - term_at < timeout )); do
             sleep "${FORK_SANDBOX_POSTMASTER_DRAIN_POLL:-2}" || true
             busy="$(pm_drain_busy)"
         done
-        pm_event "drain done busy=$busy waited=$(( $(date +%s) - start ))s"
         pm_mark_handed_off
     fi
+    pm_drain_record "drain done busy=$busy waited=$(( $(date +%s) - start ))s"
+}
+
+# Emits event "$*" and appends it, UTC-stamped, to $DRAIN_RECORD. A failed
+# append never stops the drain.
+pm_drain_record() {
+    pm_event "$*"
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$DRAIN_RECORD" 2>/dev/null || true
+}
+
+# Cuts $DRAIN_RECORD to its last PM_DRAIN_RECORD_KEEP - 1 drains, making
+# room for the one starting. Each drain starts at a `drain busy=` line.
+pm_drain_record_trim() {
+    local tmp
+    [[ -s "$DRAIN_RECORD" ]] || return 0
+    tmp="$(mktemp "$STATE/.drain-record.XXXXXX")" || return 0
+    if awk -v keep="$(( PM_DRAIN_RECORD_KEEP - 1 ))" '
+        { line[NR] = $0; if ($2 == "drain" && $3 ~ /^busy=/) starts[++n] = NR }
+        END {
+            from = (n > keep) ? starts[n - keep + 1] : 1
+            if (keep == 0) from = NR + 1
+            for (i = from; i <= NR; i++) print line[i]
+        }' "$DRAIN_RECORD" > "$tmp"; then
+        mv -f -- "$tmp" "$DRAIN_RECORD"
+    else
+        rm -f -- "$tmp"
+    fi
+}
+
+# Logs the previous process's last drain from $DRAIN_RECORD, one
+# `last-drain` event per line, and `last-drain-unfinished` when it never
+# reached its done line.
+pm_drain_record_report() {
+    local -a lines=()
+    local line done_seen=0
+    [[ -s "$DRAIN_RECORD" ]] || return 0
+    mapfile -t lines < <(awk '
+        $2 == "drain" && $3 ~ /^busy=/ { n = 0 }
+        { last[++n] = $0 }
+        END { for (i = 1; i <= n; i++) print last[i] }' "$DRAIN_RECORD")
+    for line in "${lines[@]}"; do
+        pm_event "last-drain $line"
+        [[ "$line" == *" drain done "* ]] && done_seen=1
+    done
+    (( ${#lines[@]} == 0 || done_seen )) || pm_event "last-drain-unfinished"
 }
 
 # Marks every k8s wake this exit is about to orphan with its inputs in hand
@@ -6531,7 +6592,7 @@ pm_mark_handed_off() {
         pm_wake_collecting "$f" && continue
         [[ -e "$run_dir/handed-off" ]] && continue
         : > "$run_dir/handed-off"
-        pm_event "handed-off thread=$(fs_pm_env_get "$f" THREAD | cut -c1-8) agent=$(fs_pm_env_get "$f" AGENT) run=$rid"
+        pm_drain_record "handed-off thread=$(fs_pm_env_get "$f" THREAD | cut -c1-8) agent=$(fs_pm_env_get "$f" AGENT) run=$rid"
     done
 }
 
@@ -7032,6 +7093,7 @@ cmd_deliver() {
     # trap (and that time) until it ended, up to a whole interval late.
     local stop=0 sleep_pid
     PM_TERM_AT=""
+    pm_drain_record_report
     trap 'stop=1; PM_STOP_REQUESTED=1; [[ -n "$PM_TERM_AT" ]] || PM_TERM_AT="$(date +%s)"' TERM INT
     # A signal also ends the pass in progress at the next stage boundary:
     # each stage is whole on its own and the next process runs them all

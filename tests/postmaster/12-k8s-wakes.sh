@@ -1175,6 +1175,39 @@ check "drain collect timeout: the wake cut off mid-collect is not marked" 0 \
     "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
 drain_cleanup
 
+# The drain's events also go to $STATE/drain-record on the store, which
+# outlives the pod's stdout: start, each handed-off, done.
+drain_setup
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+dr_rec="$PM_STATE_DIR/drain-record"
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=1 FORK_SANDBOX_POSTMASTER_DRAIN_POLL=0.2 \
+    dr_call pm_drain > /dev/null 2>&1
+contains "drain record: start with its busy count" "$(cat "$dr_rec" 2>/dev/null)" "Z drain busy=1 timeout=1s"
+contains "drain record: the handed-off wake" "$(cat "$dr_rec" 2>/dev/null)" \
+    "Z handed-off thread="
+contains "drain record: done with the time waited" "$(cat "$dr_rec" 2>/dev/null)" "Z drain done busy=1 waited="
+for _ in 1 2 3 4 5 6 7; do
+    FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=0 dr_call pm_drain > /dev/null 2>&1
+done
+check "drain record: bounded to the last 5 drains" 5 "$(grep -c 'Z drain busy=' "$dr_rec" 2>/dev/null)"
+check "drain record: ...each with its done line" 5 "$(grep -c 'Z drain done busy=' "$dr_rec" 2>/dev/null)"
+# A drain SIGKILLed mid-wait leaves its start and marks but no done line,
+# and the next postmaster reports that drain at startup.
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=60 drain_start_and_term
+check "drain record: the drain is waiting on the hook" 1 "$(drain_alive_after 20)"
+kill -KILL "$DR_PID" 2>/dev/null; wait "$DR_PID" 2>/dev/null
+check "drain record: the killed drain left its start" 1 \
+    "$(tail -n1 "$dr_rec" | grep -c 'Z drain busy=1 timeout=60s')"
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=0 drain_start_and_term
+check "drain record: the next postmaster exits" 0 "$(drain_alive_after 50)"
+wait "$DR_PID" 2>/dev/null || true
+contains "drain record: startup logs the last drain" "$(cat "$DR_LOG")" \
+    "Z drain busy=1 timeout=60s"
+contains "drain record: ...as a last-drain event" "$(cat "$DR_LOG")" "pm last-drain "
+contains "drain record: ...and says it never finished" "$(cat "$DR_LOG")" "pm last-drain-unfinished"
+check "drain record: only the last drain is logged" 1 "$(grep -c '^pm last-drain .* drain busy=' "$DR_LOG")"
+drain_cleanup
+
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=soon refuses \
