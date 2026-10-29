@@ -174,6 +174,13 @@
 #                the run record's RUN_DIR is not one of this postmaster's own
 #                wake directories (pm-k8s-wake.* under the wake root), so it
 #                was not adopted and the seat is treated as dead.
+#   k8s-dead-reaped run=<run id>, branch=<branch> -- a k8s seat the
+#                postmaster declared dead had its cluster objects removed;
+#                see DEAD-SEAT TEARDOWN below.
+#   k8s-dead-reap-failed run=<run id>, branch=<branch>, rc=<n|mark> -- that
+#                removal failed and is retried next pass (`mark`: the
+#                marker itself could not be written, so only retention
+#                will ever remove them).
 #   drain        busy=<n>, timeout=<s>; then busy=<n>, waited=<s> -- the
 #                loop stopped on SIGTERM/SIGINT with <n> wakes still
 #                submitting or hooks still running, and deliver waited for
@@ -749,6 +756,28 @@
 # dir: the next postmaster's adoption of it spends no `adopt-count` and
 # removes the file. Without this, a run outliving two rollouts would be
 # declared dead while its Job still ran, and its seat woken a second time.
+#
+# DEAD-SEAT TEARDOWN. Once a k8s run is declared dead -- no summary.json
+# and a dead wrapper, then the probe says failed or gone (exit 2),
+# adoptions are used up, the adoption launch fails, the adoption is
+# refused, or the run dir vanished -- nothing will ever harvest it again,
+# yet its Job may still be running (a hung tool call outliving three
+# wrappers) and a run whose driver died mid-collect still has its claude
+# proxy and token Secret (collect's `.reap-pending`, honoured only by an
+# adopt that never comes). So that harvest writes $STATE/k8s-dead-reap/<run
+# id> before it marks the run harvested, and pm_k8s_dead_reap_pass, right
+# after each harvest pass, runs `fork-sandbox-k8s.sh rm --branch <branch>`
+# for every marked run that is harvested: the Job (which stops it), the
+# scripts ConfigMap, and every Pod, Service, Secret, ConfigMap and
+# NetworkPolicy carrying the branch label. Cluster objects only: the wake
+# dir, its logs and any fetched branch stay as the evidence behind the
+# flag. Success removes the marker, writes $STATE/k8s-reaped/<run id> (so
+# retention skips it) and emits `k8s-dead-reaped`; a failure (or a call
+# past $PM_K8S_DEAD_REAP_TIMEOUT seconds) emits `k8s-dead-reap-failed`
+# and keeps the marker for the next pass. At most $PM_K8S_REAP_PER_PASS
+# runs per pass, and only a branch matching PM_K8S_REAP_BRANCH_RE, as in
+# retention. A run still being harvested (adoptable, adopted, deferred on
+# an unreachable cluster, or live) never gets a marker.
 #
 # K8S RETENTION. A k8s wake that failed keeps its Job, pods, ConfigMaps,
 # NetworkPolicies and Secrets as evidence (fork-sandbox-k8s.sh's own reap
@@ -5931,6 +5960,7 @@ pm_harvest_run() {
         # as a terminal failure: flag the thread and unblock the agent
         # instead of leaving fs_pm_find_live_run wedged on it forever.
         pm_flag_unless_closed "$tid" "run dir for $agent vanished (run $rid)"
+        [[ "$backend" == k8s ]] && pm_k8s_dead_reap_mark "$rid" "$branch"
         # Session state lives under this script's own state dir, not the
         # run dir that just vanished -- it is unaffected, so it is left
         # standing rather than cleared on evidence this branch never had.
@@ -5958,6 +5988,8 @@ pm_harvest_run() {
                 0|3) return 0 ;;
                 2) adopt_failed=" (adopting its still-live Job failed: could not launch fork-sandbox-k8s-wake.sh --adopt)" ;;
             esac
+            # Declared dead from here on: see DEAD-SEAT TEARDOWN.
+            pm_k8s_dead_reap_mark "$rid" "$branch"
         fi
         # Same crash shape as a non-zero exit code below -- no summary.json
         # ever landed, but the outbox is a host directory bind-mounted rw
@@ -6267,6 +6299,59 @@ pm_k8s_retention_pass() {
         if "$k8s" rm --branch "$branch" >/dev/null 2>&1; then
             : > "$reaped/$rid"
             pm_event "k8s-reaped run=$rid branch=$branch"
+        fi
+    done
+}
+
+# ---- k8s dead-seat teardown ----
+
+# Seconds one `rm` may take before it counts as failed: an API server that
+# black-holes requests must not stall the deliver loop.
+PM_K8S_DEAD_REAP_TIMEOUT=60
+
+# Marks run $1 (branch $2) for pm_k8s_dead_reap_pass. See DEAD-SEAT TEARDOWN in the
+# header. A failed write is logged, never fatal to the harvest.
+pm_k8s_dead_reap_mark() {
+    local rid="$1" branch="$2"
+    if ! { mkdir -p -- "$STATE/k8s-dead-reap" && : > "$STATE/k8s-dead-reap/$rid"; } 2>/dev/null; then
+        pm_event "k8s-dead-reap-failed run=$rid branch=$branch rc=mark"
+    fi
+    return 0
+}
+
+# See DEAD-SEAT TEARDOWN in the header.
+pm_k8s_dead_reap_pass() {
+    local dir="$STATE/k8s-dead-reap" reaped="$STATE/k8s-reaped"
+    [[ -d "$dir" ]] || return 0
+    local k8s="${FORK_SANDBOX_POSTMASTER_K8S:-$script_dir/fork-sandbox-k8s.sh}"
+    local m rid f branch rc tried=0
+    for m in "$dir"/*; do
+        [[ -e "$m" ]] || continue
+        rid="$(basename -- "$m")"
+        f="$RUNS/$rid.env"
+        if [[ ! "$rid" =~ $PM_WAKE_EXIT_ID_RE || ! -f "$f" ]]; then
+            rm -f -- "$m"
+            continue
+        fi
+        # Only once the harvest that declared it dead has finished.
+        [[ -e "$HARVESTED/$rid" ]] || continue
+        branch="$(fs_pm_env_get "$f" BRANCH)"
+        if [[ -e "$reaped/$rid" || "$(fs_pm_env_get "$f" BACKEND)" != k8s \
+            || ! "$branch" =~ $PM_K8S_REAP_BRANCH_RE ]]; then
+            rm -f -- "$m"
+            continue
+        fi
+        (( tried++ >= PM_K8S_REAP_PER_PASS )) && break
+        rc=0
+        "$FS_TIMEOUT" --kill-after 10 "$PM_K8S_DEAD_REAP_TIMEOUT" \
+            "$k8s" rm --branch "$branch" >/dev/null 2>&1 || rc=$?
+        if (( rc == 0 )); then
+            mkdir -p -- "$reaped"
+            : > "$reaped/$rid"
+            rm -f -- "$m"
+            pm_event "k8s-dead-reaped run=$rid branch=$branch"
+        else
+            pm_event "k8s-dead-reap-failed run=$rid branch=$branch rc=$rc"
         fi
     done
 }
@@ -6835,6 +6920,7 @@ cmd_deliver() {
         pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
+        pm_k8s_dead_reap_pass
         pm_k8s_retention_pass
         pm_deferral_pass
         pm_hook_pass "$project"
@@ -6850,6 +6936,7 @@ cmd_deliver() {
         pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
+        pm_k8s_dead_reap_pass
         pm_k8s_retention_pass
         pm_deferral_pass
         pm_hook_pass "$project"

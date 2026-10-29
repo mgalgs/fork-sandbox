@@ -1022,6 +1022,19 @@ never removes a Job that `wait --probe` reports as still running, nor
 anything from a run it did not launch itself. Each removal emits a
 `k8s-reaped` event.
 
+A k8s seat the postmaster declares dead (no `summary.json` and its wrapper
+gone, then the probe says the pod failed or is gone, its adoptions are used
+up, the adoption could not be launched, or its run directory vanished) is
+not left for retention: nothing will ever harvest it again, and its Job
+may still be running, or its claude proxy and token Secret may still be
+live. The next pass runs `fork-sandbox-k8s.sh rm --branch` for it at once,
+emitting `k8s-dead-reaped`. A failed removal emits `k8s-dead-reap-failed`
+with the run id and is retried every pass until it succeeds; it never holds
+up the harvest. Only cluster objects are removed. The run directory, its
+logs and any fetched branch stay as evidence. A run that is still
+adoptable, being adopted, or waiting on an unreachable cluster is never
+touched.
+
 `$FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline` runs the wake wrapper
 synchronously instead of inside its own detached tmux session — a test
 seam, not an operator setting.

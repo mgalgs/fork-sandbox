@@ -32,12 +32,16 @@ kr_reset() {
 }
 
 # kr_run <rid> <branch> <seconds since harvest> [backend]; omit the age to
-# leave the run unharvested.
+# leave the run unharvested (its run dir then exists, so a harvest pass
+# reads it as still running rather than vanished).
 kr_run() {
     local rid="$1" branch="$2" age="${3-}" backend="${4:-k8s}"
     printf 'AGENT=tests\nTHREAD=0123abcd-0000-0000-0000-000000000000\nBACKEND=%s\nBRANCH=%s\nRUN_DIR=%s\n' \
         "$backend" "$branch" "$work/kr-$rid" > "$KR_STATE/runs/$rid.env"
-    [[ -n "$age" ]] || return 0
+    if [[ -z "$age" ]]; then
+        mkdir -p "$work/kr-$rid"
+        return 0
+    fi
     : > "$KR_STATE/harvested/$rid"
     touch -d "@$(( $(date +%s) - age ))" "$KR_STATE/harvested/$rid"
 }
@@ -130,6 +134,76 @@ kr_reset
 kr_run r-old sbx-mail-0123abcd-tests-6 $(( 400 * day ))
 FORK_SANDBOX_POSTMASTER_K8S_RETENTION=0 once
 check "retention: 0 disables it" "" "$(kr_rm_calls)"
+
+# ============================================================
+printf '\n== k8s dead-seat teardown: the pass ==\n'
+# ============================================================
+# The harvest-side cases (which deaths mark a run, the rm itself, a failed
+# rm's retry) are in 12-k8s-wakes.sh; these are the pass's own guards.
+
+kr_dead() { mkdir -p "$KR_STATE/k8s-dead-reap"; : > "$KR_STATE/k8s-dead-reap/$1"; }
+kr_marked() { [[ -e "$KR_STATE/k8s-dead-reap/$1" ]] && echo yes || echo no; }
+# The pass alone, without a harvest pass in front of it: a run record whose
+# RUN_DIR does not exist would otherwise be harvested as vanished first.
+kr_dead_pass() {
+    (
+        # shellcheck disable=SC1090
+        source "$postmaster"
+        # shellcheck disable=SC2034  # read by the sourced functions
+        PM_EVENTS_ENABLED=1
+        pm_k8s_dead_reap_pass
+    ) > "$work/once.out" 2>&1
+}
+
+kr_reset
+kr_run r-dead sbx-mail-0123abcd-tests-6 0
+kr_dead r-dead
+kr_run r-unharvested sbx-mail-0123abcd-tests-7
+kr_dead r-unharvested
+kr_run r-forged fork-sandbox-agent-live 0
+kr_dead r-forged
+kr_run r-local sbx-mail-0123abcd-tests-9 0 local
+kr_dead r-local
+kr_dead r-no-record
+kr_dead_pass
+check "dead teardown: only the harvested, marked k8s run is removed" \
+    "rm --branch sbx-mail-0123abcd-tests-6" "$(kr_rm_calls)"
+check "dead teardown: ...without a probe first (stopping a running Job is the point)" 0 "$(kr_probe_count)"
+contains "dead teardown: k8s-dead-reaped event" "$(cat "$work/once.out")" \
+    "pm k8s-dead-reaped run=r-dead branch=sbx-mail-0123abcd-tests-6"
+check "dead teardown: a run not yet harvested is left alone, its marker kept" yes "$(kr_marked r-unharvested)"
+check "dead teardown: a branch the postmaster never mints is dropped, not removed" no "$(kr_marked r-forged)"
+check "dead teardown: a local run is dropped" no "$(kr_marked r-local)"
+check "dead teardown: a marker with no run record is dropped" no "$(kr_marked r-no-record)"
+: > "$KR_STATE/harvested/r-unharvested"
+kr_dead_pass
+check "dead teardown: once harvested, the marked run is removed" 2 "$(kr_rm_calls | wc -l)"
+kr_dead_pass
+check "dead teardown: a removed run is not removed again" 2 "$(kr_rm_calls | wc -l)"
+
+kr_reset
+for n in 1 2 3 4 5 6 7; do kr_run "r-$n" "sbx-mail-0123abcd-tests-$n" 0; kr_dead "r-$n"; done
+kr_dead_pass
+check "dead teardown: at most 5 runs per pass" 5 "$(kr_rm_calls | wc -l)"
+kr_dead_pass
+check "dead teardown: the rest go next pass" 7 "$(kr_rm_calls | wc -l)"
+
+kr_reset
+kr_run r-dead sbx-mail-0123abcd-tests-6 0
+kr_dead r-dead
+once
+check "dead teardown: deliver runs the pass" "rm --branch sbx-mail-0123abcd-tests-6" "$(kr_rm_calls)"
+
+# A k8s run whose run dir vanished is declared dead by harvest, so its
+# cluster objects go too.
+kr_reset
+kr_run r-vanished sbx-mail-0123abcd-tests-6
+rm -rf "$work/kr-r-vanished"
+once
+check "dead teardown: a vanished k8s run is removed by its branch" \
+    "rm --branch sbx-mail-0123abcd-tests-6" "$(kr_rm_calls)"
+contains "dead teardown: ...emitting k8s-dead-reaped" "$(cat "$work/once.out")" \
+    "pm k8s-dead-reaped run=r-vanished branch=sbx-mail-0123abcd-tests-6"
 
 for bad in FORK_SANDBOX_POSTMASTER_K8S_RETENTION FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY; do
     rc=0

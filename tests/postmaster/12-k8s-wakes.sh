@@ -672,15 +672,20 @@ adopt_case() {
     [[ -z "$handed_off" ]] || : > "$wake_dir/handed-off"
     [[ -z "$backend" ]] || sed -i "s/^BACKEND=.*/BACKEND=$backend/" "$env"
     printf '%s\n' "$probe_rc" > "$K8S_WAKE_BIN/probe-rc"
-    rm -f -- "$K8S_WAKE_BIN/probe-calls.log" "$K8S_WAKE_BIN/resume-calls.log"
+    rm -f -- "$K8S_WAKE_BIN/probe-calls.log" "$K8S_WAKE_BIN/resume-calls.log" "$K8S_WAKE_BIN/rm-calls.log"
     FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
     ADOPT_TID="$tid" ADOPT_RID="$rid" ADOPT_WAKE_DIR="$wake_dir"
+    ADOPT_BRANCH="$(env_val "$env" BRANCH)"
+    ADOPT_RMS="$(adopt_rm_count)"
     ADOPT_FLAG="$( [[ -e "$PM_STATE_DIR/needs-operator/$tid" ]] && echo 1 || echo 0 )"
     ADOPT_HARVESTED="$( [[ -e "$PM_STATE_DIR/harvested/$rid" ]] && echo 1 || echo 0 )"
     ADOPT_PROBES="$(wc -l < "$K8S_WAKE_BIN/probe-calls.log" 2>/dev/null || echo 0)"
     ADOPT_RESUMES="$(wc -l < "$K8S_WAKE_BIN/resume-calls.log" 2>/dev/null || echo 0)"
     unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 }
+
+# How many `rm --branch` calls the stub saw since the last adopt_case reset.
+adopt_rm_count() { cat -- "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null | grep -c '^rm --branch '; }
 
 for adopt_probe_rc in 1 0; do
     adopt_case "probe exit $adopt_probe_rc" "$adopt_probe_rc" ""
@@ -695,6 +700,9 @@ for adopt_probe_rc in 1 0; do
         "pm adopt thread=${ADOPT_TID:0:8} agent=karen run=$ADOPT_RID attempt=1"
     check "k8s adopt (probe $adopt_probe_rc): no retry scheduled" 0 \
         "$( [[ -e "$PM_STATE_DIR/retries/$ADOPT_TID/karen" ]] && echo 1 || echo 0 )"
+    check "k8s adopt (probe $adopt_probe_rc): an adoptable seat's cluster objects are not removed" 0 "$ADOPT_RMS"
+    check "k8s adopt (probe $adopt_probe_rc): ...nor marked for teardown" 0 \
+        "$( [[ -e "$PM_STATE_DIR/k8s-dead-reap/$ADOPT_RID" ]] && echo 1 || echo 0 )"
 done
 
 adopt_case "probe exit 2" 2 ""
@@ -708,6 +716,70 @@ check "k8s adopt (probe 2): no adopt-count written" 0 \
     "$( [[ -e "$ADOPT_WAKE_DIR/adopt-count" ]] && echo 1 || echo 0 )"
 contains "k8s adopt (probe 2): a retry was scheduled as before" \
     "$(cat "$PM_STATE_DIR/retries/$ADOPT_TID/karen" 2>/dev/null)" "STATE=pending"
+check "k8s dead teardown (probe 2): the dead seat's cluster objects are removed by its branch" \
+    "rm --branch $ADOPT_BRANCH" "$(grep '^rm --branch ' "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"
+contains "k8s dead teardown (probe 2): k8s-dead-reaped event names the run" "$(cat "$work/once.out")" \
+    "pm k8s-dead-reaped run=$ADOPT_RID branch=$ADOPT_BRANCH"
+check "k8s dead teardown (probe 2): the marker is consumed" 0 \
+    "$( [[ -e "$PM_STATE_DIR/k8s-dead-reap/$ADOPT_RID" ]] && echo 1 || echo 0 )"
+check "k8s dead teardown (probe 2): retention will not remove it again" 1 \
+    "$( [[ -e "$PM_STATE_DIR/k8s-reaped/$ADOPT_RID" ]] && echo 1 || echo 0 )"
+check "k8s dead teardown (probe 2): the wake dir stays as evidence" 1 \
+    "$( [[ -d "$ADOPT_WAKE_DIR" ]] && echo 1 || echo 0 )"
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+check "k8s dead teardown (probe 2): a later pass does not remove it again" 1 "$(adopt_rm_count)"
+
+# The incident shape: the driver died mid-collect after writing
+# .reap-pending, and the pod then exited Succeeded, so the probe says dead
+# and no adopt ever comes to honour the mark.
+adopt_reap_pending_case() {
+    local mid tid env rid wake_dir k8s_run_dir
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+    mid="$(send_msg '@carol' '@karen' 'adopt topic: reap pending' 'first' 8)"
+    tid="$(thread_of "$mid")"
+    STUB_K8S_NO_REPLY=1 once
+    env="$(latest_env_for_agent karen)"
+    rid="$(basename "$env" .env)"
+    wake_dir="$(env_val "$env" RUN_DIR)"
+    new_root k8s_run_dir
+    printf 'credentials\n' > "$k8s_run_dir/.reap-pending"
+    printf '%s\n' "$k8s_run_dir" > "$wake_dir/k8s-run-dir"
+    rm -f -- "$PM_STATE_DIR/harvested/$rid" "$wake_dir/summary.json" "$wake_dir/exit-code" \
+        "$wake_dir/k8s-timeout" "$wake_dir/pid-identity"
+    dead_pid_of > "$wake_dir/pid"
+    printf '2\n' > "$K8S_WAKE_BIN/probe-rc"
+    rm -f -- "$K8S_WAKE_BIN/rm-calls.log"
+    FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+    check "k8s dead teardown (.reap-pending): removed by its branch" \
+        "rm --branch $(env_val "$env" BRANCH)" "$(grep '^rm --branch ' "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"
+    contains "k8s dead teardown (.reap-pending): the harvest still records no-summary" \
+        "$(cat "$PM_STATE_DIR/needs-operator/$tid" 2>/dev/null)" "wake never produced summary.json: $rid"
+    check "k8s dead teardown (.reap-pending): harvested" 1 \
+        "$( [[ -e "$PM_STATE_DIR/harvested/$rid" ]] && echo 1 || echo 0 )"
+    unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+}
+adopt_reap_pending_case
+
+# A teardown that fails never blocks the harvest, is logged naming the run,
+# and is retried next pass until it succeeds.
+printf '1\n' > "$K8S_WAKE_BIN/rm-rc"
+adopt_case "teardown fails" 2 ""
+rm -f -- "$K8S_WAKE_BIN/rm-rc"
+check "k8s dead teardown (rm fails): harvested regardless" 1 "$ADOPT_HARVESTED"
+check "k8s dead teardown (rm fails): flagged regardless" 1 "$ADOPT_FLAG"
+contains "k8s dead teardown (rm fails): k8s-dead-reap-failed event names the run" "$(cat "$work/once.out")" \
+    "pm k8s-dead-reap-failed run=$ADOPT_RID branch=$ADOPT_BRANCH rc=1"
+check "k8s dead teardown (rm fails): the marker stays" 1 \
+    "$( [[ -e "$PM_STATE_DIR/k8s-dead-reap/$ADOPT_RID" ]] && echo 1 || echo 0 )"
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+check "k8s dead teardown (rm fails): retried next pass" 2 "$(adopt_rm_count)"
+contains "k8s dead teardown (rm fails): ...which succeeds" "$(cat "$work/once.out")" \
+    "pm k8s-dead-reaped run=$ADOPT_RID branch=$ADOPT_BRANCH"
+check "k8s dead teardown (rm fails): ...and consumes the marker" 0 \
+    "$( [[ -e "$PM_STATE_DIR/k8s-dead-reap/$ADOPT_RID" ]] && echo 1 || echo 0 )"
 
 adopt_case "adoptions used up" 1 2
 check "k8s adopt (count 2): flagged as before" 1 "$ADOPT_FLAG"
@@ -715,6 +787,10 @@ check "k8s adopt (count 2): harvested as before" 1 "$ADOPT_HARVESTED"
 check "k8s adopt (count 2): the cluster is not even probed" 0 "$ADOPT_PROBES"
 check "k8s adopt (count 2): nothing adopted" 0 "$ADOPT_RESUMES"
 check "k8s adopt (count 2): adopt-count left at 2" 2 "$(cat "$ADOPT_WAKE_DIR/adopt-count")"
+check "k8s dead teardown (count 2): the still-running Job is removed (stopped) by its branch" \
+    "rm --branch $ADOPT_BRANCH" "$(grep '^rm --branch ' "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"
+contains "k8s dead teardown (count 2): k8s-dead-reaped event names the run" "$(cat "$work/once.out")" \
+    "pm k8s-dead-reaped run=$ADOPT_RID branch=$ADOPT_BRANCH"
 
 # A wake the previous postmaster handed off on a clean shutdown is adopted
 # even with its adoptions used up, and spends none: a rollout is not a death.
@@ -727,6 +803,7 @@ check "k8s adopt (handed off, count 2): the marker is consumed" 0 \
     "$( [[ -e "$ADOPT_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
 contains "k8s adopt (handed off, count 2): pm adopt event says handed-off" "$(cat "$work/once.out")" \
     "pm adopt thread=${ADOPT_TID:0:8} agent=karen run=$ADOPT_RID attempt=2 handed-off"
+check "k8s adopt (handed off, count 2): nothing removed" 0 "$ADOPT_RMS"
 
 adopt_case "handed off, first adoption" 1 "" "" handed-off
 check "k8s adopt (handed off, first): adopted (resume ran)" 1 "$ADOPT_RESUMES"
@@ -742,6 +819,7 @@ adopt_case "local wake" 1 "" local
 check "k8s adopt (local backend): flagged as before" 1 "$ADOPT_FLAG"
 check "k8s adopt (local backend): the cluster is not probed" 0 "$ADOPT_PROBES"
 check "k8s adopt (local backend): nothing adopted" 0 "$ADOPT_RESUMES"
+check "k8s adopt (local backend): no cluster teardown" 0 "$ADOPT_RMS"
 
 # A failed adoption launch is a dead seat, and the flag says why.
 adopt_launch_fail_case() {
@@ -758,6 +836,7 @@ adopt_launch_fail_case() {
     rm -f -- "$PM_STATE_DIR/harvested/$rid" "$wake_dir/summary.json" "$wake_dir/exit-code"
     dead_pid_of > "$wake_dir/pid"
     printf '1\n' > "$K8S_WAKE_BIN/probe-rc"
+    rm -f -- "$K8S_WAKE_BIN/rm-calls.log"
     # A wrapper that cannot start a detached session (no tmux on PATH to
     # find): the non-inline path, with tmux absent from a minimal PATH.
     local fake_bin
@@ -771,6 +850,8 @@ adopt_launch_fail_case() {
         "$(cat "$PM_STATE_DIR/needs-operator/$tid" 2>/dev/null)" "adopting its still-live Job failed"
     check "k8s adopt (launch fails): harvested (dead as before)" 1 \
         "$( [[ -e "$PM_STATE_DIR/harvested/$rid" ]] && echo 1 || echo 0 )"
+    check "k8s dead teardown (launch fails): the live Job nobody will adopt is removed" \
+        "rm --branch $(env_val "$env" BRANCH)" "$(grep '^rm --branch ' "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"
 }
 adopt_launch_fail_case
 
@@ -792,7 +873,7 @@ adopt_deferred_setup() {
     rm -f -- "$PM_STATE_DIR/harvested/$AD_RID" "$AD_WAKE_DIR/summary.json" "$AD_WAKE_DIR/exit-code" \
         "$AD_WAKE_DIR/k8s-run-dir" "$AD_WAKE_DIR/k8s-timeout" "$AD_WAKE_DIR/pid-identity"
     dead_pid_of > "$AD_WAKE_DIR/pid"
-    rm -f -- "$K8S_WAKE_BIN/probe-calls.log" "$K8S_WAKE_BIN/resume-calls.log"
+    rm -f -- "$K8S_WAKE_BIN/probe-calls.log" "$K8S_WAKE_BIN/resume-calls.log" "$K8S_WAKE_BIN/rm-calls.log"
 }
 adopt_deferred_setup
 
@@ -810,6 +891,8 @@ check "k8s adopt-deferred (probe 4): nothing adopted" 0 \
     "$(wc -l < "$K8S_WAKE_BIN/resume-calls.log" 2>/dev/null || echo 0)"
 check "k8s adopt-deferred (probe 4): no retry scheduled" 0 \
     "$( [[ -e "$PM_STATE_DIR/retries/$AD_TID/karen" ]] && echo 1 || echo 0 )"
+check "k8s adopt-deferred (probe 4): nothing removed from the cluster" 0 \
+    "$(adopt_rm_count)"
 contains "k8s adopt-deferred (probe 4): pm adopt-deferred event" "$(cat "$work/once.out")" \
     "pm adopt-deferred thread=${AD_TID:0:8} agent=karen run=$AD_RID probe_rc=4"
 
