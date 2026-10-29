@@ -8450,6 +8450,36 @@ else
         "rc=$rc timeout=$resume_g_timeout out=$(cat "$resume_out_g")"
 fi
 
+# run's own wait counts its --timeout from SUBMITTED_AT too, as resume's
+# does: the Job's activeDeadlineSeconds (TIMEOUT + 600) counts from the
+# Job's creation, and everything submit does after that (here, a pod that
+# takes 3s to appear) must come out of the wait, or the cluster's deadline
+# can fire before the driver's own timeout.
+run_slow_dir="$(newdir)"; tmpdirs+=("$run_slow_dir")
+cat > "$run_slow_dir/kubectl" <<STUB
+#!/usr/bin/env bash
+if [[ " \$* " == *" get pod -l job-name="* && ! -e "$run_slow_dir/slept" ]]; then
+    : > "$run_slow_dir/slept"
+    /bin/sleep 3
+fi
+exec "$runstub_dir/kubectl" "\$@"
+STUB
+chmod +x "$run_slow_dir/kubectl"
+run_slow_log="$(newdir)/kubectl.log"; run_slow_out="$(dirname "$run_slow_log")/out.txt"
+tmpdirs+=("$(dirname "$run_slow_log")")
+rc=0
+RESUME_EXTRA_PATH="$run_slow_dir" runstub_verb "$run_slow_log" "$run_slow_out" run \
+    --branch fs-k8s-test-run-timeout-anchor --model moonshotai/kimi-k3 --timeout 900 \
+    --outbox-dir "$(newdir)/run-slow-outbox" "$proj_dir" "$handoff_file" || rc=$?
+run_slow_timeout="$(grep -oE 'timeout [0-9]+s\)' "$run_slow_out" | grep -oE '[0-9]+')"
+if (( rc == 0 )) && [[ -e "$run_slow_dir/slept" && -n "$run_slow_timeout" ]] \
+    && (( run_slow_timeout >= 890 && run_slow_timeout <= 897 )); then
+    ok "run's wait counts --timeout from SUBMITTED_AT, not from submit's return"
+else
+    no "run's wait counts --timeout from SUBMITTED_AT, not from submit's return" \
+        "rc=$rc timeout=$run_slow_timeout out=$(cat "$run_slow_out")"
+fi
+
 # A relative --outbox-dir given to a direct CLI `submit` is recorded
 # absolute, resolved against submit's own cwd -- not left relative, which
 # would resolve against `resume`'s cwd later instead of the original

@@ -341,7 +341,10 @@
 # waiting longer than the pod itself will idle is pointless. On submit (and
 # so run) it is also the run's recorded TIMEOUT, and the Job carries
 # activeDeadlineSeconds = TIMEOUT + 600: the cluster stops a Job no driver
-# is left to wait on. 0 sets no deadline.
+# is left to wait on. 0 sets no deadline. run, like resume, counts its own
+# wait's timeout from SUBMITTED_AT, so the time submit spends after the Job
+# exists (quota wait, pod-ready, inputs push) never pushes the driver's
+# timeout past the Job's deadline.
 #
 # --keep (run, collect): skip the final rm, leaving the Job and pod in place
 # after a successful fetch.
@@ -12932,6 +12935,23 @@ cmd_run() {
     # see cmd_run's own row in "The durable run log" in
     # docs/kubernetes-runs.md.
     local run_dir="$K8S_LAST_SUBMIT_RUN_DIR"
+
+    # The Job's activeDeadlineSeconds (TIMEOUT + K8S_JOB_DEADLINE_GRACE)
+    # counts from the Job's creation, but submit can spend its quota wait,
+    # pod-ready budget and inputs push after that. Counting the wait's
+    # TIMEOUT from SUBMITTED_AT instead, as resume does, keeps this
+    # driver's own timeout ahead of the cluster's deadline.
+    # Floored at 60s, as resume's is, or at the whole TIMEOUT when shorter.
+    local submitted_at elapsed floor
+    submitted_at="$(read_env_value "$run_dir/run.env" SUBMITTED_AT 2>/dev/null || true)"
+    timeout=$(( 10#$timeout ))
+    if (( timeout > 0 )) && [[ "$submitted_at" =~ ^[0-9]+$ ]]; then
+        elapsed=$(( $(date +%s) - 10#$submitted_at ))
+        (( elapsed > 0 )) || elapsed=0
+        floor=$(( timeout < 60 ? timeout : 60 ))
+        timeout=$(( timeout - elapsed ))
+        (( timeout >= floor )) || timeout=$floor
+    fi
 
     k8s_run_tail "$run_dir" "$branch" "$timeout" "$project_path" \
         "$outbox_dir" "$outbox_max_bytes" "$review_loop_cap" "$keep"
