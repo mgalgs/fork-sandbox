@@ -507,7 +507,8 @@ k8s_wake_fixture() {
 # adoption probe: exit code read from probe-rc, default 2) and \`resume\`
 # verbs: this suite must never shell out to the real cluster script (let
 # alone a cluster). \`resume\` blocks while resume-hold exists, standing in
-# for an adopted run whose Job is still going.
+# for an adopted run whose Job is still going; \`rm\` blocks while rm-hold
+# exists, standing in for an API server that black-holes requests.
 set -uo pipefail
 case "\${1:-}" in
     wait)
@@ -521,6 +522,7 @@ case "\${1:-}" in
         exit 0 ;;
 esac
 printf '%s\n' "\$*" >> "$K8S_WAKE_BIN/rm-calls.log"
+while [[ -e "$K8S_WAKE_BIN/rm-hold" ]]; do sleep 0.1; done
 [[ -f "$K8S_WAKE_BIN/rm-rc" ]] && exit "\$(cat "$K8S_WAKE_BIN/rm-rc")"
 exit 0
 STUB

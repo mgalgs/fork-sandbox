@@ -1175,6 +1175,55 @@ check "drain collect timeout: the wake cut off mid-collect is not marked" 0 \
     "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
 drain_cleanup
 
+# SIGTERM during a teardown stage cuts it short: the rm in flight is
+# stopped and the stage's remaining runs are left for the next postmaster,
+# so the drain's marks land at once instead of after up to five
+# black-holed rm calls (each 60s+). $1 is "dead-reap" (markers) or
+# "retention" (runs past the window).
+drain_teardown_case() {
+    local kind="$1" i rid
+    drain_setup nohook
+    printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+    mkdir -p -- "$PM_STATE_DIR/k8s-dead-reap"
+    for i in 1 2 3; do
+        rid="9999999999-teardown-$i"
+        printf 'AGENT=tests\nBACKEND=k8s\nBRANCH=sbx-mail-0123abcd-tests-%s\nRUN_DIR=%s\n' \
+            "$i" "$work/no-such-$rid" > "$PM_STATE_DIR/runs/$rid.env"
+        : > "$PM_STATE_DIR/harvested/$rid"
+        if [[ "$kind" == dead-reap ]]; then
+            : > "$PM_STATE_DIR/k8s-dead-reap/$rid"
+        else
+            touch -d "@$(( $(date +%s) - 4 * 86400 ))" "$PM_STATE_DIR/harvested/$rid"
+        fi
+    done
+    rm -f -- "$K8S_WAKE_BIN/rm-calls.log"
+    : > "$K8S_WAKE_BIN/rm-hold"
+    FORK_SANDBOX_POSTMASTER_INTERVAL=1 FORK_SANDBOX_POSTMASTER_DRAIN_POLL=0.2 \
+        FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=60 FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY=0 \
+        "$postmaster" deliver --project "$PROJECT_DIR" > "$DR_LOG" 2>&1 &
+    DR_PID=$!
+    for _ in $(seq 1 100); do [[ -s "$K8S_WAKE_BIN/rm-calls.log" ]] && break; sleep 0.1; done
+    check "drain mid-$kind: an rm is in flight when SIGTERM lands" 1 \
+        "$(wc -l < "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null || echo 0)"
+    kill -TERM "$DR_PID"
+    check "drain mid-$kind: exits promptly despite the black-holed rm" 0 "$(drain_alive_after 50)"
+    wait "$DR_PID" 2>/dev/null || true
+    check "drain mid-$kind: the live wake past submit is marked handed-off" 1 \
+        "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+    check "drain mid-$kind: no further rm after the signal" 1 \
+        "$(wc -l < "$K8S_WAKE_BIN/rm-calls.log")"
+    check "drain mid-$kind: nothing recorded as reaped" 0 \
+        "$(find "$PM_STATE_DIR/k8s-reaped" -type f 2>/dev/null | wc -l)"
+    if [[ "$kind" == dead-reap ]]; then
+        check "drain mid-dead-reap: every marker stays for the next postmaster" 3 \
+            "$(find "$PM_STATE_DIR/k8s-dead-reap" -type f | wc -l)"
+    fi
+    rm -f -- "$K8S_WAKE_BIN/rm-hold"
+    drain_cleanup
+}
+FORK_SANDBOX_POSTMASTER_K8S_RETENTION=0 drain_teardown_case dead-reap
+FORK_SANDBOX_POSTMASTER_K8S_RETENTION=86400 drain_teardown_case retention
+
 # The drain's events also go to $STATE/drain-record on the store, which
 # outlives the pod's stdout: start, each handed-off, done.
 drain_setup

@@ -762,7 +762,9 @@
 # running, until $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT seconds (default
 # 150; 0 skips the wait) after the signal arrived: the pass in progress,
 # cut short at its next stage, comes out of the same budget. The loop's
-# sleep between passes yields to the signal at once; a command a pass is
+# sleep between passes yields to the signal at once, and so do the k8s
+# teardown stages: their `rm`s and probes are stopped mid-call and their
+# remaining runs left to the next postmaster. Any other command a pass is
 # running when it lands delays the trap (and so the recorded time) until
 # that command returns. The pod's terminationGracePeriodSeconds must
 # exceed the timeout, and it should stay under the mail client's retry
@@ -798,8 +800,8 @@
 # dir, its logs and any fetched branch stay as the evidence behind the
 # flag. Success removes the marker, writes $STATE/k8s-reaped/<run id> (so
 # retention skips it) and emits `k8s-dead-reaped`; a failure (or a call
-# past $PM_K8S_DEAD_REAP_TIMEOUT seconds) emits `k8s-dead-reap-failed`
-# and keeps the marker for the next pass. At most $PM_K8S_REAP_PER_PASS
+# past $PM_K8S_DEAD_REAP_TIMEOUT seconds, or stopped by a shutdown) emits
+# `k8s-dead-reap-failed` and keeps the marker for the next pass. At most $PM_K8S_REAP_PER_PASS
 # runs per pass, and only a branch matching PM_K8S_REAP_BRANCH_RE, as in
 # retention. A run still being harvested (adoptable, adopted, deferred on
 # an unreachable cluster, or live) never gets a marker. Under --cluster,
@@ -819,7 +821,8 @@
 # every $FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY seconds (default 600),
 # and only for a branch this script minted whose `wait --probe` exits 0 or
 # 2 -- never a Job still running (a wait timeout's, say). At most
-# $PM_K8S_REAP_PER_PASS runs are probed per pass. A failed rm is retried
+# $PM_K8S_REAP_PER_PASS runs are probed per pass. A failed rm (or one past
+# $PM_K8S_DEAD_REAP_TIMEOUT seconds, or stopped by a shutdown) is retried
 # next time. Objects of runs the postmaster did not launch are never
 # touched.
 #
@@ -6302,6 +6305,24 @@ pm_harvest_pass() {
 
 # ---- k8s retention ----
 
+# Runs "$@" in the background and returns its status, unless a shutdown
+# signal (PM_STOP_REQUESTED) arrives first: then it is sent SIGTERM and its
+# (non-zero) status returned once it exits. A foreground command would hold
+# the trap until it returned -- with a black-holed API server, a whole
+# teardown stage past the pod's grace period, before the drain marked
+# anything.
+pm_run_stoppable() {
+    local pid rc
+    "$@" &
+    pid=$!
+    while :; do
+        rc=0
+        wait "$pid" || rc=$?
+        kill -0 "$pid" 2>/dev/null || return "$rc"
+        (( PM_STOP_REQUESTED )) && kill -TERM "$pid" 2>/dev/null
+    done
+}
+
 # Only a branch this script mints (pm_spawn_wake) is ever removed: run
 # records are writable from the cluster mail API container.
 PM_K8S_REAP_BRANCH_RE='^sbx-mail-[0-9a-f]{8}-[a-z][a-z0-9-]{0,30}-[0-9]+$'
@@ -6344,13 +6365,16 @@ pm_k8s_retention_pass() {
             : > "$reaped/$rid"
             continue
         fi
+        (( PM_STOP_REQUESTED )) && break
         (( tried++ >= PM_K8S_REAP_PER_PASS )) && break
         # Exit 0 (finished) or 2 (failed or gone) only: 1 is a Job still
         # running, 4 a cluster that could not be asked.
         probe_rc=0
-        "$k8s" wait --branch "$branch" --probe --timeout 5 >/dev/null 2>&1 || probe_rc=$?
-        (( probe_rc == 0 || probe_rc == 2 )) || continue
-        if "$k8s" rm --branch "$branch" >/dev/null 2>&1; then
+        pm_run_stoppable "$FS_TIMEOUT" --kill-after 10 "$PM_K8S_DEAD_REAP_TIMEOUT" \
+            "$k8s" wait --branch "$branch" --probe --timeout 5 >/dev/null 2>&1 || probe_rc=$?
+        (( (probe_rc == 0 || probe_rc == 2) && ! PM_STOP_REQUESTED )) || continue
+        if pm_run_stoppable "$FS_TIMEOUT" --kill-after 10 "$PM_K8S_DEAD_REAP_TIMEOUT" \
+            "$k8s" rm --branch "$branch" >/dev/null 2>&1; then
             : > "$reaped/$rid"
             pm_event "k8s-reaped run=$rid branch=$branch"
         fi
@@ -6359,8 +6383,9 @@ pm_k8s_retention_pass() {
 
 # ---- k8s dead-seat teardown ----
 
-# Seconds one `rm` may take before it counts as failed: an API server that
-# black-holes requests must not stall the deliver loop.
+# Seconds one `rm` (dead-seat or retention) may take before it counts as
+# failed: an API server that black-holes requests must not stall the
+# deliver loop.
 PM_K8S_DEAD_REAP_TIMEOUT=60
 
 # Marks run $1 (branch $2) for pm_k8s_dead_reap_pass. See DEAD-SEAT TEARDOWN in the
@@ -6409,9 +6434,10 @@ pm_k8s_dead_reap_pass() {
             pm_event "k8s-dead-reap-refused run=$rid branch=$branch"
             continue
         fi
+        (( PM_STOP_REQUESTED )) && break
         (( tried++ >= PM_K8S_REAP_PER_PASS )) && break
         rc=0
-        "$FS_TIMEOUT" --kill-after 10 "$PM_K8S_DEAD_REAP_TIMEOUT" \
+        pm_run_stoppable "$FS_TIMEOUT" --kill-after 10 "$PM_K8S_DEAD_REAP_TIMEOUT" \
             "$k8s" rm --branch "$branch" >/dev/null 2>&1 || rc=$?
         if (( rc == 0 )); then
             mkdir -p -- "$reaped"
