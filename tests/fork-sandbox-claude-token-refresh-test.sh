@@ -72,7 +72,8 @@ count_refresh_scratch_dirs() {
 #     tests, which only ever invoke it as `claude mcp list`. `sleep` (for
 #     STUB_SLEEP_SECS, default 20s) never returns on its own within a test's
 #     timescale, so a SIGTERM sent to the caller while it is still running
-#     exercises the interrupted-refresh path below. `hang` is a claude that
+#     exercises the interrupted-refresh path below; it exits
+#     STUB_SLEEP_EXIT (default 0) when it is done. `hang` is a claude that
 #     outlives SIGTERM: it ignores it and keeps running for STUB_HANG_SECS
 #     (default 120s), appending its PID to STUB_HANG_PIDFILE so a test can
 #     always kill it in the end.
@@ -164,6 +165,7 @@ if [[ -n "${STUB_MODE:-}" ]]; then
         sleep)
             sleep "${STUB_SLEEP_SECS:-20}"
             [[ -n "${STUB_SLEEP_THEN_SUCCEED:-}" ]] && succeed
+            exit "${STUB_SLEEP_EXIT:-0}"
             ;;
     esac
     exit 0
@@ -487,6 +489,52 @@ if [[ "$after_scratch" == "$before_scratch" ]]; then
     ok "an interrupted refresh leaves no refresh scratch dir behind"
 else
     no "an interrupted refresh leaves no refresh scratch dir behind" "count went from $before_scratch to $after_scratch"
+fi
+
+printf '\n== under set -e, a SIGTERM mid-refresh still merges when claude then exits non-zero ==\n'
+# The live-sync loop and the k8s keeper both run under their script's
+# inherited `set -e`, and errexit applies inside an EXIT trap too: the
+# first failing command in it ends the trap. A claude that refreshes and
+# then exits non-zero -- or one timeout had to signal, which exits 124 or
+# 137 -- made the emergency cleanup's own `wait` that failing command, so
+# it stopped right there: no merge of the token claude had just rotated,
+# no lock release, no scratch-dir removal.
+sigexit_cred="$work/sigexit-credentials.json"
+write_cred "$sigexit_cred" 10
+sigexit_dir="$(dirname "$sigexit_cred")"
+sigexit_lock1="$sigexit_dir/.oauth_refresh.lock"
+sigexit_lock2="$(realpath -m "$sigexit_dir").lock"
+before_scratch="$(count_refresh_scratch_dirs)"
+(
+    set -e
+    trap '_fs_claude_refresh_emergency_cleanup "$sigexit_lock1" "$sigexit_lock2"' EXIT
+    STUB_MODE=sleep STUB_SLEEP_SECS=4 STUB_SLEEP_THEN_SUCCEED=1 STUB_SLEEP_EXIT=1 \
+        fs_claude_refresh_if_needed "$sigexit_cred" "$stub"
+) 2>/dev/null &
+sigexit_pid=$!
+sleep 2
+kill -TERM "$sigexit_pid" 2>/dev/null
+wait "$sigexit_pid" 2>/dev/null
+if [[ "$(jq -r '.claudeAiOauth.accessToken' "$sigexit_cred" 2>/dev/null)" == stub-new-access-* ]]; then
+    ok "an interrupted refresh whose claude exits non-zero still merges the refreshed token"
+else
+    no "an interrupted refresh whose claude exits non-zero still merges the refreshed token" \
+        "accessToken is '$(jq -r '.claudeAiOauth.accessToken' "$sigexit_cred" 2>/dev/null)'"
+fi
+if [[ ! -d "$sigexit_lock1" && ! -d "$sigexit_lock2" ]]; then
+    ok "an interrupted refresh whose claude exits non-zero still releases both lock dirs"
+else
+    no "an interrupted refresh whose claude exits non-zero still releases both lock dirs" "a lock dir is still present"
+    rmdir "$sigexit_lock1" "$sigexit_lock2" 2>/dev/null || true
+fi
+if [[ "$(count_refresh_scratch_dirs)" == "$before_scratch" ]]; then
+    ok "an interrupted refresh whose claude exits non-zero leaves no scratch dir behind"
+else
+    no "an interrupted refresh whose claude exits non-zero leaves no scratch dir behind" "count changed"
+    for d in /var/tmp/claude-scratch/forks/claude-fork-token-refresh.*; do
+        [[ -d "$d" ]] && jq -e '.claudeAiOauth.accessToken | startswith("stub-new-")' "$d/.credentials.json" >/dev/null 2>&1 \
+            && rm -rf -- "$d"
+    done
 fi
 
 echo

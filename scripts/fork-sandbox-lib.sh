@@ -2328,6 +2328,14 @@ _fs_claude_refresh_finish() {
 # is not wired in there instead.
 _fs_claude_refresh_emergency_cleanup() {
     local lock1="$1" lock2="$2"
+    # Both installers run under their script's `set -e`, and errexit holds
+    # inside an EXIT trap too: the first failing command would end the trap
+    # right there. The `wait` below fails whenever the child exited non-zero
+    # -- claude itself, or timeout's 124/137 after signalling it -- which
+    # skipped the merge of a token claude may just have rotated, the lock
+    # release and the scratch-dir removal. This only ever runs in a process
+    # that is already exiting, so dropping errexit for good costs nothing.
+    set +e
     # Wait, never kill: the child may already have rotated the single-use
     # refresh token, and killing it can lose the only live copy. timeout's
     # own --kill-after bounds the wait (see _fs_claude_do_refresh).
