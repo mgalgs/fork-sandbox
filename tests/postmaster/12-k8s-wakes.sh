@@ -1136,6 +1136,45 @@ check "drain over 5000 harvested records: the live wake is still marked" 1 \
     "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
 drain_cleanup
 
+# A wake mid-collect -- its agent finished, its wrapper fetching the branch,
+# writing the summary and reaping (cmd_collect's .reap-pending in the k8s
+# run dir) -- keeps the drain busy until it is done, and is never marked:
+# it finishes within the drain, and a rollout there would lose its result.
+drain_setup nohook
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+printf 'credentials\n' > "${DR_K8S_ENV%/run.env}/.reap-pending"
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=60 drain_start_and_term
+check "drain collect: a wake mid-collect keeps the drain busy" 1 "$(drain_alive_after 20)"
+contains "drain collect: pm drain event counts it" "$(cat "$DR_LOG")" "pm drain busy=1 timeout=60s"
+check "drain collect: a wake mid-collect is not marked handed-off" 0 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+# Reaped, exit-code written; the wrapper has yet to copy summary.json.
+rm -f -- "${DR_K8S_ENV%/run.env}/.reap-pending"
+printf '0\n' > "${DR_K8S_ENV%/run.env}/exit-code"
+check "drain collect: still busy after the reap, until the wake's summary.json" 1 \
+    "$(drain_alive_after 10)"
+printf '{"exit_code": 0}' > "$DR_WAKE_DIR/summary.json"
+kill "$DR_WAKE_PID" 2>/dev/null; wait "$DR_WAKE_PID" 2>/dev/null
+check "drain collect: exits once the collect is done" 0 "$(drain_alive_after 50)"
+wait "$DR_PID" 2>/dev/null || true
+contains "drain collect: nothing cut off" "$(cat "$DR_LOG")" "pm drain done busy=0"
+check "drain collect: the collected wake was never marked" 0 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+drain_cleanup
+
+# Cut off at the timeout, a wake mid-collect is still not marked: the
+# dead-seat path takes it from there.
+drain_setup nohook
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+printf 'full\n' > "${DR_K8S_ENV%/run.env}/.reap-pending"
+FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=1 drain_start_and_term
+check "drain collect timeout: exits once the bound is spent" 0 "$(drain_alive_after 50)"
+wait "$DR_PID" 2>/dev/null || true
+contains "drain collect timeout: pm drain done names it" "$(cat "$DR_LOG")" "pm drain done busy=1"
+check "drain collect timeout: the wake cut off mid-collect is not marked" 0 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+drain_cleanup
+
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=soon refuses \
