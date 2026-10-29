@@ -1999,7 +1999,7 @@ FS_CLAUDE_PLACEHOLDER_REFRESH_TOKEN="fork-sandbox-placeholder-not-a-token"
 # fork-sandbox-claude-token-probe's checks were last verified against by
 # hand. Bump it, by hand, only after re-running the probe against a new
 # claude release and confirming its checks still hold.
-FS_CLAUDE_TOKEN_CONTRACT_VERIFIED="2.1.280"
+FS_CLAUDE_TOKEN_CONTRACT_VERIFIED="2.1.308"
 
 # The one jq filter that turns a real Claude credential into the sandbox's
 # own copy: JSON in on stdin, JSON out on stdout. Kept in exactly one place
