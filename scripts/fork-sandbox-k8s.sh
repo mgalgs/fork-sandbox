@@ -12946,16 +12946,16 @@ cmd_run() {
     # TIMEOUT from SUBMITTED_AT instead, as resume does, keeps this
     # driver's own timeout ahead of the cluster's deadline.
     # Floored at 60s, as resume's is, or at the whole TIMEOUT when shorter.
-    local submitted_at elapsed floor
+    local submitted_at elapsed floor remaining=$(( 10#$timeout ))
     submitted_at="$(read_env_value "$run_dir/run.env" SUBMITTED_AT 2>/dev/null || true)"
-    timeout=$(( 10#$timeout ))
-    if (( timeout > 0 )) && [[ "$submitted_at" =~ ^[0-9]+$ ]]; then
+    if (( remaining > 0 )) && [[ "$submitted_at" =~ ^[0-9]+$ ]]; then
         elapsed=$(( $(date +%s) - 10#$submitted_at ))
         (( elapsed > 0 )) || elapsed=0
-        floor=$(( timeout < 60 ? timeout : 60 ))
-        timeout=$(( timeout - elapsed ))
-        (( timeout >= floor )) || timeout=$floor
+        floor=$(( remaining < 60 ? remaining : 60 ))
+        remaining=$(( remaining - elapsed ))
+        (( remaining >= floor )) || remaining=$floor
     fi
+    timeout=$remaining
 
     k8s_run_tail "$run_dir" "$branch" "$timeout" "$project_path" \
         "$outbox_dir" "$outbox_max_bytes" "$review_loop_cap" "$keep"
