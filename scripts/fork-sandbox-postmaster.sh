@@ -186,9 +186,10 @@
 #                postmaster made with that branch; nothing was removed.
 #   drain        busy=<n>, timeout=<s>; then busy=<n>, waited=<s> -- the
 #                loop stopped on SIGTERM/SIGINT with <n> wakes still
-#                submitting or hooks still running, and deliver waited for
-#                them before exiting; see SHUTDOWN DRAIN below. A final
-#                busy above 0 means the timeout cut them off.
+#                submitting or collecting, or hooks still running, and
+#                deliver waited for them before exiting; see SHUTDOWN
+#                DRAIN below. A final busy above 0 means the timeout cut
+#                them off.
 #   external-mail thread -- `deliver --cluster` only: a non-fleet sender
 #                that is not on the operator list ($FORK_SANDBOX_OPERATORS)
 #                posted to this thread; it routes like fleet mail and
@@ -748,24 +749,27 @@
 # SHUTDOWN DRAIN. Adoption covers a wake whose pod already has its inputs.
 # One killed earlier -- still submitting, before INPUTS_PUSH_COMPLETE lands
 # in its k8s run.env -- cannot be adopted (resume deletes the half-built
-# Job), and a hook killed mid-run is `lost`. So when the deliver loop stops
-# on SIGTERM/SIGINT it launches nothing more and waits until no wake is
-# submitting and no hook is running, until
-# $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT seconds (default 150; 0 skips the
-# wait) after the signal arrived -- the pass in progress then, finished
-# first, comes out of the same budget. The loop's sleep between passes
-# yields to the signal at once; a command a pass is running when it lands
-# delays the trap (and so the recorded time) until that command returns.
-# The pod's terminationGracePeriodSeconds must exceed the timeout, and it
-# should stay under the mail client's retry budget, since the mail API is
-# down for the whole shutdown. A non-numeric value refuses `deliver`.
-# Every live k8s wake past submit gets a `handed-off` file in its wake dir
-# as the drain STARTS, before any waiting, and again when the wait ends (a
-# wake that finished submitting meanwhile): the next postmaster's adoption
-# of it spends no `adopt-count` and removes the file. Marking first means a
-# SIGKILL at the end of the grace period still leaves the marks. Without
-# them, a run outliving two rollouts would be declared dead while its Job
-# still ran, and its seat woken a second time.
+# Job), one killed mid-collect loses its result (no summary.json, the
+# thread flagged `no-summary`), and a hook killed mid-run is `lost`. So
+# when the deliver loop stops on SIGTERM/SIGINT it launches nothing more
+# and waits until no wake is submitting or collecting and no hook is
+# running, until $FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT seconds (default
+# 150; 0 skips the wait) after the signal arrived: the pass in progress,
+# cut short at its next stage, comes out of the same budget. The loop's
+# sleep between passes yields to the signal at once; a command a pass is
+# running when it lands delays the trap (and so the recorded time) until
+# that command returns. The pod's terminationGracePeriodSeconds must
+# exceed the timeout, and it should stay under the mail client's retry
+# budget, since the mail API is down for the whole shutdown. A non-numeric
+# value refuses `deliver`.
+# Every live k8s wake past submit and not collecting gets a `handed-off`
+# file in its wake dir as the drain STARTS, before any waiting, and again
+# when the wait ends (a wake that finished submitting meanwhile): the next
+# postmaster's adoption of it spends no `adopt-count` and removes the file.
+# Marking first means a SIGKILL at the end of the grace period still leaves
+# the marks. Without them, a run outliving two rollouts would be declared
+# dead while its Job still ran, and its seat woken a second time. A wake
+# the timeout cuts off mid-collect is left unmarked, to the dead-seat path.
 #
 # DEAD-SEAT TEARDOWN. Once a k8s run is declared dead -- no summary.json
 # and a dead wrapper, then the probe says failed or gone (exit 2),
@@ -6417,16 +6421,43 @@ pm_wake_submitting() {
     run_dir="$(fs_pm_env_get "$env_file" RUN_DIR)"
     [[ -d "$run_dir" && ! -f "$run_dir/summary.json" ]] || return 1
     pm_wake_is_dead "$run_dir" "$env_file" && return 1
-    # Same lookup as fork-sandbox-k8s-wake.sh's fs_k8s_wake_find_run_dir.
-    k8s_run_dir="$(cat -- "$run_dir/k8s-run-dir" 2>/dev/null)" || k8s_run_dir=""
-    [[ -n "$k8s_run_dir" ]] \
-        || k8s_run_dir="$(sed -n 's/^  run dir:  *//p' "$run_dir/launch.log" 2>/dev/null | head -n1)"
+    k8s_run_dir="$(pm_wake_k8s_run_dir "$run_dir")"
     [[ -n "$k8s_run_dir" ]] || return 0
     ! grep -qx 'INPUTS_PUSH_COMPLETE=true' "$k8s_run_dir/run.env" 2>/dev/null
 }
 
+# Prints the k8s run dir of wake dir $1 (empty when none is recorded yet).
+# Same lookup as fork-sandbox-k8s-wake.sh's fs_k8s_wake_find_run_dir.
+pm_wake_k8s_run_dir() {
+    local k8s_run_dir
+    k8s_run_dir="$(cat -- "$1/k8s-run-dir" 2>/dev/null)" || k8s_run_dir=""
+    [[ -n "$k8s_run_dir" ]] \
+        || k8s_run_dir="$(sed -n 's/^  run dir:  *//p' "$1/launch.log" 2>/dev/null | head -n1)"
+    printf '%s' "$k8s_run_dir"
+}
+
+# True while a live k8s wake is collecting: its agent finished, its wrapper
+# fetching the branch, writing the summary and reaping the run's objects.
+# fork-sandbox-k8s.sh's cmd_collect marks its run dir `.reap-pending` before
+# any of that (wait's runner-dead ending does too, before its own reap) and
+# writes exit-code there before it returns; the wrapper then copies
+# summary.json into the wake dir, last. Cut off here, the branch may be
+# fetched but the result is lost (`no-summary`), and adoption does not
+# resume a collect -- so the drain waits for it, and does not mark it.
+pm_wake_collecting() {
+    local env_file="$1" run_dir k8s_run_dir
+    [[ "$(fs_pm_env_get "$env_file" BACKEND)" == k8s ]] || return 1
+    run_dir="$(fs_pm_env_get "$env_file" RUN_DIR)"
+    [[ -d "$run_dir" && ! -f "$run_dir/summary.json" ]] || return 1
+    pm_wake_is_dead "$run_dir" "$env_file" && return 1
+    k8s_run_dir="$(pm_wake_k8s_run_dir "$run_dir")"
+    [[ -n "$k8s_run_dir" ]] || return 1
+    [[ -e "$k8s_run_dir/.reap-pending" || -e "$k8s_run_dir/exit-code" ]]
+}
+
 # How many detached children a restart would cut off right now: k8s wakes
-# still submitting (pm_wake_submitting) plus hooks still running.
+# still submitting (pm_wake_submitting) or collecting (pm_wake_collecting)
+# plus hooks still running.
 #
 # Runs on every drain poll over every run record -- thousands on a
 # long-lived store, nearly all harvested -- so the per-record work before
@@ -6437,7 +6468,9 @@ pm_drain_busy() {
         [[ -e "$f" ]] || continue
         rid="${f##*/}"; rid="${rid%.env}"
         [[ -e "$HARVESTED/$rid" ]] && continue
-        pm_wake_submitting "$f" && n=$((n + 1))
+        if pm_wake_submitting "$f" || pm_wake_collecting "$f"; then
+            n=$((n + 1))
+        fi
     done
     for rec in "$STATE/hooks/run"/*/; do
         [[ -d "$rec" ]] || continue
@@ -6480,7 +6513,9 @@ pm_drain() {
 # (wrapper alive, past submit, no summary.json) `handed-off` in its wake dir,
 # so the next postmaster adopts it without spending one of its adoptions: a
 # rollout is not a failure of the wake. A wake cut off mid-submit is not
-# marked; resume refuses it whatever the count says. Idempotent: a wake
+# marked; resume refuses it whatever the count says. Nor is one collecting
+# (pm_wake_collecting): it finishes within the drain, and one cut off there
+# is the dead-seat path's. Idempotent: a wake
 # already marked is left as is, with no second event.
 pm_mark_handed_off() {
     local f rid run_dir
@@ -6493,6 +6528,7 @@ pm_mark_handed_off() {
         [[ -d "$run_dir" && ! -f "$run_dir/summary.json" ]] || continue
         pm_wake_is_dead "$run_dir" "$f" && continue
         pm_wake_submitting "$f" && continue
+        pm_wake_collecting "$f" && continue
         [[ -e "$run_dir/handed-off" ]] && continue
         : > "$run_dir/handed-off"
         pm_event "handed-off thread=$(fs_pm_env_get "$f" THREAD | cut -c1-8) agent=$(fs_pm_env_get "$f" AGENT) run=$rid"
