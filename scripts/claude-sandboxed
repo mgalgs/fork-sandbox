@@ -694,7 +694,7 @@ if (( ! EXEC_MODE )); then
     # parent cannot leave it spinning against a STATE_DIR that either is
     # about to be, or already was, removed; the cleanup trap above also kills
     # it directly on every normal exit path (with `kill`, i.e. SIGTERM, which
-    # this loop can be blocked against inside the up-to-40s
+    # this loop can be blocked against inside the bounded (about a minute)
     # fs_claude_refresh_if_needed call below -- see the EXIT trap set just
     # inside this subshell for what still cleans that up).
     if [[ -n "$CRED_FILE" ]]; then
@@ -702,6 +702,10 @@ if (( ! EXEC_MODE )); then
             parent_pid=$$
             sandbox_file="$STATE_DIR/claude/.credentials.json"
             tick=0
+            # Refresh every this many ticks (2s each, so ~60s by default).
+            # FS_CLAUDE_SYNC_REFRESH_TICKS is a test hook.
+            refresh_ticks="${FS_CLAUDE_SYNC_REFRESH_TICKS:-30}"
+            [[ "$refresh_ticks" =~ ^[1-9][0-9]*$ ]] || refresh_ticks=30
             # This subshell is a fresh process with no EXIT trap of its own,
             # so it is safe to own one outright -- unlike
             # fs_claude_refresh_if_needed itself, which is also called from
@@ -709,7 +713,7 @@ if (( ! EXEC_MODE )); then
             # have one; see that function's SECURITY INVARIANT comment.
             # cleanup's `kill "$SYNC_LOOP_PID"` (a SIGTERM) can land while
             # this loop is blocked inside fs_claude_refresh_if_needed's own
-            # up-to-40s refresh call, holding claude's two locks with a
+            # bounded refresh call, holding claude's two locks with a
             # scratch dir (holding the real refresh token) open on disk; this
             # trap is what still releases and removes them when that happens
             # instead of at the loop's own next normal statement, which a
@@ -724,7 +728,7 @@ if (( ! EXEC_MODE )); then
                 # copy-forward steps below still keep the sandbox file in
                 # step with the host's, even on a machine with no host claude
                 # to refresh with.
-                if (( tick % 30 == 0 )); then
+                if (( tick % refresh_ticks == 0 )); then
                     fs_claude_refresh_if_needed "$CRED_FILE" "$HOST_CLAUDE_BIN"
                 fi
                 if [[ -f "$CRED_FILE" ]]; then

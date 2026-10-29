@@ -2142,14 +2142,15 @@ _fs_claude_take_lock() {
 
 # Holds _fs_claude_do_refresh's scratch dir path for exactly as long as that
 # dir exists and contains the real refresh token, so a signal that arrives
-# mid-refresh -- including while blocked inside the up-to-40s `claude mcp
+# mid-refresh -- including while blocked inside the bounded `claude mcp
 # list` call below -- can still find and remove it. See claude-sandboxed's
 # live-sync loop, which installs the EXIT trap (_fs_claude_refresh_emergency_
 # cleanup) that reads this.
 _FS_CLAUDE_REFRESH_SCRATCH=""
 
 # Holds the PID of the backgrounded `claude mcp list` call for exactly as
-# long as that process (up to 40s, via timeout) is running, so a signal that
+# long as that process (bounded by timeout; see _fs_claude_do_refresh) is
+# running, so a signal that
 # arrives mid-refresh can still wait for it and merge its result before
 # removing the locks and scratch dir. A SIGTERM that lands while this process
 # is `wait`-ing interrupts only the wait; the child keeps running, and if it
@@ -2213,8 +2214,22 @@ _fs_claude_do_refresh() {
     # the child, and a tracked PID is one _fs_claude_refresh_emergency_cleanup
     # can wait on again and then merge -- see its own comment and the global
     # above. `exec` makes the recorded PID timeout's own.
+    #
+    # SIGTERM after FS_CLAUDE_REFRESH_TIMEOUT_SEC (default 40), then SIGKILL
+    # after a further FS_CLAUDE_REFRESH_KILL_AFTER_SEC (default 20); both are
+    # test hooks. The SIGKILL is what bounds the call: GNU timeout without
+    # --kill-after sends its SIGTERM and then waits for as long as the child
+    # takes to act on it, so a claude that outlived SIGTERM blocked the
+    # caller -- claude-sandboxed's live-sync loop included -- forever, with
+    # nothing printed and no sync done again. A kill cannot discard a
+    # refresh that already landed: _fs_claude_refresh_finish reads whatever
+    # the child left in the scratch dir either way.
+    local term_after="${FS_CLAUDE_REFRESH_TIMEOUT_SEC:-40}" kill_after="${FS_CLAUDE_REFRESH_KILL_AFTER_SEC:-20}"
+    [[ "$term_after" =~ ^[1-9][0-9]*$ ]] || term_after=40
+    [[ "$kill_after" =~ ^[1-9][0-9]*$ ]] || kill_after=20
     touch "$dir/.oauth_refresh.lock" "$("$FS_REALPATH" -m "$dir").lock" 2>/dev/null || true
-    ( cd "$scratch" && CLAUDE_CONFIG_DIR="$scratch" exec "$FS_TIMEOUT" 40 "$claude_bin" mcp list \
+    ( cd "$scratch" && CLAUDE_CONFIG_DIR="$scratch" \
+        exec "$FS_TIMEOUT" --kill-after="$kill_after" "$term_after" "$claude_bin" mcp list \
         </dev/null >/dev/null 2>&1 ) &
     _FS_CLAUDE_REFRESH_CHILD_PID=$!
     _FS_CLAUDE_REFRESH_CRED="$cred_file"
@@ -2314,8 +2329,8 @@ _fs_claude_refresh_finish() {
 _fs_claude_refresh_emergency_cleanup() {
     local lock1="$1" lock2="$2"
     # Wait, never kill: the child may already have rotated the single-use
-    # refresh token, and killing it can lose the only live copy. timeout
-    # bounds the wait at 40s.
+    # refresh token, and killing it can lose the only live copy. timeout's
+    # own --kill-after bounds the wait (see _fs_claude_do_refresh).
     if [[ -n "$_FS_CLAUDE_REFRESH_CHILD_PID" ]]; then
         wait "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null
         _FS_CLAUDE_REFRESH_CHILD_PID=""
@@ -2356,7 +2371,8 @@ _fs_claude_refresh_emergency_cleanup() {
 # line on success or failure, and neither line contains a token.
 #
 # This function (and _fs_claude_do_refresh, which it calls) can spend up to
-# 40s blocked inside a `claude mcp list` call with both locks held and the
+# a minute (see _fs_claude_do_refresh's timeout) blocked inside a `claude
+# mcp list` call with both locks held and the
 # scratch dir on disk. A signal that kills the calling process in that window
 # skips the cleanup at the end of this function entirely -- there is no trap
 # HERE, deliberately: an EXIT trap set inside a plain function is a process-
