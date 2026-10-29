@@ -1117,6 +1117,44 @@ check "cluster: the refused adoption wrote no adopt-count" 0 \
     "$( [[ -e "$cl_decoy/adopt-count" ]] && echo 1 || echo 0 )"
 contains "cluster: pm adopt-refused event" "$(cat "$work/cl.out")" "pm adopt-refused thread="
 contains "cluster: the refused run is named" "$(cat "$work/cl.out")" "run=$cl_rid2"
+check "cluster: a refused adoption's planted RUN_DIR gets no teardown" 0 \
+    "$(cat -- "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null | grep -cF -- "rm --branch $(env_val "$cl_env2" BRANCH)")"
+contains "cluster: ...the marker is refused, naming the run" "$(cat "$work/cl.out")" \
+    "pm k8s-dead-reap-refused run=$cl_rid2"
+
+# Run records and markers are writable from the mail API container, and
+# the dead-seat teardown's `rm --branch` probes nothing: a forged record
+# naming another seat's branch must never stop that seat's Job, whether
+# its RUN_DIR is missing or is one of this postmaster's own wake dirs.
+cl_victim_branch="$(env_val "$cl_env" BRANCH)"
+rm -f -- "$K8S_WAKE_BIN/rm-calls.log"
+printf 'AGENT=kim\nTHREAD=%s\nBACKEND=k8s\nBRANCH=%s\nRUN_DIR=%s\n' \
+    "$cl_tid2" "$cl_victim_branch" "$FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT/pm-k8s-wake.gone" \
+    > "$PM_STATE_DIR/runs/9999999999-forged-1.env"
+cl_other_dir=""; cl_other_dir="$(mktemp -d "$FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT/pm-k8s-wake.XXXXXX")"
+printf '%s\0' launcher --branch sbx-mail-0123abcd-other-1 > "$cl_other_dir/fs-argv"
+printf 'AGENT=kim\nTHREAD=%s\nBACKEND=k8s\nBRANCH=%s\nRUN_DIR=%s\n' \
+    "$cl_tid2" "$cl_victim_branch" "$cl_other_dir" > "$PM_STATE_DIR/runs/9999999999-forged-2.env"
+mkdir -p -- "$PM_STATE_DIR/harvested" "$PM_STATE_DIR/k8s-dead-reap"
+: > "$PM_STATE_DIR/harvested/9999999999-forged-2"
+: > "$PM_STATE_DIR/k8s-dead-reap/9999999999-forged-2"
+cl_pass
+check "cluster: a forged dead run never removes another seat's branch" 0 \
+    "$(cat -- "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null | grep -cF -- "rm --branch $cl_victim_branch")"
+contains "cluster: ...a vanished RUN_DIR is refused" "$(cat "$work/cl.out")" \
+    "pm k8s-dead-reap-refused run=9999999999-forged-1 branch=$cl_victim_branch"
+contains "cluster: ...a wake dir spawned with another branch is refused" "$(cat "$work/cl.out")" \
+    "pm k8s-dead-reap-refused run=9999999999-forged-2 branch=$cl_victim_branch"
+
+# The real seat, once declared dead, is still torn down on a cluster: its
+# wake dir is ours and was spawned with its record's branch.
+dead_pid_of > "$cl_wake_dir/pid"
+rm -f -- "$cl_wake_dir/summary.json" "$cl_wake_dir/exit-code" "$cl_wake_dir/pid-identity"
+printf '2\n' > "$K8S_WAKE_BIN/probe-rc"
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 cl_pass
+check "cluster: a dead seat's own wake dir still gets its teardown" \
+    "rm --branch $cl_victim_branch" "$(grep '^rm --branch ' "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"
+printf '1\n' > "$K8S_WAKE_BIN/probe-rc"
 
 # ---- cluster mode: the operator list carries rule-1 authority ----
 

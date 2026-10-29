@@ -1033,7 +1033,11 @@ with the run id and is retried every pass until it succeeds; it never holds
 up the harvest. Only cluster objects are removed. The run directory, its
 logs and any fetched branch stay as evidence. A run that is still
 adoptable, being adopted, or waiting on an unreachable cluster is never
-touched.
+touched. Under `--cluster`, where the mail API container can write run
+records, a run is only removed when its run directory is a wake directory
+this postmaster made and was spawned with that same branch; anything else
+(a vanished run directory included) emits `k8s-dead-reap-refused` and is
+left to retention, which probes before it removes.
 
 `$FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline` runs the wake wrapper
 synchronously instead of inside its own detached tmux session — a test

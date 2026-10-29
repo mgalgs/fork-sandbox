@@ -181,6 +181,9 @@
 #                removal failed and is retried next pass (`mark`: the
 #                marker itself could not be written, so only retention
 #                will ever remove them).
+#   k8s-dead-reap-refused run=<run id>, branch=<branch> -- under --cluster,
+#                a marked run whose RUN_DIR is not a wake dir this
+#                postmaster made with that branch; nothing was removed.
 #   drain        busy=<n>, timeout=<s>; then busy=<n>, waited=<s> -- the
 #                loop stopped on SIGTERM/SIGINT with <n> wakes still
 #                submitting or hooks still running, and deliver waited for
@@ -777,7 +780,12 @@
 # and keeps the marker for the next pass. At most $PM_K8S_REAP_PER_PASS
 # runs per pass, and only a branch matching PM_K8S_REAP_BRANCH_RE, as in
 # retention. A run still being harvested (adoptable, adopted, deferred on
-# an unreachable cluster, or live) never gets a marker.
+# an unreachable cluster, or live) never gets a marker. Under --cluster,
+# where the mail API container can write run records and markers alike,
+# only a run whose RUN_DIR is a wake dir this postmaster made, spawned with
+# that same branch, is removed; any other marker is dropped with
+# `k8s-dead-reap-refused` and left to retention's probe (a vanished wake
+# dir included).
 #
 # K8S RETENTION. A k8s wake that failed keeps its Job, pods, ConfigMaps,
 # NetworkPolicies and Secrets as evidence (fork-sandbox-k8s.sh's own reap
@@ -5746,6 +5754,30 @@ pm_k8s_wake_launch() {
     (( rc == 0 ))
 }
 
+# Succeeds when $1 is a wake dir this postmaster made itself (pm_spawn_wake's
+# pm-k8s-wake.* child of the wake root), which nothing under $MAIL_ROOT can
+# point it at.
+pm_k8s_wake_dir_ours() {
+    local wake_root real_dir
+    wake_root="$("$FS_REALPATH" -m -- "${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}")"
+    real_dir="$("$FS_REALPATH" -m -- "$1")"
+    [[ "$(dirname -- "$real_dir")" == "$wake_root" && "$(basename -- "$real_dir")" == pm-k8s-wake.* ]]
+}
+
+# Prints the --branch pm_spawn_wake wrote into wake dir $1's fs-argv (empty
+# when there is none): the branch that wake dir's own Job runs under.
+pm_k8s_wake_dir_branch() {
+    local -a argv=()
+    local i
+    mapfile -d '' -t argv < "$1/fs-argv" 2>/dev/null || return 0
+    for (( i = 1; i + 1 < ${#argv[@]}; i++ )); do
+        if [[ "${argv[i]}" == --branch ]]; then
+            printf '%s\n' "${argv[i+1]}"
+            return 0
+        fi
+    done
+}
+
 # A k8s wake whose wrapper is gone is not necessarily a dead seat: the Job
 # outlives the process that was waiting on it (postmaster host restart,
 # pod rollout). Asks the cluster instead of the pid. Returns 0 when the Job
@@ -5760,18 +5792,13 @@ pm_k8s_wake_launch() {
 # $1 = wake dir, $2 = run id, $3 = agent, $4 = thread id, $5 = branch.
 pm_try_adopt() {
     local run_dir="$1" rid="$2" agent="$3" tid="$4" branch="$5"
-    if (( PM_CLUSTER )); then
-        # An adoption execs the wake dir's fs-argv, and RUN_DIR comes from a
-        # run record under $MAIL_ROOT/.postmaster, which the cluster mail API
-        # container can write. Only a directory this postmaster made itself
-        # (a pm-k8s-wake.* child of the wake root) is ever adopted.
-        local wake_root real_dir
-        wake_root="$("$FS_REALPATH" -m -- "${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}")"
-        real_dir="$("$FS_REALPATH" -m -- "$run_dir")"
-        if [[ "$(dirname -- "$real_dir")" != "$wake_root" || "$(basename -- "$real_dir")" != pm-k8s-wake.* ]]; then
-            pm_event "adopt-refused thread=${tid:0:8} agent=$agent run=$rid"
-            return 1
-        fi
+    # An adoption execs the wake dir's fs-argv, and RUN_DIR comes from a
+    # run record under $MAIL_ROOT/.postmaster, which the cluster mail API
+    # container can write. Only a directory this postmaster made itself is
+    # ever adopted.
+    if (( PM_CLUSTER )) && ! pm_k8s_wake_dir_ours "$run_dir"; then
+        pm_event "adopt-refused thread=${tid:0:8} agent=$agent run=$rid"
+        return 1
     fi
     local count handed_off=0
     count="$(pm_trim "$(cat -- "$run_dir/adopt-count" 2>/dev/null || true)")"
@@ -6324,7 +6351,7 @@ pm_k8s_dead_reap_pass() {
     local dir="$STATE/k8s-dead-reap" reaped="$STATE/k8s-reaped"
     [[ -d "$dir" ]] || return 0
     local k8s="${FORK_SANDBOX_POSTMASTER_K8S:-$script_dir/fork-sandbox-k8s.sh}"
-    local m rid f branch rc tried=0
+    local m rid f branch run_dir rc tried=0
     for m in "$dir"/*; do
         [[ -e "$m" ]] || continue
         rid="$(basename -- "$m")"
@@ -6339,6 +6366,20 @@ pm_k8s_dead_reap_pass() {
         if [[ -e "$reaped/$rid" || "$(fs_pm_env_get "$f" BACKEND)" != k8s \
             || ! "$branch" =~ $PM_K8S_REAP_BRANCH_RE ]]; then
             rm -f -- "$m"
+            continue
+        fi
+        # The run record, the marker and $HARVESTED are all writable from
+        # the cluster mail API container, and `rm --branch` probes nothing:
+        # a forged record naming another seat's branch would stop that
+        # seat's live Job. So on a cluster the branch must be the one the
+        # record's own wake dir -- one this postmaster made -- was spawned
+        # with. A run whose wake dir is gone is left to retention, which
+        # probes first.
+        run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
+        if (( PM_CLUSTER )) && { ! pm_k8s_wake_dir_ours "$run_dir" \
+            || [[ "$(pm_k8s_wake_dir_branch "$run_dir")" != "$branch" ]]; }; then
+            rm -f -- "$m"
+            pm_event "k8s-dead-reap-refused run=$rid branch=$branch"
             continue
         fi
         (( tried++ >= PM_K8S_REAP_PER_PASS )) && break
