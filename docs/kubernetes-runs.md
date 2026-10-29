@@ -1043,6 +1043,13 @@ alive -- `K8S_RUN_TTL` keeps ticking the whole time nobody is watching, and
 once it idles out, the container exits and `kubectl exec` can no longer
 reach it, the same unrecoverable state a too-late `wait`/`fetch`/`collect`
 already hits (see "Getting the work back without a credential" above).
+A run with a `TIMEOUT` has a harder edge too: its Job's
+`activeDeadlineSeconds` (`TIMEOUT` + 600, counted from the Job's start)
+covers the idle phase as well as the agent, so a pod whose agent finished
+early is still stopped at that deadline even with `K8S_RUN_TTL` left to
+run -- for a bare `submit` (`TIMEOUT` 3600), 70 minutes after the Job
+started, whenever the agent finished. Submit with `--timeout 0` for a run
+whose work must stay fetchable longer than that.
 Call `adopt` again soon after whatever restarted the driver, not whenever
 it is next convenient; `status`'s own `orphaned` state exists specifically
 so a caller polling it knows there is still something worth adopting,

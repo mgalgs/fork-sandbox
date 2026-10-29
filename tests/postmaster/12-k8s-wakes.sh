@@ -212,6 +212,8 @@ once
 unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY STUB_K8S_NO_REPLY STUB_K8S_TIMEOUT_MSG
 contains "k8s case5b: thread flagged as a timeout, not a generic exit" \
     "$(cat "$PM_STATE_DIR/needs-operator/$k5b_tid" 2>/dev/null)" "timed out waiting on its Job"
+contains "k8s case5b: the flag says the cluster stops the Job past its TIMEOUT" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k5b_tid" 2>/dev/null)" "the cluster stops it about 600s past the run's TIMEOUT"
 check "k8s case5b: no retry scheduled -- a live Job is not a crash" 0 \
     "$( [[ -e "$PM_STATE_DIR/retries/$k5b_tid/karen" ]] && echo 1 || echo 0 )"
 

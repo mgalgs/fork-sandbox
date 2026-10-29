@@ -893,7 +893,11 @@
 #   K8S_DENIED_PROBE=     host:port the egress gate must NOT reach.
 #                         Required for submit.
 #   K8S_RUN_TTL=          seconds the pod idles after the agent exits.
-#                         Defaults to 3600.
+#                         Defaults to 3600. A run with a TIMEOUT caps it:
+#                         the Job's activeDeadlineSeconds (TIMEOUT + 600,
+#                         counted from the Job's start, agent and idle
+#                         phase alike) stops the pod first when it comes
+#                         sooner, and its work can no longer be fetched.
 #   K8S_QUOTA_PODS=, K8S_QUOTA_REQUESTS_CPU=, K8S_QUOTA_REQUESTS_MEMORY=,
 #   K8S_QUOTA_LIMITS_CPU=, K8S_QUOTA_LIMITS_MEMORY=
 #                         the five limits of the namespace's ResourceQuota,

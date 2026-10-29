@@ -6051,7 +6051,7 @@ pm_harvest_run() {
             # retry is ever scheduled on this path, and the still-running
             # Job is left alone for an operator to fetch or remove by
             # hand.
-            pm_flag_unless_closed "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job is still running -- fetch it with fork-sandbox-k8s.sh fetch --branch $branch, or remove it with fork-sandbox-k8s.sh rm --branch $branch"
+            pm_flag_unless_closed "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job was still running, and the cluster stops it about 600s past the run's TIMEOUT -- until then fetch it with fork-sandbox-k8s.sh fetch --branch $branch; remove it with fork-sandbox-k8s.sh rm --branch $branch"
             k8s_still_running=1
         elif [[ "$exit_code" != "0" ]]; then
             # Harvest whatever outbox there is (a crash mid-reply may still
