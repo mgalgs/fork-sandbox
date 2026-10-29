@@ -229,15 +229,21 @@ Do these in order.
   "The run directory is the join" in
   [kubernetes-runs.md](kubernetes-runs.md)). So the old postmaster drains
   before it exits. On SIGTERM it launches nothing more and waits until no
-  wake is still submitting and no hook is still running, for at most
-  `FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT` seconds (default 150). The pod's
-  `terminationGracePeriodSeconds` (180) covers that wait, and the
+  wake is still submitting or collecting its result and no hook is still
+  running, until `FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT` seconds (default
+  150) after the signal; the pass in progress counts against that too. The
+  pod's `terminationGracePeriodSeconds` (180) covers that wait, and the
   whole shutdown stays inside the mail client's 5 minute retry budget. A
   `pm drain done busy=<n>` line with `n` above 0 means the timeout cut
   something off. A run may be adopted at most twice, but an adoption after
   a clean shutdown does not count: the drain marks each live wake
-  `handed-off` (a `pm handed-off` line), so a long seat survives any number
-  of rollouts. Only a wrapper that dies some other way spends one.
+  `handed-off` (a `pm handed-off` line) before it starts waiting, so a long
+  seat survives any number of rollouts. Only a wrapper that dies some other
+  way spends one. The drain's lines are also kept in
+  `.postmaster/drain-record` under the mail root (the last 5 drains), and
+  the next postmaster logs the last one at startup as `pm last-drain`
+  lines, with `pm last-drain-unfinished` when that drain was killed before
+  it finished.
 
   This is the postmaster adopting its own restarted wake wrapper
   (`fork-sandbox-k8s-wake.sh --adopt`, which calls `fork-sandbox-k8s.sh
