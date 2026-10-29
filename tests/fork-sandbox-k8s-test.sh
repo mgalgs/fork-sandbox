@@ -5153,6 +5153,52 @@ else
     no "the base install (no pi-agent/settings.json) ships no pi-agent-settings.json key" "$submit_out"
 fi
 
+printf '\n== the agent Job carries activeDeadlineSeconds = TIMEOUT + 600 ==\n'
+# The Job's own spec.activeDeadlineSeconds (empty when absent), read from
+# the Job document only: between its `spec:` and its pod `template:`.
+job_deadline() {
+    awk '/^kind: Job$/ { j = 1 } j && /^spec:$/ { s = 1; next }
+        s && /^  template:/ { exit } s && /^  activeDeadlineSeconds:/ { print $2 }' "$1"
+}
+check "a bare submit (recorded TIMEOUT 3600) gets a 4200s Job deadline" \
+    4200 "$(job_deadline "$submit_out")"
+dl_dir="$(newdir)"; tmpdirs+=("$dl_dir")
+for dl_case in "5000 5600" "0100 700" "0 "; do
+    read -r dl_timeout dl_want <<< "$dl_case"
+    if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --timeout "$dl_timeout" \
+        "$proj_dir" "$handoff_file" > "$dl_dir/submit-$dl_timeout.yaml" 2>"$dl_dir/submit-$dl_timeout.err"; then
+        check "submit --timeout $dl_timeout: Job activeDeadlineSeconds" \
+            "$dl_want" "$(job_deadline "$dl_dir/submit-$dl_timeout.yaml")"
+    else
+        no "submit --timeout $dl_timeout exits 0" "$(cat "$dl_dir/submit-$dl_timeout.err")"
+    fi
+done
+if ! grep -q 'activeDeadlineSeconds' "$dl_dir/submit-0.yaml"; then
+    ok "submit --timeout 0 (no TIMEOUT) renders no activeDeadlineSeconds anywhere"
+else
+    no "submit --timeout 0 (no TIMEOUT) renders no activeDeadlineSeconds anywhere" \
+        "$(grep -n 'activeDeadlineSeconds' "$dl_dir/submit-0.yaml")"
+fi
+if [[ "$(grep -c 'activeDeadlineSeconds' "$dl_dir/submit-5000.yaml")" == 1 ]]; then
+    ok "the deadline is on the Job only, not its pod template"
+else
+    no "the deadline is on the Job only, not its pod template" \
+        "$(grep -n 'activeDeadlineSeconds' "$dl_dir/submit-5000.yaml")"
+fi
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --timeout 14400 \
+    "$proj_dir" "$handoff_file" > "$dl_dir/run.yaml" 2>"$dl_dir/run.err"; then
+    check "run --timeout 14400 forwards it: Job activeDeadlineSeconds 15000" \
+        15000 "$(job_deadline "$dl_dir/run.yaml")"
+else
+    no "run --dry-run --timeout 14400 exits 0" "$(cat "$dl_dir/run.err")"
+fi
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint "$dl_dir/submit-5000.yaml" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: submit --dry-run --timeout output"; else no "yamllint: submit --dry-run --timeout output" "$out"; fi
+fi
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude ==\n'
 # The default (--harness pi, i.e. submit_out above) renders no claude-proxy
 # object at all -- the per-run proxy is entirely opt-in.

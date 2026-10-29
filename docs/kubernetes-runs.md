@@ -93,7 +93,12 @@ for the full timeout. A run still going at the deadline is left exactly as
 it is: `run` does not fetch a half-finished branch and does not remove a
 still-running pod, and
 its error message prints the exact `fetch` command to run by hand once the
-agent does finish. `--keep` skips the final `rm`, for a caller who wants
+agent does finish. The cluster is the backstop for a driver that is
+gone: submit records the run's `TIMEOUT` (the resolved `--timeout`, 3600
+for a bare `submit`) and gives the Job `activeDeadlineSeconds` = `TIMEOUT`
++ 600, so a Job nobody is left to wait on is stopped rather than running
+until something removes it. The 600 seconds leave the driver's own timeout
+to fire first. `--timeout 0` sets no deadline. `--keep` skips the final `rm`, for a caller who wants
 the Job and pod left in place after a successful fetch. `run` and `collect`
 also pull the run's **evidence** — the agent's transcript and the pod
 logs — back before the fetch; a failed capture, or a run that harvested

@@ -338,7 +338,10 @@
 #
 # --timeout SECONDS (run, wait): how long to wait for the agent before giving
 # up. Defaults to 3600, matching the entrypoint's own RUN_TTL default --
-# waiting longer than the pod itself will idle is pointless.
+# waiting longer than the pod itself will idle is pointless. On submit (and
+# so run) it is also the run's recorded TIMEOUT, and the Job carries
+# activeDeadlineSeconds = TIMEOUT + 600: the cluster stops a Job no driver
+# is left to wait on. 0 sets no deadline.
 #
 # --keep (run, collect): skip the final rm, leaving the Job and pod in place
 # after a successful fetch.
@@ -6500,6 +6503,10 @@ k8s_set_run_owner_refs() {
     fi
 }
 
+# Seconds a Job may run past its run's TIMEOUT before the cluster stops it
+# (activeDeadlineSeconds = TIMEOUT + this); see cmd_submit.
+K8S_JOB_DEADLINE_GRACE=600
+
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
@@ -6895,6 +6902,15 @@ cmd_submit() {
         echo "Error: --timeout must be a whole number of seconds, got '$run_timeout'." >&2
         exit 1
     fi
+    # The Job's own backstop for the run's TIMEOUT: every host-side driver
+    # (run, resume, adopt) bounds its wait by it, but only while that driver
+    # is alive, and a Job outliving it (a hung tool call, its postmaster
+    # wrapper killed by rollouts) would otherwise run until retention. The
+    # 600s grace leaves the wrapper's own timeout to fire first. TIMEOUT 0
+    # is no TIMEOUT: no deadline.
+    local active_deadline_line=""
+    (( 10#$run_timeout > 0 )) \
+        && active_deadline_line=$'\n'"  activeDeadlineSeconds: $(( 10#$run_timeout + K8S_JOB_DEADLINE_GRACE ))"
 
     # Resolved here, before anything is created, same as the checks above --
     # fs_parse_size_bytes already prints its own error naming what was given.
@@ -8449,7 +8465,7 @@ metadata:
     fork-sandbox/branch: $safe_name
     fork-sandbox/run: $run_token${extra_labels_4}
 spec:
-  backoffLimit: 0
+  backoffLimit: 0${active_deadline_line}
   template:
     metadata:
       labels:
@@ -10493,7 +10509,8 @@ cmd_wait() {
             echo "not remove a still-running pod. Its claude proxy and token" >&2
             echo "Secret stay up too, for the still-running pod; nothing" >&2
             echo "keeps the token fresh once this wait exits, unless" >&2
-            echo "'wait --run-dir' or 'resume' is run again." >&2
+            echo "'wait --run-dir' or 'resume' is run again. The cluster" >&2
+            echo "stops its Job ${K8S_JOB_DEADLINE_GRACE}s past the run's TIMEOUT." >&2
             echo "Fetch by hand once it completes:" >&2
             echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
             echo "and clean up (job, pod, proxy and token Secret alike)" >&2
