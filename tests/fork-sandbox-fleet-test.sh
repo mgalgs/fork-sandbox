@@ -532,6 +532,8 @@ printf '\n== resolve ==\n'
 
 resolve_lines() {
     # Reads the twenty-line contract into named globals for assertions.
+    # services and on-silence are read only to reach protocol, the last.
+    # shellcheck disable=SC2034
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
       read -r r_refresh_at; read -r r_triage; read -r r_preset; \
