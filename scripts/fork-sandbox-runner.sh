@@ -4238,10 +4238,18 @@ fi
 # normalized" below). When the seeding works nothing here fires and the
 # summary reads exactly as before, so silence is still the pass signal.
 #
+# A mismatch means author AND committer both differ from the expected
+# address: a broken seeding gets both wrong. A commit whose committer is the
+# expected address but whose author is not was authored on purpose (`git
+# commit --author`, a teammate's patch under their name), so it is neither
+# warned about nor rewritten; its author lands in author_email_deliberate
+# and the summary names it in a plain informational line instead.
+#
 # The addresses come from the session's commits and are untrusted text, so
 # control characters go the same way they do for the subjects below.
 author_email_want=""
 author_email_bad=""
+author_email_deliberate=""
 authorship_normalized=0
 authorship_normalized_from=""
 authorship_skip_nonlinear=0
@@ -4250,10 +4258,15 @@ authorship_normalize_log="$run_dir/authorship-normalize.log"
 if (( fetched )) && [[ "$n_commits" != "0" ]]; then
     author_email_want="$( (cd "$origin_repo" && git config --get user.email) 2>/dev/null || true )"
     if [[ -n "$author_email_want" ]]; then
-        author_email_bad="$( (cd "$origin_repo" \
-            && git log --format='%ae' "$return_base_sha..$branch") 2>/dev/null \
-            | tr -d '\000-\010\013-\037\177' \
-            | grep -vxF -- "$author_email_want" | sort -u || true )"
+        author_committer_emails="$( (cd "$origin_repo" \
+            && git log --format='%ae%x09%ce' "$return_base_sha..$branch") 2>/dev/null \
+            | tr -d '\000-\010\013-\037\177' || true )"
+        author_email_bad="$(printf '%s\n' "$author_committer_emails" \
+            | awk -F '\t' -v want="$author_email_want" \
+                'NF && $1 != want && $2 != want {print $1}' | sort -u || true )"
+        author_email_deliberate="$(printf '%s\n' "$author_committer_emails" \
+            | awk -F '\t' -v want="$author_email_want" \
+                'NF && $1 != want && $2 == want {print $1}' | sort -u || true )"
         if [[ -n "$author_email_bad" ]]; then
             author_name_want="$( (cd "$origin_repo" && git config --get user.name) 2>/dev/null || true )"
             # fs_normalize_authorship lets its plumbing calls write stderr
@@ -4481,6 +4494,14 @@ loop_findings() {
         printf '\nNothing landed in %s. Whatever the session wrote is still\n' "$origin_repo"
         printf 'in the clone at %s\n' "$clone_dir"
     fi
+    # Not a warning: the expected identity committed these and the session
+    # chose a different author on purpose, so the authors were left alone.
+    # Printed ahead of the WARNING/NOTICE so those stay nearest the end.
+    if [[ -n "$author_email_deliberate" ]]; then
+        printf '\nThe branch carries commits authored by other addresses, committed\n'
+        printf 'by %s and left as authored:\n' "$author_email_want"
+        printf '%s\n' "$author_email_deliberate" | sed 's/^/  author:   /'
+    fi
     # Second-to-last -- the uncommitted-files warning below is what is now
     # last, and the hardest line in the summary to skim past.
     if [[ -n "$author_email_bad" ]]; then
@@ -4562,6 +4583,11 @@ commit_list="$( (cd "$branch_repo" && git log --format='%H %s' "$return_base_sha
 author_email_bad_json="$(printf '%s' "$author_email_bad" \
     | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)"
 [[ -n "$author_email_bad_json" ]] || author_email_bad_json='[]'
+# Authors the session set on purpose (committer is the expected address), so
+# never counted in author_email_unexpected and never rewritten.
+author_email_deliberate_json="$(printf '%s' "$author_email_deliberate" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)"
+[[ -n "$author_email_deliberate_json" ]] || author_email_deliberate_json='[]'
 # uncommitted_files: null when the sandboxed check itself could not run
 # (unknown, never guessed at zero), otherwise the true count -- not capped,
 # unlike the list, which the summary.txt WARNING above caps the same way.
@@ -4667,6 +4693,7 @@ jq -n \
     --argjson commits_list "$commit_list" \
     --arg author_email "$author_email_want" \
     --argjson author_email_unexpected "$author_email_bad_json" \
+    --argjson author_email_deliberate "$author_email_deliberate_json" \
     --argjson authorship_normalized "$authorship_normalized" \
     --arg refresh "$refresh_ended" \
     --arg report_from "$report_from" \
@@ -4707,6 +4734,7 @@ jq -n \
         commits_list: $commits_list,
         author_email: (if $author_email == "" then null else $author_email end),
         author_email_unexpected: $author_email_unexpected,
+        author_email_deliberate: $author_email_deliberate,
         authorship_normalized: $authorship_normalized,
         fetched: $fetched,
         branch_removed: $branch_removed,

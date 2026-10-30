@@ -6,12 +6,15 @@
 #
 # fork-sandbox.sh seeds every clone with the origin repo's effective identity
 # (see fork-sandbox-clone-test.sh for that half of the contract) and, at fetch
-# time, compares each returned commit's author email against that identity
-# (grep "unexpected address" in scripts/fork-sandbox.sh). The seeding has
-# regressed at least once in the wild, so a mismatch is no longer only
-# reported: fs_normalize_authorship rewrites base..branch host-side with
-# plumbing only (rev-list, cat-file, commit-tree, update-ref) so the branch
-# carries the expected identity before the run's summary renders.
+# time, compares each returned commit's author and committer emails against
+# that identity (grep "unexpected address" in scripts/fork-sandbox.sh). The
+# seeding has regressed at least once in the wild, so a mismatch is no
+# longer only reported: fs_normalize_authorship rewrites base..branch
+# host-side with plumbing only (rev-list, cat-file, commit-tree, update-ref)
+# so the branch carries the expected identity before the run's summary
+# renders. A mismatch is author AND committer both wrong; a commit the
+# expected identity committed under another author (`git commit --author`)
+# is deliberate and must come through untouched.
 #
 # This calls fs_normalize_authorship directly against scratch repos, the same
 # level fork-sandbox-clone-test.sh tests fs_make_clone at: the function only
@@ -20,8 +23,8 @@
 #
 # Every case runs against a throwaway global config (GIT_CONFIG_GLOBAL) with
 # the system one switched off, so the host's own identity is neither read nor
-# written, and the addresses here are under a reserved .invalid domain that
-# cannot belong to anyone.
+# written, and the addresses here are under reserved domains (.invalid,
+# example.com) that cannot belong to anyone.
 
 set -uo pipefail
 
@@ -251,6 +254,62 @@ check "the rewritten commit keeps its own original author name" \
     "$WRONG_NAME" "$(cd "$repo" && git log -1 --format=%an main)"
 check "the rewritten commit's committer name falls back to the author's" \
     "$WRONG_NAME" "$(cd "$repo" && git log -1 --format=%cn main)"
+
+printf '\n== a deliberately authored commit (git commit --author) ==\n'
+
+# The committer is the expected identity -- the clone's own, seeded from the
+# origin -- and only the author differs, because the session was asked to
+# commit someone else's patch under their name. That is not the broken
+# seeding this function repairs, so the commit must come through untouched.
+OTHER_NAME="Some One"
+OTHER_EMAIL="someone@example.com"
+
+# A commit committed by the expected identity under another author.
+commit_authored_by() {
+    local dir="$1" name="$2" email="$3" msg="$4"
+    (
+        cd "$dir" || exit 1
+        printf '%s %s\n' "$msg" "$RANDOM$RANDOM" >> file.txt
+        git add file.txt || exit 1
+        git -c user.name="$WANT_NAME" -c user.email="$WANT_EMAIL" \
+            commit -q --author "$name <$email>" -m "$msg" || exit 1
+    ) || return 1
+    (cd "$dir" && git rev-parse HEAD)
+}
+
+repo="$(new_repo)"
+base="$(cd "$repo" && git rev-parse HEAD)"
+commit_authored_by "$repo" "$OTHER_NAME" "$OTHER_EMAIL" "teammate patch 1" >/dev/null
+commit_authored_by "$repo" "$OTHER_NAME" "$OTHER_EMAIL" "teammate patch 2" >/dev/null
+before="$(cd "$repo" && git rev-parse main)"
+
+out="$(fs_normalize_authorship "$repo" main "$base" "$WANT_NAME" "$WANT_EMAIL")"
+rc=$?
+check "nothing is rewritten" "0" "$out"
+check "the function returns 0" "0" "$rc"
+check "the branch tip is unchanged" "$before" "$(cd "$repo" && git rev-parse main)"
+check "both commits keep their deliberate author" \
+    "$OTHER_NAME <$OTHER_EMAIL>|$OTHER_NAME <$OTHER_EMAIL>" \
+    "$(cd "$repo" && git log --format='%an <%ae>' "$base..main" | paste -sd'|')"
+
+printf '\n== a mixed range: wrong-identity commits around a deliberate one ==\n'
+
+repo="$(new_repo)"
+base="$(cd "$repo" && git rev-parse HEAD)"
+commit_as "$repo" "$WRONG_NAME" "$WRONG_EMAIL" "wrong one" >/dev/null
+commit_authored_by "$repo" "$OTHER_NAME" "$OTHER_EMAIL" "teammate patch" >/dev/null
+commit_as "$repo" "$WRONG_NAME" "$WRONG_EMAIL" "wrong two" >/dev/null
+
+out="$(fs_normalize_authorship "$repo" main "$base" "$WANT_NAME" "$WANT_EMAIL")"
+rc=$?
+check "only the two wrong-identity commits are rewritten" "2" "$out"
+check "the function returns 0" "0" "$rc"
+check "authors oldest first: rewritten, deliberate kept, rewritten" \
+    "$WANT_NAME <$WANT_EMAIL>|$OTHER_NAME <$OTHER_EMAIL>|$WANT_NAME <$WANT_EMAIL>" \
+    "$(cd "$repo" && git log --reverse --format='%an <%ae>' "$base..main" | paste -sd'|')"
+check "the subjects are intact and in order" \
+    "wrong one|teammate patch|wrong two" \
+    "$(cd "$repo" && git log --reverse --format=%s "$base..main" | paste -sd'|')"
 
 printf '\n== a range containing a merge commit ==\n'
 

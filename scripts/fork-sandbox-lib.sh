@@ -4547,13 +4547,14 @@ fs_emit_coding_exit_note() {
     printf 'the same as any other defect.\n'
 }
 
-# Rewrites base..branch host-side, in $repo, so every commit's author
-# identity matches want_name/want_email -- called by fork-sandbox.sh's own
-# fetch-time identity check (grep "unexpected address") only after THAT
-# check has already found a commit authored under some other address. This
-# function re-checks the same thing itself, cheaply, before touching
-# anything: it prints "0" and returns 0 with NO git writes at all -- no
-# update-ref, no reflog entry -- when it finds no mismatch, which is what
+# Rewrites base..branch host-side, in $repo, so every commit made under a
+# wrong identity carries want_name/want_email as its author instead --
+# called by fork-sandbox.sh's own fetch-time identity check (grep
+# "unexpected address") only after THAT check has already found a commit
+# whose author and committer are both some other address. This function
+# re-checks the same thing itself, cheaply, before touching anything: it
+# prints "0" and returns 0 with NO git writes at all -- no update-ref, no
+# reflog entry -- when it finds no mismatch, which is what
 # keeps a clean run's branch byte-identical to what fetch brought in. A
 # caller that ran this unconditionally on every fetch would still be
 # correct, just wasteful; it is written this way so a clean run costs one
@@ -4571,9 +4572,16 @@ fs_emit_coding_exit_note() {
 # first with rev-list --reverse and re-created with commit-tree, chained
 # onto the REWRITTEN parent -- so even a commit whose author was already
 # correct still gets a new SHA, because its parent's SHA changed underneath
-# it. Only a commit whose author email does not already equal want_email
-# has its author name and email overwritten; a correctly-authored commit
-# keeps its own author name and email verbatim (just not its own SHA). A
+# it. Only a commit whose author email AND committer email both differ
+# from want_email has its author name and email overwritten -- that is the
+# shape of a clone whose identity was never seeded from the origin, where
+# every commit carries the wrong identity throughout. A commit whose
+# committer email equals want_email keeps its author, whatever it is: the
+# clone's configured identity made it, so a different author there was set
+# on purpose (`git commit --author`, committing someone else's patch under
+# their name), and rewriting it would destroy exactly the attribution the
+# session was asked to record. A correctly-authored commit likewise keeps
+# its own author name and email verbatim (just not its own SHA). A
 # merge commit in range has no single "rewritten parent" to chain onto, so
 # rather than guess which side wins, this returns 2 and does nothing --
 # the caller keeps today's plain warning for that case instead. The same
@@ -4628,13 +4636,14 @@ fs_emit_coding_exit_note() {
 #                  would turn this into a guaranteed failure for exactly
 #                  the configuration this feature exists to repair.
 # $5  want_email  author email forced onto a mismatched commit, and the
-#                  value every commit's author email is compared against.
+#                  value every commit's author and committer emails are
+#                  compared against.
 fs_normalize_authorship() {
     local repo="$1" branch="$2" base="$3" want_name="$4" want_email="$5"
-    local mismatched merges commits sha parent tree aname aemail adate msgfile n=0
+    local mismatched merges commits sha parent tree aname aemail cemail adate msgfile n=0
 
-    mismatched="$( (cd "$repo" && git log --format='%ae' "$base..$branch") 2>/dev/null \
-        | grep -vxF -- "$want_email" )" || true
+    mismatched="$( (cd "$repo" && git log --format='%ae%x09%ce' "$base..$branch") 2>/dev/null \
+        | awk -F '\t' -v want="$want_email" '$1 != want && $2 != want' )" || true
     [[ -n "$mismatched" ]] || { printf '0'; return 0; }
 
     merges="$( (cd "$repo" && git rev-list --min-parents=2 --count "$base..$branch") )" \
@@ -4663,9 +4672,11 @@ fs_normalize_authorship() {
             || { rm -f "$msgfile"; return 1; }
         aemail="$( (cd "$repo" && git log -1 --format='%ae' "$sha") )" \
             || { rm -f "$msgfile"; return 1; }
+        cemail="$( (cd "$repo" && git log -1 --format='%ce' "$sha") )" \
+            || { rm -f "$msgfile"; return 1; }
         adate="$( (cd "$repo" && git log -1 --format='%ad' --date=raw "$sha") )" \
             || { rm -f "$msgfile"; return 1; }
-        if [[ "$aemail" != "$want_email" ]]; then
+        if [[ "$aemail" != "$want_email" && "$cemail" != "$want_email" ]]; then
             [[ -n "$want_name" ]] && aname="$want_name"
             aemail="$want_email"
             n=$(( n + 1 ))

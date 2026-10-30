@@ -1699,6 +1699,93 @@ else
     no "a merge-commit run produced a run directory" "rc=$rc_skip: $out_skip"
 fi
 
+# A deliberate --author: the session commits a teammate's patch under the
+# teammate's name, so only the author differs -- the committer is the clone's
+# seeded identity, the origin's own. That is not a broken seeding, so the
+# commit must come home untouched: no rewrite, no WARNING, no NOTICE, just a
+# plain line naming the author so the operator still sees it.
+authnorm_deliberate_stub="$(mktemp -d /var/tmp/claude-scratch/fs-authnorm-deliberate.XXXXXX)"
+tmpdirs+=("$authnorm_deliberate_stub")
+cat > "$authnorm_deliberate_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+prev="" clone_dir=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+cat >/dev/null
+git -C "$clone_dir" commit --allow-empty -q \
+    --author "Some One <someone@example.com>" -m "teammate patch"
+if [[ "${AUTHNORM_MIXED:-0}" == 1 ]]; then
+    git -c user.email=wrong@fork-sandbox.invalid -c user.name="Wrong Person" \
+        -C "$clone_dir" commit --allow-empty -q -m "wrong identity"
+fi
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$authnorm_deliberate_stub/claude-sandboxed"
+
+authnorm_deliberate_branch="sandbox-test-authnorm-deliberate-$$"
+out_deliberate="$(HOME="$launcher_home" PATH="$authnorm_deliberate_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "$authnorm_deliberate_branch" \
+    "$proj" "$handoff" 2>&1)"
+rc_deliberate=$?
+rd_deliberate="$(printf '%s\n' "$out_deliberate" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_deliberate == 0 )) && [[ -n "$rd_deliberate" ]]; then
+    tmpdirs+=("$rd_deliberate")
+    lacks "a deliberately authored run's summary carries no WARNING" \
+        "WARNING: a returned commit" "$(cat "$rd_deliberate/summary.txt")"
+    lacks "a deliberately authored run's summary carries no NOTICE" \
+        "NOTICE: authorship normalized" "$(cat "$rd_deliberate/summary.txt")"
+    contains "a deliberately authored run's summary names the other author" \
+        "  author:   someone@example.com" "$(cat "$rd_deliberate/summary.txt")"
+    check "the deliberately authored commit keeps its author" \
+        "Some One <someone@example.com>" \
+        "$(cd "$proj" && git log -1 --format='%an <%ae>' "$authnorm_deliberate_branch")"
+    check "summary.json's authorship_normalized stays 0 for a deliberate author" \
+        "0" "$(jq -r '.authorship_normalized' "$rd_deliberate/summary.json")"
+    check "summary.json's author_email_unexpected does not count a deliberate author" \
+        "[]" "$(jq -c '.author_email_unexpected' "$rd_deliberate/summary.json")"
+    check "summary.json's author_email_deliberate names the deliberate author" \
+        '["someone@example.com"]' "$(jq -c '.author_email_deliberate' "$rd_deliberate/summary.json")"
+else
+    no "a deliberately authored run produced a run directory" \
+        "rc=$rc_deliberate: $out_deliberate"
+fi
+
+# The same deliberate commit followed by one made under a wrong identity:
+# only the wrong one is rewritten, and the deliberate author survives the
+# rewrite of the range around it.
+authnorm_mixed_branch="sandbox-test-authnorm-mixed-$$"
+out_mixed="$(HOME="$launcher_home" PATH="$authnorm_deliberate_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image AUTHNORM_MIXED=1 \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "$authnorm_mixed_branch" \
+    "$proj" "$handoff" 2>&1)"
+rc_mixed=$?
+rd_mixed="$(printf '%s\n' "$out_mixed" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_mixed == 0 )) && [[ -n "$rd_mixed" ]]; then
+    tmpdirs+=("$rd_mixed")
+    contains "a mixed run's summary carries the NOTICE" \
+        "NOTICE: authorship normalized -- 1 commit(s)" "$(cat "$rd_mixed/summary.txt")"
+    lacks "a mixed run's summary carries no WARNING" \
+        "WARNING: a returned commit" "$(cat "$rd_mixed/summary.txt")"
+    contains "a mixed run's summary still names the deliberate author" \
+        "  author:   someone@example.com" "$(cat "$rd_mixed/summary.txt")"
+    check "a mixed run rewrites only the wrong-identity commit" \
+        "Some One <someone@example.com>|Tester <t@fork-sandbox.invalid>" \
+        "$(cd "$proj" && git log --reverse --format='%an <%ae>' -2 "$authnorm_mixed_branch" | paste -sd'|')"
+    check "summary.json's authorship_normalized counts only the wrong-identity commit" \
+        "1" "$(jq -r '.authorship_normalized' "$rd_mixed/summary.json")"
+    check "summary.json's author_email_deliberate names the deliberate author in a mixed run" \
+        '["someone@example.com"]' "$(jq -c '.author_email_deliberate' "$rd_mixed/summary.json")"
+else
+    no "a mixed-authorship run produced a run directory" "rc=$rc_mixed: $out_mixed"
+fi
+
 # An origin whose identity is half-configured (user.email but no
 # user.name -- fs_make_clone's own seeding tolerates exactly this): forcing
 # an empty want_name onto a mismatched commit used to make every

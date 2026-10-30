@@ -933,11 +933,15 @@
 # the clone once the sandbox has touched it.
 #
 # The fetch can also rewrite what it brings back: if a returned commit's
-# author doesn't match your repo's own identity, this rewrites that commit
-# in YOUR repo, in place, to carry your identity instead of leaving the
-# mismatch for you to fix by hand. There is no flag to opt out. See
+# author AND committer both don't match your repo's own identity, this
+# rewrites that commit in YOUR repo, in place, to carry your identity
+# instead of leaving the mismatch for you to fix by hand. There is no flag
+# to opt out. A commit your identity committed under another author (`git
+# commit --author`, a teammate's patch) is deliberate and left alone. See
 # `author_email_unexpected` and `authorship_normalized` in summary.json, and
-# the NOTICE/WARNING summary.txt prints when either fires.
+# the NOTICE/WARNING summary.txt prints when either fires; deliberate
+# authors are listed in `author_email_deliberate` and named in a plain
+# informational line.
 #
 # What the session gives up:
 #   - No global ~/.claude. No global CLAUDE.md, skills, scripts, settings

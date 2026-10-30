@@ -11266,7 +11266,8 @@ cmd_collect() {
                                implement_retries, uncommitted_files, uncommitted_files_list,
                                uncommitted_patch,
                                continuations, leg_refreshes, outbox_bytes, outbox_max_bytes,
-                               author_email, author_email_unexpected, authorship_normalized,
+                               author_email, author_email_unexpected, author_email_deliberate,
+                               authorship_normalized,
                                agent_kit, harness_error, end_reason,
                                steps, refresh, report_from}
                             | with_entries(select(.value != null))
