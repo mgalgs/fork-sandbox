@@ -153,6 +153,12 @@ what it does. The postmaster substitutes `{name}`, `{operator}` and
 placeholder is how a handoff tells the agent its own address, so write
 any custom `fleet-kit.md` with at least `{name}` still in it.
 
+`protocol-<name>.md` files at the root belong to the postmaster too: a
+fleet seat with `protocol: <name>` gets that file printed verbatim right
+after its persona body in every wake handoff, and `fleet check` refuses
+the seat when the file is missing. See the `protocol:` paragraph in
+[agent-mail.md](agent-mail.md) for the placement and the byte-exact rule.
+
 There is no glob or family matching (`qwen*.md` for a whole model family is
 tempting, but the override order gets fiddly fast, and this project prefers
 predictable over clever). That is a deliberate deferral, not an oversight —

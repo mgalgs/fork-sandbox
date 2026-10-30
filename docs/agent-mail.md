@@ -635,7 +635,8 @@ content.
 `~/.config/fork-sandbox/personas`): a markdown body — the agent's
 standing instructions, opaque to the registry — with optional YAML
 frontmatter carrying `description`, `harness`, `model`, `network`
-(`pinned` or `sealed`), `thinking`, `wake-on-cc`, `triage` and `preset`.
+(`pinned` or `sealed`), `thinking`, `wake-on-cc`, `triage`, `preset` and
+`protocol`.
 
 `thinking` means what the harness makes of it. A pi seat wakes with
 `--pi-args "--thinking <value>"`. A claude seat (including one with no
@@ -680,6 +681,9 @@ agents:
   archivist:
     preset: nightly             # names $PRESETS_DIR/nightly.yaml, same
                                  # resolution chain as fork-sandbox.sh's --preset
+  critic:
+    protocol: reviewer          # appends <prompts-dir>/protocol-reviewer.md
+                                 # to the persona body in every wake handoff
 lists:
   crew:
     members: [reviewer, scribe, watcher]
@@ -690,7 +694,7 @@ lists:
 `$FORK_SANDBOX_HANDLERS_DIR`, default `~/.config/fork-sandbox/handlers`,
 and required to exist, be a regular file, and be executable both at
 `fleet check` time and again at wake time) is then required, and none of
-`harness`/`model`/`network`/`thinking`/`triage`/`persona`/`refresh-at`/`preset`
+`harness`/`model`/`network`/`thinking`/`triage`/`persona`/`refresh-at`/`preset`/`protocol`
 may be set on the same agent — in fleet.yaml or in the seat's own
 `<name>.md` frontmatter alike — since those tune an LLM seat, which a
 handler is not. `wake-on-cc` still applies: it governs whether the seat wakes on a
@@ -709,6 +713,27 @@ against) that the postmaster passes as `--preset <name>` at spawn time.
 `check` requires the named file to exist; it does not validate the
 preset's own contents (`fork-sandbox.sh` does that at spawn time). See
 docs/presets.md for the preset file format.
+
+A `protocol:` override (fleet.yaml or persona frontmatter, same
+precedence as every other LLM-seat field) names a shared block of
+protocol text — reply format, verdict tags and the like — so personas
+that share one stop each carrying a copy that drifts. The value is a
+bare name, never a path (the same shape rule as `persona:`), and the
+file is `<prompts-dir>/protocol-<name>.md`: flat, because the prompts
+directory ships to a cluster postmaster as a ConfigMap, which holds no
+subdirectories. `<prompts-dir>` is the directory the fleet kit overlay
+is read from (`$FORK_SANDBOX_PROMPTS_DIR`, else
+`$FORK_SANDBOX_CONFIG_DIR/prompts`, else `~/.config/fork-sandbox/prompts`;
+see [prompt-overlays.md](prompt-overlays.md)). `check` refuses a seat
+whose protocol file does not exist, naming the seat and the path, and
+refuses the field on a handler seat. In the wake handoff the file's
+bytes go immediately after the persona body and before the blank line
+that follows it, **verbatim**: no frontmatter stripping (a protocol file
+that starts with `---` prints that line too), no trimming, no separator.
+So a persona body ending in a newline plus a protocol file starting
+with a blank line renders byte for byte as one undivided persona holding
+both did, and a seat with no `protocol` gets exactly the handoff it
+always got.
 
 Precedence per field is **fleet.yaml entry, then persona frontmatter,
 then empty** — `wake-on-cc` included, so a fleet.yaml override wins over
@@ -801,12 +826,13 @@ other seat would be refused from a thread's first message.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # nineteen lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # twenty lines: harness, model, thinking,
                                       # network, persona-path, description,
                                       # wake-on-cc, refresh-at, triage,
                                       # preset, handler, command, backend,
                                       # endpoint, grant, review-target,
-                                      # wake-when, services, on-silence
+                                      # wake-when, services, on-silence,
+                                      # protocol
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -825,8 +851,10 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly nineteen lines;
-an unconfigured field is an empty line, never a missing one.
+than stopping at the first. `resolve` always prints exactly twenty lines;
+an unconfigured field is an empty line, never a missing one. A new field
+is only ever appended as the last line, so a reader that picks a line by
+its position keeps working.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
 `workspaces/`, `sessions/` and `state/` rows in the table above) once a
@@ -2038,7 +2066,8 @@ The generated handoff embeds everything the sandbox needs and nothing it
 could reach on its own: a fleet kit stating the agent's own address,
 whether this wake was addressed via `To` or `Cc`, and the To/Cc/list
 posture that implies; the persona's markdown body with frontmatter
-stripped; the thread; the triggering message id called out; the
+stripped, followed verbatim by the seat's protocol file when it names
+one (see `protocol:` above); the thread; the triggering message id called out; the
 reply-file format; the transparency norm (private side-channels are
 fine, but say on-thread if one shaped your reply); and — importantly —
 *no reply is a valid outcome, end your turn*. An agent is one voice on a

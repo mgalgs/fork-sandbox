@@ -108,7 +108,10 @@ Do these in order.
    keeps its fleet and personas in a repo of its own. Unset or empty falls
    back to `$config_dir`, unchanged from before this pair of variables
    existed. Every other install-time dir (prompts, handlers, hooks,
-   presets) still reads only `$config_dir`. Files under `handlers/` must
+   presets) still reads only `$config_dir`, and install's own fleet check
+   reads those same dirs, so a seat whose `protocol:` file is missing from
+   `$config_dir/prompts` fails the install before anything is applied,
+   whatever `FORK_SANDBOX_PROMPTS_DIR` the shell exports. Files under `handlers/` must
    be executable to be included; a non-executable one is skipped with a
    warning, the same way the laptop postmaster would skip it.
 
