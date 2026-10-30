@@ -156,6 +156,12 @@ Do these in order.
   template carries a `checksum/pm-config` annotation computed over the
   rendered ConfigMaps and Secrets; a changed checksum is a changed pod
   template, which rolls the pod.
+- **Personas are the exception: they apply without a roll.** They are
+  left out of the checksum because the postmaster reads a persona from
+  disk at every wake, so the new text takes effect once the kubelet syncs
+  the mounted ConfigMap (see the next point). A wake already running keeps
+  the persona it started with. A change to `fleet.yaml` in the same
+  install still rolls the pod.
 - **Config applied some other way** (a GitOps tool applying the rendered
   manifests, or a hand edit of a ConfigMap) is not live when the apply
   returns. If the pod does not roll, it sees the change only once the

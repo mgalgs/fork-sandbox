@@ -169,8 +169,9 @@ spec:
       labels:
         app: fork-sandbox-postmaster
       annotations:
-        # A hash of the rendered config ConfigMaps and the git and mail-API
-        # Secrets, filled in by `install --postmaster` at render time.
+        # A hash of the rendered config ConfigMaps (all but personas, which
+        # apply live) and the git and mail-API Secrets, filled in by
+        # `install --postmaster` at render time.
         # Annotating the POD TEMPLATE (not the Deployment's own metadata)
         # is what makes a config-only change
         # roll the pod -- see 30-proxy.yaml's checksum/nginx-conf annotation

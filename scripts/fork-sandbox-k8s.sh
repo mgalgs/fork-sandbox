@@ -4974,8 +4974,11 @@ cmd_install() {
                 --dry-run=client -o yaml)"
         fi
 
-        pm_config_checksum="$(printf '%s%s%s%s%s%s%s%s%s%s' \
-            "$pm_config_yaml" "$pm_personas_yaml" "$pm_prompts_yaml" \
+        # Personas are left out on purpose: they are read from disk at every
+        # wake, so a persona edit applies live once the kubelet syncs the
+        # mount. Adding them back makes every persona edit roll the pod.
+        pm_config_checksum="$(printf '%s%s%s%s%s%s%s%s%s' \
+            "$pm_config_yaml" "$pm_prompts_yaml" \
             "$pm_handlers_yaml" "$pm_hooks_yaml" "$pm_presets_yaml" "$pm_headroom_yaml" \
             "$pm_git_secret_yaml" "$pm_tokens_secret_yaml" \
             "$pm_claude_secret_yaml" | k8s_sha256_stdin)"
