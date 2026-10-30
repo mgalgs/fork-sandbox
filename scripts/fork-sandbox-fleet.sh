@@ -18,11 +18,11 @@
 #     agent's standing instructions, opaque to this script) with an
 #     optional YAML frontmatter block carrying `description`, `harness`,
 #     `model`, `network` (pinned|sealed), `thinking`, `wake-on-cc`,
-#     `refresh-at` and `triage`.
+#     `refresh-at`, `triage`, `preset` and `protocol`.
 #     $FORK_SANDBOX_PERSONAS_DIR, default ~/.config/fork-sandbox/personas.
 #   - The fleet file, a YAML mapping of `agents` (name -> optional
 #     persona/harness/model/network/thinking/wake-on-cc/refresh-at/triage/
-#     preset overrides, OR handler/command for a script seat -- see
+#     preset/protocol overrides, OR handler/command for a script seat -- see
 #     "Handler seats" below; plus backend/endpoint/grant, fleet.yaml-only
 #     keys with their own rules -- see fork-sandbox-fleet-parse.py's
 #     module docstring, not restated here), `lists` (name -> members, a
@@ -66,6 +66,27 @@
 # validate the preset's own contents (fork-sandbox.sh does that at spawn
 # time). Refused, alongside every other LLM-seat field, on a handler seat.
 #
+# A `protocol: <name>` override (fleet.yaml or persona frontmatter, same
+# precedence as every other LLM-seat field) names a shared block of
+# protocol text -- reply format, verdict tags and the like -- that several
+# personas can share instead of each carrying its own drifting copy. The
+# file is <prompts-dir>/protocol-<name>.md, flat because the prompts dir
+# ships to a cluster postmaster as a ConfigMap, which holds no
+# subdirectories. <prompts-dir> is $FORK_SANDBOX_PROMPTS_DIR, else
+# $FORK_SANDBOX_CONFIG_DIR/prompts, else ~/.config/fork-sandbox/prompts --
+# the same directory the postmaster reads its fleet-kit.md overlay from.
+# The value is a bare name, never a path (the same shape rule as
+# `persona:`). The postmaster prints the file into the seat's wake handoff
+# immediately after the persona body and before the blank line that
+# follows it, VERBATIM: no frontmatter stripping (a protocol file that
+# starts with `---` prints that line too), no trimming, no separator. So
+# the handoff is kit, blank line, persona body, protocol bytes, blank
+# line, the rest; persona body + protocol bytes is byte-for-byte what one
+# undivided persona body holding both would have printed, and a seat with
+# no protocol gets exactly the handoff it got before the field existed.
+# `check` requires the file to exist. Refused, alongside every other
+# LLM-seat field, on a handler seat.
+#
 # This is a registry, not a router or a store: it has no idea what
 # fork-sandbox-mail.sh's message store holds, and never touches it.
 # `expand` turns a `@list` address into its member `@agent` addresses
@@ -83,7 +104,9 @@
 #                  every bare <name>.md in the personas directory that
 #                  makes `name` an agent on its own (see fleet_is_agent
 #                  below), and, for every handler seat, that its command
-#                  exists and is executable under $FORK_SANDBOX_HANDLERS_DIR.
+#                  exists and is executable under $FORK_SANDBOX_HANDLERS_DIR,
+#                  and, for every seat naming a protocol, that
+#                  <prompts-dir>/protocol-<name>.md exists.
 #                  Exits 0 silently if clean; otherwise prints every
 #                  error found (not just the first) and exits 1. Refuses
 #                  an agent or list named "all" (reserved for @all, see
@@ -113,23 +136,26 @@
 #                  fork-sandbox-preset-parse.py, never a second parser.
 #                  Handler seats stay legal. Without --cluster, `check`
 #                  behaves exactly as it always has.
-#   resolve <name> Print exactly nineteen lines for one agent: harness,
+#   resolve <name> Print exactly twenty lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
 #                  wake-on-cc, refresh-at, triage, preset, handler,
 #                  command, backend, endpoint, grant, review-target,
-#                  wake-when, services, on-silence.
+#                  wake-when, services, on-silence, protocol.
 #                  A field with nothing configured anywhere prints as an
-#                  empty line -- output is always nineteen
-#                  lines, never fewer. A handler
+#                  empty line -- output is always twenty
+#                  lines, never fewer. A new line is only ever appended
+#                  last, so positional readers keep their line numbers. A handler
 #                  seat's harness/model/thinking/network/triage/preset/
-#                  refresh-at lines are always empty (refused together at
+#                  refresh-at/protocol lines are always empty (refused together at
 #                  `check` time); its handler/command lines are the only
 #                  ones populated besides persona-path/description/
 #                  wake-on-cc. The last seven (backend/endpoint/grant/
 #                  review-target/wake-when/services/on-silence) are fleet.yaml-only (see fork-sandbox-fleet-parse.py's
 #                  module docstring for their rules) and so carry no
 #                  persona-frontmatter fallback -- printed straight from
-#                  the fleet file, empty when unset.
+#                  the fleet file, empty when unset. protocol, the
+#                  twentieth, is the bare name (not a path), fleet.yaml
+#                  over frontmatter like the first ten.
 #   resolve-triage Print exactly two lines for the wake classifier's own
 #                  sandbox seat: harness, model. Reads only the fleet
 #                  file's top-level `triage` block (no persona fallback --
@@ -222,6 +248,10 @@ HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
 # --preset <name> always agree on where to look. Existence-only check;
 # preset content is fork-sandbox.sh's to load and validate at spawn time.
 PRESETS_DIR="${FORK_SANDBOX_PRESETS_DIR:-${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/presets}"
+# Where a seat's `protocol:` bare name resolves, as protocol-<name>.md --
+# the same chain the postmaster's pm_kit_path resolves its prompts
+# directory with, so `check` looks exactly where a wake will read.
+PROMPTS_DIR="${FORK_SANDBOX_PROMPTS_DIR:-${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/prompts}"
 FLEET_NAME_RE='^[a-z0-9][a-z0-9-]*$'
 FLEET_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 
@@ -330,12 +360,17 @@ cmd_check() {
     # on $check_out's stdout: the `check` subprocess above already parses
     # every such persona's frontmatter once, to validate it, so it emits
     # the preset it found along the way instead of us re-invoking the
-    # frontmatter parser per agent here.
-    local -A check_preset=()
+    # frontmatter parser per agent here. Each agent's resolved `protocol`
+    # comes back the same way; lines are keyed by their field column, so
+    # their order never matters here.
+    local -A check_preset=() check_protocol=()
     local check_kind check_name check_field check_value
     while IFS=$'\t' read -r check_kind check_name check_field check_value; do
-        [[ "$check_kind" == agent && "$check_field" == preset ]] || continue
-        check_preset["$check_name"]="$check_value"
+        [[ "$check_kind" == agent ]] || continue
+        case "$check_field" in
+            preset) check_preset["$check_name"]="$check_value" ;;
+            protocol) check_protocol["$check_name"]="$check_value" ;;
+        esac
     done <<< "$check_out"
 
     local rc=0
@@ -346,7 +381,7 @@ cmd_check() {
         [[ -n "$n" ]] && agent_names+=("$n")
     done < <(fleet_all_agent_names "$dump")
 
-    local name preset handler_path preset_path
+    local name preset handler_path preset_path protocol protocol_path
     for name in "${agent_names[@]}"; do
         fleet_read_agent "$dump" "$name"
         if [[ "$fleet_handler" == exec ]]; then
@@ -371,6 +406,14 @@ cmd_check() {
                 rc=1
             fi
         fi
+        protocol="${check_protocol[$name]:-}"
+        if [[ -n "$protocol" ]]; then
+            protocol_path="$PROMPTS_DIR/protocol-$protocol.md"
+            if [[ ! -f "$protocol_path" ]]; then
+                echo "Error: agents.$name.protocol: protocol file '$protocol_path' does not exist." >&2
+                rc=1
+            fi
+        fi
     done
     if (( cluster )); then
         check_cluster "$dump" "${agent_names[@]}" || rc=1
@@ -390,7 +433,8 @@ check_cluster() {
         rc=1
     fi
     for name in "$@"; do
-        # Not $(...): that strips the trailing empty lines of the seventeen.
+        # Not $(...): that strips the trailing empty lines of the twenty.
+        # Indexed by position, so the appended protocol line is never read.
         mapfile -t seat < <(resolve_with_dump "$dump" "$name")
         harness="${seat[0]-}" preset="${seat[9]-}" handler="${seat[10]-}" backend="${seat[12]-}"
         [[ "$handler" == exec ]] && continue
@@ -450,7 +494,7 @@ fleet_read_agent() {
     fleet_preset="" fleet_handler="" fleet_command=""
     fleet_backend="" fleet_endpoint="" fleet_grant=""
     fleet_review_target="" fleet_wake_when="" fleet_services=""
-    fleet_on_silence=""
+    fleet_on_silence="" fleet_protocol=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -476,6 +520,7 @@ fleet_read_agent() {
             wake-when) fleet_wake_when="$value" ;;
             services) fleet_services="$value" ;;
             on-silence) fleet_on_silence="$value" ;;
+            protocol) fleet_protocol="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -484,7 +529,7 @@ fleet_read_agent() {
 fleet_read_frontmatter() {
     local persona_path="$1" out field value
     fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
-    fm_wake_on_cc="" fm_refresh_at="" fm_triage="" fm_preset=""
+    fm_wake_on_cc="" fm_refresh_at="" fm_triage="" fm_preset="" fm_protocol=""
     out="$(python3 "$PARSE" frontmatter "$persona_path" "$persona_path")"
     while IFS=$'\t' read -r _ field value; do
         case "$field" in
@@ -497,6 +542,7 @@ fleet_read_frontmatter() {
             refresh-at) fm_refresh_at="$value" ;;
             triage) fm_triage="$value" ;;
             preset) fm_preset="$value" ;;
+            protocol) fm_protocol="$value" ;;
         esac
     done <<< "$out"
 }
@@ -525,6 +571,7 @@ resolve_with_dump() {
     local persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
     local fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
     local fm_wake_on_cc="" fm_refresh_at="" fm_triage="" fm_preset=""
+    local fm_protocol=""
     if [[ -f "$persona_path" ]]; then
         fleet_read_frontmatter "$persona_path"
     elif (( ! agent_declared )); then
@@ -560,6 +607,9 @@ resolve_with_dump() {
     printf '%s\n' "$fleet_wake_when"
     printf '%s\n' "$fleet_services"
     printf '%s\n' "$fleet_on_silence"
+    # protocol takes fleet.yaml over frontmatter, like the first ten, but
+    # came later, so it is appended here rather than placed beside them.
+    printf '%s\n' "${fleet_protocol:-$fm_protocol}"
 }
 
 cmd_resolve() {
@@ -753,6 +803,7 @@ cmd_roster() {
 
     echo "Agents:"
     local name harness model thinking network persona description wake_on_cc refresh_at triage preset handler command
+    # Reads only resolve's first twelve lines; the rest are left unread.
     for name in "${agent_names[@]}"; do
         { read -r harness; read -r model; read -r thinking; read -r network; \
           read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; \

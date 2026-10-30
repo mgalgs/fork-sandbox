@@ -531,13 +531,14 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the seventeen-line contract into named globals for assertions.
+    # Reads the twenty-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
       read -r r_refresh_at; read -r r_triage; read -r r_preset; \
       read -r r_handler; read -r r_command; read -r r_backend; \
       read -r r_endpoint; read -r r_grant; read -r r_review_target; \
-      read -r r_wake_when; \
+      read -r r_wake_when; read -r r_services; read -r r_on_silence; \
+      read -r r_protocol; \
     } < <("$fleet" resolve "$1")
 }
 
@@ -568,12 +569,13 @@ check "resolve: all-empty agent, endpoint empty" "" "$r_endpoint"
 check "resolve: all-empty agent, grant empty" "" "$r_grant"
 check "resolve: all-empty agent, review-target empty" "" "$r_review_target"
 check "resolve: all-empty agent, wake-when empty" "" "$r_wake_when"
+check "resolve: all-empty agent, protocol empty" "" "$r_protocol"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (on-silence) is empty, as it is for tuner.
-check "resolve: output is exactly nineteen lines" "19" "$("$fleet" resolve tuner | wc -l)"
+# (protocol) is empty, as it is for tuner.
+check "resolve: output is exactly twenty lines" "20" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -1063,6 +1065,155 @@ contains "preset: its error still names the missing file" "$preset_spec_err" \
 
 printf '%s\n' "$saved_fleet_for_preset" > "$FORK_SANDBOX_FLEET_FILE"
 unset FORK_SANDBOX_PRESETS_DIR
+
+printf '\n== protocol ==\n'
+
+new_root PROMPTS_TEST_DIR
+export FORK_SANDBOX_PROMPTS_DIR="$PROMPTS_TEST_DIR"
+printf '\nShared protocol text.\n' > "$PROMPTS_TEST_DIR/protocol-reviewer.md"
+saved_fleet_for_protocol="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+saved_riffler_md_for_protocol="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+
+bad "protocol: a path-shaped name is refused" \
+    "must be a bare protocol name" "agents.riffler.protocol" <<'EOF'
+agents:
+  riffler:
+    protocol: sub/reviewer
+EOF
+
+bad "protocol: a '..' name is refused" \
+    "must be a bare protocol name" "agents.riffler.protocol" <<'EOF'
+agents:
+  riffler:
+    protocol: ..
+EOF
+
+bad "protocol: refused alongside handler: exec" \
+    "not allowed alongside 'handler: exec'" "agents.riffler.protocol" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: real-handler
+    protocol: reviewer
+EOF
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    protocol: reviewer
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+check "protocol: an existing protocol file passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "protocol: fleet.yaml protocol resolves as its bare name" "reviewer" "$r_protocol"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    protocol: absent
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+protocol_err="$("$fleet" check 2>&1)"; protocol_rc=$?
+check "protocol: a missing protocol file fails check" "1" "$protocol_rc"
+contains "protocol: the error names the seat" "$protocol_err" "agents.riffler.protocol"
+contains "protocol: the error names the missing path" "$protocol_err" \
+    "$PROMPTS_TEST_DIR/protocol-absent.md"
+
+# The prompts dir follows FORK_SANDBOX_CONFIG_DIR when FORK_SANDBOX_PROMPTS_DIR
+# is unset -- the same chain the postmaster reads its kit overlay through.
+new_root PROTOCOL_CONFIG_DIR
+mkdir -p "$PROTOCOL_CONFIG_DIR/prompts"
+check "protocol: unset prompts dir falls back to the config dir (missing)" "1" \
+    "$(env -u FORK_SANDBOX_PROMPTS_DIR FORK_SANDBOX_CONFIG_DIR="$PROTOCOL_CONFIG_DIR" \
+        "$fleet" check >/dev/null 2>&1; echo $?)"
+: > "$PROTOCOL_CONFIG_DIR/prompts/protocol-absent.md"
+check "protocol: unset prompts dir falls back to the config dir (present)" "0" \
+    "$(env -u FORK_SANDBOX_PROMPTS_DIR FORK_SANDBOX_CONFIG_DIR="$PROTOCOL_CONFIG_DIR" \
+        "$fleet" check >/dev/null 2>&1; echo $?)"
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md" <<'EOF'
+---
+harness: claude
+model: opus
+description: reviews riffs
+protocol: other
+---
+Body text, opaque to the registry.
+EOF
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    protocol: reviewer
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+resolve_lines riffler
+check "protocol: fleet.yaml protocol overrides frontmatter protocol" "reviewer" "$r_protocol"
+check "protocol: an overridden frontmatter protocol is not checked for a file" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler: {}
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+resolve_lines riffler
+check "protocol: frontmatter-only protocol resolves when fleet.yaml sets none" \
+    "other" "$r_protocol"
+protocol_fm_err="$("$fleet" check 2>&1)"; protocol_fm_rc=$?
+check "protocol: frontmatter-only protocol fails check when the file does not exist" \
+    "1" "$protocol_fm_rc"
+contains "protocol: frontmatter-only error names the missing path" "$protocol_fm_err" \
+    "$PROMPTS_TEST_DIR/protocol-other.md"
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md" <<'EOF'
+---
+protocol: ../reviewer
+---
+Body text, opaque to the registry.
+EOF
+protocol_fm_err="$("$fleet" check 2>&1)"; protocol_fm_rc=$?
+check "protocol: a path-shaped frontmatter protocol fails check" "1" "$protocol_fm_rc"
+contains "protocol: the frontmatter shape error says why" "$protocol_fm_err" \
+    "must be a bare protocol name"
+
+# A persona file with no fleet.yaml entry is an agent too, and its
+# frontmatter protocol is checked the same way.
+printf '%s\n' "$saved_riffler_md_for_protocol" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+cat > "$FORK_SANDBOX_PERSONAS_DIR/loner.md" <<'EOF'
+---
+protocol: missing-one
+---
+Loner body.
+EOF
+protocol_loner_err="$("$fleet" check 2>&1)"; protocol_loner_rc=$?
+check "protocol: a bare persona's missing protocol file fails check" "1" "$protocol_loner_rc"
+contains "protocol: the bare persona's error names it" "$protocol_loner_err" \
+    "agents.loner.protocol"
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/loner.md"
+
+printf '%s\n' "$saved_fleet_for_protocol" > "$FORK_SANDBOX_FLEET_FILE"
+unset FORK_SANDBOX_PROMPTS_DIR
 
 printf '\n== backend ==\n'
 

@@ -13,7 +13,7 @@ divide, so neither can resolve as a fleet seat.
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
 harness/model/network/thinking/description/wake-on-cc/refresh-at/triage/
-preset/handler/command/services overrides), `lists` (name -> `members`, a list of
+preset/handler/command/services/protocol overrides), `lists` (name -> `members`, a list of
 agent names), and an optional top-level `triage` block (harness/model for
 the wake classifier's own sandbox seat -- absent means triage is off
 fleet-wide. No `network` field: the classifier's own launch path fixes
@@ -35,7 +35,7 @@ script.
 than an LLM seat: `command` (a bare name, resolved host-side against the
 operator's handlers directory -- see fork-sandbox-postmaster.sh) is then
 required, and none of `harness`/`model`/`network`/`thinking`/`triage`/
-`persona`/`refresh-at`/`preset` may be set on the same agent -- in
+`persona`/`refresh-at`/`preset`/`protocol` may be set on the same agent -- in
 fleet.yaml or in that agent's own `<name>.md` frontmatter alike --
 since those tune an LLM seat, which a handler is not. `handler`, when present, is
 always the literal string `exec`; nothing else validates.
@@ -62,6 +62,13 @@ resolved network is `sealed` (a pod's isolation is the NetworkPolicy's
 job, not a sealed harness's), or that resolves any preset (the cluster
 path is single-leg only in this phase, no maintainer tier, no repeat, no
 composed pipeline).
+
+`protocol` (fleet.yaml or frontmatter, fleet.yaml winning) names a shared
+block of protocol text, <prompts-dir>/protocol-<name>.md, that the
+postmaster prints into the seat's wake handoff right after the persona
+body. A bare name only, never a path, the same shape rule as `persona`.
+Existence of the file is checked bash-side (fork-sandbox-fleet.sh's
+`check`), against the prompts directory; this only validates the shape.
 
 `services` is fleet.yaml-only and takes a YAML boolean. It controls
 whether a postmaster wake, local or k8s, launches the project's per-run
@@ -99,16 +106,19 @@ addressed by path (`agents.reviewer.modle`).
 
 `check` accumulates every error across the whole fleet file and every
 persona it declares, prints them all to stderr, and exits 1. On success
-it exits 0 and emits one line to stdout per non-handler agent:
+it exits 0 and emits two lines to stdout per non-handler agent, every
+preset line first, then every protocol line:
 
     agent\t<name>\tpreset\t<value>         (empty value when the agent has
                                              no preset, fleet.yaml or
                                              persona frontmatter)
+    agent\t<name>\tprotocol\t<value>       (likewise for protocol)
 
 This spares fork-sandbox-fleet.sh a second pass over every persona file
 just to learn each agent's resolved preset for the preset-file-exists
-check below: `check` already parses every persona's frontmatter once, to
-validate it, so it hands back the preset it found along the way. Handler
+and protocol-file-exists checks below: `check` already parses every
+persona's frontmatter once, to validate it, so it hands back what it
+found along the way. A reader keys on the field column, never position. Handler
 agents are omitted (a handler is host config, not a preset-bearing LLM
 seat -- see `handler: exec` above). `dump` and `frontmatter` are for the
 bash side's `resolve`/`expand`/`roster` verbs: same validation, but since
@@ -118,7 +128,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (nineteen lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (twenty lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -137,6 +147,7 @@ routine instead of two.
     agent\t<name>\twake-when\t<value>
     agent\t<name>\tservices\t<value>
     agent\t<name>\ton-silence\t<value>
+    agent\t<name>\tprotocol\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -161,8 +172,9 @@ routine instead of two.
     field\trefresh-at\t<value>
     field\ttriage\t<value>
     field\tpreset\t<value>
+    field\tprotocol\t<value>
 
-always nine lines, empty value when unset. A persona file with no leading
+always ten lines, empty value when unset. A persona file with no leading
 `---` frontmatter block is valid and reported as all-empty, not an error.
 
 Requires PyYAML, like fork-sandbox-preset-parse.py; a machine without it
@@ -199,13 +211,14 @@ WAKE_WHEN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
           "handler", "command", "backend", "endpoint", "grant",
-          "review-target", "wake-when", "services", "on-silence")
+          "review-target", "wake-when", "services", "on-silence",
+          "protocol")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
                        "description", "wake-on-cc", "refresh-at", "triage",
-                       "preset")
+                       "preset", "protocol")
 # LLM-seat-only fields: refused alongside `handler: exec` (decision: a
 # handler is a script seat, not an LLM seat to tune). wake-on-cc is
 # deliberately absent: it governs routing (does this seat wake on a Cc at
@@ -213,7 +226,7 @@ FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
 LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
                     "persona", "refresh-at", "preset", "backend",
                     "endpoint", "grant", "review-target", "services",
-                    "on-silence")
+                    "on-silence", "protocol")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -503,6 +516,18 @@ def check_persona(value, path, errors):
     return value
 
 
+def check_protocol(value, path, errors):
+    """A protocol: names <prompts-dir>/protocol-<value>.md, so it gets
+    check_persona's shape rule: a bare name, never a path. Existence of
+    the file is checked bash-side (fork-sandbox-fleet.sh's `check`),
+    against the prompts directory the postmaster reads."""
+    if value != os.path.basename(value) or value in (".", ".."):
+        errors.append(f"{path}: must be a bare protocol name, not a "
+                       f"path, got '{value}'")
+        return ""
+    return value
+
+
 def check_preset(value, path, errors):
     """A preset: names a bare preset name, resolved bash-side against the
     presets directory -- never a path or a '.yaml' suffix. Existence of
@@ -738,6 +763,10 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["on-silence"] = check_on_silence(v, path, errors)
+            elif prop == "protocol":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["protocol"] = check_protocol(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],
@@ -815,7 +844,7 @@ def load_and_validate(fleet_file, label, errors):
 
 
 def parse_frontmatter(path, label, errors):
-    """Returns a dict of the five frontmatter fields (empty string when
+    """Returns a dict of the FRONTMATTER_FIELDS (empty string when
     unset). A file with no leading '---' block is valid: all fields
     empty, nothing appended to errors."""
     try:
@@ -879,6 +908,10 @@ def parse_frontmatter(path, label, errors):
             v = scalar(value, path_, errors)
             if v is not None:
                 fm["preset"] = check_preset(v, path_, errors)
+        elif key == "protocol":
+            v = scalar(value, path_, errors)
+            if v is not None:
+                fm["protocol"] = check_protocol(v, path_, errors)
         else:
             errors.append(f"{path_}: unknown key")
     check_network_harness_pair(fm["harness"], fm["network"],
@@ -897,6 +930,7 @@ def cmd_check(fleet_file, label, personas_dir):
     # single-process pass instead of re-invoking this parser once per
     # agent just to learn `preset`.
     resolved_presets = {}
+    resolved_protocols = {}
     if not errors:
         setters = [name for name, agent in agents.items()
                    if agent["review-target"] == "sets"]
@@ -945,6 +979,8 @@ def cmd_check(fleet_file, label, personas_dir):
                 agent["network"] or fm["network"],
                 f"agents.{name}", errors)
             resolved_presets[name] = agent["preset"] or fm.get("preset", "")
+            resolved_protocols[name] = (agent["protocol"]
+                                        or fm.get("protocol", ""))
             check_thinking_effort(
                 agent["harness"] or fm["harness"] or "claude",
                 agent["thinking"] or fm["thinking"],
@@ -1006,12 +1042,15 @@ def cmd_check(fleet_file, label, personas_dir):
                 continue
             fm = parse_frontmatter(persona_path, persona_path, errors)
             resolved_presets[name] = fm.get("preset", "")
+            resolved_protocols[name] = fm.get("protocol", "")
     if errors:
         for e in errors:
             sys.stderr.write(f"Error: {e}\n")
         sys.exit(1)
     sys.stdout.write("".join(f"agent\t{name}\tpreset\t{value}\n"
                               for name, value in resolved_presets.items()))
+    sys.stdout.write("".join(f"agent\t{name}\tprotocol\t{value}\n"
+                              for name, value in resolved_protocols.items()))
     sys.exit(0)
 
 
