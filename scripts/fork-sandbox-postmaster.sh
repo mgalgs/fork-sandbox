@@ -617,7 +617,10 @@
 # it can reach on its own: the fleet kit (share/fleet-kit.md, overlay-
 # overridable at <prompts-dir>/fleet-kit.md -- see pm_kit_path) with
 # {name}/{operator}/{via} substituted, plus the persona's markdown
-# body (frontmatter stripped), the thread section, the triggering
+# body (frontmatter stripped), then -- for a seat naming `protocol: <name>`
+# (fleet resolve's 20th line) -- <prompts-dir>/protocol-<name>.md printed
+# VERBATIM straight after the body (no frontmatter stripping, no
+# trimming, no separator; see pm_write_handoff), the thread section, the triggering
 # message-id called out, the reply-file format, the transparency norm
 # (private side-channels are fine but say so on-thread if they shaped your
 # reply), and "no reply is a valid outcome, end your turn" -- an agent is
@@ -3071,15 +3074,32 @@ pm_is_operator() {
     return 1
 }
 
+# $9, when set, is the seat's protocol name: <prompts-dir>/protocol-<name>.md
+# (the directory pm_kit_path resolves) is printed byte for byte straight
+# after the persona body, before the blank line that follows it, so a
+# persona split into body + protocol renders exactly as the undivided one
+# did. A named file gone missing since `fleet check` fails the handoff
+# rather than wake the seat without its protocol.
 pm_write_handoff() {
     local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" \
-          trigger_only="$7" is_retry="${8:-}"
-    local render_rc=0 kit_path kit_text via_label
+          trigger_only="$7" is_retry="${8:-}" protocol="${9:-}"
+    local render_rc=0 kit_path kit_text via_label protocol_path=""
     kit_path="$(pm_kit_path)" || {
         echo "Error: postmaster: fleet kit missing (checked loudly at deliver" >&2
         echo "startup; this should not be reachable mid-run)." >&2
         return 1
     }
+    if [[ -n "$protocol" ]]; then
+        local config_dir prompts_dir
+        config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+        prompts_dir="${FORK_SANDBOX_PROMPTS_DIR:-$config_dir/prompts}"
+        protocol_path="$prompts_dir/protocol-$protocol.md"
+        if [[ "$protocol" == */* || "$protocol" == . || "$protocol" == .. \
+              || ! -f "$protocol_path" ]]; then
+            echo "Error: postmaster: $agent's protocol file '$protocol_path' does not exist." >&2
+            return 1
+        fi
+    fi
     kit_text="$(<"$kit_path")"
     # Every documented `mail send`/`mail reply` invocation sends operator
     # mail as the literal address `@operator` (never the postmaster host's
@@ -3094,8 +3114,11 @@ pm_write_handoff() {
     kit_text="${kit_text//\{via\}/$via_label}"
     {
         printf '%s\n\n' "$kit_text"
-        if [[ -n "$persona_path" && -f "$persona_path" ]]; then
-            pm_persona_body "$persona_path"
+        if [[ -n "$persona_path" && -f "$persona_path" ]] || [[ -n "$protocol_path" ]]; then
+            if [[ -n "$persona_path" && -f "$persona_path" ]]; then
+                pm_persona_body "$persona_path"
+            fi
+            [[ -z "$protocol_path" ]] || cat -- "$protocol_path"
             printf '\n'
         fi
         if [[ "$trigger_only" == 1 ]]; then
@@ -4144,7 +4167,7 @@ pm_spawn_wake() {
     fi
     local harness model thinking network persona_path description wake_on_cc \
           refresh_at triage preset handler command backend endpoint grant \
-          review_target wake_when seat_services on_silence
+          review_target wake_when seat_services on_silence protocol
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
@@ -4167,13 +4190,15 @@ pm_spawn_wake() {
     # `fleet check` refuses grant/backend/endpoint on anything but a k8s
     # seat, so this read never has to special-case a local seat carrying
     # one.
+    # protocol (20th line) goes to pm_write_handoff, which prints the named
+    # protocol file after the persona body.
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \
            read -r refresh_at; read -r triage; read -r preset; read -r handler; \
            read -r command; read -r backend; read -r endpoint; read -r grant; \
            read -r review_target; read -r wake_when; read -r seat_services; \
-           read -r on_silence; \
+           read -r on_silence; read -r protocol; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
@@ -4355,7 +4380,7 @@ pm_spawn_wake() {
     via="$(pm_wake_via "$mid" "$agent")"
 
     local handoff_file="$HANDOFFS/$run_id.md"
-    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$is_retry"; then
+    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$is_retry" "$protocol"; then
         pm_flag "$tid" "handoff render failed for $agent: $mid"
         return 0
     fi
