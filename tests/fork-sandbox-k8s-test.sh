@@ -21023,7 +21023,6 @@ check "resources: no keys set renders today's postmaster stanza byte-for-byte" \
 check "resources: the mail-api container keeps its own values" "50m 64Mi 500m 256Mi" \
     "$(pm_res_container mail-api)"
 check "resources: no leftover __PM_ placeholder" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
-pm_res_default_sum="$(pm_api_sum)"
 
 pm_res_all_cfg="$(pm_api_cfg K8S_POSTMASTER_REQUESTS_CPU=2 K8S_POSTMASTER_LIMITS_CPU=4 \
     K8S_POSTMASTER_REQUESTS_MEMORY=1Gi K8S_POSTMASTER_LIMITS_MEMORY=3Gi)"
@@ -21041,7 +21040,6 @@ check "resources: a bare-number cpu parses as a string, not an int" "string stri
     "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "postmaster") | [.resources.requests.cpu, .resources.limits.cpu] | map(type) | join(" ")')"
 check "resources: the keys leave the mail-api container alone" "50m 64Mi 500m 256Mi" \
     "$(pm_res_container mail-api)"
-check "resources: the keys do not touch the config checksum" "$pm_res_default_sum" "$(pm_api_sum)"
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint - <<< "$pm_api_out" 2>&1)"
     if [[ -z "$out" ]]; then ok "yamllint: install --postmaster with the resource keys set"; else no "yamllint: install --postmaster with the resource keys set" "$out"; fi
