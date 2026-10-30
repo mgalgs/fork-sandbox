@@ -722,6 +722,25 @@ else
     no "the probe reports no FAIL lines against a fully compliant stub" "$probe_out"
 fi
 
+printf '\n== a probe whose claude ignores SIGTERM is killed, not waited on ==\n'
+# The probe runs claude six times; with no --kill-after, one that outlives
+# its SIGTERM hung the probe forever. The FS_CLAUDE_PROBE_* knobs only
+# shorten the waits.
+: > "$work/probe-hang-pids"
+probe_hang_start=$SECONDS
+probe_hang_out="$(STUB_MODE=hang STUB_HANG_SECS=60 STUB_HANG_PIDFILE="$work/probe-hang-pids" \
+    FS_CLAUDE_PROBE_TIMEOUT_SEC=1 FS_CLAUDE_PROBE_KILL_AFTER_SEC=1 \
+    timeout --kill-after=5 50 "$probe" --claude "$stub" 2>&1)"
+probe_hang_rc=$?
+probe_hang_secs=$(( SECONDS - probe_hang_start ))
+if (( probe_hang_rc == 1 && probe_hang_secs < 40 )); then
+    ok "a claude that ignores SIGTERM is killed, and the probe reports failure (${probe_hang_secs}s)"
+else
+    no "a claude that ignores SIGTERM is killed, and the probe reports failure" \
+        "rc=$probe_hang_rc after ${probe_hang_secs}s: $probe_hang_out"
+fi
+while read -r p; do [[ -n "$p" ]] && kill -KILL "$p" 2>/dev/null; done < "$work/probe-hang-pids"
+
 declare -A BREAK_LABELS=(
     [startup_refresh]="refresh at startup"
     [lock_live]="refresh lock path, live"

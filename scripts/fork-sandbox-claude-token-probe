@@ -162,10 +162,19 @@ _probe_unchanged() {
         && "$(_probe_field "$file" expiresAt)" == "$orig_exp" ]]
 }
 
+# SIGTERM after FS_CLAUDE_PROBE_TIMEOUT_SEC (default 40), then SIGKILL after
+# a further FS_CLAUDE_PROBE_KILL_AFTER_SEC (default 20); both are test hooks.
+# Without --kill-after, GNU timeout waits for as long as the child takes to
+# act on its SIGTERM, so a claude that ignores it hung the probe forever --
+# the same bound _fs_claude_do_refresh puts on the host refresh's claude.
 # shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
 _probe_run_claude() {
     local dir="$1"; shift
-    ( cd "$dir" && CLAUDE_CONFIG_DIR="$dir" "$FS_TIMEOUT" 40 "$@" </dev/null >/dev/null 2>&1 ) || true
+    local term_after="${FS_CLAUDE_PROBE_TIMEOUT_SEC:-40}" kill_after="${FS_CLAUDE_PROBE_KILL_AFTER_SEC:-20}"
+    [[ "$term_after" =~ ^[1-9][0-9]*$ ]] || term_after=40
+    [[ "$kill_after" =~ ^[1-9][0-9]*$ ]] || kill_after=20
+    ( cd "$dir" && CLAUDE_CONFIG_DIR="$dir" \
+        "$FS_TIMEOUT" --kill-after="$kill_after" "$term_after" "$@" </dev/null >/dev/null 2>&1 ) || true
 }
 
 PROBE_REASON=""
