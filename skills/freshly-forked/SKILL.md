@@ -141,9 +141,9 @@ writing a detailed handoff so nothing gets dropped.
      It blocks for two minutes so your closing words stay on screen, and
      the running command's timer is the user's countdown; interrupting it
      cancels the reap. Then the pane moves into the tmux session
-     `reaped`, and a later reap closes it with SIGTERM once it is 24
+     `reaped`, and a later reap closes it with SIGTERM once it is 3
      hours old, keeping the transcript. To keep it after that, move its
-     window out of `reaped` before the 24 hours are up.
+     window out of `reaped` before the 3 hours are up.
    - **Exit 0, but something remains:** stay. When the last of it is
      done and reported, give the retiring line with the time as above,
      and run `tmux-reap.sh --delay 120` then.

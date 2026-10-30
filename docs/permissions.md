@@ -310,7 +310,7 @@ is exactly the moment a human should look at what is about to run.
 cleans up after itself: `fork-task.sh --ack` prints a token, the new session
 runs `fork-task-ack.sh <token>` first thing, and the old session waits with
 `fork-task-ack.sh --wait <token>`, then parks its pane with `tmux-reap.sh`
-(into the `reaped` tmux session; panes there are closed after a 24h grace).
+(into the `reaped` tmux session; panes there are closed after a 3h grace).
 `fork-task-ack.sh` takes arguments only and validates its token, so it is
 safe to allowlist. `tmux-reap.sh` signals processes, but only in panes it
 stamped itself inside session `reaped`. The ack file lives under

@@ -14,7 +14,7 @@
 #                     running-command timer is the countdown; interrupting
 #                     the command cancels the reap.
 #   --grace SECS      for --sweep: close panes reaped at least SECS ago
-#                     (default 86400, 24h).
+#                     (default 10800, 3h).
 #   --term-wait SECS  for --sweep: how long to wait after SIGTERM before
 #                     falling back to kill-pane (default 30).
 #
@@ -41,7 +41,7 @@
 set -euo pipefail
 
 session=reaped
-grace=86400
+grace=10800
 grace_set=
 term_wait=30
 mode=reap
