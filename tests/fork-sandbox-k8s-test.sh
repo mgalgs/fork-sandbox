@@ -217,7 +217,8 @@
 #     the rendered ConfigMap while its executable sibling does; the total
 #     ConfigMap payload is capped at 900 KiB, refusing and naming the
 #     biggest file over that; the checksum/pm-config annotation changes
-#     when fleet.yaml's content changes; and the git deploy key and known
+#     when fleet.yaml's content changes, but not when only a persona's
+#     does (personas apply live); and the git deploy key and known
 #     hosts file content never appear in the command's stdout or stderr --
 #     only the placeholder "not shown" line does. The plain (non-
 #     --postmaster) install stays byte-identical, pinned against a fixture
@@ -20166,6 +20167,17 @@ if [[ -n "$pm_sum1" && -n "$pm_sum2" && "$pm_sum1" != "$pm_sum2" ]]; then
     ok "checksum/pm-config changes when fleet.yaml changes"
 else
     no "checksum/pm-config changes when fleet.yaml changes" "sum1=$pm_sum1 sum2=$pm_sum2"
+fi
+
+# 11b. ...but not when only a persona's content changes: personas apply live.
+printf 'Revised standing instructions.\n' > "$pm_cfg_fleet/personas/beta.md"
+pm_log_fleet3="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_fleet3")")
+pm_sum3="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_fleet3" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_fleet" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null | grep -o 'checksum/pm-config: "[a-f0-9]*"')"
+if [[ -n "$pm_sum2" && "$pm_sum3" == "$pm_sum2" ]]; then
+    ok "checksum/pm-config ignores a persona-only change"
+else
+    no "checksum/pm-config ignores a persona-only change" "sum2=$pm_sum2 sum3=$pm_sum3"
 fi
 
 # 12. The Secret's key file content never appears in stdout or stderr.
