@@ -20466,6 +20466,26 @@ check "a handler seat whose command is in \$config_dir/handlers installs" "0" "$
 pm_api_install "$pm_cfg_pin" FORK_SANDBOX_HANDLERS_DIR="$pm_empty_dir" FORK_SANDBOX_PRESETS_DIR="$pm_empty_dir"
 check "a caller env pointing handlers/presets elsewhere does not change the result" "0" "$pm_api_rc"
 
+# A seat's protocol file is checked against $config_dir/prompts, the dir
+# install ships as the prompts ConfigMap, never the caller's own
+# FORK_SANDBOX_PROMPTS_DIR.
+pm_cfg_proto="$(pm_api_cfg)"
+printf 'agents:\n  alpha: {harness: pi, backend: k8s, protocol: reviewer}\n' > "$pm_cfg_proto/fleet.yaml"
+pm_proto_elsewhere="$(newdir)"; tmpdirs+=("$pm_proto_elsewhere")
+printf '\nShared protocol text.\n' > "$pm_proto_elsewhere/protocol-reviewer.md"
+pm_api_refused "a protocol file missing from \$config_dir/prompts refuses install --postmaster" \
+    "would crash-loop on this fleet" "$pm_cfg_proto"
+check "... naming the seat and the missing path" "1" \
+    "$(grep -c "agents.alpha.protocol: protocol file '$pm_cfg_proto/prompts/protocol-reviewer.md'" <<< "$pm_api_err")"
+pm_api_refused "a caller env holding the protocol file does not satisfy install" \
+    "$pm_cfg_proto/prompts/protocol-reviewer.md" "$pm_cfg_proto" \
+    FORK_SANDBOX_PROMPTS_DIR="$pm_proto_elsewhere"
+mkdir -p "$pm_cfg_proto/prompts"
+cp "$pm_proto_elsewhere/protocol-reviewer.md" "$pm_cfg_proto/prompts/"
+pm_api_install "$pm_cfg_proto" FORK_SANDBOX_PROMPTS_DIR="$pm_empty_dir"
+check "the protocol file in \$config_dir/prompts installs, whatever the caller's env" "0" "$pm_api_rc"
+check "... and ships in the prompts ConfigMap" "1" "$(grep -c '^  protocol-reviewer.md: ' <<< "$pm_api_out")"
+
 # 14f-bis. FORK_SANDBOX_FLEET_FILE / FORK_SANDBOX_PERSONAS_DIR: unlike
 # handlers/presets above, these two DO take their fleet file and personas
 # dir from the caller's env when set, so a site can keep them in a repo

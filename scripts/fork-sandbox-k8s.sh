@@ -4173,9 +4173,11 @@ cmd_install() {
         fi
         # The check the pod runs at startup, against the fleet file and
         # personas dir this install will ship (resolved above), and the
-        # handlers/presets dirs pinned to $config_dir rather than whatever
-        # FORK_SANDBOX_*_DIR the caller's shell exports otherwise: it must
-        # see what the pod will see. FORK_SANDBOX_CLUSTER_CLAUDE mirrors the
+        # handlers/presets/prompts dirs pinned to $config_dir rather than
+        # whatever FORK_SANDBOX_*_DIR the caller's shell exports otherwise:
+        # it must see what the pod will see. prompts is where a seat's
+        # `protocol:` file lives, so a missing one fails here, before
+        # anything is applied. FORK_SANDBOX_CLUSTER_CLAUDE mirrors the
         # env var the manifest sets on the postmaster container (below) when
         # a claude credential is being shipped, so this gate and the pod's
         # own `deliver --cluster` startup check agree on whether claude
@@ -4185,6 +4187,7 @@ cmd_install() {
             FORK_SANDBOX_PERSONAS_DIR="$pm_personas_dir"
             FORK_SANDBOX_HANDLERS_DIR="$config_dir/handlers"
             FORK_SANDBOX_PRESETS_DIR="$config_dir/presets"
+            FORK_SANDBOX_PROMPTS_DIR="$config_dir/prompts"
         )
         if $pm_have_claude; then
             pm_fleet_env+=(FORK_SANDBOX_CLUSTER_CLAUDE=1)
