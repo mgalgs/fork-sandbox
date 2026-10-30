@@ -638,6 +638,71 @@ else
     done
 fi
 
+printf '\n== a second signal during the emergency cleanup cannot cut it short ==\n'
+# claude-sandboxed's cleanup, a supervisor or an impatient operator can
+# signal the live-sync loop again while its EXIT trap is still waiting on the
+# refresh child. Killed there, the trap never merges the token claude may
+# just have rotated, and leaves the scratch dir (holding the real refresh
+# token) and both lock dirs behind. Hold the cleanup in its wait on a slow
+# stub, confirmed by its own "stopping with ..." line, then signal again.
+for second_sig in TERM HUP; do
+    resig_dir="$work/resig-$second_sig"; mkdir -p "$resig_dir"
+    resig_cred="$resig_dir/credentials.json"
+    write_cred "$resig_cred" 10
+    resig_lock1="$resig_dir/.oauth_refresh.lock"
+    resig_lock2="$(realpath -m "$resig_dir").lock"
+    resig_err="$work/resig-$second_sig.err"
+    before_scratch="$(count_refresh_scratch_dirs)"
+    (
+        set -e
+        trap '_fs_claude_refresh_emergency_cleanup "$resig_lock1" "$resig_lock2"' EXIT
+        STUB_MODE=sleep STUB_SLEEP_SECS=5 STUB_SLEEP_THEN_SUCCEED=1 \
+            fs_claude_refresh_if_needed "$resig_cred" "$stub"
+    ) 2>"$resig_err" &
+    resig_pid=$!
+    sleep 1.5
+    kill -TERM "$resig_pid" 2>/dev/null
+    for _ in $(seq 1 30); do
+        grep -q "stopping with a host token refresh still running" "$resig_err" 2>/dev/null && break
+        sleep 0.1
+    done
+    if grep -q "stopping with a host token refresh still running" "$resig_err" 2>/dev/null; then
+        ok "the first TERM puts the cleanup in its wait on the refresh child (then $second_sig)"
+    else
+        no "the first TERM puts the cleanup in its wait on the refresh child (then $second_sig)" "$(cat "$resig_err")"
+    fi
+    sleep 0.5
+    kill "-$second_sig" "$resig_pid" 2>/dev/null
+    wait "$resig_pid" 2>/dev/null
+    # On failure the stub outlives its killed parent; let it finish so what
+    # it leaves behind is the state a real run would be left in.
+    for _ in $(seq 1 60); do
+        pgrep -f "$stub" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    resig_at="$(jq -r '.claudeAiOauth.accessToken' "$resig_cred" 2>/dev/null)"
+    if [[ "$resig_at" == stub-new-access-* ]]; then
+        ok "a $second_sig during the cleanup still lets it merge the rotated token"
+    else
+        no "a $second_sig during the cleanup still lets it merge the rotated token" "accessToken is '$resig_at'"
+    fi
+    if [[ ! -d "$resig_lock1" && ! -d "$resig_lock2" ]]; then
+        ok "a $second_sig during the cleanup still lets it release both lock dirs"
+    else
+        no "a $second_sig during the cleanup still lets it release both lock dirs" "a lock dir is still present"
+        rmdir "$resig_lock1" "$resig_lock2" 2>/dev/null || true
+    fi
+    if [[ "$(count_refresh_scratch_dirs)" == "$before_scratch" ]]; then
+        ok "a $second_sig during the cleanup still lets it remove the scratch dir"
+    else
+        no "a $second_sig during the cleanup still lets it remove the scratch dir" "count changed"
+        for d in /var/tmp/claude-scratch/forks/claude-fork-token-refresh.*; do
+            [[ -d "$d" ]] && jq -e '.claudeAiOauth.accessToken | startswith("stub-new-")' "$d/.credentials.json" >/dev/null 2>&1 \
+                && rm -rf -- "$d"
+        done
+    fi
+done
+
 echo
 echo '=== fork-sandbox-claude-token-probe ==='
 

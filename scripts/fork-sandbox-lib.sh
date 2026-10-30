@@ -2370,8 +2370,13 @@ _fs_claude_refresh_emergency_cleanup() {
     # that is already exiting, so dropping errexit for good costs nothing.
     # Likewise SIGPIPE: the lines below go to whatever stderr is left, and a
     # reader that is already gone must cost a line, not the cleanup itself.
+    # And a second TERM, HUP or INT -- claude-sandboxed's cleanup, a
+    # supervisor or an operator signalling again while this still waits on
+    # the child -- must not cut it short either: killed here, it leaves the
+    # scratch dir with the real refresh token in it, both lock dirs, and
+    # possibly a rotated token never merged. Once started, it runs to the end.
     set +e
-    trap '' PIPE
+    trap '' PIPE TERM HUP INT
     # Wait, never kill: the child may already have rotated the single-use
     # refresh token, and killing it can lose the only live copy. timeout's
     # own --kill-after bounds the wait (see _fs_claude_do_refresh).
