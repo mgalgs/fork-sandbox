@@ -1448,7 +1448,7 @@ K8S_QUOTA_LIMITS_MEMORY="${K8S_QUOTA_LIMITS_MEMORY:-40Gi}"
 # Optional explicit resources for the container that runs the legs (see the
 # header table). CPU/memory unset fields use the LimitRange defaults. Storage
 # requests default to 1Gi only when neither storage key is set; 0 disables
-# the rendered request. Validated below by k8s_validate_agent_resources.
+# the rendered request. Validated below by k8s_validate_resources.
 K8S_AGENT_REQUESTS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_CPU || true)"
 K8S_AGENT_REQUESTS_MEMORY="$(read_env_value "$k8s_env" K8S_AGENT_REQUESTS_MEMORY || true)"
 K8S_AGENT_LIMITS_CPU="$(read_env_value "$k8s_env" K8S_AGENT_LIMITS_CPU || true)"
@@ -1498,6 +1498,18 @@ K8S_POSTMASTER_STORAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_STORAGE || tr
 K8S_POSTMASTER_STORAGE="${K8S_POSTMASTER_STORAGE:-20Gi}"
 K8S_POSTMASTER_MAIL_STORAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_MAIL_STORAGE || true)"
 K8S_POSTMASTER_MAIL_STORAGE="${K8S_POSTMASTER_MAIL_STORAGE:-2Gi}"
+# The postmaster container's own requests and limits (not the mail-api
+# container's). Each defaults to the value the manifest carried before these
+# keys existed, so a k8s.env that sets none renders the same Deployment and
+# an upgrade does not roll the pod. Validated by k8s_validate_resources.
+K8S_POSTMASTER_REQUESTS_CPU="$(read_env_value "$k8s_env" K8S_POSTMASTER_REQUESTS_CPU || true)"
+K8S_POSTMASTER_REQUESTS_CPU="${K8S_POSTMASTER_REQUESTS_CPU:-250m}"
+K8S_POSTMASTER_REQUESTS_MEMORY="$(read_env_value "$k8s_env" K8S_POSTMASTER_REQUESTS_MEMORY || true)"
+K8S_POSTMASTER_REQUESTS_MEMORY="${K8S_POSTMASTER_REQUESTS_MEMORY:-512Mi}"
+K8S_POSTMASTER_LIMITS_CPU="$(read_env_value "$k8s_env" K8S_POSTMASTER_LIMITS_CPU || true)"
+K8S_POSTMASTER_LIMITS_CPU="${K8S_POSTMASTER_LIMITS_CPU:-1}"
+K8S_POSTMASTER_LIMITS_MEMORY="$(read_env_value "$k8s_env" K8S_POSTMASTER_LIMITS_MEMORY || true)"
+K8S_POSTMASTER_LIMITS_MEMORY="${K8S_POSTMASTER_LIMITS_MEMORY:-1Gi}"
 K8S_POSTMASTER_ACCESS_MODE="$(read_env_value "$k8s_env" K8S_POSTMASTER_ACCESS_MODE || true)"
 K8S_POSTMASTER_ACCESS_MODE="${K8S_POSTMASTER_ACCESS_MODE:-ReadWriteOncePod}"
 K8S_POSTMASTER_SEAT_SERVICES="$(read_env_value "$k8s_env" K8S_POSTMASTER_SEAT_SERVICES || true)"
@@ -1557,17 +1569,34 @@ k8s_quantity_value() {
     }'
 }
 
-# Validates K8S_AGENT_{REQUESTS,LIMITS}_{CPU,MEMORY,EPHEMERAL_STORAGE}, shape and
-# ordering checks, before anything is rendered or applied. Each value lands
-# in a YAML manifest with no quoting of its own, so the anchored shape check
-# is also what keeps a value from injecting YAML.
-k8s_validate_agent_resources() {
+# A validated quantity as a YAML scalar: quoted when YAML would read it as a
+# number (4, 0.5, 1073741824), bare otherwise (500m, 1Gi). Kubernetes takes
+# either, but the bare forms are what the postmaster manifest has always
+# carried, so its defaults (250m, "1", 512Mi, 1Gi) render byte-for-byte as
+# they did before they were configurable.
+k8s_yaml_quantity() {
+    if [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        printf '"%s"' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Validates PREFIX_{REQUESTS,LIMITS}_KIND for each KIND given (cpu, memory,
+# ephemeral_storage), shape and ordering checks, before anything is rendered
+# or applied: K8S_AGENT_* for the run pods, K8S_POSTMASTER_* for the
+# postmaster container. Each value lands in a YAML manifest with no quoting
+# of its own, so the anchored shape check is also what keeps a value from
+# injecting YAML.
+#   k8s_validate_resources PREFIX KIND...
+k8s_validate_resources() {
+    local prefix="$1"; shift
     local kind key val what max_val def_val
-    for kind in cpu memory ephemeral_storage; do
-        for key in "K8S_AGENT_REQUESTS_${kind^^}" "K8S_AGENT_LIMITS_${kind^^}"; do
+    for kind in "$@"; do
+        for key in "${prefix}_REQUESTS_${kind^^}" "${prefix}_LIMITS_${kind^^}"; do
             val="${!key}"
             [[ -z "$val" ]] && continue
-            if [[ "$key" == K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE && "$val" == 0 ]]; then
+            if [[ "$key" == "${prefix}_REQUESTS_EPHEMERAL_STORAGE" && "$val" == 0 ]]; then
                 continue
             fi
             if [[ "$kind" == cpu ]]; then
@@ -1581,7 +1610,7 @@ k8s_validate_agent_resources() {
                 exit 1
             fi
         done
-        local req_key="K8S_AGENT_REQUESTS_${kind^^}" lim_key="K8S_AGENT_LIMITS_${kind^^}"
+        local req_key="${prefix}_REQUESTS_${kind^^}" lim_key="${prefix}_LIMITS_${kind^^}"
         local req="${!req_key}" lim="${!lim_key}" req_n lim_n
         if [[ "$kind" == cpu ]]; then
             max_val="$K8S_LIMITRANGE_MAX_CPU"; def_val="$K8S_LIMITRANGE_DEFAULT_CPU"
@@ -1729,7 +1758,8 @@ if [[ "${1-}" != check-grant && ! "$K8S_QUOTA_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]];
     exit 1
 fi
 if [[ "${1-}" != check-grant ]]; then
-    k8s_validate_agent_resources
+    k8s_validate_resources K8S_AGENT cpu memory ephemeral_storage
+    k8s_validate_resources K8S_POSTMASTER cpu memory
     local_priority_class_re='^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
     if [[ -n "$K8S_AGENT_PRIORITY_CLASS" ]] && { (( ${#K8S_AGENT_PRIORITY_CLASS} > 253 )) || [[ ! "$K8S_AGENT_PRIORITY_CLASS" =~ $local_priority_class_re ]]; }; then
         echo "Error: K8S_AGENT_PRIORITY_CLASS must be a DNS-1123 subdomain." >&2
@@ -1761,6 +1791,8 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
         "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
         "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_MAIL_STORAGE" \
+        "$K8S_POSTMASTER_REQUESTS_CPU" "$K8S_POSTMASTER_REQUESTS_MEMORY" \
+        "$K8S_POSTMASTER_LIMITS_CPU" "$K8S_POSTMASTER_LIMITS_MEMORY" \
         "$K8S_POSTMASTER_ACCESS_MODE" \
         "$K8S_POSTMASTER_OPERATORS" "$K8S_POSTMASTER_HOOKS_SECRET" \
         "$K8S_MAIL_API_TOKENS_FILE" "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
@@ -4992,6 +5024,10 @@ cmd_install() {
             -e "s|__PM_ACCESS_MODE__|$K8S_POSTMASTER_ACCESS_MODE|g" \
             -e "s|__PM_STORAGE__|$K8S_POSTMASTER_STORAGE|g" \
             -e "s|__PM_MAIL_STORAGE__|$K8S_POSTMASTER_MAIL_STORAGE|g" \
+            -e "s|__PM_REQUESTS_CPU__|$(k8s_yaml_quantity "$K8S_POSTMASTER_REQUESTS_CPU")|g" \
+            -e "s|__PM_REQUESTS_MEMORY__|$(k8s_yaml_quantity "$K8S_POSTMASTER_REQUESTS_MEMORY")|g" \
+            -e "s|__PM_LIMITS_CPU__|$(k8s_yaml_quantity "$K8S_POSTMASTER_LIMITS_CPU")|g" \
+            -e "s|__PM_LIMITS_MEMORY__|$(k8s_yaml_quantity "$K8S_POSTMASTER_LIMITS_MEMORY")|g" \
             -e "s|__PM_CONFIG_CHECKSUM__|$pm_config_checksum|g" \
             -e "s|__PM_OPERATORS__|$K8S_POSTMASTER_OPERATORS|g" \
             -e "s|__PM_CLAUDE_POOL__|$pm_claude_pool_value|g" \
@@ -7512,7 +7548,7 @@ cmd_submit() {
     # This run's --agent-resources: each key given becomes both the request
     # and the limit, over k8s.env's values for this run only, for
     # k8s_agent_resources_yaml to render. The top-level
-    # k8s_validate_agent_resources pass is not re-run: a key set here has
+    # k8s_validate_resources pass is not re-run: a key set here has
     # request = limit <= the LimitRange max (k8s_parse_resources_spec), and
     # a key not given keeps the k8s.env pair that pass already checked.
     if [[ "$agent_resources_given" == true ]]; then

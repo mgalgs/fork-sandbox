@@ -6,6 +6,8 @@
 # K8S_POSTMASTER_* keys in k8s.env (K8S_POSTMASTER_IMAGE,
 # K8S_POSTMASTER_ACCESS_MODE, K8S_POSTMASTER_STORAGE,
 # K8S_POSTMASTER_MAIL_STORAGE, K8S_POSTMASTER_STORAGE_CLASS,
+# K8S_POSTMASTER_{REQUESTS,LIMITS}_{CPU,MEMORY} (the postmaster container's
+# resources; numeric values are quoted by install, so cpu: "4" stays a string),
 # K8S_POSTMASTER_OPERATORS,
 # K8S_POSTMASTER_HOOKS_SECRET, and a sha256
 # install computes over the rendered ConfigMaps and Secrets), one token per
@@ -16,6 +18,10 @@
 #   __PM_ACCESS_MODE__
 #   __PM_STORAGE__
 #   __PM_MAIL_STORAGE__
+#   __PM_REQUESTS_CPU__
+#   __PM_REQUESTS_MEMORY__
+#   __PM_LIMITS_CPU__
+#   __PM_LIMITS_MEMORY__
 #   __PM_STORAGE_CLASS__
 #   __PM_CONFIG_CHECKSUM__
 #   __PM_OPERATORS__
@@ -246,11 +252,11 @@ spec:
               drop: ["ALL"]
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
+              cpu: __PM_REQUESTS_CPU__
+              memory: __PM_REQUESTS_MEMORY__
             limits:
-              cpu: "1"
-              memory: 1Gi
+              cpu: __PM_LIMITS_CPU__
+              memory: __PM_LIMITS_MEMORY__
           # No subPath: kubelet may create a missing subPath directory as
           # root, which a non-root pod cannot then write. The pod init
           # script makes the directories it needs on the volume root. The

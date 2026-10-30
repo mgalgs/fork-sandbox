@@ -20998,6 +20998,92 @@ env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_badmail_wd/log" FORK_SANDBOX_CON
 check "storage: a refused real install exits 1" "1" "$?"
 check "storage: a refused real install applies nothing" "0" "$(cat "$pm_badmail_wd/log" 2>/dev/null | grep -c 'apply')"
 
+printf '\n== install --postmaster: postmaster container resources ==\n'
+# K8S_POSTMASTER_{REQUESTS,LIMITS}_{CPU,MEMORY} size the postmaster container
+# only. Unset, the stanza must be the exact text the manifest carried before
+# the keys existed: the rendered Deployment feeds the rollout, so a changed
+# byte would restart every operator's postmaster on upgrade.
+
+# pm_res_block: the first `resources:` stanza in the Deployment (the
+# postmaster container's; the mail-api container's comes after it).
+pm_res_block() { awk '/^          resources:$/ && !n {n = 1; c = 7} c > 0 {print; c--}' <<< "$pm_api_out"; }
+pm_res_container() { pm_api_dep ".spec.template.spec.containers[] | select(.name == \"$1\") | .resources | [.requests.cpu, .requests.memory, .limits.cpu, .limits.memory] | join(\" \")"; }
+
+pm_res_default_cfg="$(pm_api_cfg)"
+pm_api_install "$pm_res_default_cfg"
+check "resources: no keys set renders today's postmaster stanza byte-for-byte" \
+    '          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi' \
+    "$(pm_res_block)"
+check "resources: the mail-api container keeps its own values" "50m 64Mi 500m 256Mi" \
+    "$(pm_res_container mail-api)"
+check "resources: no leftover __PM_ placeholder" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+pm_res_default_sum="$(pm_api_sum)"
+
+pm_res_all_cfg="$(pm_api_cfg K8S_POSTMASTER_REQUESTS_CPU=2 K8S_POSTMASTER_LIMITS_CPU=4 \
+    K8S_POSTMASTER_REQUESTS_MEMORY=1Gi K8S_POSTMASTER_LIMITS_MEMORY=3Gi)"
+pm_api_install "$pm_res_all_cfg"
+check "resources: all four keys render, numbers quoted as strings" \
+    '          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 3Gi' \
+    "$(pm_res_block)"
+check "resources: a bare-number cpu parses as a string, not an int" "string string" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "postmaster") | [.resources.requests.cpu, .resources.limits.cpu] | map(type) | join(" ")')"
+check "resources: the keys leave the mail-api container alone" "50m 64Mi 500m 256Mi" \
+    "$(pm_res_container mail-api)"
+check "resources: the keys do not touch the config checksum" "$pm_res_default_sum" "$(pm_api_sum)"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint - <<< "$pm_api_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: install --postmaster with the resource keys set"; else no "yamllint: install --postmaster with the resource keys set" "$out"; fi
+fi
+
+# Each key alone changes its own field; millicores and fractions render too.
+for pm_res_one in \
+    'K8S_POSTMASTER_REQUESTS_CPU=500m|500m 512Mi 1 1Gi' \
+    'K8S_POSTMASTER_LIMITS_CPU=1500m|250m 512Mi 1500m 1Gi' \
+    'K8S_POSTMASTER_LIMITS_CPU=2.5|250m 512Mi 2.5 1Gi' \
+    'K8S_POSTMASTER_REQUESTS_MEMORY=768Mi|250m 768Mi 1 1Gi' \
+    'K8S_POSTMASTER_LIMITS_MEMORY=2Gi|250m 512Mi 1 2Gi' \
+    'K8S_POSTMASTER_LIMITS_MEMORY=1.5Gi|250m 512Mi 1 1.5Gi' \
+    'K8S_POSTMASTER_LIMITS_CPU=|250m 512Mi 1 1Gi'; do
+    IFS='|' read -r pm_res_kv pm_res_want <<< "$pm_res_one"
+    pm_api_install "$(pm_api_cfg "$pm_res_kv")"
+    check "resources: $pm_res_kv renders $pm_res_want" "$pm_res_want" "$(pm_res_container postmaster)"
+done
+
+# Bad values are refused before any kubectl call, naming the key, with the
+# K8S_AGENT_* validator's own wording.
+pm_res_bad_cases=(
+    'K8S_POSTMASTER_REQUESTS_CPU=four|Error: K8S_POSTMASTER_REQUESTS_CPU in |a Kubernetes cpu quantity'
+    'K8S_POSTMASTER_LIMITS_CPU=2Gi|Error: K8S_POSTMASTER_LIMITS_CPU in |a Kubernetes cpu quantity'
+    'K8S_POSTMASTER_LIMITS_CPU=0|Error: K8S_POSTMASTER_LIMITS_CPU in |a Kubernetes cpu quantity'
+    'K8S_POSTMASTER_LIMITS_CPU=1: 2|Error: K8S_POSTMASTER_LIMITS_CPU in |a Kubernetes cpu quantity'
+    'K8S_POSTMASTER_REQUESTS_MEMORY=lots|Error: K8S_POSTMASTER_REQUESTS_MEMORY in |a Kubernetes memory quantity'
+    'K8S_POSTMASTER_LIMITS_MEMORY=2GB|Error: K8S_POSTMASTER_LIMITS_MEMORY in |a Kubernetes memory quantity'
+    'K8S_POSTMASTER_LIMITS_MEMORY=500m|Error: K8S_POSTMASTER_LIMITS_MEMORY in |a Kubernetes memory quantity'
+    'K8S_POSTMASTER_REQUESTS_CPU=2|Error: K8S_POSTMASTER_REQUESTS_CPU in |is above K8S_POSTMASTER_LIMITS_CPU'
+    'K8S_POSTMASTER_REQUESTS_MEMORY=2Gi|Error: K8S_POSTMASTER_REQUESTS_MEMORY in |is above K8S_POSTMASTER_LIMITS_MEMORY'
+    'K8S_POSTMASTER_LIMITS_CPU=5|Error: K8S_POSTMASTER_LIMITS_CPU in |above the namespace LimitRange max'
+    'K8S_POSTMASTER_LIMITS_MEMORY=9Gi|Error: K8S_POSTMASTER_LIMITS_MEMORY in |above the namespace LimitRange max'
+)
+for pm_res_bad in "${pm_res_bad_cases[@]}"; do
+    IFS='|' read -r pm_res_kv pm_res_key_needle pm_res_why <<< "$pm_res_bad"
+    pm_res_bad_cfg="$(pm_api_cfg "$pm_res_kv")"
+    pm_api_refused "resources: $pm_res_kv is refused, naming the key" "$pm_res_key_needle" "$pm_res_bad_cfg"
+    check "resources: $pm_res_kv: the error says why" "1" \
+        "$(grep -c -F -- "$pm_res_why" <<< "$pm_api_err" | sed 's/^[1-9][0-9]*$/1/')"
+done
+
 printf '\n== install --postmaster: team access (shared mail API token, Role, binding) ==\n'
 # Everything here runs against the kubectl stub above; K8S_STUB_STATE gives
 # it a team-token Secret that outlives one install, so "a second install
