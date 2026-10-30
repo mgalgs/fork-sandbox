@@ -1224,6 +1224,40 @@ drain_teardown_case() {
 FORK_SANDBOX_POSTMASTER_K8S_RETENTION=0 drain_teardown_case dead-reap
 FORK_SANDBOX_POSTMASTER_K8S_RETENTION=86400 drain_teardown_case retention
 
+# A shutdown signal also ends the pass in progress at its next stage: a
+# signal landing in the dead-reap stage must not let retention (the stage
+# after it) start, and the drain then proceeds. Retention writes its stamp
+# before it looks at a single run, so a missing stamp means it never ran;
+# nothing before this pass had run it either.
+drain_setup nohook
+printf 'INPUTS_PUSH_COMPLETE=true\n' >> "$DR_K8S_ENV"
+mkdir -p -- "$PM_STATE_DIR/k8s-dead-reap"
+dr_stage_rid="9999999999-stage-1"
+printf 'AGENT=tests\nBACKEND=k8s\nBRANCH=sbx-mail-0123abcd-tests-1\nRUN_DIR=%s\n' \
+    "$work/no-such-$dr_stage_rid" > "$PM_STATE_DIR/runs/$dr_stage_rid.env"
+: > "$PM_STATE_DIR/harvested/$dr_stage_rid"
+: > "$PM_STATE_DIR/k8s-dead-reap/$dr_stage_rid"
+rm -f -- "$K8S_WAKE_BIN/rm-calls.log" "$PM_STATE_DIR/k8s-retention-last"
+: > "$K8S_WAKE_BIN/rm-hold"
+FORK_SANDBOX_POSTMASTER_INTERVAL=1 FORK_SANDBOX_POSTMASTER_DRAIN_POLL=0.2 \
+    FORK_SANDBOX_POSTMASTER_DRAIN_TIMEOUT=60 FORK_SANDBOX_POSTMASTER_K8S_RETENTION=86400 \
+    FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY=0 \
+    "$postmaster" deliver --project "$PROJECT_DIR" > "$DR_LOG" 2>&1 &
+DR_PID=$!
+for _ in $(seq 1 100); do [[ -s "$K8S_WAKE_BIN/rm-calls.log" ]] && break; sleep 0.1; done
+check "drain mid-pass: the pass is held in the dead-reap stage when SIGTERM lands" 1 \
+    "$(wc -l < "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null || echo 0)"
+kill -TERM "$DR_PID"
+check "drain mid-pass: exits promptly" 0 "$(drain_alive_after 50)"
+wait "$DR_PID" 2>/dev/null || true
+check "drain mid-pass: the retention stage after it never ran" 0 \
+    "$( [[ -e "$PM_STATE_DIR/k8s-retention-last" ]] && echo 1 || echo 0 )"
+contains "drain mid-pass: the drain then proceeds" "$(cat "$DR_LOG")" "pm drain busy="
+check "drain mid-pass: ...and marks the live wake handed-off" 1 \
+    "$( [[ -e "$DR_WAKE_DIR/handed-off" ]] && echo 1 || echo 0 )"
+rm -f -- "$K8S_WAKE_BIN/rm-hold"
+drain_cleanup
+
 # The drain's events also go to $STATE/drain-record on the store, which
 # outlives the pod's stdout: start, each handed-off, done.
 drain_setup
