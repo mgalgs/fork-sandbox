@@ -71,6 +71,7 @@ Do these in order.
    | `K8S_POSTMASTER_STORAGE_CLASS` | no | `storageClassName` of both PVCs; empty (the default) omits the field, so the cluster's default StorageClass applies |
    | `K8S_POSTMASTER_STORAGE` | no | the data volume's requested size; default `20Gi`; must match `^[0-9]+(Mi\|Gi\|Ti)$` |
    | `K8S_POSTMASTER_MAIL_STORAGE` | no | the mail volume's requested size; default `2Gi`; same pattern as `K8S_POSTMASTER_STORAGE` |
+   | `K8S_POSTMASTER_REQUESTS_CPU`, `K8S_POSTMASTER_LIMITS_CPU`, `K8S_POSTMASTER_REQUESTS_MEMORY`, `K8S_POSTMASTER_LIMITS_MEMORY` | no | the postmaster container's requests and limits (not the mail API container's); defaults `250m`, `1`, `512Mi`, `1Gi`. Validated like `K8S_AGENT_REQUESTS_CPU` and its siblings: a malformed value, a request above its limit, or a limit above the namespace `LimitRange` max is refused before anything is applied. See "Capacity". |
    | `K8S_POSTMASTER_ACCESS_MODE` | no | access mode of both PVCs: `ReadWriteOncePod` (default) or `ReadWriteOnce`, for a StorageClass or CSI driver that does not support RWOP yet; anything else is refused |
    | `K8S_POSTMASTER_SEAT_SERVICES` | no | `true` (default) or `false` for k8s seat services; a seat's `services` value in `fleet.yaml` wins over this default. Other values are refused by `install --postmaster`. |
    | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
@@ -598,6 +599,23 @@ container of a fixed-skeleton seat and the `leg` container of a composed
 default. The postmaster pod carries the same `k8s.env`, so the keys apply to
 the seats it launches once `install --postmaster` has been re-run; see "The
 agent's container resources" in [kubernetes-runs.md](kubernetes-runs.md).
+
+The postmaster container itself defaults to a `250m` / `512Mi` request and
+a `1` / `1Gi` limit. A postmaster pinned at its cpu limit is CFS-throttled,
+and every seat wake waits on it; raise it with `K8S_POSTMASTER_LIMITS_CPU`
+(and `K8S_POSTMASTER_REQUESTS_CPU`, `_MEMORY` likewise), for example:
+
+```
+K8S_POSTMASTER_REQUESTS_CPU=1
+K8S_POSTMASTER_LIMITS_CPU=2
+```
+
+then re-run `install --postmaster`. A changed value rolls the pod; with none
+set the Deployment renders exactly as before the keys existed, so an upgrade
+does not. The limits count against the namespace quota's
+`K8S_QUOTA_LIMITS_CPU` / `K8S_QUOTA_LIMITS_MEMORY` (and the requests against
+`K8S_QUOTA_REQUESTS_*`), alongside every seat; install does not check that
+headroom, so raise the quota keys too if the namespace is near its limits.
 
 ## Storage
 

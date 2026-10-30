@@ -1051,6 +1051,18 @@
 #                         also accepted (for a StorageClass/CSI driver
 #                         that does not support RWOP yet). Any other value
 #                         is refused.
+#   K8S_POSTMASTER_REQUESTS_CPU=, K8S_POSTMASTER_LIMITS_CPU=,
+#   K8S_POSTMASTER_REQUESTS_MEMORY=, K8S_POSTMASTER_LIMITS_MEMORY=
+#                         the postmaster container's resource requests and
+#                         limits (the mail-api container's are fixed).
+#                         Optional; default to 250m, 1, 512Mi and 1Gi, the
+#                         values the manifest has always carried, so with
+#                         none set the Deployment renders unchanged and an
+#                         upgrade does not roll the pod. Validated exactly
+#                         as the K8S_AGENT_* keys are (shape, request <=
+#                         limit, limit <= the LimitRange max), before
+#                         anything is applied. The limits count against
+#                         K8S_QUOTA_LIMITS_CPU / K8S_QUOTA_LIMITS_MEMORY.
 #   K8S_POSTMASTER_SEAT_SERVICES=
 #                         true (default) or false; fleet.yaml services overrides.
 #                         Any other value is refused by install --postmaster.
