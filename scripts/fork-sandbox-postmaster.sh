@@ -6297,7 +6297,7 @@ pm_harvest_pass() {
     mkdir -p -- "$RUNS" "$HARVESTED"
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
+        rid="${f##*/}"; rid="${rid%.env}"   # fork-free: once per record, ~5000 of them
         [[ -e "$HARVESTED/$rid" ]] && continue
         pm_harvest_run "$project" "$rid"
     done
@@ -6354,7 +6354,7 @@ pm_k8s_retention_pass() {
     local f rid branch harvested_at probe_rc tried=0
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
+        rid="${f##*/}"; rid="${rid%.env}"   # fork-free, as in pm_harvest_pass
         [[ "$rid" =~ $PM_WAKE_EXIT_ID_RE ]] || continue
         [[ -e "$HARVESTED/$rid" && ! -e "$reaped/$rid" ]] || continue
         [[ "$(fs_pm_env_get "$f" BACKEND)" == k8s ]] || continue
@@ -6406,7 +6406,7 @@ pm_k8s_dead_reap_pass() {
     local m rid f branch run_dir rc tried=0
     for m in "$dir"/*; do
         [[ -e "$m" ]] || continue
-        rid="$(basename -- "$m")"
+        rid="${m##*/}"   # fork-free, as in pm_harvest_pass
         f="$RUNS/$rid.env"
         if [[ ! "$rid" =~ $PM_WAKE_EXIT_ID_RE || ! -f "$f" ]]; then
             rm -f -- "$m"
