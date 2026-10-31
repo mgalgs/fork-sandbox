@@ -517,9 +517,35 @@ fs_pm_state_paths() {
 # first-match-wins and is its own copy for a different, unrelated surface
 # (fork-sandbox-configure's target table and the Kubernetes run path) — this
 # one is the postmaster's run-record format specifically.
+#
+# Fork-free (bash `read`, as pm_header): the postmaster reads thousands of
+# fields per pass, and the `sed | tail` this replaces cost two processes per
+# read. Byte-for-byte the old output: nothing for a missing file or key, the
+# value after the key's `=` (so a value may hold `=`), and a newline after
+# it unless the matching line was the file's unterminated last line.
 fs_pm_env_get() {
     [[ -f "$1" ]] || return 0
-    sed -n "s/^$2=//p" "$1" | tail -n1
+    local line="" val="" found=0 nl="" key="$2="
+    while IFS= read -r line; do
+        [[ "$line" == "$key"* ]] && { val="${line#"$key"}"; found=1; nl=$'\n'; }
+    done < "$1" || true
+    [[ "$line" == "$key"* ]] && { val="${line#"$key"}"; found=1; nl=""; }
+    (( found )) && printf '%s%s' "$val" "$nl"
+    return 0
+}
+
+# fs_pm_env_read <var> <file> <key>: fs_pm_env_get's value into variable
+# <var> (empty when there is none), so a hot loop needs no command
+# substitution -- a subshell per read -- either.
+fs_pm_env_read() {
+    local _fs_l="" _fs_v="" _fs_k="$3="
+    if [[ -f "$2" ]]; then
+        while IFS= read -r _fs_l; do
+            [[ "$_fs_l" == "$_fs_k"* ]] && _fs_v="${_fs_l#"$_fs_k"}"
+        done < "$2" || true
+        [[ "$_fs_l" == "$_fs_k"* ]] && _fs_v="${_fs_l#"$_fs_k"}"
+    fi
+    printf -v "$1" '%s' "$_fs_v"
 }
 
 # Prints a live run's id for (agent, tid) against $RUNS/$HARVESTED (set by
