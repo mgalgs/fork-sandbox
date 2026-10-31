@@ -450,6 +450,32 @@ latest_env_for_agent() {
 
 env_val() { sed -n "s/^$2=//p" "$1" | tail -n1; }
 
+# idx_check <label>: after a pass in which only the postmaster wrote the
+# store, its run index (see fork-sandbox-lib.sh) is still fresh -- every
+# spawn and harvest re-stamped it -- its live entries are exactly the
+# unharvested runs (no stale marker after a harvest), and every run has its
+# thread entry.
+idx_check() {
+    local label="$1" st="$FORK_SANDBOX_MAIL_ROOT/.postmaster" f rid want="" got="" missing=""
+    local idx="$st/run-index"
+    if [[ -f "$idx/complete" && ! "$st/runs" -nt "$idx/complete" && ! "$st/harvested" -nt "$idx/complete" ]]; then
+        ok "$label: run index still fresh"
+    else
+        no "$label: run index still fresh" "$(ls -la --time-style=full-iso "$st" "$idx" 2>&1)"
+    fi
+    for f in "$st/runs"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ -e "$st/harvested/$rid" ]] || want+="$rid "
+        [[ -e "$idx/thread/$(env_val "$f" THREAD)/$rid.env" ]] || missing+="$rid "
+    done
+    for f in "$idx/live"/*.env; do
+        [[ -e "$f" ]] && got+="$(basename -- "$f" .env) "
+    done
+    check "$label: live entries are exactly the unharvested runs" "$want" "$got"
+    check "$label: every run has its thread entry" "" "$missing"
+}
+
 # Ends the live run for $1: exit code $2, then a summary.json naming
 # session $3 (or carrying a null session_id when $3 is omitted) -- exit-code
 # before summary.json, matching fork-sandbox.sh's own write order (exit-code

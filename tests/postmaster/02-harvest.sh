@@ -43,6 +43,7 @@ short="${tid:0:8}"
 : > "$STUB_ARGV_LOG"
 once
 check "pending: first message spawns bob" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
+idx_check "pending: local spawn"
 
 run_env="$(env_file_for_agent bob)"
 check "pending: exactly one live run for bob" "1" "$( [[ -n "$run_env" ]] && echo 1 || echo 0 )"
@@ -64,6 +65,7 @@ once
 check "pending: harvest fires a follow-up wake for the pending message" 1 \
     "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
 contains "pending: follow-up wake's TRIGGER is the pending message" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env)" "TRIGGER=$mid2"
+idx_check "pending: local harvest, then a follow-up spawn"
 
 # ============================================================
 printf '\n== harvest: delivered-live mail suppresses the follow-up wake ==\n'

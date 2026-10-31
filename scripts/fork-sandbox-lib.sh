@@ -493,8 +493,8 @@ fs_lock_clone_dir() {
 # guards an rm -rf are exactly the kind that must not drift apart.
 
 # Sets the postmaster's on-disk state paths as globals: MAIL_ROOT, STATE,
-# LOCK_FILE, RUNS, HARVESTED, PM_SESSION_STATE, PM_SESSIONS, PM_WORKSPACES.
-# A caller with its own additional paths under STATE (fork-sandbox-postmaster.sh
+# LOCK_FILE, RUNS, HARVESTED, RUN_INDEX, PM_SESSION_STATE, PM_SESSIONS,
+# PM_WORKSPACES. A caller with its own additional paths under STATE (fork-sandbox-postmaster.sh
 # has several) sets those itself, after calling this.
 fs_pm_state_paths() {
     MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
@@ -503,6 +503,7 @@ fs_pm_state_paths() {
     LOCK_FILE="$STATE/lock"
     RUNS="$STATE/runs"
     HARVESTED="$STATE/harvested"
+    RUN_INDEX="$STATE/run-index"
     # shellcheck disable=SC2034  # written here, read by the sourcing scripts
     PM_SESSION_STATE="$STATE/state"
     # shellcheck disable=SC2034  # written here, read by the sourcing scripts
@@ -548,17 +549,180 @@ fs_pm_env_read() {
     printf -v "$1" '%s' "$_fs_v"
 }
 
-# Prints a live run's id for (agent, tid) against $RUNS/$HARVESTED (set by
-# fs_pm_state_paths) and returns 0, or returns 1.
-fs_pm_find_live_run() {
-    local agent="$1" tid="$2" f rid a t
+# ---- run index ----
+#
+# The run store ($RUNS/<rid>.env, one record per run, plus a
+# $HARVESTED/<rid> marker once a run is harvested) is never pruned, so a
+# walk of every record costs more with every day the postmaster lives. The
+# run index under $RUN_INDEX lets the hot paths read only the runs they
+# are asking about:
+#
+#   live/<rid>.env           one empty marker per unharvested run
+#   thread/<tid>/<rid>.env   one empty marker per run whose THREAD is <tid>
+#   complete                 the index's generation; present only once a
+#                            full build has finished
+#
+# Markers carry the record's own file name, so a glob of either directory
+# lists its runs in exactly the order a glob of $RUNS/*.env would.
+#
+# The index is derived data, never trusted on its own say-so. It counts
+# only while `complete` exists AND is no older than both $RUNS and
+# $HARVESTED (fs_pm_index_gen): adding, renaming or removing anything in
+# either directory bumps that directory's mtime, so a record or marker
+# written by anything that does not keep the index -- an older postmaster,
+# a hand edit, a test fixture -- leaves the index stale. The postmaster
+# rebuilds a stale or half-built index from a full scan at the top of every
+# pass, under its lock (fs_pm_index_ensure), and every write it makes to
+# either directory keeps the index current and re-stamps it
+# (fs_pm_index_hold / fs_pm_index_settle). A reader that finds no fresh
+# index, or one that was rebuilt or went stale while it read, answers from
+# the full scan instead, so the answer is the same either way. Entries are
+# added before the record they describe and removed after its harvested
+# marker, so a crash only ever leaves an extra entry, and readers check
+# every entry against the record and $HARVESTED before reporting it.
+#
+# Not covered: a foreign write landing between a postmaster write and its
+# re-stamp (one tick of the filesystem clock) goes unseen until the next
+# rebuild. Only the postmaster, under its lock, writes the store.
+
+# A <tid> the index can use as a directory name. Any other THREAD value has
+# no thread/ entry, and a lookup for one answers from the full scan.
+_fs_pm_index_key_ok() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._@+=-]{0,127}$ ]]
+}
+
+# fs_pm_index_gen <var>: sets <var> to the index's generation and returns 0
+# when the index is complete and fresh (see above); returns 1 otherwise.
+fs_pm_index_gen() {
+    local _fs_s="$RUN_INDEX/complete" _fs_g=""
+    [[ -f "$_fs_s" && ! "$RUNS" -nt "$_fs_s" && ! "$HARVESTED" -nt "$_fs_s" ]] || return 1
+    { IFS= read -r _fs_g < "$_fs_s"; } 2>/dev/null || true
+    [[ -n "$_fs_g" ]] || return 1
+    printf -v "$1" '%s' "$_fs_g"
+}
+
+# fs_pm_index_hold <var> before a write to $RUNS or $HARVESTED, then
+# fs_pm_index_settle "$<var>" after it (and after the index entries it
+# needs): re-stamps the index only if it was fresh before the write and
+# nothing rebuilt or invalidated it since.
+fs_pm_index_hold() {
+    fs_pm_index_gen "$1" || printf -v "$1" '%s' ""
+}
+
+fs_pm_index_settle() {
+    [[ -n "${1-}" ]] || return 0
+    local cur=""
+    { IFS= read -r cur < "$RUN_INDEX/complete"; } 2>/dev/null || return 0
+    [[ "$cur" == "$1" ]] || return 0
+    { printf '%s\n' "$1" > "$RUN_INDEX/complete"; } 2>/dev/null || fs_pm_index_invalidate
+}
+
+fs_pm_index_invalidate() {
+    rm -f -- "$RUN_INDEX/complete" 2>/dev/null || true
+}
+
+# fs_pm_index_add <rid> <tid> <live>: the entries for a run about to be
+# recorded (<live> 1 for an unharvested one). Called BEFORE the record is
+# written. A failed write invalidates the index rather than leave it
+# complete and missing a run.
+fs_pm_index_add() {
+    local rid="$1" tid="$2" live="$3" idx="$RUN_INDEX"
+    {
+        if (( live )); then
+            { [[ -d "$idx/live" ]] || mkdir -p -- "$idx/live"; } && : > "$idx/live/$rid.env"
+        fi &&
+        if _fs_pm_index_key_ok "$tid"; then
+            { [[ -d "$idx/thread/$tid" ]] || mkdir -p -- "$idx/thread/$tid"; } \
+                && : > "$idx/thread/$tid/$rid.env"
+        fi
+    } 2>/dev/null || fs_pm_index_invalidate
+}
+
+# fs_pm_index_unlive <rid>: drops a run's live/ entry. Called AFTER its
+# $HARVESTED marker is written.
+fs_pm_index_unlive() {
+    [[ -e "$RUN_INDEX/live/$1.env" ]] || return 0
+    rm -f -- "$RUN_INDEX/live/$1.env" 2>/dev/null || fs_pm_index_invalidate
+}
+
+# Rebuilds the index from a full scan of the store. The postmaster's lock
+# must be held. `complete` is removed first and its successor is written
+# BEFORE the scan and only renamed into place after it, so a crash
+# mid-build leaves no `complete` (the next pass rebuilds), and a record
+# written while the scan ran is newer than the stamp (the index is stale
+# at once, never complete without it).
+fs_pm_index_rebuild() {
+    local idx="$RUN_INDEX" gen f rid t
+    mkdir -p -- "$RUNS" "$HARVESTED" "$idx" || return 1
+    fs_pm_index_invalidate
+    rm -rf -- "$idx/live" "$idx/thread" "$idx/complete.new" || return 1
+    mkdir -p -- "$idx/live" "$idx/thread" || return 1
+    gen="${EPOCHREALTIME:-$SECONDS}.$$.$RANDOM$RANDOM"
+    printf '%s\n' "$gen" > "$idx/complete.new" || return 1
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
-        [[ -e "$HARVESTED/$rid" ]] && continue
-        a="$(fs_pm_env_get "$f" AGENT)"
-        t="$(fs_pm_env_get "$f" THREAD)"
-        if [[ "$a" == "$agent" && "$t" == "$tid" ]]; then
+        rid="${f##*/}"; rid="${rid%.env}"
+        if [[ ! -e "$HARVESTED/$rid" ]]; then
+            : > "$idx/live/$rid.env" || return 1
+        fi
+        fs_pm_env_read t "$f" THREAD
+        if _fs_pm_index_key_ok "$t"; then
+            [[ -d "$idx/thread/$t" ]] || mkdir -- "$idx/thread/$t" || return 1
+            : > "$idx/thread/$t/$rid.env" || return 1
+        fi
+    done
+    mv -f -- "$idx/complete.new" "$idx/complete"
+}
+
+# Rebuilds the index unless it is already complete and fresh. The
+# postmaster's lock must be held. A failed rebuild is not an error: every
+# reader then answers from the full scan.
+fs_pm_index_ensure() {
+    local gen
+    fs_pm_index_gen gen && return 0
+    fs_pm_index_rebuild 2>/dev/null || fs_pm_index_invalidate
+    return 0
+}
+
+# fs_pm_thread_runs <array> <tid> [live]: fills <array> with the id of
+# every run whose record says THREAD=<tid>, in $RUNS/*.env glob order;
+# with `live`, only the unharvested ones.
+fs_pm_thread_runs() {
+    local -n _fs_tr_out="$1"
+    local tid="$2" only_live="${3:-}" g1 g2 f rid t
+    _fs_tr_out=()
+    if _fs_pm_index_key_ok "$tid" && fs_pm_index_gen g1; then
+        for f in "$RUN_INDEX/thread/$tid"/*.env; do
+            [[ -e "$f" ]] || continue
+            rid="${f##*/}"; rid="${rid%.env}"
+            [[ -e "$RUNS/$rid.env" ]] || continue
+            [[ -n "$only_live" && -e "$HARVESTED/$rid" ]] && continue
+            fs_pm_env_read t "$RUNS/$rid.env" THREAD
+            [[ "$t" == "$tid" ]] && _fs_tr_out+=("$rid")
+        done
+        fs_pm_index_gen g2 && [[ "$g2" == "$g1" ]] && return 0
+        _fs_tr_out=()
+    fi
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="${f##*/}"; rid="${rid%.env}"
+        [[ -n "$only_live" && -e "$HARVESTED/$rid" ]] && continue
+        fs_pm_env_read t "$f" THREAD
+        [[ "$t" == "$tid" ]] && _fs_tr_out+=("$rid")
+    done
+    return 0
+}
+
+# Prints a live run's id for (agent, tid) against $RUNS/$HARVESTED (set by
+# fs_pm_state_paths) and returns 0, or returns 1. The first such run in
+# $RUNS/*.env glob order, read off the run index when it is fresh.
+fs_pm_find_live_run() {
+    local agent="$1" tid="$2" rid a
+    local -a _fs_fl_rids
+    fs_pm_thread_runs _fs_fl_rids "$tid" live
+    for rid in "${_fs_fl_rids[@]}"; do
+        fs_pm_env_read a "$RUNS/$rid.env" AGENT
+        if [[ "$a" == "$agent" ]]; then
             printf '%s' "$rid"
             return 0
         fi

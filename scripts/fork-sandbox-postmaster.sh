@@ -1058,6 +1058,15 @@
 #                                   harvested (or found malformed) --
 #                                   nothing here outlives its own wake
 #   harvested/<run-id>             marker: this run's outbox is collected
+#   run-index/                     derived from runs/ and harvested/: a
+#                                   live/<run-id>.env marker per unharvested
+#                                   run, thread/<thread-id>/<run-id>.env per
+#                                   run, and `complete`, the stamp of a
+#                                   finished build. The hot paths read it
+#                                   instead of every record; it is trusted
+#                                   only while fresh, rebuilt each pass when
+#                                   not, and safe to delete -- see the run
+#                                   index in fork-sandbox-lib.sh
 #   delivered-live/<thread-id>     one line per message rule 4 confirmed
 #                                   was delivered live at harvest (agent,
 #                                   message-id, run-id) -- an audit trail
@@ -3235,7 +3244,10 @@ INSTR
 # half-written file. value is an id list or a counter -- never text that
 # needs sed escaping.
 pm_run_env_set() {
-    local f="$1" key="$2" value="$3" tmp
+    local f="$1" key="$2" value="$3" tmp ig
+    # The rename bumps $RUNS's mtime: re-stamp the run index after it (see
+    # the run index in fork-sandbox-lib.sh).
+    fs_pm_index_hold ig
     tmp="$(mktemp "$(dirname -- "$f")/.tmp.XXXXXX")"
     if grep -q "^$key=" "$f"; then
         sed "s/^$key=.*/$key=$value/" "$f" > "$tmp"
@@ -3243,6 +3255,27 @@ pm_run_env_set() {
         { cat -- "$f"; printf '%s=%s\n' "$key" "$value"; } > "$tmp"
     fi
     mv -- "$tmp" "$f"
+    fs_pm_index_settle "$ig"
+}
+
+# pm_run_record_begin <var> <rid> <tid>, just before a spawn writes run
+# <rid>'s record: holds the run index (see fork-sandbox-lib.sh) into <var>
+# and adds the run's entries. The caller writes the record, then
+# `fs_pm_index_settle "$<var>"`.
+pm_run_record_begin() {
+    fs_pm_index_hold "$1"
+    fs_pm_index_add "$2" "$3" 1
+}
+
+# Writes run <rid>'s $HARVESTED marker: from here on no reader counts it
+# live. Drops its live entry from the run index after the marker.
+pm_mark_harvested() {
+    local rid="$1" ig
+    mkdir -p -- "$HARVESTED"
+    fs_pm_index_hold ig
+    : > "$HARVESTED/$rid"
+    fs_pm_index_unlive "$rid"
+    fs_pm_index_settle "$ig"
 }
 
 # Succeeds when <sha> is a commit in the project repo, fetching <branch>
@@ -3962,6 +3995,8 @@ pm_exec_wake() {
     rm -rf -- "$outbox"
 
     mkdir -p -- "$RUNS"
+    local ig
+    pm_run_record_begin ig "$run_id" "$tid"
     {
         printf 'AGENT=%s\n' "$agent"
         printf 'THREAD=%s\n' "$tid"
@@ -3972,8 +4007,8 @@ pm_exec_wake() {
     } > "$RUNS/$run_id.env"
     pm_harvest_record "$RUNS/$run_id.env" "$(( rc == 0 ))" "$replies" "$reply_files"
 
-    mkdir -p -- "$HARVESTED"
-    : > "$HARVESTED/$run_id"
+    pm_mark_harvested "$run_id"
+    fs_pm_index_settle "$ig"
 
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
@@ -4571,6 +4606,8 @@ pm_spawn_wake() {
         fi
 
         mkdir -p -- "$RUNS"
+        local ig
+        pm_run_record_begin ig "$run_id" "$tid"
         {
             printf 'AGENT=%s\n' "$agent"
             printf 'THREAD=%s\n' "$tid"
@@ -4595,6 +4632,7 @@ pm_spawn_wake() {
                 printf 'REVIEW_TARGET_VERSION=%s\n' "$rt_version"
             fi
         } > "$RUNS/$run_id.env"
+        fs_pm_index_settle "$ig"
         mkdir -p -- "$SPAWNS" "$SEQ"
         printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
         pm_seat_records_clear "$tid" "$agent"
@@ -4690,6 +4728,8 @@ pm_spawn_wake() {
     fi
 
     mkdir -p -- "$RUNS"
+    local ig
+    pm_run_record_begin ig "$run_id" "$tid"
     {
         printf 'AGENT=%s\n' "$agent"
         printf 'THREAD=%s\n' "$tid"
@@ -4714,6 +4754,7 @@ pm_spawn_wake() {
             printf 'REVIEW_TARGET_VERSION=%s\n' "$rt_version"
         fi
     } > "$RUNS/$run_id.env"
+    fs_pm_index_settle "$ig"
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
     pm_seat_records_clear "$tid" "$agent"
@@ -6047,8 +6088,7 @@ pm_harvest_run() {
         # run dir that just vanished -- it is unaffected, so it is left
         # standing rather than cleared on evidence this branch never had.
         pm_harvest_record "$f" 0 0 0
-        mkdir -p -- "$HARVESTED"
-        : > "$HARVESTED/$rid"
+        pm_mark_harvested "$rid"
         pm_regate_deferred "$project" "$tid" "$rid"
         return 0
     fi
@@ -6231,8 +6271,7 @@ pm_harvest_run() {
     # `status --json` and must see this run as harvested with its count.
     pm_harvest_record "$f" "$clean_exit" "$replies" "$reply_files"
 
-    mkdir -p -- "$HARVESTED"
-    : > "$HARVESTED/$rid"
+    pm_mark_harvested "$rid"
 
     # The wedge bound: only a RESUMED wake's failure counts (a wake that
     # never resumed anything has no session for clearing to help), and 3
@@ -7125,6 +7164,7 @@ cmd_deliver() {
     printf '%s\n' "$project" > "$STATE/project"
 
     if (( once )); then
+        fs_pm_index_ensure
         pm_hook_reap
         pm_route_pass "$project"
         pm_held_pass "$project"
@@ -7150,6 +7190,7 @@ cmd_deliver() {
     # each stage is whole on its own and the next process runs them all
     # again, while the drain's marks must land inside the grace period.
     while (( ! stop )); do
+        fs_pm_index_ensure
         pm_hook_reap
         pm_route_pass "$project"
         (( stop )) || pm_held_pass "$project"

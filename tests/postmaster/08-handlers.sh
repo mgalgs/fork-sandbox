@@ -201,6 +201,7 @@ contains "happy: handler event logged with exit=0" \
     "$(cat "$work/once.out")" "pm handler thread=${tid:0:8} agent=happy exit=0"
 contains "happy: harvest event logged for the handler seat, not just LLM seats" \
     "$(cat "$work/once.out")" "pm harvest thread=${tid:0:8} agent=happy replies=1"
+idx_check "happy: a handler wake, recorded already harvested"
 check "happy: exactly one handler invocation" 1 \
     "$(grep -c -- '^----CALL----$' "$HANDLER_LOG")"
 check "happy: FS_HANDLER_AGENT is the seat's own name, no @" "AGENT:happy" \

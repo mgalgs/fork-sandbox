@@ -204,6 +204,7 @@ check "dead teardown: a vanished k8s run is removed by its branch" \
     "rm --branch sbx-mail-0123abcd-tests-6" "$(kr_rm_calls)"
 contains "dead teardown: ...emitting k8s-dead-reaped" "$(cat "$work/once.out")" \
     "pm k8s-dead-reaped run=r-vanished branch=sbx-mail-0123abcd-tests-6"
+idx_check "dead teardown: a vanished run's harvest"
 
 for bad in FORK_SANDBOX_POSTMASTER_K8S_RETENTION FORK_SANDBOX_POSTMASTER_K8S_RETENTION_EVERY; do
     rc=0

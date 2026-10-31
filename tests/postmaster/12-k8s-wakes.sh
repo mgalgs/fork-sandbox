@@ -54,6 +54,7 @@ once
 k3_joined="$(tr '\n' $'\x01' < "$STUB_ARGV_LOG")"
 k3_expected="--allow-namespace"$'\x01'"ns-one"$'\x01'"--allow-namespace"$'\x01'"ns-two"$'\x01'"--reach-probe"$'\x01'"svc.ns-one:80"$'\x01'"--reach-probe"$'\x01'"svc.ns-two:443"$'\x01'"--host-alias"$'\x01'"192.0.2.1=a.example.com,b.example.com"$'\x01'"--host-alias"$'\x01'"192.0.2.2=c.example.com"$'\x01'"--context-ro"$'\x01'"$k3_ctx_dir"
 contains "k8s case3: grant flags forwarded in file order" "$k3_joined" "$k3_expected"
+idx_check "k8s case3: a k8s spawn and its harvest"
 
 # ---- case 3b: a grant's context Secret is forwarded as --context-secret ----
 
