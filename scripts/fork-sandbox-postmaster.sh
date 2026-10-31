@@ -112,6 +112,9 @@
 #                succeeded); the wake proceeds as if the first fetch had
 #                worked. A window that runs out ends in the ordinary
 #                `flag` event (keyword upstream-head or review-target).
+#   skip         thread, agent, reason=wake-when -- the seat's wake gate
+#                (rule 5) answered "nothing owed" (exit 3): no spawn, no
+#                budget slot, and the seat's standing deferral is dropped
 #   wake-gate-error thread, agent, reason=exit-<N>|timeout|missing|context --
 #                a wake gate could not answer, so the seat was woken anyway
 #   refuse       agent, thread, reason=hops|budget|budget-reserved|no-grant|
@@ -535,6 +538,13 @@
 #      count, keyword wake-deferred, "wake deferred: @a at <mid> and
 #      nothing woke it"; with a budget-reserved record too, one flag,
 #      reasons joined by "; ", keyword wake-deferred,budget-reserved).
+#      Exit 3 skips -- the seat owes nothing on this message: no spawn, no
+#      budget slot, no wake-deferred line, a `skip` event, and the seat's
+#      wake-deferred line on the thread, if one stands, is dropped (an
+#      author deferred mid-round whose gate says "converged" on the last
+#      reply must not leave that older deferral to flag the thread).
+#      The same answer holds on every path that asks the gate: a new
+#      message, a pending message's follow-up, and the re-gate below.
 #      Anything else fails open (wake + `wake-gate-error`): another exit
 #      status, a timeout ($FORK_SANDBOX_WAKE_GATE_TIMEOUT, default 30 s),
 #      a missing or non-executable hook, or a failure to build its
@@ -4051,19 +4061,26 @@ pm_seat_record_set() {
     mv -- "$tmp" "$dir/$tid"
 }
 
-# Drops seat $2's line from every per-thread seat record of thread $1; a
-# record left empty is removed. Called wherever a seat actually spawns.
+# Drops seat $3's line from per-thread seat record $1/$2; a record left
+# empty is removed.
+pm_seat_record_drop() {
+    local dir="$1" tid="$2" agent="$3" tmp
+    [[ -s "$dir/$tid" ]] || return 0
+    tmp="$(mktemp "$dir/.tmp.XXXXXX")"
+    awk -v a="$agent" '$1 != a' "$dir/$tid" > "$tmp"
+    if [[ -s "$tmp" ]]; then
+        mv -- "$tmp" "$dir/$tid"
+    else
+        rm -f -- "$tmp" "$dir/$tid"
+    fi
+}
+
+# Drops seat $2's line from every per-thread seat record of thread $1.
+# Called wherever a seat actually spawns.
 pm_seat_records_clear() {
-    local tid="$1" agent="$2" dir tmp
+    local dir
     for dir in "${PM_SEAT_RECORD_DIRS[@]}"; do
-        [[ -s "$dir/$tid" ]] || continue
-        tmp="$(mktemp "$dir/.tmp.XXXXXX")"
-        awk -v a="$agent" '$1 != a' "$dir/$tid" > "$tmp"
-        if [[ -s "$tmp" ]]; then
-            mv -- "$tmp" "$dir/$tid"
-        else
-            rm -f -- "$tmp" "$dir/$tid"
-        fi
+        pm_seat_record_drop "$dir" "$1" "$2"
     done
 }
 
@@ -4141,10 +4158,13 @@ pm_message_is_operator() {
 }
 
 # The per-seat wake gate: runs $HOOKS_DIR/wake-when.<suffix> for a seat
-# about to be spawned and returns 0 to wake it, 1 to defer. Synchronous, so
+# about to be spawned and returns 0 to wake it, 1 to defer, 2 to skip (the
+# hook's exit 3: the seat owes nothing here, so nothing is recorded and a
+# deferral standing for it on the thread is dropped). Synchronous, so
 # routing waits (under the store lock: the gate must only read the store),
-# and fail-open: only exit 1 defers; any other status, a timeout, a missing
-# or non-executable hook or a failure to build its context wakes the seat.
+# and fail-open: only exits 1 and 3 keep the seat asleep; any other status,
+# a timeout, a missing or non-executable hook or a failure to build its
+# context wakes the seat.
 # The gate gets the thread as files (export and status, the same bytes the
 # `mail export --json` and `status --thread --json` verbs print) in a temp
 # dir removed on every path. It never inherits the store lock fd.
@@ -4185,6 +4205,10 @@ pm_wake_gate() {
             pm_seat_record_set "$WAKE_DEFERRED" "$tid" "$agent" "$mid"
             pm_event "defer thread=${tid:0:8} agent=$agent reason=wake-when"
             return 1 ;;
+        3)
+            pm_seat_record_drop "$WAKE_DEFERRED" "$tid" "$agent"
+            pm_event "skip thread=${tid:0:8} agent=$agent reason=wake-when"
+            return 2 ;;
         124|137) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=timeout" ;;
         *) pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=exit-$rc" ;;
     esac
@@ -4243,7 +4267,10 @@ pm_spawn_wake() {
     fi
     # The one choke point for the wake gate: every spawn path passes here.
     # A retry and a held seat's release were already admitted, so neither
-    # is asked again (PM_WAKE_ADMITTED is set by pm_held_pass).
+    # is asked again (PM_WAKE_ADMITTED is set by pm_held_pass). A defer and
+    # a skip both end the spawn here; the gate itself wrote (or dropped) the
+    # seat's wake-deferred line, and no caller acts on anything but the run
+    # this leaves behind (none).
     if [[ -n "$wake_when" && -z "$is_retry" && -z "${PM_WAKE_ADMITTED:-}" ]] \
         && ! pm_wake_gate "$agent" "$tid" "$mid" "$wake_when"; then
         return 0
@@ -6017,8 +6044,8 @@ pm_retry_malformed_schedule() {
 # record for, after run $3 was harvested having posted nothing: the gate only
 # ever ran when a message arrived, and nothing else would retry it. Through
 # the ordinary spawn path, with the deferred message as the trigger: exit 0
-# wakes the seat, exit 1 records the same deferral again, anything else fails
-# open. A closed thread is skipped, and hops/budget/reserve apply as to any
+# wakes the seat, exit 1 records the same deferral again, exit 3 drops it,
+# anything else fails open. A closed thread is skipped, and hops/budget/reserve apply as to any
 # follow-up wake.
 pm_regate_deferred() {
     local project="$1" tid="$2" rid="$3" agent mid

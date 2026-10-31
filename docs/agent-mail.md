@@ -1580,6 +1580,8 @@ attempt=<n> — a deferred retry firing; a discarded-reply retry has
 reason=malformed in place of attempt; see "Retrying a dead wake" below),
 `regate` (thread, agent, run=<harvested run id> — a deferred seat's wake gate
 re-run after that run posted no reply; see rule 5),
+`skip` (thread, agent, reason=wake-when — a seat's wake gate said nothing
+is owed and dropped the seat's deferral; see rule 5),
 `defer` (thread, agent, reason=wake-when — a seat's wake gate said not
 now; see rule 5; or reason=fetch-miss, attempt=<n> — the sha a wake needs
 is not on `origin` yet, so the wake is held and re-checked; see "Upstream
@@ -1926,7 +1928,16 @@ thread routes it.
      test). Seats without `wake-when` behave exactly as before.
    - **Exit codes.** 0 wakes the seat. 1 *defers* it: no spawn, no budget
      slot, a `defer` event, and the trigger is dropped — the seat's next
-     wake renders the whole thread anyway. **Anything else fails open**:
+     wake renders the whole thread anyway. 3 *skips* it: the seat owes
+     nothing on this message — no spawn, no budget slot, no
+     `wake-deferred` line, a `skip` event (thread, agent,
+     reason=wake-when), and the seat's own `wake-deferred` line on the
+     thread, if one stands, is dropped (another seat's is left alone).
+     An author deferred mid-round while reviewers answer, whose gate
+     returns 3 on the last positive reply, so leaves no old deferral to
+     flag the converged thread. The answer is honoured the same way on
+     every path that asks the gate: a new message, a follow-up wake, and
+     the re-gate below. **Anything else fails open**:
      any other exit code, a timeout, a missing or non-executable hook,
      or a failure to build the gate's context wakes the seat and emits
      `wake-gate-error` with `reason=exit-<N>`, `timeout`, `missing` or
@@ -1970,8 +1981,8 @@ thread routes it.
      postmaster re-runs the gate of every seat with a `wake-deferred` line
      on that thread, through the ordinary spawn path, with the deferred
      message as the trigger (`FS_HOOK_MESSAGE`). Exit 0 wakes the seat,
-     exit 1 records the same deferral again, anything else fails open as
-     always. A closed thread is skipped, and hops, budget and reserve apply
+     exit 1 records the same deferral again, exit 3 drops it, anything
+     else fails open as always. A closed thread is skipped, and hops, budget and reserve apply
      as to any follow-up wake. A `regate` event names the thread, the
      seat and the harvested run. The harvested run's record is written
      first, so the gate (whose `status --thread <tid> --json` takes no
@@ -2357,7 +2368,7 @@ own thread scans never see it:
 | `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
 | `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, `file`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
 | `hooks/logs/<id>.log` | a reaped hook's stdout and stderr, and a wake gate's (`<time>-wake-when-<thread>-<agent>-<n>.log`); the newest 100 are kept |
-| `wake-deferred/<thread-id>` | one `<agent> <message-id>` line per seat whose spawn its `wake-when` gate deferred; cleared per seat when it spawns — see rule 5 |
+| `wake-deferred/<thread-id>` | one `<agent> <message-id>` line per seat whose spawn its `wake-when` gate deferred; cleared per seat when it spawns or its gate skips (exit 3) — see rule 5 |
 | `budget-reserved/<thread-id>` | the same shape, for a seat the budget reserve refused — see rule 3 |
 | `deferral-marks/<thread-id>` | the message count at which the thread's seat records were last flagged, so a quiescent state flags once |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |

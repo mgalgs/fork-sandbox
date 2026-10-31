@@ -257,10 +257,10 @@ printf '\n== wake gate: wake-when.<suffix> guards a seat spawn ==\n'
 # Seats are added to the fleet for this group only (a bare persona file is
 # an agent too, so those are removed again at the end).
 wg_saved_fleet="$(cat "$FORK_SANDBOX_FLEET_FILE")"
-for wg_seat in hana hugo hera; do
+for wg_seat in hana hugo hera hedy; do
     printf 'Gate fixture seat.\n' > "$FORK_SANDBOX_PERSONAS_DIR/$wg_seat.md"
 done
-sed -i 's/^agents:$/agents:\n  hana:\n    wake-when: gate\n  hugo:\n    wake-when: absent\n  hera:\n    wake-when: noexec/' \
+sed -i 's/^agents:$/agents:\n  hana:\n    wake-when: gate\n  hedy:\n    wake-when: gate\n  hugo:\n    wake-when: absent\n  hera:\n    wake-when: noexec/' \
     "$FORK_SANDBOX_FLEET_FILE"
 new_root WG_HOOKS
 new_root WG_OUT
@@ -316,14 +316,78 @@ check "wake gate: the gate's output is logged under hooks/logs" 1 \
     "$(find "$WG_STATE/hooks/logs" -name '*-wake-when-*' | wc -l)"
 
 wg_new_store
-wg_gate 'exit 3'
+wg_gate 'exit 2'
 mid="$(send_msg '@alice' '@hana' 'gate errors' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
-check "wake gate: exit 3 fails open (spawns)" 1 "$(wg_spawns hana)"
-contains "wake gate: exit 3 emits wake-gate-error" "$(cat "$work/once.out")" \
-    "pm wake-gate-error thread=$short agent=hana reason=exit-3"
+check "wake gate: exit 2 fails open (spawns)" 1 "$(wg_spawns hana)"
+contains "wake gate: exit 2 emits wake-gate-error" "$(cat "$work/once.out")" \
+    "pm wake-gate-error thread=$short agent=hana reason=exit-2"
+not_contains "wake gate: exit 2 is not a defer" "$(cat "$work/once.out")" "pm defer"
+not_contains "wake gate: exit 2 is not a skip" "$(cat "$work/once.out")" "pm skip"
+
+wg_new_store
+wg_gate 'exit 3'
+mid="$(send_msg '@alice' '@hana' 'gate skips' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: exit 3 skips (no spawn)" 0 "$(wg_spawns hana)"
+check "wake gate: exit 3 spends no budget slot" 0 "$(spawn_count_of "$tid")"
+contains "wake gate: exit 3 emits the skip event" "$(cat "$work/once.out")" \
+    "pm skip thread=$short agent=hana reason=wake-when"
 not_contains "wake gate: exit 3 is not a defer" "$(cat "$work/once.out")" "pm defer"
+not_contains "wake gate: exit 3 is not a gate error" "$(cat "$work/once.out")" "wake-gate-error"
+check "wake gate: exit 3 writes no wake-deferred record" 0 \
+    "$( [[ -s "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
+check "wake gate: a skipped message is routed" 1 \
+    "$( [[ -e "$WG_STATE/routed/$mid" ]] && echo 1 || echo 0 )"
+
+# A deferral standing for a seat is dropped by that seat's skip, and only
+# that seat's: hana and hedy both defer on the root, then hana's gate skips
+# a later reply.
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@hana, @hedy' 'gate skip clears' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: both seats deferred on the root" "hana $mid|hedy $mid" \
+    "$(paste -sd'|' "$WG_STATE/wake-deferred/$tid")"
+# shellcheck disable=SC2016  # expands in the gate, not here
+wg_gate '[[ "$FS_HOOK_AGENT" == hana ]] && exit 3; exit 1'
+mid2="$(reply_msg '@alice' "$mid" 'last positive reply' --to '@hana')"
+once
+contains "wake gate: the later skip emits its event" "$(cat "$work/once.out")" \
+    "pm skip thread=$short agent=hana reason=wake-when"
+check "wake gate: the skip dropped hana's standing deferral, kept hedy's" "hedy $mid" \
+    "$(cat "$WG_STATE/wake-deferred/$tid")"
+check "wake gate: nothing spawned" "0 0" "$(wg_spawns hana) $(wg_spawns hedy)"
+check "wake gate: the skip of a reply spends no budget slot" 0 "$(spawn_count_of "$tid")"
+[[ -n "$mid2" ]] || no "wake gate: the reply was sent"
+wg_gate 'exit 3'
+reply_msg '@alice' "$mid" 'hedy too' --to '@hedy' >/dev/null
+once
+check "wake gate: the last skip removes the empty record" 0 \
+    "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
+
+# The re-gate asks the same gate: a deferred seat whose re-gate answers 3
+# loses its deferral without a spawn, so quiescence flags nothing.
+wg_new_store
+wg_gate 'exit 1'
+mid="$(send_msg '@alice' '@hana, @carol' 'regate skip' 'body' 8)"
+tid="$(thread_of "$mid")"; short="${tid:0:8}"
+once
+check "wake gate: re-gate fixture: hana deferred" "hana $mid" "$(cat "$WG_STATE/wake-deferred/$tid")"
+wg_gate 'exit 3'
+PM_STATE_DIR="$WG_STATE" finish_run carol 0
+once
+contains "wake gate: the re-gate ran" "$(cat "$work/once.out")" "pm regate thread=$short agent=hana"
+contains "wake gate: the re-gate's exit 3 skips" "$(cat "$work/once.out")" \
+    "pm skip thread=$short agent=hana reason=wake-when"
+check "wake gate: the re-gate's skip spawns nothing" 0 "$(wg_spawns hana)"
+check "wake gate: and drops the deferral" 0 \
+    "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
+once
+check "wake gate: the quiet thread is not flagged" "" "$(cat "$WG_STATE/needs-operator/$tid" 2>/dev/null)"
 
 wg_new_store
 wg_gate 'sleep 30'
@@ -926,6 +990,6 @@ unset FORK_SANDBOX_THREAD_BUDGET
 
 unset FORK_SANDBOX_HOOKS_DIR WG_OUT
 printf '%s\n' "$wg_saved_fleet" > "$FORK_SANDBOX_FLEET_FILE"
-rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/hana.md" "$FORK_SANDBOX_PERSONAS_DIR/hugo.md" "$FORK_SANDBOX_PERSONAS_DIR/hera.md"
+rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/hana.md" "$FORK_SANDBOX_PERSONAS_DIR/hugo.md" "$FORK_SANDBOX_PERSONAS_DIR/hera.md" "$FORK_SANDBOX_PERSONAS_DIR/hedy.md"
 
 finish_suite

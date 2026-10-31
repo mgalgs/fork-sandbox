@@ -76,8 +76,9 @@ services.
 
 `wake-when` is fleet.yaml-only as well: a suffix (^[a-z0-9][a-z0-9._-]*$)
 naming the postmaster's per-seat wake gate, $HOOKS_DIR/wake-when.<suffix>
-(see docs/agent-mail.md). Unlike `grant` it is legal on a handler seat: the
-gate guards a spawn, whatever the seat is.
+(see docs/agent-mail.md: exit 0 wakes, 1 defers, 3 skips, anything else
+fails open). Unlike `grant` it is legal on a handler seat: the gate guards a
+spawn, whatever the seat is.
 
 `on-silence` is fleet.yaml-only and LLM-only. `flag` has the postmaster
 flag the thread when a wake of the seat exits 0 having posted nothing;
