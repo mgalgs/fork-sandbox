@@ -943,7 +943,10 @@
 # the same as a zero exit code (their outbox, if any, is still posted)
 # but also flag the thread, since an empty outbox from a crashed wake is
 # not the documented "no reply is a valid outcome" and needs an
-# operator's eyes.
+# operator's eyes. A k8s wake's non-zero-exit reason ends with
+# `; output: <tail>`, a capped, redacted, one-line tail of the wake's own
+# output (pm_wake_output_tail): a wake that dies before its pod runs has
+# no agent log, and this says why.
 #
 # SILENT WAKE. A clean exit with nothing in the outbox is a valid outcome
 # by default: whether a seat owed a reply is the seat's protocol, which the
@@ -2564,6 +2567,104 @@ print(json.dumps(record))
     fi
     rm -f -- "$tmp"
     return 1
+}
+
+# The caps on the wake-output tail a k8s wake-exit flag reason carries: the
+# last 3 lines, then at most 300 bytes of them (the end kept), on one line.
+PM_WAKE_OUTPUT_TAIL_LINES=3
+PM_WAKE_OUTPUT_TAIL_BYTES=300
+
+# Prints a short, one-line tail of k8s wake dir $1's own output, for the
+# wake-exit flag reason: what the launch printed (launch.log, the
+# wrapper's combined stdout+stderr of fork-sandbox.sh --k8s) or, when that
+# is absent or blank, the detached wrapper's own (wake.out). A wake that
+# dies before its pod ever runs -- an exhausted model quota, an expired
+# token, a pod that never started -- has no agent log at all, and this is
+# then the only text that says why. Empty when there is none.
+#
+# The output is not sandboxed agent text but can echo anything the launch
+# path printed: a headroom or credential hook's stderr, a kubectl error, a
+# server's response body. So it is treated as untrusted and as possibly
+# secret: python3 reads it by path (no symlink, regular file, last 16 KiB
+# only), strips ANSI and control characters, keeps the last non-blank
+# lines, and replaces anything token-shaped with [redacted] -- known token
+# prefixes, JWTs, Bearer/Basic credentials, private-key headers, the value
+# of any key=value or "key": value whose key names a token, secret,
+# password, credential or API key, and any run of 32+ token characters
+# mixing letters and digits that is not a plain UUID (run and thread ids
+# are). Redaction runs before the caps, so a cut never splits a secret
+# into a piece that escapes the patterns.
+pm_wake_output_tail() {
+    local wake_dir="$1"
+    [[ -n "$wake_dir" && -d "$wake_dir" ]] || return 0
+    python3 - "$wake_dir" "$PM_WAKE_OUTPUT_TAIL_LINES" "$PM_WAKE_OUTPUT_TAIL_BYTES" <<'PY' 2>/dev/null || true
+import os, re, stat, sys
+
+wake_dir, max_lines, max_bytes = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+READ = 16384
+
+def read(name):
+    try:
+        fd = os.open(os.path.join(wake_dir, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return ""
+        os.lseek(fd, max(0, st.st_size - READ), os.SEEK_SET)
+        data = os.read(fd, READ)
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+    return data.decode("utf-8", "replace")
+
+def lines_of(text):
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    out = []
+    for line in text.split("\n"):
+        line = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", line)
+        line = " ".join(line.split())
+        if line:
+            out.append(line)
+    return out
+
+KEYWORD = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|credential|api[_-]?key|apikey|auth)[A-Za-z0-9_.-]*"
+PATTERNS = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*", re.I), "[redacted]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+"), r"\1 [redacted]"),
+    (re.compile(r"(?i)\b(" + KEYWORD + r")(\"?\s*[:=]\s*\"?)[^\s\"',;}]+"), r"\1\2[redacted]"),
+    (re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}"), "[redacted]"),
+    (re.compile(r"\b(?:gh[pousr]_|github_pat_|glpat-|xox[abprs]-)[A-Za-z0-9_-]{8,}"), "[redacted]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[redacted]"),
+    (re.compile(r"\bya29\.[A-Za-z0-9_-]+"), "[redacted]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),
+]
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+LONG = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+
+def long_run(m):
+    s = m.group(0)
+    if UUID.fullmatch(s) or not (re.search(r"[A-Za-z]", s) and re.search(r"[0-9]", s)):
+        return s
+    return "[redacted]"
+
+def redact(line):
+    for pat, rep in PATTERNS:
+        line = pat.sub(rep, line)
+    return LONG.sub(long_run, line)
+
+lines = lines_of(read("launch.log")) or lines_of(read("wake.out"))
+if lines:
+    text = " | ".join(redact(l) for l in lines[-max_lines:])
+    enc = text.encode("utf-8")
+    if len(enc) > max_bytes:
+        text = "..." + enc[-(max_bytes - 3):].decode("utf-8", "ignore")
+    sys.stdout.write(text)
+PY
 }
 
 # Read only the already-sanitized record written above. This text is used in
@@ -6346,9 +6447,15 @@ pm_harvest_run() {
             local log_key=""
             pm_wake_exit_record "$tid" "$agent" "$rid" "$exit_code" "$run_dir" "$backend" \
                 && log_key="log=$rid"
-            local failure_reason="wake for $agent exited $exit_code (run $rid); outbox may be incomplete" suffix=""
-            [[ "$backend" == k8s ]] && suffix="$(pm_wake_exit_suffix "$tid" "$agent" "$rid")"
+            local failure_reason="wake for $agent exited $exit_code (run $rid); outbox may be incomplete" suffix="" output=""
+            if [[ "$backend" == k8s ]]; then
+                suffix="$(pm_wake_exit_suffix "$tid" "$agent" "$rid")"
+                output="$(pm_wake_output_tail "$run_dir")"
+            fi
             [[ -z "$suffix" ]] || failure_reason="wake for $agent exited $exit_code (run $rid) ($suffix); outbox may be incomplete"
+            # The wake's own last words, after everything clear and the
+            # keyword match read: only the reason text grows.
+            [[ -z "$output" ]] || failure_reason+="; output: $output"
             if [[ -f "$run_dir/launch.log" ]] && grep -q 'headroom: no candidate' "$run_dir/launch.log"; then
                 failure_reason="wake for $agent failed: headroom: no candidate (run $rid)"
             fi

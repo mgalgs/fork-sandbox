@@ -1529,6 +1529,25 @@ cleared entry keeps its tail. The `flag` event for a wake-exit carries
 of seats that produced a `summary.json` are covered; a wake that never
 produced one is flagged as before and has no entry.
 
+A k8s wake-exit flag reason also ends with the wake's own last words:
+`; output: <tail>`, the last 3 non-blank lines of what the launch printed
+(the wake dir's `launch.log`, or the detached wrapper's `wake.out` when
+that is empty), joined with ` | `, capped at 300 bytes (the end kept), on
+one line with ANSI and control characters stripped. A wake that exits
+non-zero within a minute — an exhausted model quota, an expired token, a
+pod that never started — has no agent log at all, and this is then the
+only text that says why. That output can echo anything the launch path
+printed (a credential or headroom hook's stderr, a server's error body),
+so anything token-shaped is replaced with `[redacted]` before the caps
+apply: known token prefixes (`sk-`, `ghp_`, `github_pat_`, `glpat-`,
+`xox?-`, `AKIA`, `ya29.`), JWTs, `Bearer`/`Basic` credentials, private-key
+headers, the value of any `key=value` or `"key": value` whose key names a
+token, secret, password, credential, auth or API key, and any run of 32 or
+more token characters mixing letters and digits that is not a plain UUID.
+The keyword stays `wake-exit` and the `(run <id>)` token stays where it
+was, so the flag clears exactly as below; only the reason text grows. A
+wake that printed nothing keeps the old reason.
+
 ### A successful retry clears its seat's wake-exit flag
 
 When a later wake of the same seat on the same thread exits 0 (a posted

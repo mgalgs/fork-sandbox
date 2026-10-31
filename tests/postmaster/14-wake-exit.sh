@@ -545,6 +545,75 @@ STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
 check "clear: a thread that never failed has no clear event" 0 "$(grep -c '^pm flag-clear ' "$work/once.out")"
 check "clear: and no journal" 0 "$([[ -e "$PM_STATE_DIR/needs-operator-journal/$we_tid" ]] && echo 1 || echo 0)"
 
+# ============================================================
+printf '\n== wake-exit output: a k8s wake that dies fast says why in its flag ==\n'
+# ============================================================
+
+# wo_flag <tid>: the thread's current flag reason.
+wo_flag() { cat "$PM_STATE_DIR/needs-operator/$1" 2>/dev/null || true; }
+wo_out="$work/wo-stderr.txt"
+
+we_fresh 'output: quota'
+printf 'fork-sandbox: submitting the Job\nError: model quota exhausted for this account\n' > "$wo_out"
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_STDERR="$wo_out" once
+wo_rid="$(basename "$(latest_env_for_agent karen)" .env)"
+wo_reason="$(wo_flag "$we_tid")"
+check "output: no agent log for the fast failure" missing \
+    "$(we_py "$(we_json "$we_tid")" 'd["wake_failures"][0]["log"]["state"]')"
+contains "output: the flag reason carries the wake's last output" "$wo_reason" \
+    "; output: "
+contains "output: including the error that says why" "$wo_reason" \
+    "fork-sandbox: submitting the Job | Error: model quota exhausted for this account"
+check "output: the reason still starts as a wake-exit reason does" \
+    "wake for karen exited 1 (run $wo_rid); outbox may be incomplete; output: " \
+    "${wo_reason%%; output: *}; output: "
+check "output: the keyword is unchanged" "pm flag thread=${we_tid:0:8} reason=wake-exit log=$wo_rid" \
+    "$(grep '^pm flag ' "$work/once.out")"
+check "output: the reason is one line" 1 "$(wc -l < "$PM_STATE_DIR/needs-operator/$we_tid")"
+STUB_K8S_EXIT=0 STUB_K8S_NO_REPLY=1 once
+check "output: a clean retry still clears the flag" "" "$(wo_flag "$we_tid")"
+contains "output: with the ordinary clear event" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=${we_tid:0:8} agent=karen reason=wake-exit run=$wo_rid"
+
+# Capped: the last 3 lines at most, then 300 bytes, on one line, control
+# characters gone.
+we_fresh 'output: capped'
+{
+    seq 1 50 | sed 's/^/noise line /'
+    printf 'tab\there \033[31mred\033[0m bell\007 cr\r\n'
+    head -c 2000 /dev/zero | tr '\0' 'x'; printf '\n'
+    printf 'Error: the very last line\n'
+} > "$wo_out"
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_STDERR="$wo_out" once
+wo_tail="$(wo_flag "$we_tid")"; wo_tail="${wo_tail#*; output: }"
+check "output: the tail is capped at 300 bytes" 1 "$(( $(printf '%s' "$wo_tail" | wc -c) <= 300 ))"
+contains "output: and keeps the end" "$wo_tail" "Error: the very last line"
+not_contains "output: older lines are cut" "$wo_tail" "noise line"
+check "output: no control character survives" 0 \
+    "$(printf '%s' "$wo_tail" | LC_ALL=C grep -c '[[:cntrl:]]' || true)"
+check "output: the flag file is one line" 1 "$(wc -l < "$PM_STATE_DIR/needs-operator/$we_tid")"
+check "output: the journal line is one tab-separated record" 4 \
+    "$(awk -F'\t' '$2=="flag"{print NF}' "$PM_STATE_DIR/needs-operator-journal/$we_tid" | tail -n1)"
+
+# A token-shaped string in the output never reaches the flag.
+we_fresh 'output: secrets'
+printf 'Error: credential refresh failed: sk-ant-oat01-Zq9x8Wv7Ut6Sr5Qp4On3Ml2Kj1\nAuthorization: Bearer abcdef0123456789secret token=hunter2hunter2 "accessToken":"q1w2e3r4t5"\njwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJl ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 Zm9yay1zYW5kYm94LXNlY3JldC0xMjM0NTY3ODkw\n' > "$wo_out"
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_STDERR="$wo_out" once
+wo_all="$(wo_flag "$we_tid") $(cat "$PM_STATE_DIR/needs-operator-journal/$we_tid") $(we_json "$we_tid")"
+for wo_secret in Zq9x8Wv7Ut6Sr5Qp4On3Ml2Kj1 abcdef0123456789secret hunter2hunter2 q1w2e3r4t5 \
+        eyJzdWIiOiJhZ2VudCJ9 ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 Zm9yay1zYW5kYm94LXNlY3JldC0xMjM0NTY3ODkw; do
+    not_contains "output: a secret-shaped ${wo_secret:0:6}... never reaches the flag" "$wo_all" "$wo_secret"
+done
+contains "output: what was redacted says so" "$(wo_flag "$we_tid")" "[redacted]"
+contains "output: the error text around it survives" "$(wo_flag "$we_tid")" "Error: credential refresh failed:"
+
+# No output at all: the reason is exactly what it always was.
+we_fresh 'output: none'
+STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1 STUB_K8S_NO_RUNDIR=1 once
+wo_rid="$(basename "$(latest_env_for_agent karen)" .env)"
+check "output: a wake that printed nothing keeps the old reason" \
+    "wake for karen exited 1 (run $wo_rid); outbox may be incomplete" "$(wo_flag "$we_tid")"
+
 # Leave nothing exported for the sections after these two.
 unset FORK_SANDBOX_POSTMASTER_K8S_DETACH FORK_SANDBOX_POSTMASTER_K8S \
     FORK_SANDBOX_CONFIG_DIR FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF

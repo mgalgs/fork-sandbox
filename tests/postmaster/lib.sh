@@ -318,6 +318,9 @@ if (( is_k8s )); then
     if [[ -n "${STUB_K8S_TERMINAL_JSON:-}" && -z "${STUB_K8S_NO_RUNDIR:-}" ]]; then
         cp -- "$STUB_K8S_TERMINAL_JSON" "$run_dir/terminal-status.json"
     fi
+    # STUB_K8S_STDERR: a file whose content the launch prints on stderr,
+    # landing in the wake dir's launch.log like the real launch's output.
+    [[ -z "${STUB_K8S_STDERR:-}" ]] || cat -- "$STUB_K8S_STDERR" >&2
     if [[ -n "${STUB_K8S_TIMEOUT_MSG:-}" ]]; then
         printf 'Error: timed out after 60s waiting for branch\n' >&2
     fi
