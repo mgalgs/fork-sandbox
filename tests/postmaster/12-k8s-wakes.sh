@@ -391,6 +391,94 @@ check "k8s case7: grant --clear before release -- still held" 0 \
 check "k8s case7: still holding a record" 1 \
     "$( [[ -f "$PM_STATE_DIR/held/$k7b_tid/karl" ]] && echo 1 || echo 0 )"
 
+# ---- case 7c: a grant that releases the seat clears its no-grant flag ----
+
+k7c_mid="$(send_msg '@carol' '@karl' 'hold clears topic' 'first' 8)"
+k7c_tid="$(thread_of "$k7c_mid")"; k7c_short="${k7c_tid:0:8}"
+once
+check "k8s case7c: held and flagged no-grant" "no grant for k8s seat karl: $k7c_mid" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k7c_tid" 2>/dev/null)"
+"$MAIL" grant "$k7c_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$work/once.out"
+once
+k7c_rid="$(basename "$(latest_env_for_agent karl)" .env)"
+check "k8s case7c: the release clears the no-grant flag" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$k7c_tid" ]] && echo 1 || echo 0 )"
+contains "k8s case7c: a flag-clear event names the released run" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=$k7c_short agent=karl reason=no-grant by=$k7c_rid flagged=no"
+check "k8s case7c: the journal keeps the flag and records the clear" \
+    "no grant for k8s seat karl: $k7c_mid cleared by run $k7c_rid" \
+    "$(awk -F'\t' '$2=="clear"{print $4}' "$PM_STATE_DIR/needs-operator-journal/$k7c_tid")"
+
+# An unrelated flag on the thread stays: alice's wake exits 1 while karl is
+# held, then karl's hold re-flags on a new trigger, then the grant arrives.
+k7d_mid="$(send_msg '@carol' '@karl,@alice' 'hold keeps topic' 'first' 8)"
+k7d_tid="$(thread_of "$k7d_mid")"; k7d_short="${k7d_tid:0:8}"
+once
+# This store still has case 7's live alice run; finish this thread's.
+for k7d_env in "$PM_STATE_DIR/runs"/*.env; do
+    [[ ! -e "$PM_STATE_DIR/harvested/$(basename "$k7d_env" .env)" ]] \
+        && grep -qx "AGENT=alice" "$k7d_env" && grep -qx "THREAD=$k7d_tid" "$k7d_env" && break
+done
+k7d_rd="$(env_val "$k7d_env" RUN_DIR)"
+mkdir -p -- "$k7d_rd/outbox"
+printf '1\n' > "$k7d_rd/exit-code"
+printf '{"session_id":null}\n' > "$k7d_rd/summary.json"
+once
+contains "k8s case7d: alice's failure is the current flag" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k7d_tid" 2>/dev/null)" "wake for alice exited 1"
+k7d_mid2="$(reply_msg '@carol' "$k7d_mid" 'second, for karl' --to '@karl')"
+once
+check "k8s case7d: karl's new trigger re-flags no-grant" "no grant for k8s seat karl: $k7d_mid2" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k7d_tid" 2>/dev/null)"
+"$MAIL" grant "$k7d_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$work/once.out"
+once
+contains "k8s case7d: the release leaves alice's wake-exit flag standing" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k7d_tid" 2>/dev/null)" "wake for alice exited 1"
+contains "k8s case7d: and says the thread is still flagged" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=$k7d_short agent=karl reason=no-grant"
+check "k8s case7d: a clear line for each of karl's two no-grant flags" 2 \
+    "$(awk -F'\t' '$2=="clear" && $3=="no-grant"' "$PM_STATE_DIR/needs-operator-journal/$k7d_tid" | wc -l)"
+check "k8s case7d: no clear touched alice's wake-exit" 0 \
+    "$(awk -F'\t' '$2=="clear" && $3=="wake-exit"' "$PM_STATE_DIR/needs-operator-journal/$k7d_tid" | wc -l)"
+
+# A reason cleared under another keyword is never written back: alice's
+# wake exits 1 over karl's no-grant flag, alice recovers (the flag falls
+# back to karl's no-grant), then the grant arrives and nothing is left.
+k7e_finish_alice() {
+    local env rd
+    for env in "$PM_STATE_DIR/runs"/*.env; do
+        [[ ! -e "$PM_STATE_DIR/harvested/$(basename "$env" .env)" ]] \
+            && grep -qx "AGENT=alice" "$env" && grep -qx "THREAD=$k7e_tid" "$env" && break
+    done
+    rd="$(env_val "$env" RUN_DIR)"
+    mkdir -p -- "$rd/outbox"
+    printf '%s\n' "$1" > "$rd/exit-code"
+    printf '{"session_id":null}\n' > "$rd/summary.json"
+}
+k7e_mid="$(send_msg '@carol' '@karl,@alice' 'hold recovers topic' 'first' 8)"
+k7e_tid="$(thread_of "$k7e_mid")"
+once
+k7e_finish_alice 1
+once
+contains "k8s case7e: alice's failure is the current flag" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k7e_tid" 2>/dev/null)" "wake for alice exited 1"
+reply_msg '@carol' "$k7e_mid" 'second, for alice' --to '@alice' >/dev/null
+once
+k7e_finish_alice 0
+once
+check "k8s case7e: alice's recovery falls back to karl's no-grant" \
+    "no grant for k8s seat karl: $k7e_mid" "$(cat "$PM_STATE_DIR/needs-operator/$k7e_tid" 2>/dev/null)"
+"$MAIL" grant "$k7e_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$work/once.out"
+once
+check "k8s case7e: the release unflags, not back to alice's cleared failure" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$k7e_tid" ]] && echo 1 || echo 0 )"
+contains "k8s case7e: and says so" "$(cat "$work/once.out")" \
+    "agent=karl reason=no-grant by="
+contains "k8s case7e: flagged=no" "$(grep 'agent=karl reason=no-grant' "$work/once.out")" "flagged=no"
+
 # ---- case 8: hold supersede -- a second message while held ----
 
 k8a_mid="$(send_msg '@carol' '@karl' 'supersede topic' 'first' 8)"

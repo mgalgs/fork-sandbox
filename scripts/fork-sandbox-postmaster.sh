@@ -95,13 +95,17 @@
 #                flag|retry` seat's clean wake posted nothing, but the seat
 #                had already replied on the run's review target, so the
 #                thread is not flagged (see SILENT WAKE below)
-#   flag-clear   thread, agent, reason=wake-exit, run=<failed run id>,
+#   flag-clear   thread, agent, reason=wake-exit|silent-wake|no-grant,
+#                run=<failed run id> (wake-exit and silent-wake only),
 #                by=<recovering run id>, flagged=yes|no -- a wake of the
 #                same seat on the same thread exited 0 and cleared the
-#                wake-exit flag reason that seat's failed wake raised
-#                (flagged says whether the thread is still flagged for
-#                something else). One line per cleared attempt; nothing
-#                else is cleared. See pm_wake_exit_clear.
+#                wake-exit flag reason that seat's failed wake raised (or
+#                replied, clearing its silent-wake reason; or a grant
+#                released it, clearing its no-grant reason, by=grant when
+#                the release spawned no run). flagged says whether the
+#                thread is still flagged for something else. One line per
+#                cleared attempt; nothing else is cleared. See
+#                pm_wake_exit_clear.
 #   defer        thread, agent, reason=wake-when -- the seat's wake gate
 #                (rule 5) answered "not now": no spawn, no budget slot
 #   defer        thread, agent, reason=fetch-miss, attempt=<n> -- the sha
@@ -165,7 +169,9 @@
 #                its grant file showed up, or its seat stopped resolving
 #                `grant: required` at all. The held record is deleted and
 #                trigger's wake is re-dispatched via pm_followup_wake in
-#                the same pass.
+#                the same pass. A release by a grant also clears that
+#                seat's no-grant flag reason(s): a `flag-clear` line with
+#                reason=no-grant, by=<the released run id, or grant>.
 #   adopt        agent, thread, run=<run id>, attempt=<n> -- a `backend:
 #                k8s` wake's wrapper process died (postmaster restart) but
 #                its Job is still running or finished-but-uncollected, so
@@ -2587,12 +2593,18 @@ pm_wake_exit_mark_cleared() {
 # A wake of $2 on thread $1 exited 0 (run $3): clears the wake-exit flag
 # reason(s) that seat's earlier failed wakes raised, and nothing else. $4/$5
 # swap in another per-seat keyword and reason prefix: the silent-wake flag
-# (SILENT WAKE in the header) is cleared the same way once the seat replies.
+# (SILENT WAKE in the header) is cleared the same way once the seat replies,
+# and the no-grant flag when a grant releases the held seat (pm_held_pass).
+# A reason with no `(run <id>)` in it (no-grant's) is matched by its full
+# text instead: a `clear` line answers every earlier `flag` line with that
+# exact reason, and a later re-flag with the same text is open again.
 #
 # The flag file holds one reason (pm_flag overwrites, see pm_flag_keyword),
 # so what a thread is flagged for is read from its journal: every `flag`
-# line since the last `unflag`, minus the wake-exit lines a `clear` line
-# has answered. Exit 0 is the criterion, not a posted reply -- no reply is
+# line since the last `unflag`, minus the lines a `clear` line has
+# answered -- under any keyword, so the reason the flag file falls back to
+# is never one an earlier clear of another seat or keyword already
+# resolved. A `clear` answers a `flag` with the same keyword and run id. Exit 0 is the criterion, not a posted reply -- no reply is
 # a valid outcome of a wake. Only `wake-exit` lines for this agent are
 # cleared; another seat's, a retry-exhausted ("failed after N retries"),
 # a budget flag, anything else stays. When the flag file currently shows
@@ -2619,20 +2631,27 @@ pm_wake_exit_clear() {
         }
         $1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:]+Z$/ { next }
         { reason = $0; sub(/^[^\t]*\t[^\t]*\t[^\t]*\t/, "", reason) }
-        $2 == "unflag" { n = 0; delete cleared; next }
-        $2 == "clear"  { r = runid(reason); if (r != "") cleared[r] = 1; next }
+        $2 == "unflag" { n = 0; delete cleared; delete done; next }
+        $2 == "clear"  {
+            r = runid(reason)
+            if (r != "") { cleared[$3, r] = 1; next }
+            sub(/ cleared by run [^ ]*$/, "", reason)
+            for (i = 1; i <= n; i++) if (rs[i] == reason) done[i] = 1
+            next
+        }
         $2 == "flag"   { n++; kw[n] = $3; rs[n] = reason; next }
         END {
             for (i = 1; i <= n; i++) {
                 r = runid(rs[i])
-                if (kw[i] == key && index(rs[i], pref) == 1 && !(r in cleared) && !(r in seen)) {
-                    if (r != "") seen[r] = 1
+                k = (r == "" ? "text:" rs[i] : r)
+                if (kw[i] == key && index(rs[i], pref) == 1 && !((key, r) in cleared) && !(k in seen) && !(i in done)) {
+                    seen[k] = 1
                     print "open\t" (r == "" ? "-" : r) "\t" rs[i]
                 }
             }
             for (i = n; i >= 1; i--) {
                 r = runid(rs[i])
-                if (kw[i] == key && (index(rs[i], pref) == 1 || r in cleared)) continue
+                if ((kw[i] == key && index(rs[i], pref) == 1) || ((kw[i], r) in cleared) || (i in done)) continue
                 print "keep\t" kw[i] "\t" rs[i]
                 break
             }
@@ -6968,9 +6987,16 @@ pm_held_pass() {
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
             [[ "$retry_flag" == 1 || "$retry_flag" == malformed ]] && is_retry="$retry_flag"
             rm -f -- "$f"
-            local PM_WAKE_ADMITTED=1
+            local PM_WAKE_ADMITTED=1 by
             pm_event "held-release thread=${tid:0:8} agent=$agent trigger=${trigger:0:8}"
             pm_followup_wake "$project" "$agent" "$tid" "$trigger" "$is_retry"
+            # The grant answers this seat's no-grant flag(s) on the thread,
+            # cleared like a recovered wake-exit (by the run the release
+            # spawned, or `grant` when it spawned none), and nothing else.
+            if [[ -e "$MAIL_ROOT/.postmaster/grants/$tid.env" ]]; then
+                by="$(fs_pm_find_live_run "$agent" "$tid")" || by=grant
+                pm_wake_exit_clear "$tid" "$agent" "$by" no-grant "no grant for k8s seat $agent: " || true
+            fi
         done
     done
 }

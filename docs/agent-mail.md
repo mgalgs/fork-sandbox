@@ -1062,7 +1062,14 @@ thread has no environment to wait for, so the seat spawns at once with no
 `--allow-namespace`, `--reach-probe`, `--host-alias`, `--agent-resources`,
 `--context-ro` or `--context-secret` flags. A thread without that header always holds. Run
 `fork-sandbox-mail.sh grant <thread-id> ...` (above) to release it — the
-next `deliver` pass picks the grant up and dispatches the held trigger. See
+next `deliver` pass picks the grant up and dispatches the held trigger,
+and clears that seat's `no-grant` flag reason(s) the way a recovering wake
+clears a `wake-exit` one: a journal `clear` line (`<reason> cleared by run
+<id>`, the released run's id, or `grant` when the release spawned none), a
+`flag-clear` event with `reason=no-grant`, and the flag file replaced by
+the newest reason still standing (another seat's flag, a budget flag) or
+removed when none is. Nothing but the released seat's `no-grant` reasons
+is cleared. See
 "The held state file is a read contract" below for the on-disk record, and
 `status`'s `held:` section for what's currently waiting.
 
@@ -1602,9 +1609,11 @@ replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>; the `wake-exit` flag adds `log=<run-id>`, the entry
 of `status --thread --json`'s `wake_failures` that holds that attempt's log
 tail, and omits it when no entry could be written), `flag-clear` (thread,
-agent, reason=wake-exit|silent-wake, run=<failed run id>, by=<recovering run id>,
+agent, reason=wake-exit|silent-wake|no-grant, run=<failed run id> (not for
+no-grant), by=<recovering run id, or `grant`>,
 flagged=yes|no — a seat's successful wake cleared its earlier wake-exit
-flag, or a seat's reply cleared its earlier silent-wake flag; `flagged` says whether the thread is still flagged for something
+flag, a seat's reply cleared its earlier silent-wake flag, or a grant that
+released a held seat cleared its no-grant flag; `flagged` says whether the thread is still flagged for something
 else; one line per cleared attempt), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; a discarded-reply retry has
 reason=malformed in place of attempt; see "Retrying a dead wake" below),
