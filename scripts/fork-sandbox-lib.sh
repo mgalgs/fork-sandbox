@@ -684,6 +684,29 @@ fs_pm_index_ensure() {
     return 0
 }
 
+# fs_pm_live_runs <array>: fills <array> with every unharvested run's id,
+# in $RUNS/*.env glob order.
+fs_pm_live_runs() {
+    local -n _fs_lr_out="$1"
+    local g1 g2 f rid
+    _fs_lr_out=()
+    if fs_pm_index_gen g1; then
+        for f in "$RUN_INDEX/live"/*.env; do
+            [[ -e "$f" ]] || continue
+            rid="${f##*/}"; rid="${rid%.env}"
+            [[ -e "$RUNS/$rid.env" && ! -e "$HARVESTED/$rid" ]] && _fs_lr_out+=("$rid")
+        done
+        fs_pm_index_gen g2 && [[ "$g2" == "$g1" ]] && return 0
+        _fs_lr_out=()
+    fi
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="${f##*/}"; rid="${rid%.env}"
+        [[ -e "$HARVESTED/$rid" ]] || _fs_lr_out+=("$rid")
+    done
+    return 0
+}
+
 # fs_pm_thread_runs <array> <tid> [live]: fills <array> with the id of
 # every run whose record says THREAD=<tid>, in $RUNS/*.env glob order;
 # with `live`, only the unharvested ones.

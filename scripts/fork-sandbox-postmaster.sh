@@ -6357,11 +6357,13 @@ pm_harvest_run() {
 }
 
 pm_harvest_pass() {
-    local project="$1" f rid
+    local project="$1" rid
+    local -a rids
     mkdir -p -- "$RUNS" "$HARVESTED"
-    for f in "$RUNS"/*.env; do
-        [[ -e "$f" ]] || continue
-        rid="${f##*/}"; rid="${rid%.env}"   # fork-free: once per record, ~5000 of them
+    # The live runs, off the run index (fork-sandbox-lib.sh). Re-checked one
+    # by one: a harvest can harvest another run before the loop reaches it.
+    fs_pm_live_runs rids
+    for rid in "${rids[@]}"; do
         [[ -e "$HARVESTED/$rid" ]] && continue
         pm_harvest_run "$project" "$rid"
     done
@@ -6415,13 +6417,16 @@ pm_k8s_retention_pass() {
     mkdir -p -- "$reaped"
     printf '%s\n' "$now" > "$stamp"
     local k8s="${FORK_SANDBOX_POSTMASTER_K8S:-$script_dir/fork-sandbox-k8s.sh}"
-    local f rid branch harvested_at probe_rc tried=0
+    local f rid branch harvested_at probe_rc tried=0 backend
+    # Every harvested record, not just live ones: no index covers these. The
+    # per-record work is fork-free up to the stat of a k8s run's marker.
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
-        rid="${f##*/}"; rid="${rid%.env}"   # fork-free, as in pm_harvest_pass
+        rid="${f##*/}"; rid="${rid%.env}"
         [[ "$rid" =~ $PM_WAKE_EXIT_ID_RE ]] || continue
         [[ -e "$HARVESTED/$rid" && ! -e "$reaped/$rid" ]] || continue
-        [[ "$(fs_pm_env_get "$f" BACKEND)" == k8s ]] || continue
+        fs_pm_env_read backend "$f" BACKEND
+        [[ "$backend" == k8s ]] || continue
         harvested_at="$("$FS_STAT" -c %Y -- "$HARVESTED/$rid" 2>/dev/null)" || continue
         (( now - harvested_at >= retention )) || continue
         branch="$(fs_pm_env_get "$f" BRANCH)"
@@ -6565,15 +6570,14 @@ pm_wake_collecting() {
 # still submitting (pm_wake_submitting) or collecting (pm_wake_collecting)
 # plus hooks still running.
 #
-# Runs on every drain poll over every run record -- thousands on a
-# long-lived store, nearly all harvested -- so the per-record work before
-# the harvested check is fork-free.
+# Runs on every drain poll, so it reads only the live runs (the run index,
+# fork-sandbox-lib.sh), not the thousands of harvested records beside them.
 pm_drain_busy() {
     local n=0 f rid rec
-    for f in "$RUNS"/*.env; do
-        [[ -e "$f" ]] || continue
-        rid="${f##*/}"; rid="${rid%.env}"
-        [[ -e "$HARVESTED/$rid" ]] && continue
+    local -a rids
+    fs_pm_live_runs rids
+    for rid in "${rids[@]}"; do
+        f="$RUNS/$rid.env"
         if pm_wake_submitting "$f" || pm_wake_collecting "$f"; then
             n=$((n + 1))
         fi
@@ -6670,9 +6674,10 @@ pm_drain_record_report() {
 # already marked is left as is, with no second event.
 pm_mark_handed_off() {
     local f rid run_dir
-    for f in "$RUNS"/*.env; do
-        [[ -e "$f" ]] || continue
-        rid="${f##*/}"; rid="${rid%.env}"   # fork-free, as in pm_drain_busy
+    local -a rids
+    fs_pm_live_runs rids
+    for rid in "${rids[@]}"; do
+        f="$RUNS/$rid.env"
         [[ -e "$HARVESTED/$rid" ]] && continue
         [[ "$(fs_pm_env_get "$f" BACKEND)" == k8s ]] || continue
         run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
@@ -6925,13 +6930,10 @@ pm_thread_message_count() {
 # recovered, exhausted and FAILS-only files are permanent history. A flagged
 # thread can be quiescent.
 pm_thread_is_quiescent() {
-    local tid="$1" f rid
-    for f in "$RUNS"/*.env; do
-        [[ -e "$f" ]] || continue
-        [[ "$(fs_pm_env_get "$f" THREAD)" == "$tid" ]] || continue
-        rid="$(basename -- "$f" .env)"
-        [[ -e "$HARVESTED/$rid" ]] || return 1
-    done
+    local tid="$1" f
+    local -a live
+    fs_pm_thread_runs live "$tid" live
+    (( ${#live[@]} == 0 )) || return 1
     [[ "$(pm_thread_unrouted_count "$tid")" == 0 ]] || return 1
     # On a closed thread a pending retry or a held seat will never fire (the
     # retry and held passes refuse and drop them), so neither keeps it busy.
@@ -7287,10 +7289,10 @@ cmd_status_json() {
         printf '%s\0' budget "$budget" "$budget_source" spawns_total "${total//[[:space:]]/}"
 
         local rid agent run_state run_dir resumed
-        for f in "$RUNS"/*.env; do
-            [[ -e "$f" ]] || continue
-            [[ "$(fs_pm_env_get "$f" THREAD)" == "$tid" ]] || continue
-            rid="$(basename -- "$f" .env)"
+        local -a rids
+        fs_pm_thread_runs rids "$tid"
+        for rid in "${rids[@]}"; do
+            f="$RUNS/$rid.env"
             run_state=live
             [[ -e "$HARVESTED/$rid" ]] && run_state=harvested
             agent="$(fs_pm_env_get "$f" AGENT)"
@@ -7498,10 +7500,10 @@ cmd_status() {
 
     printf '\nlive runs:\n'
     local any_live=0 rid agent tid run_dir resumed session
-    for f in "$RUNS"/*.env; do
-        [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
-        [[ -e "$HARVESTED/$rid" ]] && continue
+    local -a rids
+    fs_pm_live_runs rids
+    for rid in "${rids[@]}"; do
+        f="$RUNS/$rid.env"
         agent="$(fs_pm_env_get "$f" AGENT)"
         tid="$(fs_pm_env_get "$f" THREAD)"
         run_dir="$(fs_pm_env_get "$f" RUN_DIR)"

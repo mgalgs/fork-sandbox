@@ -171,7 +171,13 @@ check "backfill: no entry for a THREAD that is not a safe name" "" \
 # stamp stays fresh) and the answer moves. Then put it back.
 rm -f -- "$ri_idx/thread/$T1/r-100-a.env"
 check "backfill: lookups are served from the index" "r-100-a-2" "$(ri_pm fs_pm_find_live_run alice "$T1")"
+not_contains "backfill: status --json is served from the index" "$(ri_pm cmd_status_json "$T1")" '"r-100-a"'
+rm -f -- "$ri_idx/thread/$T1/r-100-a-2.env"
+check "backfill: quiescence is served from the index" yes \
+    "$(ri_pm pm_thread_is_quiescent "$T1" && echo yes || echo no)"
 : > "$ri_idx/thread/$T1/r-100-a.env"
+: > "$ri_idx/thread/$T1/r-100-a-2.env"
+check "backfill: entries put back, the answers are the full scan's again" "$oracle" "$(ri_pm ri_answers)"
 
 # 3. Deleted (or its completion stamp lost): readers fall back, the next
 # pass rebuilds it.
