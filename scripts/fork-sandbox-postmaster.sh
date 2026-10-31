@@ -7284,6 +7284,8 @@ pm_hook_pass() {
 # every matching hook file run in the FOREGROUND under the same timeout, one
 # `file=<name> exit=<n>` line per file on stdout (the hooks' own output goes
 # to stderr). No store lock, no hook record. Exits 1 when any hook failed.
+# In the cluster container it sets GIT_SSH_COMMAND as pod-init does for
+# deliver when it is unset (fs_git_ssh_export), so it works from any shell.
 cmd_hook() {
     [[ "${1:-}" == fire ]] || { echo "Usage: fork-sandbox-postmaster.sh hook fire --thread <thread-id> --event on-target|on-quiescent [--project <path>]" >&2; return 2; }
     shift
@@ -7307,6 +7309,14 @@ cmd_hook() {
         project="$(cat -- "$STATE/project" 2>/dev/null || true)"
     fi
     PM_PROJECT="$project"
+    # deliver inherits GIT_SSH_COMMAND from pod-init; a shell exec'd into
+    # the container does not, and the hook's git fetch would fail host-key
+    # verification. Same helper, same command, unset only. Sourced here,
+    # the one verb that needs it.
+    # shellcheck source=fork-sandbox-git-ssh-lib.sh
+    # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+    source "$script_dir/fork-sandbox-git-ssh-lib.sh"
+    fs_git_ssh_export
     local -a extra=()
     if [[ "$event" == on-target ]]; then
         local rt="$STATE/review-target/$tid.env" present=0

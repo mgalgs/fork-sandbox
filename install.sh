@@ -343,6 +343,7 @@ PLUMBING=(
     fork-sandbox-k8s-review-loop.sh
     fork-sandbox-k8s-service-ready.sh
     fork-sandbox-k8s-services-parse.py
+    fork-sandbox-git-ssh-lib.sh  # sourced by fork-sandbox-postmaster.sh hook fire and its pod-init
     fork-sandbox-k8s-wake.sh
     fork-sandbox-lib.sh
     fork-sandbox-mail-remote.py

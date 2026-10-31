@@ -1837,7 +1837,13 @@ flag reason. It ignores the markers and does not touch them. It runs every
 matching hook file in the FOREGROUND under the same timeout, prints one
 line per file (`file=<basename> exit=<n>`), and exits non-zero if any hook
 failed. It takes no store lock and writes no hook record. `on-harvest` is
-refused, because it needs a run's context.
+refused, because it needs a run's context. In the cluster postmaster's
+container it works from any shell (`kubectl exec`): when `GIT_SSH_COMMAND`
+is unset and the deploy key and `known_hosts` that pod-init installs are in
+`$HOME/.ssh`, it sets `GIT_SSH_COMMAND` exactly as pod-init sets it for
+`deliver` (one shared helper, `fork-sandbox-git-ssh-lib.sh`), so a hook's
+`git fetch` passes host-key verification. A set `GIT_SSH_COMMAND` is left
+alone.
 
 `FS_HOOK_REPO` and `FS_TARGET_REPO` come from `--project <path>` when given,
 else from the project of the last `deliver` (recorded in `$STATE/project`).

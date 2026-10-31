@@ -210,6 +210,31 @@ check "hook fire: non-zero when any hook failed" 1 "$hk_rc"
 rm -f "$HK_DIR/on-target.zz-fail"
 hk_rc=0; "$postmaster" hook fire --thread "$hk_tid" --event on-harvest >/dev/null 2>&1 || hk_rc=$?
 check "hook fire: on-harvest is refused" 2 "$hk_rc"
+
+# GIT_SSH_COMMAND: set as pod-init sets it for deliver, from the key and
+# known_hosts pod-init installs in $HOME/.ssh, and only when unset.
+cat > "$HK_DIR/on-target.zz-ssh" <<'HOOK'
+#!/usr/bin/env bash
+printf '%s' "${GIT_SSH_COMMAND-<unset>}" > "$HK_OUT/ssh"
+HOOK
+chmod +x "$HK_DIR/on-target.zz-ssh"
+new_root HK_HOME
+mkdir -p "$HK_HOME/.ssh"
+printf 'FAKE PRIVATE KEY\n' > "$HK_HOME/.ssh/deploy-key"
+printf 'git.example ssh-ed25519 FAKEHOSTKEY\n' > "$HK_HOME/.ssh/known_hosts"
+env -u GIT_SSH_COMMAND HOME="$HK_HOME" "$postmaster" hook fire --thread "$hk_tid" --event on-target >/dev/null 2>&1
+check "hook fire: sets GIT_SSH_COMMAND from the installed deploy key" \
+    "ssh -i $HK_HOME/.ssh/deploy-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HK_HOME/.ssh/known_hosts" \
+    "$(cat "$HK_OUT/ssh")"
+check "hook fire: the same command pod-init builds" \
+    "$(bash -c 'source "$1"; fs_git_ssh_command "$2"' _ "$repo_dir/scripts/fork-sandbox-git-ssh-lib.sh" "$HK_HOME/.ssh")" \
+    "$(cat "$HK_OUT/ssh")"
+GIT_SSH_COMMAND="ssh -F /dev/null" HOME="$HK_HOME" "$postmaster" hook fire --thread "$hk_tid" --event on-target >/dev/null 2>&1
+check "hook fire: a GIT_SSH_COMMAND already set is left alone" "ssh -F /dev/null" "$(cat "$HK_OUT/ssh")"
+rm -f "$HK_HOME/.ssh/known_hosts"
+env -u GIT_SSH_COMMAND HOME="$HK_HOME" "$postmaster" hook fire --thread "$hk_tid" --event on-target >/dev/null 2>&1
+check "hook fire: without the installed files nothing is set" "<unset>" "$(cat "$HK_OUT/ssh")"
+rm -f "$HK_DIR/on-target.zz-ssh"
 hk_uninstall
 
 # SHA_PRESENT is 0 for a sha that is not in the repo, and the hook still fires.

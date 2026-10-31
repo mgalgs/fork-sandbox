@@ -42,7 +42,8 @@
 #   5. Copies the mounted deploy key and known_hosts
 #      ($FORK_SANDBOX_GIT_SECRET_DIR, default /etc/fork-sandbox/git) into
 #      $HOME/.ssh (0600/0644) and exports GIT_SSH_COMMAND so the postmaster's
-#      own later git calls inherit it.
+#      own later git calls inherit it (built by fs_git_ssh_command in
+#      fork-sandbox-git-ssh-lib.sh, which `postmaster hook fire` shares).
 #   6. Clones $K8S_POSTMASTER_REPO_URL to $HOME/src/$project if that
 #      directory has no .git yet, else fetches it and fast-forwards the
 #      checked-out branch to its upstream (a fetch alone only moves
@@ -70,6 +71,8 @@ set -euo pipefail
 
 self="$(readlink -f "${BASH_SOURCE[0]}")"
 script_dir="$(dirname "$self")"
+# shellcheck source-path=SCRIPTDIR source=fork-sandbox-git-ssh-lib.sh
+source "$script_dir/fork-sandbox-git-ssh-lib.sh"
 
 if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
     sed -n '2,/^$/p' "$self" | sed 's/^# \{0,1\}//'
@@ -282,7 +285,10 @@ chmod 0644 -- "$tmp"
 cat -- "$mounted_known_hosts" >> "$tmp"
 mv -- "$tmp" "$known_hosts"
 
-export GIT_SSH_COMMAND="ssh -i $deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+# Built by the shared helper, so `postmaster hook fire` run from another
+# shell in this container sets exactly the same command (fs_git_ssh_export).
+GIT_SSH_COMMAND="$(fs_git_ssh_command "$ssh_dir")"
+export GIT_SSH_COMMAND
 
 # --- 6. repo ----------------------------------------------------------
 
