@@ -12,7 +12,8 @@
 #                              [--seat-resources SEAT=cpu=QTY[,memory=QTY]]...
 #                              [--context-ro DIR] [--context-secret NAME]
 #                              [--review-target <branch>:<sha>] [--budget <n>]
-#                              [--no-grant] [--services-env KEY=VAL]...
+#                              [--no-grant|--grant-pending]
+#                              [--services-env KEY=VAL]...
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
@@ -47,7 +48,8 @@
 # and write nothing to the store. The printed form is PORTABLE: every bare
 # address is qualified with this host's peer name, so it means the same on
 # any host. --emit does not carry grants, --review-target, --budget,
-# --no-grant, --services-env or the upstream flags (refused). It exists so
+# --no-grant, --grant-pending, --services-env or the upstream flags
+# (refused). It exists so
 # lane-mail.sh can deliver a message to another host before anything is
 # written here.
 #
@@ -191,6 +193,14 @@
 #                                 of holding, and `grant <tid> <values>`
 #                                 refuses the thread. Absent never means
 #                                 "no environment" (docs/agent-mail.md)
+#   X-Grant: pending              `send --grant-pending` only (refused
+#                                 together with --no-grant or any grant
+#                                 flag), on the thread's root only: the
+#                                 grant is coming later (`grant <tid>`),
+#                                 so a `grant: required` k8s seat holds
+#                                 quietly, unflagged, until it does or
+#                                 the postmaster's grant-pending timeout
+#                                 runs out (docs/agent-mail.md)
 #   X-<Name>: <value>             any number of caller-supplied custom
 #                                 headers, via a repeatable --header
 #                                 'X-Name: value' flag on send/reply. Name
@@ -205,7 +215,8 @@
 #                                 only via `reply --upstream-head` and
 #                                 `reply --upstream-state`, the budget only
 #                                 via `send --budget`, X-Grant only via
-#                                 `send --no-grant`). --header
+#                                 `send --no-grant`/`--grant-pending`).
+#                                 --header
 #                                 does not refuse
 #                                 X-Review-Target/X-Review-Target-Set/
 #                                 X-Version -- those are stamped by
@@ -1023,7 +1034,7 @@ mail_emit_check() {
     local verb="$1" n_multi="$2" other="$3"
     if (( n_multi > 0 )) || [[ -n "$other" ]]; then
         echo "Error: $verb: --emit does not carry grants, a review target, a" >&2
-        echo "thread budget, --no-grant, --services-env or upstream flags." >&2
+        echo "thread budget, --no-grant, --grant-pending, --services-env or upstream flags." >&2
         return 1
     fi
 }
@@ -1089,12 +1100,13 @@ cmd_send() {
     local -a grant_allow_ns=() grant_reach_probe=() grant_host_alias=() grant_seat_resources=()
     local -a services_env=()
     local grant_context_ro="" grant_context_secret="" review_target_arg="" emit=0
-    local budget="" no_grant=0
+    local budget="" no_grant=0 grant_pending=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --emit) emit=1; shift ;;
             --services-env) services_env+=("${2:?--services-env requires KEY=VALUE}"); shift 2 ;;
             --no-grant) no_grant=1; shift ;;
+            --grant-pending) grant_pending=1; shift ;;
             --budget) budget="${2:?--budget requires a positive integer}"; shift 2 ;;
             --from) from="${2:?--from requires an address}"; shift 2 ;;
             --to) to="${to:+$to,}${2:?--to requires an address list}"; shift 2 ;;
@@ -1142,6 +1154,19 @@ cmd_send() {
         echo "--context-secret." >&2
         return 1
     fi
+    if (( grant_pending && no_grant )); then
+        echo "Error: send: --grant-pending (a grant is coming) and --no-grant (no environment at all)" >&2
+        echo "cannot be combined." >&2
+        return 1
+    fi
+    if (( grant_pending )) && { (( ${#grant_allow_ns[@]} > 0 )) || (( ${#grant_reach_probe[@]} > 0 )) \
+            || (( ${#grant_host_alias[@]} > 0 )) || (( ${#grant_seat_resources[@]} > 0 )) \
+            || [[ -n "$grant_context_ro$grant_context_secret" ]]; }; then
+        echo "Error: send: --grant-pending says the grant comes later (mail grant <thread-id>) and cannot" >&2
+        echo "be combined with --allow-namespace, --reach-probe, --host-alias, --seat-resources," >&2
+        echo "--context-ro or --context-secret." >&2
+        return 1
+    fi
     mail_validate_no_newline "$subject" "--subject" || return 1
     local -a validated_headers=()
     local eh hline
@@ -1160,6 +1185,7 @@ cmd_send() {
     if (( emit )); then
         local no_grant_mark=""
         (( no_grant )) && no_grant_mark="no-grant"
+        (( grant_pending )) && no_grant_mark+="grant-pending"
         mail_emit_check send \
             "$(( ${#grant_allow_ns[@]} + ${#grant_reach_probe[@]} + ${#grant_host_alias[@]} + ${#grant_seat_resources[@]} + ${#services_env[@]} ))" \
             "$grant_context_ro$grant_context_secret$review_target_arg$budget$no_grant_mark" || return 1
@@ -1282,6 +1308,7 @@ cmd_send() {
     hlines+=("X-Hops: $hops")
     [[ -n "$budget" ]] && hlines+=("X-Thread-Budget: $budget")
     (( no_grant )) && hlines+=("X-Grant: none")
+    (( grant_pending )) && hlines+=("X-Grant: pending")
     if (( saw_review_target )); then
         # The setter signal, plus the ordinary per-message target headers
         # (every message about a commit carries X-Review-Target; see
@@ -1350,6 +1377,11 @@ cmd_reply() {
             --no-grant)
                 echo "Error: reply: --no-grant applies to a new thread only (mail send); a thread's environment" >&2
                 echo "is chosen when it is opened." >&2
+                return 1
+                ;;
+            --grant-pending)
+                echo "Error: reply: --grant-pending applies to a new thread only (mail send); a thread's" >&2
+                echo "environment is chosen when it is opened." >&2
                 return 1
                 ;;
             --budget)

@@ -205,7 +205,7 @@ flag and refused, since there is no way to tell it from one.
 
 | verb | positionals | flags | auth |
 |---|---|---|---|
-| send | 0 | `--from --to* --cc* --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --host-alias* --seat-resources* --context-secret --review-target --budget --no-grant` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--host-alias`/`--seat-resources`/`--context-secret`/`--no-grant` also need cap `grant`; `--review-target` also needs cap `target`; `--budget` needs no cap (it only lowers spend) |
+| send | 0 | `--from --to* --cc* --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --host-alias* --seat-resources* --context-secret --review-target --budget --no-grant --grant-pending` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--host-alias`/`--seat-resources`/`--context-secret`/`--no-grant`/`--grant-pending` also need cap `grant`; `--review-target` also needs cap `target`; `--budget` needs no cap (it only lowers spend) |
 | reply | 0 | `--from --reply-to --body --to* --cc* --subject --attach* --hops --header* --upstream-head --upstream-state` | `--from` in the token's identities; `--upstream-head` and `--upstream-state` also need cap `upstream` |
 | show | 1 | | `read` |
 | tree | 1 | | `read` |
@@ -254,8 +254,9 @@ reason). Those headers are the review-target and upstream contracts (see
 the postmaster may write the review-target ones, only `mail reply
 --upstream-head` may write `X-Upstream-Head`, and only `mail reply
 --upstream-state` may write `X-Upstream-State`, and only `mail send
---budget` may write `X-Thread-Budget` and only `mail send --no-grant` (cap
-`grant`) may write `X-Grant`, so no caller may set them
+--budget` may write `X-Thread-Budget` and only `mail send --no-grant` or
+`mail send --grant-pending` (cap `grant`) may write `X-Grant`, so no caller
+may set them
 through `--header`, including an operator token. `list`'s `--header`
 is a read-only filter and is never subject to this restriction.
 

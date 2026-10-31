@@ -168,7 +168,8 @@ In-Reply-To: <parent uuid>      replies only
 References: <uuid> <uuid>...    replies only, root-to-parent order
 X-Hops: <int>                   default 8 on a new thread
 X-Thread-Budget: <int>          root only, `send --budget` only
-X-Grant: none                   root only, `send --no-grant` only
+X-Grant: none|pending           root only, `send --no-grant` or
+                                 `send --grant-pending` only
 X-<Name>: <value>               any number of caller-supplied custom
                                  headers, one per repeatable --header
                                  'X-Name: value' flag on send/reply
@@ -234,11 +235,18 @@ authority is written down.
   `grant: required` seat on it spawns at once with no grant flags instead
   of holding, and `mail grant <tid> <values>` refuses it. ABSENT means "a
   grant may be required" — today's hold — and must never be read as "no
-  environment"; any value other than `none` reads as absent. `--header`
-  refuses it in any letter case, `reply --no-grant` is refused, `ingest`
-  and `--emit` refuse it, and the mail API refuses it as a raw header for
-  every token, an operator's included. `send --no-grant` over the API needs
-  cap `grant`: choosing a thread's environment is grant authority.
+  environment". The literal `pending`, written by `mail send
+  --grant-pending` (refused together with `--no-grant` and with every
+  grant flag above), says the grant **is coming later** (`mail grant
+  <tid>` once the environment is up): such a seat holds exactly as for an
+  absent header, but quietly — no `no-grant` flag — until the grant
+  arrives or the postmaster's grant-pending timeout runs out (see
+  "Cluster seats"). Any other value reads as absent. `--header` refuses it
+  in any letter case, `reply --no-grant` and `reply --grant-pending` are
+  refused, `ingest` and `--emit` refuse it, and the mail API refuses it as
+  a raw header for every token, an operator's included. `send --no-grant`
+  and `send --grant-pending` over the API need cap `grant`: choosing a
+  thread's environment is grant authority.
 - **`X-Attachment`**: store-owned; `--header` refuses to set it directly.
 - **`X-AI-Persona`**: postmaster-stamped on every harvested reply. ABSENT
   means the message was not a harvested reply — an operator message or
@@ -970,6 +978,15 @@ working. If a grant file nonetheless exists for such a thread (placed by
 hand), the postmaster ignores it for every k8s seat — nothing is
 forwarded — and emits `grant-ignored thread=<8>` on each k8s wake.
 
+`mail send --grant-pending` is the in-between choice: it stamps `X-Grant:
+pending` on the root and means "the environment is on its way". A CI that
+opens the review thread as soon as checks pass, and grants it only once a
+preview environment is up, sends the root this way so the seats that need
+no grant start at once and the ones that do wait without flagging. It is
+refused together with `--no-grant` and with any of the six grant flags,
+and on `reply`; `grant <thread-id> <values>` works on such a thread as on
+any other, and is what ends the wait.
+
 ### The grant file as a read contract
 
 Path: `$MAIL_ROOT/.postmaster/grants/<thread-id>.env`. Written atomically
@@ -1027,7 +1044,19 @@ wake" below) — there is no inbox hook to write a banner into mid-Job.
 A `grant: required` seat with no grant file yet for a thread **holds**
 instead of failing: the message itself still routes normally (Cc triage
 already ran), only that one seat waits, flagged once with reason
-`no grant for k8s seat <agent>: <message-id>` (keyword `no-grant`), unless
+`no grant for k8s seat <agent>: <message-id>` (keyword `no-grant`) — or,
+when the root carries `X-Grant: pending` (`mail send --grant-pending`),
+not flagged at all while the grant is pending: the hold is recorded
+(`QUIET=1`, a `refuse ... reason=grant-pending` event) and the thread is
+not marked as needing an operator. A pending hold flags exactly as above
+once `$FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT` seconds (default
+7200, two hours: long enough for a slow preview deploy, on the order of an
+hour, plus one re-run of it, short enough that a grant that is never
+coming is flagged the same working session; `0` turns the quiet hold off)
+have passed since the root arrived (the root message file's write time) —
+on the next `deliver` pass, whether or not a new message arrives. A value
+that is set but not a non-negative integer fails `deliver` at startup. The
+held seat is released by a grant exactly as below. Unless
 the thread's root carries `X-Grant: none` (`mail send --no-grant`): that
 thread has no environment to wait for, so the seat spawns at once with no
 `--allow-namespace`, `--reach-probe`, `--host-alias`, `--agent-resources`,
@@ -2312,6 +2341,7 @@ mktemp+mv rewrite on every write, never a partial one:
 | `TRIGGER` | the message id whose wake is being held |
 | `SINCE` | epoch seconds the record was first created, kept across a superseding `TRIGGER` |
 | `RETRY` | `1` when this hold was entered from `pm_retry_pass` firing an already-scheduled crash retry into it, `malformed` for a discarded-reply retry (the reasons are in `discards/`), else `0`. `fetch-wait/` records carry the same value |
+| `QUIET` | `1` while the hold waits on a pending grant (`X-Grant: pending` on the root, inside the grant-pending timeout) and has raised no flag, else `0`. Absent in a record written before the field existed, which reads as `0` |
 
 Created the first time a `backend: k8s`, `grant: required` seat's wake
 would otherwise spawn with no grant file present. A new message addressed

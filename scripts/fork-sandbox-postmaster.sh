@@ -122,7 +122,7 @@
 #   wake-gate-error thread, agent, reason=exit-<N>|timeout|missing|context --
 #                a wake gate could not answer, so the seat was woken anyway
 #   refuse       agent, thread, reason=hops|budget|budget-reserved|no-grant|
-#                upstream-closed -- an agent's
+#                grant-pending|upstream-closed -- an agent's
 #                wake was refused (X-Hops or thread-budget gate, a seat
 #                outside the budget reserve while the thread is in its
 #                band (rule 3), or a
@@ -132,7 +132,11 @@
 #                budget (keyword hops-exhausted/budget-exhausted), and for
 #                a NEW or superseded no-grant hold (keyword no-grant; a
 #                repeat check of the same hold emits this event again but
-#                does not re-flag). At route-pass time (a message the
+#                does not re-flag). reason=grant-pending is the same hold
+#                on a thread whose root says X-Grant: pending (`mail send
+#                --grant-pending`) inside the grant-pending timeout: no flag
+#                at all; when the timeout runs out the held pass emits
+#                reason=no-grant and flags once. At route-pass time (a message the
 #                hops/budget gate refuses wholesale) this only names To:
 #                candidates -- Cc resolution (wake-on-cc, triage) is
 #                skipped outright for that message, so there is no
@@ -872,7 +876,13 @@
 # environment: such a seat spawns at once with no grant flags, and a grant
 # file for the thread, if one exists, is ignored (event grant-ignored). A
 # thread without the header keeps the hold -- absence never reads as "no
-# environment".
+# environment". A thread whose root carries X-Grant: pending (`mail send
+# --grant-pending`) keeps the hold too, but quietly: no no-grant flag (event
+# reason=grant-pending, held record QUIET=1) until
+# $FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT seconds after the root
+# arrived (default 7200, see PM_GRANT_PENDING_TIMEOUT_DEFAULT for why;
+# 0 turns the quiet hold off), when pm_held_pass flags it exactly as a hold
+# without the header is flagged. A grant releases it the ordinary way.
 #
 # REPLY HARVEST
 #
@@ -1156,7 +1166,9 @@
 #                                   RETRY (1 when the hold absorbed a
 #                                   crash retry that would otherwise have
 #                                   fired, `malformed` when it absorbed a
-#                                   discarded-reply retry, else 0). Written atomically
+#                                   discarded-reply retry, else 0), QUIET
+#                                   (1 while it waits on a pending grant
+#                                   unflagged, else 0). Written atomically
 #                                   (tmp+mv) by pm_spawn_wake, released by
 #                                   pm_held_pass; a full read/write
 #                                   contract for this file lives in
@@ -1502,6 +1514,42 @@ pm_root_header() {
 # an absent or any other header is "a grant may be required", never "none".
 pm_thread_no_grant() {
     [[ "$(pm_root_header "$1" X-Grant)" == none ]]
+}
+
+# How long, in seconds from the root's arrival, a thread opened with
+# `mail send --grant-pending` may wait for its grant before a held seat
+# flags. The default, two hours, covers a slow preview deploy (on the order
+# of an hour, the CI's reason for sending the root before the environment
+# is up) with room for one re-run of it, and still flags a grant that is
+# never coming within the same working session.
+PM_GRANT_PENDING_TIMEOUT_DEFAULT=7200
+
+# Validates $FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT. Unset or empty
+# takes the default; 0 is legal and turns the quiet hold off (a pending
+# root then holds and flags exactly like a root without the header).
+pm_require_grant_pending_timeout() {
+    local raw="${FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT-}"
+    [[ -z "$raw" || "$raw" =~ ^[0-9]+$ ]] && return 0
+    echo "Error: postmaster: \$FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT '$raw' is not a non-negative integer (seconds)." >&2
+    return 1
+}
+
+# True while thread $1's root says `X-Grant: pending` (`mail send
+# --grant-pending`) and arrived less than the grant-pending timeout ago: a
+# held seat waits for the grant quietly. The root's arrival is its file's
+# modification time -- the store writes a message once, by rename, and
+# never touches it again. No grant file is the caller's test.
+pm_grant_pending_quiet() {
+    local tid="$1" root at limit="${FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT:-$PM_GRANT_PENDING_TIMEOUT_DEFAULT}"
+    [[ "$(pm_root_header "$tid" X-Grant)" == pending ]] || return 1
+    for root in "$MAIL_ROOT/threads/$tid"/*-"$tid".msg; do
+        [[ -f "$root" ]] || return 1
+        at="$("$FS_STAT" -c %Y -- "$root" 2>/dev/null)" || return 1
+        [[ "$at" =~ ^[0-9]+$ ]] || return 1
+        (( $(date +%s) - at < 10#$limit ))
+        return
+    done
+    return 1
 }
 
 # `<budget> <source>` for thread $1: the lower of the root's X-Thread-Budget
@@ -4042,9 +4090,10 @@ pm_exec_wake() {
 # see the pm_spawn_wake hold check and pm_held_pass, and the "held/" read
 # contract in docs/agent-mail.md. Same full-file mktemp+mv idiom as
 # pm_retry_raw_write: an external reader (`status`, pm_held_pass itself on
-# a later pass) must never see a partial write.
+# a later pass) must never see a partial write. $6 is QUIET: 1 while the
+# hold waits on a pending grant unflagged (pm_grant_pending_quiet), else 0.
 pm_held_write() {
-    local tid="$1" agent="$2" trigger="$3" since="$4" retry="$5"
+    local tid="$1" agent="$2" trigger="$3" since="$4" retry="$5" quiet="${6:-0}"
     mkdir -p -- "$STATE/held/$tid"
     local tmp
     tmp="$(mktemp "$STATE/held/$tid/.tmp.XXXXXX")"
@@ -4052,6 +4101,7 @@ pm_held_write() {
         printf 'TRIGGER=%s\n' "$trigger"
         printf 'SINCE=%s\n' "$since"
         printf 'RETRY=%s\n' "$retry"
+        printf 'QUIET=%s\n' "$quiet"
     } > "$tmp"
     mv -- "$tmp" "$STATE/held/$tid/$agent"
 }
@@ -4376,22 +4426,32 @@ pm_spawn_wake() {
     # routed (Cc triage already ran), so only this one seat waits, not the
     # whole message. See pm_held_pass for the release side. A thread opened
     # with --no-grant (X-Grant: none on its root) has no environment to wait
-    # for: the seat spawns at once with no grant flags.
+    # for: the seat spawns at once with no grant flags. One opened with
+    # --grant-pending (X-Grant: pending) has its grant on the way: the seat
+    # holds the same, but quietly (QUIET=1, no flag) until the grant-pending
+    # timeout runs out; pm_held_pass raises the flag then. A hold that was
+    # quiet flags on its first non-quiet check whatever its trigger.
     if [[ "$backend" == k8s && "$grant" == required ]]; then
         local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env"
         if [[ ! -e "$grant_file" ]] && ! pm_thread_no_grant "$tid"; then
-            local held_file="$STATE/held/$tid/$agent" old_trigger="" since retry_flag=0
+            local held_file="$STATE/held/$tid/$agent" old_trigger="" old_quiet since retry_flag=0 quiet=0
             old_trigger="$(fs_pm_env_get "$held_file" TRIGGER)"
+            old_quiet="$(fs_pm_env_get "$held_file" QUIET)"
             if [[ -e "$held_file" ]]; then
                 since="$(fs_pm_env_get "$held_file" SINCE)"
             else
                 since="$(date +%s)"
             fi
             [[ -n "$is_retry" ]] && retry_flag="$is_retry"
-            pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag"
-            pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
-            if [[ "$old_trigger" != "$mid" ]]; then
-                pm_flag "$tid" "no grant for k8s seat $agent: $mid"
+            pm_grant_pending_quiet "$tid" && quiet=1
+            pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag" "$quiet"
+            if (( quiet )); then
+                pm_event "refuse thread=${tid:0:8} agent=$agent reason=grant-pending"
+            else
+                pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
+                if [[ "$old_trigger" != "$mid" || "$old_quiet" == 1 ]]; then
+                    pm_flag "$tid" "no grant for k8s seat $agent: $mid"
+                fi
             fi
             return 0
         fi
@@ -6884,7 +6944,20 @@ pm_held_pass() {
                     release=1
                 fi
             fi
-            (( release )) || continue
+            if (( ! release )); then
+                # A quiet hold (a pending grant) whose timeout has run out
+                # flags now, once, exactly as a hold without the header
+                # would have when it began.
+                if [[ "$(fs_pm_env_get "$f" QUIET)" == 1 ]] && ! pm_grant_pending_quiet "$tid"; then
+                    local q_trigger
+                    q_trigger="$(fs_pm_env_get "$f" TRIGGER)"
+                    pm_held_write "$tid" "$agent" "$q_trigger" "$(fs_pm_env_get "$f" SINCE)" \
+                        "$(fs_pm_env_get "$f" RETRY)" 0
+                    pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
+                    pm_flag_unless_closed "$tid" "no grant for k8s seat $agent: $q_trigger"
+                fi
+                continue
+            fi
             if pm_upstream_closed "$tid"; then
                 rm -f -- "$f"
                 pm_upstream_refuse "$tid" "$agent"
@@ -7207,6 +7280,7 @@ cmd_deliver() {
     pm_require_k8s_timeout || return 1
     pm_require_fetch_window || return 1
     pm_require_drain_timeout || return 1
+    pm_require_grant_pending_timeout || return 1
     pm_require_k8s_retention || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"

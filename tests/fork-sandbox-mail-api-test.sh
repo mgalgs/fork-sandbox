@@ -909,6 +909,29 @@ check "... and is mail's own refusal: rc 1" "1" "$(rjson rc)"
 check "... which created no thread" "$ng_threads" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
 
+printf '== 11f. send --grant-pending: needs cap grant, never on reply ==\n'
+
+check "no caps: send --grant-pending: 403" "403" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- send --from @bot --to @x --subject n --body - --grant-pending)"
+contains "... names the 'grant' cap" "$(rjson error)" "'grant' cap"
+check "grant cap: send --grant-pending: 200" "200" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject n --body - --grant-pending)"
+check "grant cap: that send ran: rc 0" "0" "$(rjson rc)"
+gp_tid="$(rjson stdout | tr -d '\n')"
+contains "the root carries X-Grant: pending" "$("$mail" show "$gp_tid")" "X-Grant: pending"
+check "reply --grant-pending: 403" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$gp_tid" --body - --grant-pending)"
+check "--grant-pending with --no-grant passes the API" "200" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject n --body - --grant-pending --no-grant)"
+check "... and is mail's own refusal: rc 1" "1" "$(rjson rc)"
+as_ ci-kickoff mail --remote send --from @ci-kickoff --to @x --subject shim --body - --grant-pending <<< "hi" \
+    > "$work/gp-shim.out" 2>/dev/null
+check "the shim sends --grant-pending: rc 0" "0" "$?"
+contains "... and its root carries X-Grant: pending" "$("$mail" show "$(tr -d '\n' < "$work/gp-shim.out")")" \
+    "X-Grant: pending"
+check "raw X-Grant: pending header refused on send" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Grant: pending")"
+
 printf '== 12. list --json --header for a read token ==\n'
 
 demo_tid="$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject demo --body - --header "X-Demo-PR: 42" >/dev/null; rjson stdout | tr -d '\n')"

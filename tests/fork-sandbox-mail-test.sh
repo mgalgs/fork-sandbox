@@ -1019,6 +1019,39 @@ check "the refused grant writes no file" "0" \
 "$mail" grant "$bd_plain" --allow-namespace ns-x --reach-probe svc.ns-x:80 >/dev/null 2>&1
 check "grant on a thread without the header still works" "0" "$?"
 
+printf '\n== send: --grant-pending ==\n'
+
+gp_id="$("$mail" send --from @alice --to @bob --subject "Env later" --body - --grant-pending <<< "x" 2>/dev/null)"
+gp_raw="$("$mail" show "$gp_id")"
+check "send --grant-pending stamps X-Grant: pending once" "1" "$(grep -c '^X-Grant: pending$' <<< "$gp_raw")"
+check "... and nothing else in X-Grant" "1" "$(grep -c '^X-Grant:' <<< "$gp_raw")"
+contains "--help names --grant-pending" "$("$mail" --help 2>&1)" "--grant-pending"
+gp_threads="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+gp_grants="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+gp_out="$("$mail" send --from @alice --to @bob --subject "Both" --body - --grant-pending --no-grant <<< "x" 2>&1)"; rc=$?
+check "--grant-pending with --no-grant exits 1" "1" "$rc"
+contains "... and names both flags" "$gp_out" "--grant-pending (a grant is coming) and --no-grant"
+for gp_flag in "--allow-namespace ns-x" "--reach-probe svc.ns-x:80" "--host-alias 192.0.2.1=a.example.com" \
+        "--seat-resources core=cpu=1" "--context-ro /tmp" "--context-secret ctx"; do
+    # shellcheck disable=SC2086  # the flag and its value are two words
+    gp_out="$("$mail" send --from @alice --to @bob --subject "Conflict" --body - --grant-pending $gp_flag <<< "x" 2>&1)"; rc=$?
+    check "--grant-pending with ${gp_flag%% *} exits 1" "1" "$rc"
+    contains "--grant-pending with ${gp_flag%% *} names the conflict" "$gp_out" "--grant-pending"
+done
+check "the --grant-pending conflicts create no thread" "$gp_threads" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "the --grant-pending conflicts write no grant file" "$gp_grants" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+gp_out="$("$mail" reply --from @bob --reply-to "$gp_id" --body - --grant-pending <<< "x" 2>&1)"; rc=$?
+check "reply --grant-pending exits 1" "1" "$rc"
+contains "reply's --grant-pending refusal names send" "$gp_out" "mail send"
+gp_out="$("$mail" send --from @alice --to @bob --subject "Raw" --body - --header "X-Grant: pending" <<< "x" 2>&1)"; rc=$?
+check "send --header 'X-Grant: pending' exits 1" "1" "$rc"
+"$mail" grant "$gp_id" --allow-namespace ns-x --reach-probe svc.ns-x:80 >/dev/null 2>&1
+check "grant on a pending thread works" "0" "$?"
+check "... and writes the grant file" "1" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name "$gp_id.env" | wc -l)"
+
 printf '\n== reply: --upstream-head ==\n'
 
 uh_sha="fedcba9876543210fedcba9876543210fedcba98"
@@ -1429,6 +1462,8 @@ hx_emit_budget() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s 
 refuses "--emit refuses --budget" hx_emit_budget
 hx_emit_no_grant() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --no-grant; }
 refuses "--emit refuses --no-grant" hx_emit_no_grant
+hx_emit_grant_pending() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --grant-pending; }
+refuses "--emit refuses --grant-pending" hx_emit_grant_pending
 hx_emit_host_alias() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --host-alias 192.0.2.1=a.example.com; }
 refuses "--emit refuses --host-alias" hx_emit_host_alias
 hx_emit_seat_resources() { printf 'b\n' | ma send --emit --from @fe --to @x --subject s --body - --seat-resources core=cpu=1; }

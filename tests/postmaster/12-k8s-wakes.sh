@@ -549,6 +549,75 @@ check "no header: the grant file is forwarded to the released seat" 1 \
     "$(grep -c -- '^--allow-namespace$' "$STUB_ARGV_LOG")"
 not_contains "no header: no grant-ignored event" "$(cat "$work/once.out")" "grant-ignored"
 
+# ---- pending grant: X-Grant: pending on the root holds quietly ----
+gp_root_age() { touch -d "@$(( $(date +%s) - $2 ))" -- "$FORK_SANDBOX_MAIL_ROOT/threads/$1/"*"-$1.msg"; }
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+printf '%s\n' 'env coming' > "$work/body.tmp"
+gp_mid="$("$MAIL" send --from '@carol' --to '@karl,@alice' --subject 'pending env topic' \
+    --body "$work/body.tmp" --hops 8 --grant-pending 2>/dev/null)"
+gp_tid="$(thread_of "$gp_mid")"; gp_short="${gp_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "pending grant: the seat that needs no grant starts at once" 1 "$(grep -c -- '^--clone-dir$' "$STUB_ARGV_LOG")"
+check "pending grant: the grant: required seat holds" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+contains "pending grant: a grant-pending refusal" "$(cat "$work/once.out")" \
+    "pm refuse thread=$gp_short agent=karl reason=grant-pending"
+not_contains "pending grant: no no-grant refusal" "$(cat "$work/once.out")" "reason=no-grant"
+check "pending grant: no flag" 0 "$( [[ -e "$PM_STATE_DIR/needs-operator/$gp_tid" ]] && echo 1 || echo 0 )"
+check "pending grant: the held record is quiet" 1 "$(env_val "$PM_STATE_DIR/held/$gp_tid/karl" QUIET)"
+reply_msg '@carol' "$gp_mid" 'another message for karl' --to '@karl' >/dev/null
+once
+check "pending grant: a new trigger while pending still does not flag" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$gp_tid" ]] && echo 1 || echo 0 )"
+gp_root_age "$gp_tid" 7100
+once
+check "pending grant: just inside the default timeout, still no flag" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$gp_tid" ]] && echo 1 || echo 0 )"
+gp_root_age "$gp_tid" 7300
+: > "$work/once.out"
+once
+gp_trigger="$(env_val "$PM_STATE_DIR/held/$gp_tid/karl" TRIGGER)"
+check "pending grant: past the timeout the held pass flags as today" \
+    "no grant for k8s seat karl: $gp_trigger" "$(cat "$PM_STATE_DIR/needs-operator/$gp_tid" 2>/dev/null)"
+contains "pending grant: with the no-grant refusal event" "$(cat "$work/once.out")" \
+    "pm refuse thread=$gp_short agent=karl reason=no-grant"
+check "pending grant: the record is no longer quiet" 0 "$(env_val "$PM_STATE_DIR/held/$gp_tid/karl" QUIET)"
+check "pending grant: and keeps its trigger" 1 "$( [[ -n "$gp_trigger" ]] && echo 1 || echo 0 )"
+: > "$work/once.out"
+once
+not_contains "pending grant: flagged once, not every pass" "$(cat "$work/once.out")" "pm flag "
+check "pending grant: still held, not launched" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+"$MAIL" grant "$gp_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "pending grant: a grant releases the held seat as today" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "pending grant: with the grant's flags" 1 "$(grep -c -- '^--allow-namespace$' "$STUB_ARGV_LOG")"
+
+# A grant inside the timeout: released with nothing ever flagged.
+gp2_mid="$("$MAIL" send --from '@carol' --to '@karl' --subject 'pending env topic 2' \
+    --body "$work/body.tmp" --hops 8 --grant-pending 2>/dev/null)"
+gp2_tid="$(thread_of "$gp2_mid")"
+once
+"$MAIL" grant "$gp2_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "pending grant: an early grant releases the seat" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "pending grant: and the thread was never flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$gp2_tid" ]] && echo 1 || echo 0 )"
+
+# The timeout is a setting: 0 turns the quiet hold off.
+gp3_mid="$("$MAIL" send --from '@carol' --to '@karl' --subject 'pending env topic 3' \
+    --body "$work/body.tmp" --hops 8 --grant-pending 2>/dev/null)"
+gp3_tid="$(thread_of "$gp3_mid")"
+FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT=0 once
+check "pending grant: a 0 timeout flags at once" "no grant for k8s seat karl: $gp3_mid" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$gp3_tid" 2>/dev/null)"
+FORK_SANDBOX_POSTMASTER_GRANT_PENDING_TIMEOUT=1h refuses \
+    "pending grant: a non-numeric timeout refuses deliver" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+
 # ---- case 10: a malformed K8S_TIMEOUT refuses deliver at startup ----
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT

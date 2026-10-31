@@ -95,8 +95,9 @@ starts with '-' is a flag, so a positional that starts with '-' is refused.
 mail:
     send    0; --from --to* --cc* --subject --body --attach* --hops --header*
             --allow-namespace* --reach-probe* --host-alias* --seat-resources*
-            --context-secret --review-target --budget --no-grant; --from in
-            the token's identities (the five grant flags and --no-grant also need cap
+            --context-secret --review-target --budget --no-grant
+            --grant-pending; --from in the token's identities (the five
+            grant flags, --no-grant and --grant-pending also need cap
             grant, --review-target needs cap target; --budget needs no cap,
             it only lowers spend)
     reply   0; --from --reply-to --body --to* --cc* --subject --attach* --hops
@@ -119,7 +120,8 @@ name that starts with X-Review-Target (case-insensitively): the review-target he
 contract's, and only mail's own --review-target flag and the postmaster may
 write them, X-Upstream-Head only comes from mail reply --upstream-head and
 X-Upstream-State only from mail reply --upstream-state, X-Thread-Budget only
-from mail send --budget, X-Grant only from mail send --no-grant -- these refusals
+from mail send --budget, X-Grant only from mail send --no-grant or
+--grant-pending -- these refusals
 apply to an operator token too. An operator passes every other check.
 --body must be '-': the
 body comes in stdin_b64. --attach names a key of "files" (a plain basename,
@@ -191,7 +193,8 @@ SPEC = {
             "--allow-namespace": MULTI, "--reach-probe": MULTI,
             "--host-alias": MULTI, "--seat-resources": MULTI,
             "--context-secret": VALUE, "--review-target": VALUE,
-            "--budget": VALUE, "--no-grant": BOOL}),
+            "--budget": VALUE, "--no-grant": BOOL,
+            "--grant-pending": BOOL}),
         "reply": (0, 0, {
             "--from": VALUE, "--reply-to": VALUE, "--body": VALUE,
             "--to": MULTI, "--cc": MULTI, "--subject": VALUE,
@@ -259,10 +262,11 @@ THREAD_BUDGET_HEADER_WHY = (
     "--header may not set X-Thread-Budget: only send --budget may set it")
 
 
-# X-Grant: only mail's own send --no-grant flag (which needs cap grant) may
-# produce it.
+# X-Grant: only mail's own send --no-grant and --grant-pending flags (which
+# need cap grant) may produce it.
 GRANT_HEADER_WHY = (
-    "--header may not set X-Grant: only send --no-grant may set it")
+    "--header may not set X-Grant: only send --no-grant or --grant-pending "
+    "may set it")
 
 
 def refused_header_name(raw):
@@ -288,7 +292,8 @@ MUTATING = {("mail", "send"), ("mail", "reply"), ("mail", "seen"),
             ("mail", "grant"), ("postmaster", "flag"),
             ("postmaster", "unflag")}
 GRANT_FLAGS = ("--allow-namespace", "--reach-probe", "--host-alias",
-               "--seat-resources", "--context-secret", "--no-grant")
+               "--seat-resources", "--context-secret", "--no-grant",
+               "--grant-pending")
 
 
 class ConfigError(Exception):
