@@ -68,6 +68,82 @@ contains "pending: follow-up wake's TRIGGER is the pending message" "$(cat "$FOR
 idx_check "pending: local harvest, then a follow-up spawn"
 
 # ============================================================
+printf '\n== pending: no follow-up for a message the run was already shown ==\n'
+# ============================================================
+
+# sh_ids <run env>: the message-id list recorded beside that run's snapshot.
+sh_ids() { printf '%s' "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-threads/$(basename "$1" .env).message-ids"; }
+sh_live() { PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster" live_env_for_agent "$1"; }
+sh_finish() {
+    local rd
+    rd="$(sed -n 's/^RUN_DIR=//p' "$1")"
+    mkdir -p -- "$rd/outbox"
+    printf '0\n' > "$rd/exit-code"
+    printf '{}\n' > "$rd/summary.json"
+    printf '\nAcknowledged, thanks.\n' > "$rd/outbox/mail-1.md"
+}
+
+check "shown: the run above recorded its snapshot's ids" "$mid1" "$(cat "$(sh_ids "$run_env")")"
+check "shown: the list is not in the mounted snapshot dir" 0 \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-threads/$(basename "$run_env" .env)" -name 'message-ids*' | wc -l)"
+
+# Two messages land before one pass: the first spawns bob, the second pends
+# on that live run -- but bob's snapshot already held it.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+sh_mid1="$(send_msg '@alice' '@bob' 'shown test' 'first message' 8)"
+sh_tid="$(thread_of "$sh_mid1")"; sh_short="${sh_tid:0:8}"
+sh_mid2="$(reply_msg '@alice' "$sh_mid1" 'second message, same pass' --to '@bob')"
+: > "$STUB_ARGV_LOG"
+once
+check "shown: one spawn for the pair" 1 "$(grep -c -- "^sbx-mail-$sh_short-bob-" "$STUB_ARGV_LOG")"
+sh_env="$(sh_live bob)"
+contains "shown: the second message pended on the live run" "$(cat "$sh_env")" "PENDING_MSGS=$sh_mid2"
+check "shown: and is in the snapshot's id list" 1 "$(grep -cxF -- "$sh_mid2" "$(sh_ids "$sh_env")")"
+sh_finish "$sh_env"
+: > "$STUB_ARGV_LOG"
+once
+check "shown: no follow-up wake for a message the run was shown" 0 \
+    "$(grep -c -- "^sbx-mail-$sh_short-bob-" "$STUB_ARGV_LOG")"
+contains "shown: the drop is logged" "$(cat "$work/once.out")" \
+    "pm followup-drop thread=$sh_short agent=bob msg=${sh_mid2:0:8} run=$(basename "$sh_env" .env) reason=shown"
+
+# A message that arrives after the spawn still gets its follow-up, even
+# beside one the run was shown.
+sh_mid3="$(reply_msg '@alice' "$sh_mid1" 'third message' --to '@bob')"
+sh_mid4="$(reply_msg '@alice' "$sh_mid1" 'fourth message, same pass' --to '@bob')"
+once
+sh_env="$(sh_live bob)"
+sh_mid5="$(reply_msg '@alice' "$sh_mid1" 'fifth message, after the spawn' --to '@bob')"
+once
+contains "shown: both later messages pended" "$(cat "$sh_env")" "PENDING_MSGS=$sh_mid4,$sh_mid5"
+sh_finish "$sh_env"
+: > "$STUB_ARGV_LOG"
+once
+check "shown: an unseen pending message still gets its follow-up" 1 \
+    "$(grep -c -- "^sbx-mail-$sh_short-bob-" "$STUB_ARGV_LOG")"
+check "shown: on that message" "$sh_mid5" "$(env_val "$(sh_live bob)" TRIGGER)"
+contains "shown: the shown one is dropped" "$(cat "$work/once.out")" "pm followup-drop thread=$sh_short agent=bob msg=${sh_mid4:0:8}"
+[[ -n "$sh_mid3" ]] || no "shown: fixture: the third message was sent"
+
+# A run recorded before the list existed proves nothing: follow up as before.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+sh_mid1="$(send_msg '@alice' '@bob' 'legacy shown test' 'first message' 8)"
+sh_tid="$(thread_of "$sh_mid1")"; sh_short="${sh_tid:0:8}"
+sh_mid2="$(reply_msg '@alice' "$sh_mid1" 'second message, same pass' --to '@bob')"
+once
+sh_env="$(sh_live bob)"
+rm -f -- "$(sh_ids "$sh_env")"
+sh_finish "$sh_env"
+: > "$STUB_ARGV_LOG"
+once
+check "shown: a legacy run with no id list follows up as before" 1 \
+    "$(grep -c -- "^sbx-mail-$sh_short-bob-" "$STUB_ARGV_LOG")"
+check "shown: legacy follow-up's trigger is the pending message" "$sh_mid2" "$(env_val "$(sh_live bob)" TRIGGER)"
+not_contains "shown: and drops nothing" "$(cat "$work/once.out")" "followup-drop"
+
+# ============================================================
 printf '\n== harvest: delivered-live mail suppresses the follow-up wake ==\n'
 # ============================================================
 

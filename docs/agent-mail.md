@@ -1955,7 +1955,18 @@ thread routes it.
    live delivery never finished acting on what it saw, so it is treated
    exactly like an undelivered pending message: rules 2-3 are
    re-checked and a follow-up wake is spawned for the newest pending
-   message if they still pass.
+   message if they still pass. A pending message the run was **already
+   shown** is dropped first: when two messages land in one pass, the
+   first spawns the seat and the second pends on that run, but the run's
+   thread snapshot (`/thread`) already held it. The spawn lists the
+   Message-ID of every message in that snapshot
+   (`wake-threads/<run-id>.message-ids`, listed just before the render),
+   and a pending message on that list gets a `followup-drop` event
+   (thread, agent, msg=<short-id>, run=<run id>, reason=shown) instead of
+   a wake; when nothing is left, no follow-up is spawned. Only the list
+   counts as proof — never a date comparison — so a run with no list (one
+   spawned before the list existed, or whose snapshot failed) follows up
+   every pending message as before.
 5. **Wake gate.** A seat with `wake-when: <suffix>` has
    `$FORK_SANDBOX_HOOKS_DIR/wake-when.<suffix>` (the same flat dir as the
    hooks below, so the cluster ships it in the same ConfigMap) asked
@@ -2423,6 +2434,7 @@ own thread scans never see it:
 | `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
 | `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, `file`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
 | `hooks/logs/<id>.log` | a reaped hook's stdout and stderr, and a wake gate's (`<time>-wake-when-<thread>-<agent>-<n>.log`); the newest 100 are kept |
+| `wake-threads/<run-id>.message-ids` | the Message-ID of every message in that wake's thread snapshot, one per line, listed just before the render and written only beside a snapshot that was; outside the mounted dir. A pending message on the list is not followed up (rule 4) |
 | `wake-deferred/<thread-id>` | one `<agent> <message-id>` line per seat whose spawn its `wake-when` gate deferred; cleared per seat when it spawns or its gate skips (exit 3) — see rule 5 |
 | `budget-reserved/<thread-id>` | the same shape, for a seat the budget reserve refused — see rule 3 |
 | `deferral-marks/<thread-id>` | the message count at which the thread's seat records were last flagged, so a quiescent state flags once |

@@ -95,6 +95,11 @@
 #                flag|retry` seat's clean wake posted nothing, but the seat
 #                had already replied on the run's review target, so the
 #                thread is not flagged (see SILENT WAKE below)
+#   followup-drop thread, agent, msg=<short-id>, run=<run id>, reason=shown
+#                -- a message pended on a live run (rule 4) was already in
+#                the thread snapshot that run was given at spawn (the
+#                message ids listed beside it), so no follow-up wake is
+#                spawned for it; one line per dropped message
 #   flag-clear   thread, agent, reason=wake-exit|silent-wake|no-grant,
 #                run=<failed run id> (wake-exit and silent-wake only),
 #                by=<recovering run id>, flagged=yes|no -- a wake of the
@@ -538,7 +543,13 @@
 #      -- the hook never fired again, live delivery was skipped for the
 #      harness, or the wake died first -- rules 2-3 are re-checked and a
 #      follow-up wake is spawned for the newest pending message exactly as
-#      before live delivery existed.
+#      before live delivery existed. Before any of that, a pending message
+#      the run was already shown is dropped (`followup-drop` event): one
+#      whose id the spawn listed beside the run's thread snapshot
+#      (wake-threads/<run-id>.message-ids, see pm_pending_unshown). Two
+#      messages landing in one pass otherwise spawn the seat on the first
+#      and again, after harvest, for the second it had already read. A run
+#      with no list follows up as before.
 #   5. Wake gate: a seat with `wake-when: <suffix>` (fleet.yaml-only) has
 #      $FORK_SANDBOX_HOOKS_DIR/wake-when.<suffix> run before it is SPAWNED
 #      (pm_spawn_wake, the one choke point: a new message and a pending
@@ -1197,6 +1208,14 @@
 #                                   handoff, gets no mount, and the thread
 #                                   is flagged. Never reaped, the same as
 #                                   handoffs/ and runs/ above
+#   wake-threads/<run-id>.message-ids  the Message-ID of every message in
+#                                   that snapshot, one per line, listed just
+#                                   before it was rendered and written only
+#                                   when the snapshot was. Outside the
+#                                   mounted dir. What proves at harvest that
+#                                   the run was shown a message pended on it
+#                                   (pm_pending_unshown); a run without one
+#                                   follows up every pending message
 #   state/<thread-id>/<agent>/     the harness's transcript/session store
 #                                   for that one (thread, agent) pair, bound
 #                                   into every wake of it with
@@ -3814,6 +3833,42 @@ pm_record_upstream_state() {
     return 0
 }
 
+# The Message-ID of every message thread $1 holds right now, one per line.
+pm_thread_message_ids() {
+    local f id
+    for f in "$MAIL_ROOT/threads/$1"/*.msg; do
+        [[ -e "$f" ]] || continue
+        id="$(pm_header "$f" Message-ID)"
+        [[ -z "$id" ]] || printf '%s\n' "$id"
+    done
+}
+
+# Sets PM_PENDING_UNSHOWN to the comma list $3 of messages pended on run $1
+# (seat $2 on thread $4), minus those the run was already shown: the ids its spawn listed beside
+# the thread snapshot it was given (wake-threads/<run-id>.message-ids). A
+# dropped message gets a followup-drop event. A run with no such list (one
+# spawned before the list existed, or whose snapshot failed) proves nothing,
+# so its pending list comes back whole. (A variable, not stdout: the drop
+# events are stdout.)
+PM_PENDING_UNSHOWN=""
+pm_pending_unshown() {
+    local rid="$1" agent="$2" pending="$3" tid="$4"
+    local ids="$MAIL_ROOT/.postmaster/wake-threads/$rid.message-ids" out="" m
+    PM_PENDING_UNSHOWN="$pending"
+    [[ -n "$pending" && -f "$ids" ]] || return 0
+    local -a msgs
+    IFS=, read -ra msgs <<< "$pending"
+    for m in "${msgs[@]}"; do
+        [[ -n "$m" ]] || continue
+        if grep -qxF -- "$m" "$ids"; then
+            pm_event "followup-drop thread=${tid:0:8} agent=$agent msg=${m:0:8} run=$rid reason=shown"
+        else
+            out+="${out:+,}$m"
+        fi
+    done
+    PM_PENDING_UNSHOWN="$out"
+}
+
 pm_append_pending() {
     local rid="$1" mid="$2"
     local f="$RUNS/$rid.env" existing
@@ -4496,17 +4551,25 @@ pm_spawn_wake() {
     fi
     local trigger_only=""
     local snap_dir="$MAIL_ROOT/.postmaster/wake-threads/$run_id"
+    # The snapshot's message ids are listed BEFORE it is rendered: messages
+    # are only ever added, so every id listed is in the render, and the list
+    # is what proves later that the run was shown a message (see
+    # pm_pending_unshown). It lands only beside a snapshot that did, and
+    # beside the snapshot dir rather than in it: the dir is the wake's mount.
     if ! mkdir -p -- "$snap_dir" 2>/dev/null; then
         pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (mkdir)"
-    elif ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" > "$snap_dir/thread.txt.part" 2>/dev/null; then
-        rm -f -- "$snap_dir/thread.txt.part"
+    elif ! pm_thread_message_ids "$tid" > "$snap_dir.message-ids.part" 2>/dev/null \
+        || ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" > "$snap_dir/thread.txt.part" 2>/dev/null; then
+        rm -f -- "$snap_dir/thread.txt.part" "$snap_dir.message-ids.part"
         pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (render)"
     else
         chmod 644 -- "$snap_dir/thread.txt.part" 2>/dev/null
         if mv -- "$snap_dir/thread.txt.part" "$snap_dir/thread.txt" 2>/dev/null; then
             trigger_only=1
+            mv -- "$snap_dir.message-ids.part" "$snap_dir.message-ids" 2>/dev/null \
+                || rm -f -- "$snap_dir.message-ids.part"
         else
-            rm -f -- "$snap_dir/thread.txt.part"
+            rm -f -- "$snap_dir/thread.txt.part" "$snap_dir.message-ids.part"
             pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (move)"
         fi
     fi
@@ -6428,7 +6491,8 @@ pm_harvest_run() {
     fi
 
     local pending
-    pending="$(fs_pm_env_get "$f" PENDING_MSGS)"
+    pm_pending_unshown "$rid" "$agent" "$(fs_pm_env_get "$f" PENDING_MSGS)" "$tid"
+    pending="$PM_PENDING_UNSHOWN"
     if [[ -n "$pending" ]]; then
         # This follow-up wake already re-wakes the seat on the newest
         # pending message, so it supersedes any deferred retry of the
