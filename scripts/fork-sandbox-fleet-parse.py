@@ -81,7 +81,8 @@ fails open). Unlike `grant` it is legal on a handler seat: the gate guards a
 spawn, whatever the seat is.
 
 `on-silence` is fleet.yaml-only and LLM-only. `flag` has the postmaster
-flag the thread when a wake of the seat exits 0 having posted nothing;
+flag the thread when a wake of the seat exits 0 having posted nothing
+(unless the seat already replied on the run's review target);
 `retry` does the same and also re-wakes the seat once when every reply
 file it wrote was discarded as malformed, or when it wrote none and has no
 reply yet on its review target (see docs/agent-mail.md). Leave

@@ -91,6 +91,10 @@
 #                `status --thread --json` holds under `wake_failures`.
 #                The key is left off when no record could be written. The
 #                log text itself never appears on this line.
+#   silent       thread, agent, reason=replied-on-target -- an `on-silence:
+#                flag|retry` seat's clean wake posted nothing, but the seat
+#                had already replied on the run's review target, so the
+#                thread is not flagged (see SILENT WAKE below)
 #   flag-clear   thread, agent, reason=wake-exit, run=<failed run id>,
 #                by=<recovering run id>, flagged=yes|no -- a wake of the
 #                same seat on the same thread exited 0 and cleared the
@@ -928,7 +932,11 @@
 # recorded a review target and the seat has posted no reply on that target
 # yet (pm_seat_replied_on_target): it owes a verdict there, and nothing else
 # would wake it again. A seat that already replied on the target may stay
-# silent on a follow-up, so that one is flagged only. No retry for a newer
+# silent on a follow-up: that wake is neither retried nor flagged, for
+# `flag` and `retry` alike (the same test, pm_run_target_answered, decides
+# both), and logs `silent thread=<short-id> agent=<a>
+# reason=replied-on-target` instead. A silent wake on a target the seat has
+# not answered flags as above, however it was addressed (To or Cc). No retry for a newer
 # pending message, a closed thread, or
 # a trigger that already had its one such retry (the marker
 # discards/<tid>/<agent>.spent holds the trigger id). It rides the
@@ -6010,6 +6018,16 @@ pm_seat_replied_on_target() {
     return 1
 }
 
+# Succeeds when run record $1 (seat $3 on thread $2) carries a review target
+# the seat has already replied on: its verdict on that version stands, so a
+# silent wake of it owes nothing. The one predicate both the silent-wake flag
+# and the silent retry consult, so the two can never disagree.
+pm_run_target_answered() {
+    local sha
+    sha="$(fs_pm_env_get "$1" REVIEW_TARGET_SHA)"
+    [[ -n "$sha" ]] && pm_seat_replied_on_target "$2" "$3" "$sha"
+}
+
 # Schedules the one re-wake of an `on-silence: retry` seat whose reply files
 # were all discarded, or that wrote none while owing its first reply on the
 # run's review target: the discard reasons (or PM_NO_REPLY_FILE_REASON) are
@@ -6290,7 +6308,14 @@ pm_harvest_run() {
     if (( clean_exit && replies > 0 )); then
         pm_wake_exit_clear "$tid" "$agent" "$rid" silent-wake "wake for $agent posted no reply " || true
     elif (( clean_exit && reply_files == 0 )) && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == flag || "$(fs_pm_env_get "$f" ON_SILENCE)" == retry ]]; then
-        pm_flag_unless_closed "$tid" "wake for $agent posted no reply (run $rid)" silent-wake
+        # A seat that already replied on the run's review target owes
+        # nothing on it (a courtesy Cc, a follow-up for someone else); this
+        # run's own REPLIES is not written yet, so it never counts itself.
+        if pm_run_target_answered "$f" "$tid" "$agent"; then
+            pm_event "silent thread=${tid:0:8} agent=$agent reason=replied-on-target"
+        else
+            pm_flag_unless_closed "$tid" "wake for $agent posted no reply (run $rid)" silent-wake
+        fi
     fi
 
     # The run's durable outcome, written BEFORE the harvested marker (and
@@ -6370,7 +6395,7 @@ pm_harvest_run() {
               && "$(cat -- "$DISCARDS/$tid/$agent.spent" 2>/dev/null || true)" != "$trigger" ]] \
         && { (( reply_files > 0 )) \
              || { [[ -n "$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)" ]] \
-                  && ! pm_seat_replied_on_target "$tid" "$agent" "$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)"; }; } \
+                  && ! pm_run_target_answered "$f" "$tid" "$agent"; }; } \
         && ! pm_upstream_closed "$tid"; then
         # Every reply file was discarded, or none was written by a seat with
         # no reply yet on its review target, and no newer message is pending

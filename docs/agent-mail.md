@@ -796,7 +796,8 @@ handler seat included.
 
 A per-agent `on-silence: flag` (or `retry`, below) says that every wake of the seat owes a
 reply. A wake of such a seat that exits 0 having written no reply file
-flags the thread `silent-wake`; see "Silent wakes" under "Replies". Leave it
+flags the thread `silent-wake`, unless the seat already replied on the
+run's review target; see "Silent wakes" under "Replies". Leave it
 unset on a seat whose protocol allows a silent wake (a reviewer told to
 stay quiet until others answer, say): unset, a clean exit with an empty
 outbox is a valid outcome. It is fleet.yaml-only and LLM-only: a persona
@@ -1580,6 +1581,9 @@ attempt=<n> — a deferred retry firing; a discarded-reply retry has
 reason=malformed in place of attempt; see "Retrying a dead wake" below),
 `regate` (thread, agent, run=<harvested run id> — a deferred seat's wake gate
 re-run after that run posted no reply; see rule 5),
+`silent` (thread, agent, reason=replied-on-target — an `on-silence` seat's
+clean wake posted nothing on a review target it had already replied on, so
+the thread was not flagged; see "Silent wakes"),
 `skip` (thread, agent, reason=wake-when — a seat's wake gate said nothing
 is owed and dropped the seat's deferral; see rule 5),
 `defer` (thread, agent, reason=wake-when — a seat's wake gate said not
@@ -2148,6 +2152,17 @@ also a silence. The seat's next wake that posts a reply clears the flag
 same way a clean exit clears a wake-exit flag: the flag is replaced by the
 newest reason left standing, or removed when none is.
 
+One silence is not flagged: a run that carries a review target (a
+`review-target: follow` seat's `REVIEW_TARGET_SHA`) on which the seat has
+already posted a reply. Its verdict on that version stands, so a later
+wake (a courtesy Cc, a follow-up meant for another seat) may rightly stay
+silent; the postmaster logs `silent` (thread, agent,
+reason=replied-on-target) instead of flagging. This is the same test the
+silent retry below uses, so a silence that is not retried is not flagged
+either, under `flag` and `retry` alike. How the seat was addressed (To or
+Cc) plays no part. A silent wake on a target the seat has not answered
+flags as above.
+
 `on-silence: retry` does everything `flag` does, and adds one thing: a
 clean wake that wrote at least one reply file, every one of which the
 postmaster discarded (`reply_files > 0` and `replies == 0`), is re-woken
@@ -2157,7 +2172,8 @@ review target and the seat has posted no reply yet on that target: it owes
 a verdict on every version, and nothing else would wake it again, so the
 panel could never converge. A seat that already replied on the target may
 legitimately stay silent on a follow-up (personas are told to end a wake
-silently when it brings nothing for their lane), so that is not retried.
+silently when it brings nothing for their lane), so that is neither retried
+nor flagged.
 A seat with no review target is never retried for silence. The retry is dropped, not scheduled, when the seat
 already has a newer message pending (that wake renders the whole thread
 anyway) or the thread's upstream state is closed, and a retry whose own

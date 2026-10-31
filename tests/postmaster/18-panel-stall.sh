@@ -171,11 +171,13 @@ check "silent retry: the follow-up woke the seat" 2 "$(ps_spawns rhea)"
 ps_rid2="$(basename "$(live_env_for_agent rhea)" .env)"
 finish_run rhea 0
 once
+ps_out="$(cat "$work/once.out")"
 once
 check "silent retry: a later silence after a reply is not retried" 2 "$(ps_spawns rhea)"
 check "silent retry: and leaves no retry file" 0 "$([[ -e "$(ps_retry_file rhea)" ]] && echo 1 || echo 0)"
-check "silent retry: it is flagged as before" \
-    "wake for rhea posted no reply (run $ps_rid2)" "$(ps_flag)"
+check "silent retry: nor flagged: the seat's verdict on the target stands" "" "$(ps_flag)"
+contains "silent retry: the silence is logged instead" "$ps_out" \
+    "pm silent thread=$ps_short agent=rhea reason=replied-on-target"
 
 printf '\n== on-silence: retry: a reply on an earlier target does not excuse a silent first wake on the new one ==\n'
 ps_target_thread rhea
@@ -204,6 +206,37 @@ once
 once
 check "silent retry: an on-silence: flag seat spawns nothing more" 1 "$(ps_spawns fay)"
 check "silent retry: and is flagged" "wake for fay posted no reply (run $ps_rid1)" "$(ps_flag)"
+
+printf '\n== on-silence: flag: a seat that already replied on the target is not flagged for a later silence ==\n'
+ps_target_thread fay
+once
+ps_reply_file fay
+once
+check "replied-on-target: the verdict posts, nothing flagged" "" "$(ps_flag)"
+reply_msg '@alice' "$ps_mid" 'courtesy copy, nothing for you' --to '@alice' --cc '@fay' >/dev/null
+once
+check "replied-on-target: the Cc woke the seat" 2 "$(ps_spawns fay)"
+finish_run fay 0
+once
+check "replied-on-target: the silent Cc wake is not flagged" "" "$(ps_flag)"
+contains "replied-on-target: the event names thread, agent and reason" "$(cat "$work/once.out")" \
+    "pm silent thread=$ps_short agent=fay reason=replied-on-target"
+not_contains "replied-on-target: no flag event" "$(cat "$work/once.out")" "pm flag "
+# A new version: the seat has not answered it, so silence flags as before
+# (by To this time; the test never looks at the header).
+ps_rt2="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree "$rt1_tree" -p "$rt1_sha" -m 'review target commit 2b')"
+git -C "$PROJECT_DIR" update-ref "refs/heads/$rt1_branch" "$ps_rt2"
+printf 'BRANCH=%s\nSHA=%s\nVERSION=2\nSET_BY=@carol\nSET_AT=2026-01-01T00:00:00Z\n' \
+    "$rt1_branch" "$ps_rt2" > "$PM_STATE_DIR/review-target/$ps_tid.env"
+reply_msg '@alice' "$ps_mid" 'version 2' --to '@fay' >/dev/null
+once
+ps_rid3="$(basename "$(live_env_for_agent fay)" .env)"
+finish_run fay 0
+once
+check "replied-on-target: a silence on an unanswered target flags as before" \
+    "wake for fay posted no reply (run $ps_rid3)" "$(ps_flag)"
+not_contains "replied-on-target: and logs no silent event" "$(cat "$work/once.out")" "pm silent"
 # (rita, on-silence: retry with no review target, is covered above.)
 
 printf '\n== on-silence: retry: no retry when a newer message is pending ==\n'
