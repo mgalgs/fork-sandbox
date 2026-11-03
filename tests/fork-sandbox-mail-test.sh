@@ -161,6 +161,49 @@ id_hops_reply="$("$mail" reply --from @bob --reply-to "$id_hops" --body - <<< "y
 raw_hops_reply="$("$mail" show "$id_hops_reply")"
 contains "reply copies parent's X-Hops verbatim" "$raw_hops_reply" "X-Hops: 2"
 
+printf '\n== one-way mail: send without --from is From: @noreply ==\n'
+
+ow_id="$("$mail" send --to @bob --cc @carol --subject "One way" --body - <<< "no reply expected" 2>diag.txt)"
+rc=$?
+check "send without --from exits 0" "0" "$rc"
+ow_raw="$("$mail" show "$ow_id")"
+check "send without --from stamps From: @noreply" "From: @noreply" "$(grep '^From:' <<< "$ow_raw")"
+check "send without --from: To as given" "To: @bob" "$(grep '^To:' <<< "$ow_raw")"
+check "send without --from: Cc as given" "Cc: @carol" "$(grep '^Cc:' <<< "$ow_raw")"
+check "send without --from: Subject as given" "Subject: One way" "$(grep '^Subject:' <<< "$ow_raw")"
+check "send without --from: body as given" "no reply expected" "$(sed '1,/^$/d' <<< "$ow_raw")"
+check "send without --from adds no other marker header" "" "$(grep -i '^X-One-Way' <<< "$ow_raw")"
+check "a one-way message is in its recipient's inbox" "$ow_id" "$("$mail" inbox bob | cut -f1 | grep -x "$ow_id")"
+ow_explicit="$("$mail" send --from @noreply --to @bob --subject "Explicit" --body - <<< "x" 2>diag.txt)"
+check "explicit --from @noreply means the same" "From: @noreply" "$("$mail" show "$ow_explicit" | grep '^From:')"
+
+ow_reply="$("$mail" reply --from @bob --reply-to "$ow_id" --body - <<< "answer" 2>diag.txt)"
+rc=$?
+check "reply to a one-way message with other participants exits 0" "0" "$rc"
+check "reply-all drops @noreply, keeps the others" "To: @carol" "$("$mail" show "$ow_reply" | grep '^To:')"
+
+ow_solo="$("$mail" send --to @bob --subject "Solo" --body - <<< "x" 2>diag.txt)"
+ow_count() { find "$FORK_SANDBOX_MAIL_ROOT/threads" -name '*.msg' | wc -l | tr -d ' '; }
+ow_before="$(ow_count)"
+ow_out="$("$mail" reply --from @bob --reply-to "$ow_solo" --body - <<< "answer" 2>&1)"; rc=$?
+check "reply to a one-way message with nobody left exits 1" "1" "$rc"
+contains "the refusal says the message is one-way" "$ow_out" "one-way"
+contains "the refusal says there is no return address" "$ow_out" "no return address"
+check "the refusal is one line" "1" "$(printf '%s\n' "$ow_out" | wc -l | tr -d ' ')"
+check "the refused reply stores nothing" "$ow_before" "$(ow_count)"
+ow_to="$("$mail" reply --from @bob --reply-to "$ow_solo" --to @dave --body - <<< "fwd" 2>diag.txt)"
+check "an explicit --to still replies to a one-way message" "To: @dave" "$("$mail" show "$ow_to" | grep '^To:')"
+
+for ow_bad in @noreply @noreply:alpha; do
+    refuses "send refuses $ow_bad in --to" "$mail" send --from @alice --to "@bob,$ow_bad" --subject x --body /etc/hostname
+    refuses "send refuses $ow_bad in --cc" "$mail" send --from @alice --to @bob --cc "$ow_bad" --subject x --body /etc/hostname
+    refuses "reply refuses $ow_bad in --to" "$mail" reply --from @alice --reply-to "$id1" --to "$ow_bad" --body /etc/hostname
+    refuses "reply refuses $ow_bad in --cc" "$mail" reply --from @alice --reply-to "$id1" --to @bob --cc "$ow_bad" --body /etc/hostname
+done
+ow_out="$("$mail" send --from @alice --to @noreply --subject x --body /etc/hostname 2>&1)"
+check "the recipient refusal is one line" "1" "$(printf '%s\n' "$ow_out" | wc -l | tr -d ' ')"
+check "refused @noreply recipients stored nothing" "$(( ow_before + 1 ))" "$(ow_count)"
+
 printf '\n== address validation ==\n'
 
 refuses "rejects a bare name with no @" "$mail" send --from alice --to @bob --subject x --body -
@@ -169,7 +212,6 @@ refuses "rejects a leading hyphen" "$mail" send --from @-alice --to @bob --subje
 refuses "rejects an empty address" "$mail" send --from @ --to @bob --subject x --body -
 refuses "rejects an address with embedded spaces" "$mail" send --from "@al ice" --to @bob --subject x --body -
 refuses "rejects a malformed --to" "$mail" send --from @alice --to bob --subject x --body -
-refuses "rejects a missing --from" "$mail" send --to @bob --subject x --body -
 
 printf '\n== address list trimming ==\n'
 
@@ -1446,6 +1488,16 @@ hx_send_to() { printf 'b\n' | ma send --from @fe --to "$1" --subject s --body -;
 for bad in @x:Beta @x: @x:-b @x:b:c @x:b_c @:beta; do
     refuses "address '$bad' is refused" hx_send_to "$bad"
 done
+
+hx_ow_emit="$(printf 'body\n' | ma send --emit --to @ow:beta --subject oneway --body - 2>/dev/null)"
+contains "--emit qualifies the no---from sentinel with this host" "$hx_ow_emit" $'\nFrom: @noreply:alpha\n'
+printf '%s\n' "$hx_ow_emit" | mb ingest --peer alpha >/dev/null 2>diag.txt; rc=$?
+check "ingest --peer accepts a qualified @noreply From" "0" "$rc"
+hx_ow_id="$(sed -n 's/^Message-ID: //p' <<< "$hx_ow_emit")"
+check "ingest keeps @noreply qualified with the sending host" "From: @noreply:alpha" "$(mb show "$hx_ow_id" | grep '^From:')"
+hx_ow_out="$(printf 'r\n' | mb reply --from @ow --reply-to "$hx_ow_id" --body - 2>&1)"; rc=$?
+check "reply refuses a one-way message whose qualified sentinel is all that is left" "1" "$rc"
+contains "that refusal says one-way" "$hx_ow_out" "one-way"
 
 hx_emit="$(printf 'body\n' | ma send --emit --from @fe --to @x:beta,@y --cc @w --subject portable --body - 2>/dev/null)"
 contains "--emit qualifies a bare From with this host" "$hx_emit" $'\nFrom: @fe:alpha\n'

@@ -2,7 +2,7 @@
 # fork-sandbox-mail.sh — A shared maildir-style message store for a fleet of
 # asynchronous agents
 #
-# Usage: fork-sandbox-mail.sh send --from @a --to @b[,@c] [--cc @d[,@e]]
+# Usage: fork-sandbox-mail.sh send [--from @a] --to @b[,@c] [--cc @d[,@e]]
 #                              --subject <s> (--body <file>|-)
 #                              [--attach <file>]... [--hops <n>]
 #                              [--header 'X-Name: value']...
@@ -264,6 +264,16 @@
 # live agent. --to and --cc each take a comma-separated list and may be
 # repeated; repeats accumulate, so `--to @a --to @b` is `--to @a,@b`.
 #
+# One-way mail. `send` without --from stamps `From: @noreply` (an explicit
+# `--from @noreply` means the same): a message from a sender that holds no
+# mailbox, with no reply expected. `@noreply` is the one marker -- no other
+# header says it. It is never a recipient: `send`/`reply` naming it (bare or
+# `@noreply:host`) in --to or --cc is refused. `reply` drops it, in either
+# form, from the reply-all set; when nothing else is left the reply is
+# refused as one-way with no return address, and nothing is written.
+# Across hosts it qualifies like any other address (`--emit` prints
+# `@noreply:<this host>`). `reply` still requires --from.
+#
 # Privacy is addressing, not access control. This store has no ACLs at all:
 # `show`, `tree`, `list` and a raw grep of the store see every message
 # regardless of who it was addressed to -- they are host-side operator
@@ -431,6 +441,31 @@ mail_trim() {
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
     printf '%s' "$s"
+}
+
+# The one-way sentinel: `send` with no --from stamps `From: @noreply`. It
+# names no mailbox -- it is never a recipient, reply-all drops it, and
+# lane-mail.sh refuses to register the lane -- so a message from it plainly
+# has no return address. Succeeds for the bare and any host-qualified form.
+MAIL_NOREPLY="@noreply"
+mail_is_noreply() {
+    [[ "$1" == "$MAIL_NOREPLY" || "$1" == "$MAIL_NOREPLY":* ]]
+}
+
+# Refuses a normalized ", "-joined recipient list ($1) that names the
+# one-way sentinel; $2 is the verb and $3 the flag, for the error.
+mail_refuse_noreply_recipient() {
+    local -a parts
+    local p
+    IFS=',' read -ra parts <<< "$1"
+    for p in "${parts[@]:-}"; do
+        p="$(mail_trim "$p")"
+        if mail_is_noreply "$p"; then
+            echo "Error: $2: $p in $3 is the one-way sender sentinel, not a mailbox; it cannot be a recipient." >&2
+            return 1
+        fi
+    done
+    return 0
 }
 
 # Prints a validated address in this store's own terms: an address naming
@@ -1137,7 +1172,8 @@ cmd_send() {
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
         esac
     done
-    [[ -n "$from" ]] || { echo "Error: send: --from is required." >&2; return 1; }
+    # No --from: a one-way message (see mail_is_noreply).
+    [[ -n "$from" ]] || from="$MAIL_NOREPLY"
     [[ -n "$to" ]] || { echo "Error: send: --to is required." >&2; return 1; }
     [[ -n "$subject" ]] || { echo "Error: send: --subject is required." >&2; return 1; }
     [[ -n "$body_arg" ]] || { echo "Error: send: --body is required." >&2; return 1; }
@@ -1182,6 +1218,8 @@ cmd_send() {
     to_norm="$(mail_validate_addr_list "$to")" || return 1
     cc_norm=""
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
+    mail_refuse_noreply_recipient "$to_norm" send --to || return 1
+    mail_refuse_noreply_recipient "$cc_norm" send --cc || return 1
     if (( emit )); then
         local no_grant_mark=""
         (( no_grant )) && no_grant_mark="no-grant"
@@ -1433,6 +1471,8 @@ cmd_reply() {
     local to_norm="" cc_norm=""
     [[ -n "$to" ]] && { to_norm="$(mail_validate_addr_list "$to")" || return 1; }
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
+    mail_refuse_noreply_recipient "$to_norm" reply --to || return 1
+    mail_refuse_noreply_recipient "$cc_norm" reply --cc || return 1
     if (( emit )); then
         mail_emit_check reply 0 "$upstream_head_arg$upstream_state_arg" || return 1
     fi
@@ -1462,7 +1502,8 @@ cmd_reply() {
     p_references="$(mail_header "$parent_file" References)"
 
     if [[ -z "$to_norm" ]]; then
-        # reply-all: dedup(parent's From + To + Cc) minus the sender.
+        # reply-all: dedup(parent's From + To + Cc) minus the sender and
+        # the one-way sentinel, which has no mailbox to answer.
         local -a candidates=() seen_addr=() result=()
         [[ -n "$p_from" ]] && candidates+=("$p_from")
         local rest="$p_to${p_cc:+, $p_cc}"
@@ -1478,6 +1519,7 @@ cmd_reply() {
         local c dup
         for c in "${candidates[@]}"; do
             [[ "$c" == "$from" ]] && continue
+            mail_is_noreply "$c" && continue
             dup=0
             for a in "${seen_addr[@]:-}"; do
                 [[ "$a" == "$c" ]] && { dup=1; break; }
@@ -1489,6 +1531,11 @@ cmd_reply() {
         local joined
         joined="$(IFS=','; printf '%s' "${result[*]:-}")"
         to_norm="$(mail_validate_addr_list "$joined")" || { rm -f -- "$body_file"; return 1; }
+        if [[ -z "$to_norm" ]] && mail_is_noreply "$p_from"; then
+            rm -f -- "$body_file"
+            echo "Error: reply: $reply_to is a one-way message (From: $p_from) with no return address and no other participants; pass --to explicitly." >&2
+            return 1
+        fi
         [[ -n "$to_norm" ]] || { rm -f -- "$body_file"; echo "Error: reply: reply-all resolved to no recipients; pass --to explicitly." >&2; return 1; }
     fi
 
