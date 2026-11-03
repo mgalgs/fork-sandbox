@@ -605,6 +605,88 @@ check "@operator in To: does not clobber a real flag reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_op" 2>/dev/null)"
 
 # ============================================================
+printf '\n== an external sender on its own thread is never unresolvable (rule 0) ==\n'
+# ============================================================
+# An external client (a mail-API token sending --from @some-client) opens
+# a thread To a seat; the seat's harvested reply is a reply-all, so it
+# names @some-client in its own To:. That name does not resolve, but it
+# sent mail into this thread -- a typo'd seat cannot have -- so it is an
+# external participant: no route-dead, no flag, and the thread settles.
+
+# xs_quiescent <tid>: yes when pm_thread_is_quiescent holds for it.
+# shellcheck disable=SC1090
+xs_quiescent() { ( source "$postmaster"; pm_thread_is_quiescent "$1" ) && echo yes || echo no; }
+# xs_finish <agent> [reply]: finishes the agent's live run, leaving one
+# outbox reply when given.
+xs_finish() {
+    local PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster" env_f
+    env_f="$(live_env_for_agent "$1")" || { no "xs_finish: no live run for $1"; return; }
+    finish_run "$1" 0
+    [[ -z "${2:-}" ]] || printf '\n%s\n' "$2" > "$(sed -n 's/^RUN_DIR=//p' "$env_f")/outbox/mail-1.md"
+}
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_xs="$(send_msg '@some-client' '@bob' 'external client thread' 'body' 8)"
+tid_xs="$(thread_of "$mid_xs")"
+short_xs="${tid_xs:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "external sender: the To seat wakes" 1 "$(grep -c -- "^sbx-mail-$short_xs-bob-" "$STUB_ARGV_LOG")"
+xs_finish bob 'On it.'
+once
+cp -- "$work/once.out" "$work/xs-harvest.out"
+once
+cat -- "$work/once.out" >> "$work/xs-harvest.out"
+xs_reply="$(grep -l '^From: @bob$' "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_xs"/*.msg | head -n1)"
+contains "external sender: the seat's harvested reply-all names the sender in To:" \
+    "$(header_of_file "$xs_reply" To)" "@some-client"
+not_contains "external sender in To: no route-dead event" \
+    "$(cat "$work/xs-harvest.out")" "route-dead"
+check "external sender in To: the thread is not flagged" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_xs" 2>/dev/null || true)"
+check "external sender in To: the thread is quiescent after harvest" yes "$(xs_quiescent "$tid_xs")"
+check "external sender in To: the sender is never a wake candidate" 0 \
+    "$(grep -c -- "-some-client-" "$STUB_ARGV_LOG")"
+
+# A typo'd @-name that never sent mail still flags on this same thread,
+# beside the exempted sender, and the flag names only the typo.
+: > "$STUB_ARGV_LOG"
+mid_xs_typo="$(reply_msg '@bob' "$mid_xs" 'typo beside the client' --to '@some-client,@nobdy')"
+once
+contains "external sender: a typo'd name on the same message still emits route-dead" \
+    "$(cat "$work/once.out")" "pm route-dead thread=$short_xs unresolved=1"
+xs_flag="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_xs" 2>/dev/null)"
+contains "external sender: the typo flags as before" "$xs_flag" "unresolvable To: @nobdy at $mid_xs_typo"
+not_contains "external sender: the flag does not name the exempted sender" "$xs_flag" "@some-client"
+
+# Same on Cc: the seat copies the client as an observer.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_xc="$(send_msg '@some-client' '@bob' 'external client cc thread' 'body' 8)"
+tid_xc="$(thread_of "$mid_xc")"
+short_xc="${tid_xc:0:8}"
+once
+xs_finish bob
+once
+reply_msg '@bob' "$mid_xc" 'handing to alice' --to '@alice' --cc '@some-client' >/dev/null
+once
+not_contains "external sender in Cc: no route-dead event" "$(cat "$work/once.out")" "route-dead"
+not_contains "external sender in Cc: no flag event" "$(cat "$work/once.out")" "pm flag thread=$short_xc"
+check "external sender in Cc: the thread is not flagged" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_xc" 2>/dev/null || true)"
+xs_finish alice
+once
+check "external sender in Cc: the thread is quiescent after harvest" yes "$(xs_quiescent "$tid_xc")"
+
+# A typo'd Cc name that never sent mail still flags, as before.
+mid_xc_typo="$(reply_msg '@bob' "$mid_xc" 'typo on cc' --to '@alice' --cc '@some-client,@nobdy')"
+once
+contains "external sender: a typo'd Cc name on the same thread still flags" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_xc" 2>/dev/null)" \
+    "unresolvable Cc: @nobdy at $mid_xc_typo"
+
+# ============================================================
 printf '\n== @operator sink: zero wake candidates, never unresolvable ==\n'
 # ============================================================
 # fleet expand's @operator sink (see docs/agent-mail.md, "Routing

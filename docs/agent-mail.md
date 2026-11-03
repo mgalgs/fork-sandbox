@@ -1685,7 +1685,9 @@ first, in which case that reason wins instead — pm_flag overwrites, not
 appends, so only one reason survives a message that trips both; the
 names themselves never appear on this line, only the count — `@operator`
 does not count here, since `fleet expand` resolves it successfully via
-its zero-candidate sink rather than failing (see rule 0 below). Because
+its zero-candidate sink rather than failing (see rule 0 below), and
+neither does a name that is the `From` of a message already in the
+thread (an external participant, see rule 0). Because
 `mail reply` defaults to reply-all and copies a
 message's own From/To/Cc into every reply, the same unresolved name tends
 to reappear on every later message in the thread; `unresolved` counts
@@ -1904,6 +1906,13 @@ thread routes it.
    flags either, but for a different reason: `fleet expand` resolves it
    successfully with zero candidates, so it is simply never a wake
    candidate and never reaches the unresolved path at all.
+   An `@`-shaped name that does not resolve but is the `From` of any
+   message already in T when M is routed never flags either, on `To` or
+   `Cc`: it is an external participant — say a mail-API client that
+   opened the thread with `--from @some-client`, which a seat's reply-all
+   then names in its `To:` — and a typo'd seat name cannot have sent
+   mail into the thread. It is still never a wake candidate and gains no
+   rule-1 authority; a name that never sent mail flags exactly as above.
    An unknown fleet name reached via `Cc` flags too, the same way and the
    same once-per-thread dedup, but with its own reason naming it as
    arriving via `Cc` (keyword `unresolvable-cc`) rather than `To`, so the

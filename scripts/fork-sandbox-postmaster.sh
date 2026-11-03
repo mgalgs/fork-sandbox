@@ -248,7 +248,9 @@
 #                one or more @-shaped names that `fleet expand` could not
 #                resolve (typo'd seat, missing fleet file -- never
 #                `@operator`, which `fleet expand` resolves successfully
-#                via its zero-candidate sink, see docs/agent-mail.md) and
+#                via its zero-candidate sink, see docs/agent-mail.md, and
+#                never a name that is the From of a message already in
+#                the thread, an external participant -- see rule 0) and
 #                that this thread had not already recorded before
 #                (reply-all reintroduces the same unresolved name on
 #                every later message, and a name once recorded -- flagged
@@ -463,8 +465,13 @@
 #      candidate on either header: an unknown fleet name (typo'd seat,
 #      missing fleet file) also flags T needs-operator the first time
 #      this thread sees it (see the route-dead event above), while
-#      `@operator` -- or anything not @-shaped -- is treated as
-#      genuinely external and never flags. External senders receive mail
+#      `@operator` -- or anything not @-shaped, or an @-shaped name that
+#      is the From of any message already in T when M is routed (an
+#      external participant, e.g. a mail-API client a seat answered with
+#      reply-all; a typo'd seat cannot have sent mail) -- is treated as
+#      genuinely external and never flags. Such a sender gains nothing
+#      else: it is still never a wake candidate, and rule 1 alone decides
+#      its authority. External senders receive mail
 #      only in the archive. M's own
 #      From is never a wake candidate on either header, even when it only
 #      reaches the list via a list address M's To: or Cc: expands through
@@ -3934,6 +3941,31 @@ pm_record_upstream_state() {
     return 0
 }
 
+# Prints, one per line, each name in $2.. that is NOT the From of a message
+# thread $1 holds right now. Rule 0's unresolved-name check runs its
+# @-shaped misses through this: a name that already sent mail into the
+# thread is an external participant (a mail-API client, say, whose thread
+# a seat answered with reply-all), not a typo'd seat -- a typo cannot have
+# sent anything. Only the unresolved/flag path uses it; such a name is
+# still never a wake candidate and gains no rule-1 authority.
+pm_drop_thread_senders() {
+    local tid="$1" f from u
+    shift
+    local -a senders=()
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] || continue
+        from="$(pm_trim "$(pm_header "$f" From)")"
+        [[ -n "$from" ]] && senders+=("$from")
+    done
+    for u in "$@"; do
+        local sent=0 s
+        for s in "${senders[@]:-}"; do
+            [[ "$s" == "$u" ]] && { sent=1; break; }
+        done
+        (( sent )) || printf '%s\n' "$u"
+    done
+}
+
 # The Message-ID of every message thread $1 holds right now, one per line.
 pm_thread_message_ids() {
     local f id
@@ -5188,6 +5220,9 @@ pm_process_message() {
     local -a unresolved_to=()
     mapfile -t unresolved_to < "$to_unresolved_file"
     rm -f -- "$to_unresolved_file"
+    if (( ${#unresolved_to[@]} )); then
+        mapfile -t unresolved_to < <(pm_drop_thread_senders "$tid" "${unresolved_to[@]}")
+    fi
     local -a to_candidates=()
     local cand
     for cand in "${to_expanded[@]}"; do
@@ -5207,7 +5242,8 @@ pm_process_message() {
         return 0
     fi
 
-    # An @-shaped To: name that never expanded is a typo'd seat or a
+    # An @-shaped To: name that never expanded, and never sent mail into
+    # this thread (pm_drop_thread_senders, above), is a typo'd seat or a
     # missing fleet file, not an external address (rule 0 already let
     # those through silently, above) -- flag it even when Cc: rescues a
     # wake for someone else on the same message, since the To: line
@@ -5325,6 +5361,9 @@ pm_process_message() {
         local -a unresolved_cc=()
         mapfile -t unresolved_cc < "$cc_unresolved_file"
         rm -f -- "$cc_unresolved_file"
+        if (( ${#unresolved_cc[@]} )); then
+            mapfile -t unresolved_cc < <(pm_drop_thread_senders "$tid" "${unresolved_cc[@]}")
+        fi
         if (( ${#unresolved_cc[@]} )); then
             mkdir -p -- "$UNRESOLVED_TO"
             local cc_seen_file="$UNRESOLVED_TO/$tid" u
