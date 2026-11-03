@@ -205,6 +205,22 @@ else
     no "register --about with bad text refuses before registering" "rc=$rc: $out"
 fi
 
+nr_home="$scratch/noreply-home"; mkdir -p "$nr_home"
+nr_sid="$sid-noreply"; dir_sids+=("$nr_sid")
+out="$(HOME="$nr_home" CLAUDE_CODE_SESSION_ID="$nr_sid" "$sc" register noreply \
+    --about "one way" --dir /tmp/lane-mail-test-proj/noreply 2>&1)"; rc=$?
+if (( rc != 0 )) && [[ "$out" == *"reserved for one-way mail"* ]]; then
+    ok "register noreply is refused as the one-way sentinel"
+else
+    no "register noreply is refused as the one-way sentinel" "rc=$rc: $out"
+fi
+if [[ ! -e "/tmp/claude-$(id -u)/lane-mail-lanes/$nr_sid" && ! -e "$nr_home/.local/state/fork-sandbox/lanes.json" \
+        && ! -e "$scratch/root/agents/noreply/about" ]]; then
+    ok "the refused register noreply wrote nothing"
+else
+    no "the refused register noreply wrote nothing"
+fi
+
 printf '== lanes.json: register --dir (write path) ==\n'
 
 lanes_home="$(mktemp -d)"

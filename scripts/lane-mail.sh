@@ -96,7 +96,8 @@
 # grants or review target (refused). A receiving fork-sandbox that predates
 # bundle support refuses the whole delivery with an error naming the
 # upgrade it needs; nothing is stored, here or there. `--from` must be a
-# lane on this host. Waking is unchanged: the receiving host's watcher and
+# lane on this host; a send without --from passes, since its `@noreply`
+# sentinel is qualified with this host like any other From. Waking is unchanged: the receiving host's watcher and
 # unread-mail hook see the message in that host's own store. `inbox` and
 # `seen` are always this host's; nothing reads a remote inbox.
 #
@@ -104,6 +105,9 @@
 # /tmp/claude-$UID/lane-mail-lanes/<session-id>; the unread-mail hooks
 # (lane-mail-hook.sh) read that mapping to surface inbox state between
 # turns. Sessions that never register are invisible to the hooks.
+# `register noreply` is refused before anything is written: `@noreply` is
+# the store's one-way sender (`send` without --from), and no mailbox may
+# answer to it.
 
 set -euo pipefail
 
@@ -463,6 +467,13 @@ case "$cmd" in
         [[ -n "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"] [--dir <abs-path>]" >&2; exit 2; }
         if [[ ! "$lane" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
             echo "lane-mail: bad lane name '$lane' (want ^[a-z0-9][a-z0-9-]*$, no leading @)" >&2
+            exit 2
+        fi
+        # @noreply is the store's one-way sender sentinel (`send` without
+        # --from); a mailbox answering to it would turn "no return address"
+        # into a real one.
+        if [[ "$lane" == noreply ]]; then
+            echo "lane-mail: 'noreply' is reserved for one-way mail (send without --from) and cannot be registered" >&2
             exit 2
         fi
         # Validate --dir before anything is written, same as --about below.

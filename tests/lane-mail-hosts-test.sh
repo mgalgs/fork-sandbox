@@ -241,6 +241,12 @@ err="$(printf 'x\n' | ha send --from @fe:beta --to @x:beta --subject s --body - 
 check "--from must be a lane on this host" "1" "$rc"
 contains "it says so" "$err" "--from must be a lane on this host"
 
+before_b="$(msgs beta)"
+out="$(printf 'one way\n' | ha send --to @x:beta --subject oneway --body - 2>"$scratch/ow.err")"; rc=$?
+check "a send without --from passes the same-host check and is delivered" "0 $(( before_b + 1 ))" "$rc $(msgs beta)"
+check "the peer sees the sentinel qualified with the sender host" "@noreply:alpha" "$(hdr "$(hb show "$out")" From)"
+check "the sender's copy has the bare sentinel" "@noreply" "$(hdr "$(ha show "$out")" From)"
+
 echo "== cross-host attachments =="
 printf 'attach\n' > "$scratch/att.txt"
 out="$(printf 'see attached\n' | ha send --from @fe --to @x:beta --subject 'with attach' --body - --attach "$scratch/att.txt" 2>"$scratch/err")"; rc=$?
