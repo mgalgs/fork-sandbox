@@ -5,6 +5,7 @@
 #        fork-sandbox status [options] <run-dir>
 #        fork-sandbox say <run-dir> <message>
 #        fork-sandbox stop [--timeout SECS] <run-dir>
+#        fork-sandbox prune [--dry-run] [--older-than DAYS]
 #        fork-sandbox adopt <run-dir>
 #        fork-sandbox k8s <sub-verb> [options]
 #        fork-sandbox log <sub-verb> [options]
@@ -23,6 +24,7 @@
 #   status     fork-sandbox-status.sh
 #   say        fork-sandbox-say.sh
 #   stop       fork-sandbox-stop.sh
+#   prune      fork-sandbox-prune.sh
 #   k8s        fork-sandbox-k8s.sh
 #   adopt      fork-sandbox-k8s.sh adopt --run-dir
 #   log        sandbox-run-log.py
@@ -80,6 +82,9 @@ case "$verb" in
     stop)
         target='fork-sandbox-stop.sh'
         ;;
+    prune)
+        target='fork-sandbox-prune.sh'
+        ;;
     adopt)
         target='fork-sandbox-k8s.sh'
         # A plain `-h`/`--help` right after the verb must reach cmd_adopt's
@@ -125,7 +130,7 @@ case "$verb" in
         ;;
     *)
         printf "fork-sandbox: unknown verb '%s'\n" "$verb" >&2
-        printf '%s\n' 'Verbs: run status say stop adopt configure k8s log validate-services mail mail-api mail-forward fleet postmaster' >&2
+        printf '%s\n' 'Verbs: run status say stop prune adopt configure k8s log validate-services mail mail-api mail-forward fleet postmaster' >&2
         printf '%s\n' "Try 'fork-sandbox --help'." >&2
         exit 2
         ;;

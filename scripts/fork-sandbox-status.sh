@@ -435,7 +435,7 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|tidy.json|.driver.lock|.reap-pending|pipeline.json) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|plan.md|tidy.json|.driver.lock|.reap-pending|clone-pruned|pipeline.json) ;;
         step-[0-9]*-loop.json)
             [[ "$name" =~ ^step-[0-9]+-loop\.json$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         # One file per leg, named by the runner. The leg kinds are
@@ -1051,6 +1051,18 @@ run_state() {
     fi
 }
 
+# " (pruned <date>; ...)" when `fork-sandbox prune` removed this run's clone
+# (its clone-pruned marker, see fork-sandbox-prune.sh), so the clone: line
+# never names a directory that is gone as if it were still there. Empty
+# otherwise.
+clone_pruned_note() {
+    local marker at when
+    marker="$(run_file_read clone-pruned 2>/dev/null)" || return 0
+    at="$(printf '%s\n' "$marker" | sed -n 's/^pruned_at=\([0-9][0-9]*\)$/\1/p' | head -n1)"
+    when="$( [[ -n "$at" ]] && date -u -d "@$at" '+%Y-%m-%d %H:%M UTC' 2>/dev/null)" || when=""
+    printf ' (pruned%s; the branch came home, the clone is gone)' "${when:+ $when}"
+}
+
 exit_code() {
     local rc
     rc="$(run_file_read exit-code 2>/dev/null)" || { printf '?'; return; }
@@ -1265,7 +1277,7 @@ print_status_block() {
     printf '\n'
     printf 'branch:   %s\n' "$branch"
     printf 'origin:   %s\n' "$origin_repo"
-    printf 'clone:    %s\n' "$clone_dir"
+    printf 'clone:    %s%s\n' "$clone_dir" "$(clone_pruned_note)"
     # A composed --k8s run (network=cluster) has no tmux session to name --
     # see tmux_target's own comment, above, for why -- so this prints the
     # cluster object an operator can actually look at instead of a session

@@ -49,7 +49,7 @@ cp "$dispatcher" "$tmp/fork-sandbox"
 chmod +x "$tmp/fork-sandbox"
 
 for target in fork-sandbox.sh fork-sandbox-status.sh fork-sandbox-say.sh \
-    fork-sandbox-stop.sh fork-sandbox-k8s.sh sandbox-run-log.py \
+    fork-sandbox-stop.sh fork-sandbox-prune.sh fork-sandbox-k8s.sh sandbox-run-log.py \
     fork-sandbox-k8s-services-parse.py \
     fork-sandbox-mail.sh fork-sandbox-mail-api.py fork-sandbox-mail-forward.py \
     fork-sandbox-fleet.sh \
@@ -96,6 +96,8 @@ else
 fi
 run_case 'stop passes arguments' $'fork-sandbox-stop.sh\n--timeout\n30\n/run/dir' \
     stop --timeout 30 /run/dir
+run_case 'prune passes arguments' $'fork-sandbox-prune.sh\n--dry-run\n--older-than\n30' \
+    prune --dry-run --older-than 30
 run_case 'k8s sub-verb passes through' \
     $'fork-sandbox-k8s.sh\nsubmit\n--branch\nx\nproj\nhandoff' \
     k8s submit --branch x proj handoff
@@ -133,6 +135,7 @@ run_case 'help after verb reaches target' $'fork-sandbox.sh\n--help' run --help
 help="$("$tmp"/fork-sandbox --help)"
 if [[ "$help" == *'run'* && "$help" == *'status'* && "$help" == *'say'* &&
     "$help" == *'stop'* && "$help" == *'adopt'* &&
+    "$help" == *'fork-sandbox prune [--dry-run]'* &&
     "$help" == *'configure'* && "$help" == *'k8s'* && "$help" == *'log'* &&
     "$help" == *'validate-services'* && "$help" == *'mail'* && "$help" == *'fleet'* &&
     "$help" == *'postmaster'* &&
@@ -168,7 +171,7 @@ if grep -Fq "unknown verb 'frobnicate'" "$tmp/unknown-err"; then
 else
     no 'unknown verb names offender' "$(cat "$tmp/unknown-err")"
 fi
-if grep -qF 'Verbs: run status say stop adopt configure k8s log validate-services mail mail-api mail-forward fleet postmaster' \
+if grep -qF 'Verbs: run status say stop prune adopt configure k8s log validate-services mail mail-api mail-forward fleet postmaster' \
         "$tmp/unknown-err"; then
     ok 'unknown verb lists every verb'
 else

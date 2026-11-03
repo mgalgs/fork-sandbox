@@ -305,6 +305,7 @@ PORCELAIN=(
     fork-sandbox-mail-render.py
     fork-sandbox-mail.sh
     fork-sandbox-postmaster.sh
+    fork-sandbox-prune.sh
     fork-sandbox-say.sh
     fork-sandbox-status.sh
     fork-sandbox-stop.sh
