@@ -325,6 +325,28 @@ and hyphens, no leading hyphen. Anything else is refused. The store does
 not consult the registry: an address here is a string, not a claim that
 anyone will answer.
 
+### One-way mail: `@noreply`
+
+A sender that holds no mailbox (an operator-side session relaying a
+message, say) can leave out `--from`: `send` then stamps `From: @noreply`,
+and an explicit `--from @noreply` means the same. Inventing a sender name
+instead would point replies at a mailbox nobody reads. `@noreply` is the
+only marker; there is no other header for it, and From stays a required
+header everywhere else (`ingest`, the mail API, rendering, the postmaster,
+which treats it like any external sender).
+
+- It is never a recipient: `send` or `reply` naming `@noreply` (bare or
+  `@noreply:<host>`) in `--to` or `--cc` is refused.
+- `reply` drops it, in either form, from the reply-all set. When nothing
+  else is left the reply is refused as a one-way message with no return
+  address and nothing is written; `--to` still works. `reply` itself
+  still needs `--from`.
+- `lane-mail.sh register noreply` is refused, so no real mailbox ever
+  answers to it.
+- Across hosts it qualifies like any other address: `--emit` prints
+  `@noreply:<this host>` and the receiving `ingest --peer` keeps that form,
+  so lane-mail.sh's "`--from` must be a lane on this host" check passes.
+
 ### Attachments, and the things that are refused
 
 Attachments are copied into the thread's `attachments/` directory, capped
@@ -522,7 +544,8 @@ A failure — an unreachable peer, an ssh error, the far side refusing —
 exits non-zero with the reason and writes nothing locally; with several
 hosts, hosts delivered before the failure are named. There is no retry queue:
 re-send. A cross-host message carries no grants or review target (refused);
-`--from` must be a lane on this host. It does carry `--attach` — see
+`--from` must be a lane on this host (a send without `--from` passes: its
+`@noreply` is qualified with this host). It does carry `--attach` — see
 "Attachments" below.
 
 **Attachments.** `send`/`reply --attach` works cross-host too, carried as a
