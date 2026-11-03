@@ -130,7 +130,7 @@ agents:
   happy:
     handler: exec
     command: happy-handler
-  noreply:
+  silent:
     handler: exec
     command: noreply-handler
   malformed:
@@ -264,7 +264,7 @@ check "on-harvest (handler): FS_HOOK_MESSAGES is the posted message id" \
 contains "on-harvest (handler): the event line carries the hook file" \
     "$(cat "$work/once.out")" "pm hook thread=${hkm_tid:0:8} hook=on-harvest file=on-harvest exit=0"
 : > "$HANDLER_LOG"
-hkm_mid="$(send_msg '@carol' '@noreply' 'Hook noreply' 'nothing to say')"
+hkm_mid="$(send_msg '@carol' '@silent' 'Hook noreply' 'nothing to say')"
 once
 check "on-harvest (handler): a harvest that posted nothing fires nothing" 1 "$(hk_count on-harvest)"
 hk_uninstall
@@ -292,7 +292,7 @@ check "sigpipe: the pass still ran to completion and posted the reply" 1 "$sigpi
 
 # --- scenario: no reply written is a valid outcome, not a flag ---
 : > "$HANDLER_LOG"
-mid="$(send_msg '@carol' '@noreply' 'Silence' 'nothing to say')"
+mid="$(send_msg '@carol' '@silent' 'Silence' 'nothing to say')"
 tid="$(thread_of "$mid")"
 once
 check "no-reply: handler ran" 1 "$(grep -c -- '^----CALL----$' "$HANDLER_LOG")"
