@@ -346,6 +346,9 @@ which treats it like any external sender).
 - Across hosts it qualifies like any other address: `--emit` prints
   `@noreply:<this host>` and the receiving `ingest --peer` keeps that form,
   so lane-mail.sh's "`--from` must be a lane on this host" check passes.
+- The mail API keeps `--from` required: it runs the store with
+  `FORK_SANDBOX_MAIL_REQUIRE_FROM=1`, under which a send without `--from`
+  is refused as before, so a remote client cannot post anonymously.
 
 ### Attachments, and the things that are refused
 
@@ -2710,6 +2713,7 @@ marker**, so strip leading whitespace first, then test for `> `.
 | Variable | Default | Used by |
 |---|---|---|
 | `FORK_SANDBOX_MAIL_ROOT` | `/var/tmp/claude-scratch/agent-mail` | store, router, renderer |
+| `FORK_SANDBOX_MAIL_REQUIRE_FROM` | unset | store (`1`: `send` without `--from` is refused instead of stamping `@noreply`; the mail API sets it) |
 | `FORK_SANDBOX_FLEET_FILE` | `~/.config/fork-sandbox/fleet.yaml` | registry |
 | `FORK_SANDBOX_PERSONAS_DIR` | `~/.config/fork-sandbox/personas` | registry |
 | `FORK_SANDBOX_THREAD_BUDGET` | `96` | router (rule 3) |

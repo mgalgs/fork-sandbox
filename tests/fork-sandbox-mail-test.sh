@@ -174,6 +174,9 @@ check "send without --from: Subject as given" "Subject: One way" "$(grep '^Subje
 check "send without --from: body as given" "no reply expected" "$(sed '1,/^$/d' <<< "$ow_raw")"
 check "send without --from adds no other marker header" "" "$(grep -i '^X-One-Way' <<< "$ow_raw")"
 check "a one-way message is in its recipient's inbox" "$ow_id" "$("$mail" inbox bob | cut -f1 | grep -x "$ow_id")"
+ow_out="$(FORK_SANDBOX_MAIL_REQUIRE_FROM=1 "$mail" send --to @bob --subject x --body /etc/hostname 2>&1)"; rc=$?
+check "FORK_SANDBOX_MAIL_REQUIRE_FROM=1 keeps a missing --from refused" "1" "$rc"
+contains "that refusal names --from" "$ow_out" "--from is required"
 ow_explicit="$("$mail" send --from @noreply --to @bob --subject "Explicit" --body - <<< "x" 2>diag.txt)"
 check "explicit --from @noreply means the same" "From: @noreply" "$("$mail" show "$ow_explicit" | grep '^From:')"
 

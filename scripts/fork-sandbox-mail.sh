@@ -272,7 +272,10 @@
 # form, from the reply-all set; when nothing else is left the reply is
 # refused as one-way with no return address, and nothing is written.
 # Across hosts it qualifies like any other address (`--emit` prints
-# `@noreply:<this host>`). `reply` still requires --from.
+# `@noreply:<this host>`). `reply` still requires --from. With
+# FORK_SANDBOX_MAIL_REQUIRE_FROM=1 in the environment a missing --from is
+# refused as before; the mail API sets it on every store it runs, so a
+# remote client cannot post anonymously.
 #
 # Privacy is addressing, not access control. This store has no ACLs at all:
 # `show`, `tree`, `list` and a raw grep of the store see every message
@@ -1172,8 +1175,16 @@ cmd_send() {
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
         esac
     done
-    # No --from: a one-way message (see mail_is_noreply).
-    [[ -n "$from" ]] || from="$MAIL_NOREPLY"
+    # No --from: a one-way message (see mail_is_noreply) -- unless the
+    # caller is the mail API, where a sender comes from the token and a
+    # missing one stays an error (FORK_SANDBOX_MAIL_REQUIRE_FROM).
+    if [[ -z "$from" ]]; then
+        if [[ "${FORK_SANDBOX_MAIL_REQUIRE_FROM:-}" == 1 ]]; then
+            echo "Error: send: --from is required." >&2
+            return 1
+        fi
+        from="$MAIL_NOREPLY"
+    fi
     [[ -n "$to" ]] || { echo "Error: send: --to is required." >&2; return 1; }
     [[ -n "$subject" ]] || { echo "Error: send: --subject is required." >&2; return 1; }
     [[ -n "$body_arg" ]] || { echo "Error: send: --body is required." >&2; return 1; }

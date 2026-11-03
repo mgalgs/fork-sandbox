@@ -34,7 +34,9 @@ and the postmaster read the same variable, so there is one source. Only an
 operator token may post as a name on the list. The loader refuses to start
 if a client entry's identities include a listed name, `mint` refuses to
 mint one, and the allowlist refuses `--from <listed name>` from anything
-but an operator token, unconditionally.
+but an operator token, unconditionally. A send with no `--from` is not the
+one-way `@noreply` mail it is locally (docs/agent-mail.md): the server runs
+the store with `FORK_SANDBOX_MAIL_REQUIRE_FROM=1`, so the store refuses it.
 
 What a client's mail can do depends on which postmaster reads it:
 

@@ -16,7 +16,9 @@ docs/mail-api.md.
 
 serve reads the tokens file once, at startup. Rotation is a restart. It runs
 the scripts by absolute path from its own directory, with the environment it
-was started with (so FORK_SANDBOX_MAIL_ROOT passes through), without a shell.
+was started with (so FORK_SANDBOX_MAIL_ROOT passes through) plus
+FORK_SANDBOX_MAIL_REQUIRE_FROM=1, which keeps a send without --from refused
+rather than stamped From: @noreply, without a shell.
 
 check runs the loader serve runs on the tokens file and exits: it prints
 "ok: <n> entries (<k> operator, <m> client)" and exits 0, or prints the one
@@ -574,10 +576,13 @@ def run_tool(tool, argv, stdin):
     """Run the script and return (rc, stdout, stderr). The child gets its
     own session so a timeout can kill its whole process group, not just the
     shell (subprocess.run would leave grandchildren holding the pipes)."""
+    # A client's sender comes from its token, so the store must not stamp
+    # the one-way @noreply for a send that names none: it refuses instead.
+    env = dict(os.environ, FORK_SANDBOX_MAIL_REQUIRE_FROM="1")
     proc = subprocess.Popen(
         [TOOL_SCRIPTS[tool]] + argv, shell=False, stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
+        start_new_session=True, env=env)
     try:
         out, err = proc.communicate(stdin, timeout=EXEC_TIMEOUT)
     except subprocess.TimeoutExpired:
