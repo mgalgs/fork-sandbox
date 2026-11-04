@@ -56,6 +56,10 @@ trap cleanup EXIT
 
 printf '== register ==\n'
 
+# CLAUDE_PID names this shell as the registering Claude Code process, so the
+# registration is live for as long as the test runs, with or without a real
+# Claude Code above it.
+export CLAUDE_PID=$$
 out="$(CLAUDE_CODE_SESSION_ID="$sid" "$lane_mail" register testlane 2>&1)"
 rc=$?
 if (( rc == 0 )); then ok "register succeeds"; else no "register succeeds" "rc=$rc: $out"; fi
@@ -94,7 +98,7 @@ printf '== lanes ==\n'
 lanes="$("$lane_mail" lanes 2>&1)"
 rc=$?
 if (( rc == 0 )); then ok "lanes succeeds"; else no "lanes succeeds" "rc=$rc: $lanes"; fi
-if grep -qx $'live\ttestlane\t' <<<"$lanes"; then
+if grep -q $'^live\ttestlane\t\t[0-9]' <<<"$lanes"; then
     ok "lanes lists a registered lane as live"
 else
     no "lanes lists a registered lane as live" "$lanes"
@@ -135,7 +139,7 @@ else
 fi
 
 lanes="$("$sc" lanes 2>&1)"
-if grep -qx $'live\talpha\tthe alpha widget repo, v2' <<<"$lanes"; then
+if grep -q $'^live\talpha\tthe alpha widget repo, v2\t' <<<"$lanes"; then
     ok "lanes shows the description, and it outlived the first session"
 else
     no "lanes shows the description, and it outlived the first session" "$lanes"

@@ -210,5 +210,32 @@ else
     no "the hook leaves no temp file in the registry"
 fi
 
+printf '== lanes: live and stale ==\n'
+
+rm -f "$reg_dir"/*
+row() { "$sc" lanes | grep -P "^[a-z]+\t$1\t"; }
+held live-z env CLAUDE_CODE_SESSION_ID=sess-z "$sc" register zeta \
+    || no "fake claude came up" "$(cat "$scratch/live-z.out")"
+pid_z=$held_pid
+"$claude" env CLAUDE_CODE_SESSION_ID=sess-y "$sc" register theta >/dev/null 2>&1
+check "a lane registered by a running session is live" live "$(row zeta | cut -f1)"
+check "a lane whose registering process exited is stale" stale "$(row theta | cut -f1)"
+if [[ "$(row theta | cut -f4)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}$ ]]; then
+    ok "a stale lane shows its last-seen time"
+else
+    no "a stale lane shows its last-seen time" "$(row theta)"
+fi
+release live-z "$pid_z"
+check "the live lane goes stale when its session ends" stale "$(row zeta | cut -f1)"
+# A second session on the same lane, alive, makes it live again.
+held live-z2 env CLAUDE_CODE_SESSION_ID=sess-z2 "$sc" register zeta \
+    || no "fake claude came up" "$(cat "$scratch/live-z2.out")"
+pid_z2=$held_pid
+check "a lane is live when any of its registrations is" live "$(row zeta | cut -f1)"
+check "and is listed once" 1 "$(row zeta | wc -l)"
+release live-z2 "$pid_z2"
+printf 'legacy\n' > "$reg_dir/sess-old"
+check "lanes reads a legacy file (stale: no owner recorded)" stale "$(row legacy | cut -f1)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

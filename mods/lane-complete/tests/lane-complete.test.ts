@@ -292,6 +292,13 @@ test('parseLanes orders live, mailbox, then peers, drops bad names', () => {
   expect(lanes.map(l => l.address)).toEqual(['@alpha', '@beta', '@alpha:hostone', '@beta:hostone'])
 })
 
+test('parseLanes puts stale lanes after live ones and before mailbox lanes, with their descriptions', () => {
+  const out = parseLanes('mailbox\tbeta\t\t\nstale\tgamma\tthe gamma repo\t2026-01-02 03:04\nlive\talpha\t\t2026-01-05 06:07\npeer\thostone\t\t\n')
+  expect(out.map(l => l.address)).toEqual(['@alpha', '@gamma', '@beta', '@alpha:hostone', '@gamma:hostone', '@beta:hostone'])
+  expect(out[1]).toEqual({ address: '@gamma', source: 'stale', description: 'the gamma repo' })
+  expect(out[0]?.description).toBeUndefined()
+})
+
 test('parseLanes lists remote lanes after mailbox lanes, once, and drops malformed ones', () => {
   const out = parseLanes('live\talpha\nremote\tbuilder:hostb\nremote\tbuilder:hostb\nremote\tBad:host\nremote\tnohost\nremote\ta:b:c\npeer\thostb\n')
   expect(out.map(l => l.address)).toEqual(['@alpha', '@builder:hostb', '@alpha:hostb'])

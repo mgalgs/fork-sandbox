@@ -49,16 +49,25 @@ tab=$'\t'
 
 check "nothing known prints nothing" "" "$(list)"
 
-printf 'alpha\n' > "$reg_dir/sess-1"
+# sess-1 is owned by this shell (alive); sess-2 is a legacy one-line file
+# (no owner: not live) seen more recently, so alpha is live and its last
+# seen is sess-2's.
+read -r stat < "/proc/$$/stat"; stat="${stat##*) }"
+# shellcheck disable=SC2086  # split on purpose
+set -- $stat
+printf 'alpha\nowner_pid=%s\nowner_start=%s\n' "$$" "${20}" > "$reg_dir/sess-1"
 printf 'alpha\n' > "$reg_dir/sess-2"
+touch -d '2026-01-02 03:04' "$reg_dir/sess-1"
+touch -d '2026-01-05 06:07' "$reg_dir/sess-2"
+seen='2026-01-05 06:07'
 printf 'Bad Lane\n' > "$reg_dir/sess-3"
 mkdir -p "$scratch/root/agents/alpha" "$scratch/root/agents/beta" "$scratch/root/agents/-bad"
 printf '# peers\nhostone ssh.example.test\nselfhost ssh.example.test\nBAD host\n' \
     > "$scratch/config/lane-mail-peers"
 
-want="live${tab}alpha${tab}
-mailbox${tab}beta${tab}
-peer${tab}hostone${tab}"
+want="live${tab}alpha${tab}${tab}$seen
+mailbox${tab}beta${tab}${tab}
+peer${tab}hostone${tab}${tab}"
 check "live first, then mailbox-only, then peers; deduped; invalid and self dropped" \
     "$want" "$(list)"
 
@@ -119,19 +128,19 @@ From: @second:hosttwo
 Subject: another sender
 
 EOF
-want="live${tab}alpha${tab}
-mailbox${tab}beta${tab}
-remote${tab}builder:hostb${tab}
-remote${tab}second:hosttwo${tab}
-peer${tab}hostone${tab}"
+want="live${tab}alpha${tab}${tab}$seen
+mailbox${tab}beta${tab}${tab}
+remote${tab}builder:hostb${tab}${tab}
+remote${tab}second:hosttwo${tab}${tab}
+peer${tab}hostone${tab}${tab}"
 check "remote lanes: From: headers only; own host, dups, malformed, To, Cc, body excluded" \
     "$want" "$(list)"
 printf 'From: @notamsg:hostz\n' > "$scratch/root/threads/t5/note.txt"
 check "non-message files in the store are ignored" "$want" "$(list)"
 rm -rf "$scratch/root/threads"
-check "no thread store: only the original sources" "live${tab}alpha${tab}
-mailbox${tab}beta${tab}
-peer${tab}hostone${tab}" "$(list)"
+check "no thread store: only the original sources" "live${tab}alpha${tab}${tab}$seen
+mailbox${tab}beta${tab}${tab}
+peer${tab}hostone${tab}${tab}" "$(list)"
 
 check "--help prints the header" "list-lanes.sh -- Print the lane-mail lanes the lane-complete mod can offer" \
     "$(list --help | head -1)"
@@ -148,9 +157,9 @@ case "$err" in *"lane-mail scripts not found"*) ok "missing scripts says so" ;; 
 printf 'the alpha widget repo\n' > "$scratch/root/agents/alpha/about"
 printf 'beta tab\there\r\nsecond line\n' > "$scratch/root/agents/beta/about"
 printf 'orphan\n' > "$scratch/root/agents/-bad/about"
-want="live${tab}alpha${tab}the alpha widget repo
-mailbox${tab}beta${tab}beta tab here
-peer${tab}hostone${tab}"
+want="live${tab}alpha${tab}the alpha widget repo${tab}$seen
+mailbox${tab}beta${tab}beta tab here${tab}
+peer${tab}hostone${tab}${tab}"
 check "a described lane carries its first line as the third column; tabs flattened" \
     "$want" "$(list)"
 check "the first two fields are unchanged by descriptions" \
@@ -161,8 +170,37 @@ mkdir -p "$scratch/root/agents/alpha" "$scratch/root/agents/gamma"
 printf 'gamma\n' > "$reg_dir/sess-4"
 check "a live lane's description survives its session being replaced" \
     "the alpha widget repo" "$(rm -f "$reg_dir/sess-1" "$reg_dir/sess-2"; printf 'alpha\n' > "$reg_dir/sess-9"; list | awk -F'\t' '$2 == "alpha" { print $3 }')"
+touch -d '2026-02-03 04:05' "$reg_dir/sess-4"
 check "an undescribed lane has an empty third column" \
-    "live${tab}gamma${tab}" "$(list | grep -P '\tgamma\t')"
+    "stale${tab}gamma${tab}${tab}2026-02-03 04:05" "$(list | grep -P '\tgamma\t')"
+check "a lane whose only registration has no owner is stale, described" \
+    "stale${tab}alpha${tab}the alpha widget repo" "$(list | grep -P '\talpha\t' | cut -f1-3)"
+
+# Liveness: a registration is live only while its recorded process exists
+# with the recorded start time.
+rm -f "$reg_dir"/*
+sleep 30 & dead_pid=$!
+read -r stat < "/proc/$dead_pid/stat"; stat="${stat##*) }"
+# shellcheck disable=SC2086
+set -- $stat
+dead_start="${20}"
+printf 'delta\nowner_pid=%s\nowner_start=%s\n' "$dead_pid" "$dead_start" > "$reg_dir/sess-d"
+check "a registration whose process runs is live" live "$(list | awk -F'\t' '$2 == "delta" { print $1 }')"
+printf 'delta\nowner_pid=%s\nowner_start=%s\n' "$dead_pid" "$(( dead_start + 1 ))" > "$reg_dir/sess-d"
+check "the same pid with another start time (a reused pid) is stale" \
+    stale "$(list | awk -F'\t' '$2 == "delta" { print $1 }')"
+printf 'delta\nowner_pid=%s\nowner_start=%s\n' "$dead_pid" "$dead_start" > "$reg_dir/sess-d"
+kill "$dead_pid"; wait "$dead_pid" 2>/dev/null
+touch -d '2026-03-04 05:06' "$reg_dir/sess-d"
+check "once that process is gone the lane is stale, with its last seen" \
+    "stale${tab}delta${tab}${tab}2026-03-04 05:06" "$(list | grep -P '\tdelta\t')"
+mkdir -p "$scratch/root/agents/delta" "$scratch/root/agents/epsilon"
+check "stale is listed once, ahead of mailbox-only lanes" \
+    "stale${tab}delta
+mailbox${tab}alpha
+mailbox${tab}beta
+mailbox${tab}epsilon
+mailbox${tab}gamma" "$(list | grep -v '^peer' | cut -f1,2)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

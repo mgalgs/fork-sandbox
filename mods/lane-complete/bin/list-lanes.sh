@@ -69,29 +69,48 @@ fi
 # spaces and carriage returns dropped so the column format holds.
 describe_of() {
     local line=""
-    case "$1" in live|mailbox) ;; *) return 0 ;; esac
+    case "$1" in live|stale|mailbox) ;; *) return 0 ;; esac
     [[ -f "$LANE_MAIL_ROOT/agents/$2/about" ]] || return 0
     IFS= read -r line < "$LANE_MAIL_ROOT/agents/$2/about" || true
     line="${line//$'\t'/ }"
     printf '%s' "${line//$'\r'/}"
 }
 
-# A lane is listed once, under its most relevant source (live beats mailbox).
+# A lane is listed once, under its most relevant source (live or stale beats
+# mailbox). $3 is the last-seen column, for registered lanes.
 declare -A seen=()
 emit() {
     local source="$1" name="$2" key="$1:$2"
     [[ "$source" == peer ]] || key="lane:$2"
     [[ -n "${seen[$key]:-}" ]] && return 0
     seen[$key]=1
-    printf '%s\t%s\t%s\n' "$source" "$name" "$(describe_of "$source" "$name")"
+    printf '%s\t%s\t%s\t%s\n' "$source" "$name" "$(describe_of "$source" "$name")" "${3:-}"
 }
 
+# Registered lanes: live when any of a lane's registrations is, else stale;
+# last seen is the most recent of them (each file's mtime).
 if [[ -n "$LANES_DIR" && -d "$LANES_DIR" ]]; then
+    declare -A reg_live=() reg_seen=()
+    reg_order=()
     for f in "$LANES_DIR"/*; do
         [[ -f "$f" ]] || continue
-        lane=""
-        IFS= read -r lane < "$f" || true
-        [[ "$lane" =~ $LANE_MAIL_LANE_RE ]] && emit live "$lane"
+        lane_mail_reg_read "$f" || continue
+        # shellcheck disable=SC2154  # set by lane_mail_reg_read (lane-mail-lib.sh)
+        lane="$lm_reg_lane"
+        [[ "$lane" =~ $LANE_MAIL_LANE_RE ]] || continue
+        t="$(lane_mail_mtime "$f")" || continue
+        if [[ -z "${reg_seen[$lane]:-}" ]]; then
+            reg_order+=("$lane")
+            reg_live[$lane]=0 reg_seen[$lane]=0
+        fi
+        lane_mail_reg_live && reg_live[$lane]=1
+        (( t > reg_seen[$lane] )) && reg_seen[$lane]=$t
+    done
+    for lane in "${reg_order[@]:-}"; do
+        [[ -n "$lane" ]] || continue
+        source=stale
+        (( reg_live[$lane] )) && source=live
+        emit "$source" "$lane" "$(lane_mail_when "${reg_seen[$lane]}")"
     done
 fi
 

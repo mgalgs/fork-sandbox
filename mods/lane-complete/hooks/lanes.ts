@@ -8,7 +8,7 @@ import type { LanePicker } from '../types'
 export type Lane = {
   /** The lane-mail address as it is typed: `@lane` or `@lane:host`. */
   address: string
-  source: 'live' | 'mailbox' | 'remote' | 'peer'
+  source: 'live' | 'stale' | 'mailbox' | 'remote' | 'peer'
   /** What the lane owns, one line (`lane-mail.sh describe`); local lanes only. */
   description?: string
 }
@@ -40,14 +40,16 @@ const REMOTE = /^[a-z0-9][a-z0-9-]*:[a-z0-9][a-z0-9.-]*$/
 const FILTER_CHARS = /^[A-Za-z0-9:.-]+$/
 
 /**
- * Parses list-lanes.sh output (`<source>\t<name>[\t<description>]` lines) into addresses:
- * live lanes, then mailbox-only lanes, then remote lanes that have written
+ * Parses list-lanes.sh output (`<source>\t<name>[\t<description>[\t<last seen>]]`
+ * lines) into addresses: live lanes, then stale ones (registered, but no
+ * session alive), then mailbox-only lanes, then remote lanes that have written
  * here (`lane:host`), then each local lane qualified with each peer host (the
  * peers file names hosts, not their lanes, and a lane is usually run on both
  * ends of a link).
  */
 export function parseLanes(stdout: string): Lane[] {
   const live: string[] = []
+  const stale: string[] = []
   const mailbox: string[] = []
   const remote: string[] = []
   const peers: string[] = []
@@ -60,10 +62,11 @@ export function parseLanes(stdout: string): Lane[] {
       continue
     }
     if (!NAME.test(name)) continue
-    if ((source === 'live' || source === 'mailbox') && description && !described.has(name)) {
+    if ((source === 'live' || source === 'stale' || source === 'mailbox') && description && !described.has(name)) {
       described.set(name, description)
     }
     if (source === 'live') live.push(name)
+    else if (source === 'stale') stale.push(name)
     else if (source === 'mailbox') mailbox.push(name)
     else if (source === 'peer') peers.push(name)
   }
@@ -72,13 +75,14 @@ export function parseLanes(stdout: string): Lane[] {
   const add = (address: string, source: Lane['source']) => {
     if (seen.has(address)) return
     seen.add(address)
-    const description = source === 'live' || source === 'mailbox' ? described.get(address.slice(1)) : undefined
+    const description = source === 'live' || source === 'stale' || source === 'mailbox' ? described.get(address.slice(1)) : undefined
     lanes.push(description === undefined ? { address, source } : { address, source, description })
   }
   for (const name of live) add(`@${name}`, 'live')
+  for (const name of stale) add(`@${name}`, 'stale')
   for (const name of mailbox) add(`@${name}`, 'mailbox')
   for (const name of remote) add(`@${name}`, 'remote')
-  for (const name of [...live, ...mailbox]) {
+  for (const name of [...live, ...stale, ...mailbox]) {
     for (const peer of peers) add(`@${name}:${peer}`, 'peer')
   }
   return lanes
