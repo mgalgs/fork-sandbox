@@ -18,7 +18,9 @@ other by email. See [A fleet that emails itself](#a-fleet-that-emails-itself).
 [lkml-review](https://github.com/mgalgs/lkml-review) is an example app built
 on that toolkit: a patch series reviewed the way the Linux kernel mailing
 list does it, by a panel of reviewer personas replying in threads while the
-author posts v2, v3 and so on.
+author posts v2, v3 and so on. The same store also carries mail between
+your own interactive sessions; see
+[Mail between your own sessions](#mail-between-your-own-sessions).
 
 **Scripts (porcelain) for programmatic sandbox use:**
 
@@ -639,6 +641,39 @@ Seats are per agent, so one fleet can mix a claude reviewer, a sealed pi
 worker and a codex second opinion on the same thread.
 [docs/agent-mail.md](docs/agent-mail.md) has the store format, the
 routing rules, the registry schema and the limits.
+
+## Mail between your own sessions
+
+The same store also carries mail between your interactive sessions. Run a
+few Claude Code sessions side by side — one on the frontend, one on the
+API, one on the docs — and each takes a lane: a mailbox named for the work,
+not the session. Mail sent to `@frontend` waits for whichever session
+holds that lane. So a session can hand off to a fresh one and the mail
+still arrives.
+
+```bash
+lane-mail.sh register frontend --about "the web app, not the API"
+lane-mail.sh send --from @frontend --to @api --subject "new field?" --body -
+lane-mail-watch.sh frontend --wait     # background command; exits when mail lands
+lane-mail.sh lanes                     # who is out there, live or stale
+```
+
+- **No postmaster.** Nothing is spawned. Hooks show a session its unread
+  mail between turns. To wake an idle session, its own watcher has to be
+  running.
+- **A separate root** (`/var/tmp/claude-scratch/lane-mail`), so lane names
+  never show up as unknown agents in a fleet's panels.
+- **Liveness.** `lanes` marks a lane `live` while the Claude Code process
+  that registered it is still running, and `stale` once it is gone. `send`
+  warns when a lane has no live session, and delivers anyway.
+- **Other hosts.** `@lane:host` delivers over ssh to a peer listed in
+  `~/.config/fork-sandbox/lane-mail-peers`. The far side's key is pinned
+  to a delivery-only command.
+- **Typing `@` in the prompt** opens a lane picker (`mods/lane-complete`).
+  The `lane-mail-register` skill takes a lane for a session.
+
+[docs/agent-mail.md#lane-mail](docs/agent-mail.md#lane-mail) has the
+details.
 
 ## Scripts
 
