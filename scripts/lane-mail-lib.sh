@@ -135,7 +135,9 @@ lane_mail_is_claude() {
 }
 
 # Sets lm_owner_pid and lm_owner_start to the nearest ancestor of this shell
-# that is the Claude Code CLI; returns 1 when there is none.
+# that is the Claude Code CLI; returns 1 when there is none. Pid 1 is a
+# candidate too (a container or `bwrap --as-pid-1` can run claude as pid 1);
+# the walk ends at its parent, pid 0.
 lane_mail_claude_owner() {
     local pid="$$" depth=0
     lm_owner_pid="" lm_owner_start=""
@@ -144,7 +146,7 @@ lane_mail_claude_owner() {
             lm_owner_pid="$pid" lm_owner_start="$lm_stat_start"
             return 0
         fi
-        [[ "$lm_stat_ppid" =~ ^[1-9][0-9]*$ && "$lm_stat_ppid" != 1 ]] || return 1
+        [[ "$lm_stat_ppid" =~ ^[1-9][0-9]*$ ]] || return 1
         pid="$lm_stat_ppid"
     done
     return 1

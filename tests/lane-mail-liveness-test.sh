@@ -113,6 +113,18 @@ check "tmux_pane is recorded when set" "%7" "$(reg_value "$f" tmux_pane)"
 check "registration prints the lane alone" alpha "$(CLAUDE_CODE_SESSION_ID=sess-a "$sc" registration)"
 release reg-a "$pid_a"
 
+# Claude Code as pid 1 of its pid namespace (a container entrypoint, or
+# bwrap --as-pid-1): the walk must test pid 1 rather than stop before it.
+if unshare --pid --fork --map-root-user --mount-proc true 2>/dev/null; then
+    # shellcheck disable=SC2016  # expanded by the inner bash
+    check "a Claude Code process that is pid 1 is found" 1 \
+        "$(unshare --pid --fork --map-root-user --mount-proc "$claude" bash -c \
+            'source "$1"; lane_mail_claude_owner && printf %s "$lm_owner_pid"' _ \
+            "$scratch/scripts/lane-mail-lib.sh" 2>&1)"
+else
+    printf '  skip  a Claude Code process that is pid 1 is found (no unprivileged unshare)\n'
+fi
+
 "$claude" env CLAUDE_CODE_SESSION_ID=sess-b "$sc" register beta >/dev/null 2>&1
 if ! grep -q '^tmux_pane=' "$reg_dir/sess-b"; then
     ok "no tmux_pane line without TMUX_PANE"
