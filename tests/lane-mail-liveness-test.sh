@@ -204,6 +204,20 @@ else
     no "an unregistered session stays silent and gets no file" "rc=$rc: $out"
 fi
 
+# A session id that is not a plain id never names a file outside the registry.
+outside="$reg_dir-outside"
+holds+=("$outside")
+printf 'legacy\n' > "$outside"
+touch -d '2026-01-02 03:04' "$outside"
+before="$(stat -c %Y "$outside")"
+out="$("$claude" "$hook" prompt <<<"{\"session_id\":\"../$reg_name-outside\"}" 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ -z "$out" ]] && [[ "$(stat -c %Y "$outside")" == "$before" ]] \
+    && [[ "$(cat "$outside")" == legacy ]]; then
+    ok "a session id with a path in it is ignored"
+else
+    no "a session id with a path in it is ignored" "rc=$rc: $out; $(cat "$outside")"
+fi
+
 # A registry the hook cannot write never fails the turn.
 printf 'legacy\n' > "$reg_dir/sess-ro"
 chmod a-w "$reg_dir"

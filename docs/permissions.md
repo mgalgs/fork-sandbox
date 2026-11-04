@@ -237,7 +237,17 @@ Four hook commands are meant to run on every prompt or stop, for
 session and, if it has unread mail, injects a banner of message count plus
 one line per subject — deliberately never bodies, so a full inbox cannot
 flood the new turn's context. A session that never ran `lane-mail.sh register
-<lane>` costs this hook one file stat and nothing else.
+<lane>` costs this hook sourcing `lane-mail-lib.sh`, one `jq` over the hook
+input and one file stat; it writes nothing.
+
+Both modes also write, but only to the calling session's own registration
+file (`/tmp/claude-$UID/lane-mail-lanes/<session_id>`), and only when that
+file already exists: they refresh its mtime (the lane's last-seen time in
+`lane-mail.sh lanes`), or, when the Claude Code process it records is not
+alive, rewrite it in place (temp file plus rename) with the current one. The
+`session_id` from the hook input must be a plain id (letters, digits, `_`,
+`-`) or the hook does nothing, so it cannot name a path outside that
+directory. A failed write never fails the turn.
 
 **`lane-mail-hook.sh stop`** blocks the stop (`decision: block`) while the
 registered session has unread mail, so it processes its inbox before going

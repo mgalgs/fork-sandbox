@@ -6,9 +6,11 @@
 #   lane-mail-hook.sh stop      # Stop: block idling while unread mail sits
 #
 # Reads the hook JSON on stdin for session_id and looks up the lane that
-# `lane-mail.sh register <lane>` recorded for it. Sessions with no
-# registration exit silently -- the cost of these global hooks for an
-# ordinary session is one file stat.
+# `lane-mail.sh register <lane>` recorded for it; a session_id that is not a
+# plain id (letters, digits, `_`, `-`) is ignored, so it never names a path
+# outside the registry. Sessions with no registration exit silently -- the
+# cost of these global hooks for an ordinary session is sourcing
+# lane-mail-lib.sh, one jq and one file stat.
 #
 # Every run by a registered session also marks it seen: the registration's
 # mtime is its last-seen time (`lane-mail.sh lanes`). A registration whose
@@ -49,7 +51,8 @@ esac
 
 input="$(cat)"
 sid="$(jq -r '.session_id // empty' <<<"$input")"
-[[ -n "$sid" && -f "$LANES_DIR/$sid" ]] || exit 0
+# A plain id only: the hook writes $LANES_DIR/$sid, so no path may slip in.
+[[ "$sid" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ && -f "$LANES_DIR/$sid" ]] || exit 0
 lane=""
 IFS= read -r lane < "$LANES_DIR/$sid" || [[ -n "$lane" ]] || exit 0
 [[ "$lane" =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit 0
