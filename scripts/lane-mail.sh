@@ -133,11 +133,13 @@ die() {
 # Sets the array `remote_hosts` to the distinct hosts, other than this one,
 # named by the recipients of a `send`/`reply` invocation (args: verb, then the
 # store's arguments). A reply with no --to inherits the parent's From/To/Cc.
+# Also sets `recip_addrs` (every recipient, trimmed), `recip_from` (the
+# --from value) and `recip_self` (this host's peer name, or empty).
 find_remote_hosts() {
     local verb="$1"; shift
     local -a recips=() parts=()
     local reply_to="" have_to=0 line name self="" addr host seen h
-    remote_hosts=()
+    remote_hosts=() recip_addrs=() recip_from=""
     while (( $# )); do
         case "$1" in
             --to|--cc)
@@ -147,7 +149,8 @@ find_remote_hosts() {
                 shift $(( $# >= 2 ? 2 : 1 ))
                 ;;
             --reply-to) reply_to="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
-            --from|--subject|--body|--attach|--hops|--header|--allow-namespace|--reach-probe|--host-alias|--seat-resources|\
+            --from) recip_from="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+            --subject|--body|--attach|--hops|--header|--allow-namespace|--reach-probe|--host-alias|--seat-resources|\
             --context-ro|--context-secret|--review-target|--upstream-head|--upstream-state|--services-env)
                 shift $(( $# >= 2 ? 2 : 1 ))
                 ;;
@@ -167,15 +170,54 @@ find_remote_hosts() {
         done < <(FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT" "$mail_bin" show "$reply_to" 2>/dev/null || true)
     fi
     self="$(lane_mail_self_name || true)"
+    recip_self="$self"
     for addr in "${recips[@]:-}"; do
         addr="${addr#"${addr%%[![:space:]]*}"}"
         addr="${addr%"${addr##*[![:space:]]}"}"
+        [[ -n "$addr" ]] && recip_addrs+=("$addr")
         [[ "$addr" == @*:* ]] || continue
         host="${addr#*:}"
         [[ "$host" == "$self" ]] && continue
         seen=0
         for h in "${remote_hosts[@]:-}"; do [[ "$h" == "$host" ]] && seen=1; done
         (( seen )) || remote_hosts+=("$host")
+    done
+}
+
+# Sets the array `stale_warnings` to one line per local lane among the
+# recipients last parsed by find_remote_hosts that has registrations but no
+# live one (see "Session registrations" in lane-mail-lib.sh). A lane that was
+# never registered (mailbox-only), a remote `@lane:host`, @noreply and the
+# sender's own lane are never checked. Nothing here refuses or holds mail.
+find_stale_lanes() {
+    local addr lane f any live best t from_lane
+    local -A checked=()
+    stale_warnings=()
+    [[ -d "$LANES_DIR" ]] || return 0
+    from_lane="${recip_from#@}"
+    from_lane="${from_lane%%:*}"
+    for addr in "${recip_addrs[@]:-}"; do
+        [[ "$addr" == @* ]] || continue
+        lane="${addr#@}"
+        if [[ "$lane" == *:* ]]; then
+            [[ -n "$recip_self" && "${lane#*:}" == "$recip_self" ]] || continue
+            lane="${lane%%:*}"
+        fi
+        [[ "$lane" =~ $LANE_MAIL_LANE_RE && "$lane" != noreply && "$lane" != "$from_lane" ]] || continue
+        [[ -z "${checked[$lane]:-}" ]] || continue
+        checked[$lane]=1
+        any=0 live=0 best=0
+        for f in "$LANES_DIR"/*; do
+            # shellcheck disable=SC2154  # set by lane_mail_reg_read (lane-mail-lib.sh)
+            [[ -f "$f" ]] && lane_mail_reg_read "$f" && [[ "$lm_reg_lane" == "$lane" ]] || continue
+            any=1
+            if lane_mail_reg_live; then live=1; break; fi
+            t="$(lane_mail_mtime "$f")" || continue
+            (( t > best )) && best=$t
+        done
+        (( any && ! live )) || continue
+        if (( best > 0 )); then t="$(lane_mail_when "$best" age)"; else t="unknown"; fi
+        stale_warnings+=("lane-mail: @$lane: registered but no live session (last seen $t); mail will wait")
     done
 }
 
@@ -539,11 +581,18 @@ case "$cmd" in
         export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
         remote_hosts=()
         find_remote_hosts "$cmd" "${@:2}"
+        find_stale_lanes
+        rc=0
         if (( ${#remote_hosts[@]} > 0 )); then
             cross_host "$cmd" "${@:2}"
         else
-            exec "$mail_bin" "$@"
+            "$mail_bin" "$@" || rc=$?
         fi
+        # Delivered: say which local recipients have no session to read it.
+        if (( rc == 0 )); then
+            for w in "${stale_warnings[@]:-}"; do [[ -z "$w" ]] || echo "$w" >&2; done
+        fi
+        exit "$rc"
         ;;
     show|tree|list|inbox|seen)
         export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"

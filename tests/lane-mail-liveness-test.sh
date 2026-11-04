@@ -237,5 +237,76 @@ release live-z2 "$pid_z2"
 printf 'legacy\n' > "$reg_dir/sess-old"
 check "lanes reads a legacy file (stale: no owner recorded)" stale "$(row legacy | cut -f1)"
 
+printf '== send and reply warn about stale lanes ==\n'
+
+# theta: registered, its process gone. zeta: registered, alive. omega: a
+# mailbox and no registration.
+held send-z env CLAUDE_CODE_SESSION_ID=sess-z "$sc" register zeta \
+    || no "fake claude came up" "$(cat "$scratch/send-z.out")"
+pid_z=$held_pid
+mkdir -p "$scratch/root/agents/omega"
+# send <args...>: body "hi" on stdin; sets out, err (stderr without the
+# store's own "sent" line) and rc.
+send() {
+    out="$(printf 'hi\n' | "$sc" "$@" --body - 2>"$scratch/err")"; rc=$?
+    err="$(grep -v '^fork-sandbox mail: sent ' "$scratch/err")"
+}
+send send --to @theta --subject "to theta"
+want_re='^lane-mail: @theta: registered but no live session \(last seen [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}, (just now|[0-9]+ (min|h|d) ago)\); mail will wait$'
+if (( rc == 0 )) && [[ "$err" =~ $want_re ]]; then
+    ok "send to a stale lane warns on stderr and exits 0"
+else
+    no "send to a stale lane warns on stderr and exits 0" "rc=$rc err=$err"
+fi
+theta_mid="$out"
+if [[ -n "$theta_mid" ]] && "$sc" inbox theta | grep -q "^$theta_mid"; then
+    ok "and the message is delivered"
+else
+    no "and the message is delivered" "mid=$theta_mid inbox=$("$sc" inbox theta)"
+fi
+
+touch -d '3 hours ago' "$reg_dir/sess-y"
+send send --to @theta --subject "later"
+if [[ "$err" == *", 3 h ago); mail will wait" ]]; then ok "the warning gives the age of the last sighting"; else no "the warning gives the age of the last sighting" "$err"; fi
+
+send send --to @zeta --subject "to zeta"
+if (( rc == 0 )) && [[ -z "$err" ]]; then ok "send to a live lane does not warn"; else no "send to a live lane does not warn" "rc=$rc err=$err"; fi
+send send --to @omega --subject "to omega"
+if (( rc == 0 )) && [[ -z "$err" ]]; then ok "send to a mailbox-only lane does not warn"; else no "send to a mailbox-only lane does not warn" "rc=$rc err=$err"; fi
+
+send send --to @theta,@zeta --cc @theta,@omega --subject "to all"
+if (( rc == 0 )) && [[ "$(grep -c . <<<"$err")" == 1 && "$err" == *"@theta: registered but no live session"* ]]; then
+    ok "a stale lane named twice among several recipients warns once"
+else
+    no "a stale lane named twice among several recipients warns once" "rc=$rc err=$err"
+fi
+
+send send --from @theta --to @zeta --subject "from theta"
+from_theta="$out"
+if (( rc == 0 )) && [[ -z "$err" ]]; then ok "the sender's own lane is not warned about"; else no "the sender's own lane is not warned about" "rc=$rc err=$err"; fi
+send reply --from @zeta --reply-to "$from_theta"
+if (( rc == 0 )) && [[ "$err" == *"@theta: registered but no live session"* ]]; then
+    ok "reply warns about a stale lane it inherits as a recipient"
+else
+    no "reply warns about a stale lane it inherits as a recipient" "rc=$rc err=$err"
+fi
+
+mkdir -p "$HOME/.config/fork-sandbox"
+printf 'LANE_MAIL_PEER_NAME=selfhost\n' > "$HOME/.config/fork-sandbox/lane-mail.env"
+send send --to @theta:selfhost --subject "qualified"
+if (( rc == 0 )) && [[ "$err" == *"@theta: registered but no live session"* ]]; then
+    ok "a stale lane qualified with this host's own name warns too"
+else
+    no "a stale lane qualified with this host's own name warns too" "rc=$rc err=$err"
+fi
+
+send send --to @theta
+if (( rc != 0 )) && [[ "$err" != *"no live session"* ]]; then
+    ok "a send that fails does not warn"
+else
+    no "a send that fails does not warn" "rc=$rc err=$err"
+fi
+release send-z "$pid_z"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
