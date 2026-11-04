@@ -496,7 +496,7 @@ case "$cmd" in
         # session is registered, so the refusal changes nothing.
         if (( have_dir )); then lanes_json_set "$dir" "$lane" || exit $?; fi
         mkdir -p "$LANES_DIR"
-        printf '%s\n' "$lane" > "$LANES_DIR/$sid"
+        lane_mail_reg_write "$LANES_DIR/$sid" "$lane" || die "could not write $LANES_DIR/$sid"
         echo "lane-mail: session ${sid:0:8}... registered as @$lane"
         if (( have_about )); then set_description "$lane" "$about"; fi
         # Registering arms no watch. Say how, here, where the caller acts.
@@ -510,8 +510,9 @@ case "$cmd" in
         ;;
     registration)
         sid="${CLAUDE_CODE_SESSION_ID:-}"
-        if [[ -n "$sid" && -f "$LANES_DIR/$sid" ]]; then
-            cat "$LANES_DIR/$sid"
+        if [[ -n "$sid" && -f "$LANES_DIR/$sid" ]] && lane_mail_reg_read "$LANES_DIR/$sid"; then
+            # shellcheck disable=SC2154  # set by lane_mail_reg_read (lane-mail-lib.sh)
+            printf '%s\n' "$lm_reg_lane"
         else
             echo "lane-mail: this session has no registered lane" >&2
             exit 1
@@ -524,7 +525,9 @@ case "$cmd" in
         # session. Deregistering silences the hooks; the mail waits.
         sid="${CLAUDE_CODE_SESSION_ID:-}"
         if [[ -n "$sid" && -f "$LANES_DIR/$sid" ]]; then
-            lane="$(<"$LANES_DIR/$sid")"
+            lane_mail_reg_read "$LANES_DIR/$sid" || true
+            # shellcheck disable=SC2154  # set by lane_mail_reg_read (lane-mail-lib.sh)
+            lane="$lm_reg_lane"
             rm -f "$LANES_DIR/$sid"
             echo "lane-mail: session ${sid:0:8}... unregistered from @$lane"
         else

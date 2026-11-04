@@ -23,6 +23,11 @@
 
 set -euo pipefail
 
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+have_lib=0
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/lane-mail-lib.sh" 2>/dev/null && have_lib=1
+
 LANES_DIR="/tmp/claude-$(id -u)/lane-mail-lanes"
 
 mode="${1:-}"
@@ -37,8 +42,22 @@ esac
 input="$(cat)"
 sid="$(jq -r '.session_id // empty' <<<"$input")"
 [[ -n "$sid" && -f "$LANES_DIR/$sid" ]] || exit 0
-lane="$(<"$LANES_DIR/$sid")"
+lane=""
+IFS= read -r lane < "$LANES_DIR/$sid" || [[ -n "$lane" ]] || exit 0
 [[ "$lane" =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit 0
+
+# Last seen: this turn. A registration whose recorded owner is not this
+# session's live process (one written before owners were recorded, or a
+# session resumed in a new process) is rewritten with the current one.
+refresh_registration() {
+    local f="$LANES_DIR/$sid"
+    if (( have_lib )) && lane_mail_reg_read "$f" && ! lane_mail_reg_live; then
+        lane_mail_reg_write "$f" "$lane" existing
+    else
+        touch -c -- "$f"
+    fi
+}
+refresh_registration 2>/dev/null || true
 
 # TSV per unread message: mid, thread, To|Cc, from, subject.
 unread="$(lane-mail.sh inbox "$lane" 2>/dev/null || true)"
