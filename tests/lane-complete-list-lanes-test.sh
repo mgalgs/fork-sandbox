@@ -194,6 +194,20 @@ kill "$dead_pid"; wait "$dead_pid" 2>/dev/null
 touch -d '2026-03-04 05:06' "$reg_dir/sess-d"
 check "once that process is gone the lane is stale, with its last seen" \
     "stale${tab}delta${tab}${tab}2026-03-04 05:06" "$(list | grep -P '\tdelta\t')"
+# Ordering across registrations: every live lane before every stale one,
+# whatever order the registration files glob in.
+printf 'aaa-stale\n' > "$reg_dir/sess-a0"
+sleep 30 & live_pid=$!
+read -r stat < "/proc/$live_pid/stat"; stat="${stat##*) }"
+# shellcheck disable=SC2086
+set -- $stat
+printf 'zzz-live\nowner_pid=%s\nowner_start=%s\n' "$live_pid" "${20}" > "$reg_dir/sess-z9"
+check "live lanes are listed before stale ones" \
+    "live${tab}zzz-live
+stale${tab}aaa-stale
+stale${tab}delta" "$(list | grep -E '^(live|stale)' | cut -f1,2)"
+kill "$live_pid"; wait "$live_pid" 2>/dev/null
+rm -f "$reg_dir/sess-a0" "$reg_dir/sess-z9"
 mkdir -p "$scratch/root/agents/delta" "$scratch/root/agents/epsilon"
 check "stale is listed once, ahead of mailbox-only lanes" \
     "stale${tab}delta

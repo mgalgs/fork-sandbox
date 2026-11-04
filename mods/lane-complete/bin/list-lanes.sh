@@ -114,11 +114,15 @@ if [[ -n "$LANES_DIR" && -d "$LANES_DIR" ]]; then
         lane_mail_reg_live && reg_live[$lane]=1
         (( t > reg_seen[$lane] )) && reg_seen[$lane]=$t
     done
-    for lane in "${reg_order[@]:-}"; do
-        [[ -n "$lane" ]] || continue
-        source=stale
-        (( reg_live[$lane] )) && source=live
-        emit "$source" "$lane" "$(lane_mail_when "${reg_seen[$lane]}")"
+    # Every live lane, then every stale one.
+    for want in 1 0; do
+        for lane in "${reg_order[@]:-}"; do
+            [[ -n "$lane" ]] || continue
+            (( reg_live[$lane] == want )) || continue
+            source=stale
+            (( want )) && source=live
+            emit "$source" "$lane" "$(lane_mail_when "${reg_seen[$lane]}")"
+        done
     done
 fi
 
