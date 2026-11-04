@@ -14,10 +14,12 @@
 # naming a directory that is gone.
 #
 # --dry-run          list what would be pruned, with sizes; delete nothing.
-# --older-than DAYS  retention age, a non-negative whole number of days,
+# --older-than DAYS  retention age, a whole number of days from 0 to 36500,
 #                    measured from the run's own ended_at in summary.json
 #                    (never the run dir's mtime). Default: the configured
-#                    retention below when it is a positive number, else 14.
+#                    retention below when it is a positive number, else 14;
+#                    a configured value that is not a whole number from 0
+#                    to 36500 is refused rather than replaced by 14.
 # --auto             what `fork-sandbox run` starts, detached, at every
 #                    launch: prune with the configured retention, print
 #                    nothing, and append one summary line to
@@ -86,9 +88,23 @@ die() {
     exit 2
 }
 
+# True when $1 is a whole number of days from 0 to MAX_DAYS. Leading zeros
+# are stripped before the length check, so no arithmetic ever sees a value
+# long enough to overflow.
+valid_days() {
+    local d="$1"
+    [[ "$d" =~ ^[0-9]+$ ]] || return 1
+    d="${d#"${d%%[!0]*}"}"
+    (( ${#d} <= ${#MAX_DAYS} )) && (( 10#${d:-0} <= MAX_DAYS ))
+}
+
 fs_require_gnu_tools || exit 1
 
 DEFAULT_DAYS=14
+# The largest retention accepted, about a century. Beyond it DAYS * 86400
+# would soon overflow bash arithmetic and wrap the cutoff into the future,
+# turning "keep for a very long time" into "prune everything that ended".
+MAX_DAYS=36500
 LOCK_NAME='.fork-sandbox-prune.lock'
 LOG_NAME='.fork-sandbox-prune.log'
 MARKER_NAME='clone-pruned'
@@ -116,8 +132,8 @@ done
 if (( auto )) && { (( dry_run )) || [[ -n "$older_than" ]]; }; then
     die "--auto takes no other option; it reads its retention from the config"
 fi
-if [[ -n "$older_than" && ! "$older_than" =~ ^[0-9]+$ ]]; then
-    die "--older-than must be a whole number of days, got '$older_than'"
+if [[ -n "$older_than" ]] && ! valid_days "$older_than"; then
+    die "--older-than must be a whole number of days from 0 to $MAX_DAYS, got '$older_than'"
 fi
 
 config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
@@ -142,15 +158,19 @@ auto_log() {
 
 if (( auto )); then
     days="${configured_days:-$DEFAULT_DAYS}"
-    if [[ ! "$days" =~ ^[0-9]+$ ]]; then
-        auto_log "prune --auto: $runs_env sets FORK_SANDBOX_RUN_RETENTION_DAYS='$days', not a whole number of days; nothing pruned"
+    if ! valid_days "$days"; then
+        auto_log "prune --auto: $runs_env sets FORK_SANDBOX_RUN_RETENTION_DAYS='$days', not a whole number of days from 0 to $MAX_DAYS; nothing pruned"
         exit 0
     fi
     days=$((10#$days))
     (( days > 0 )) || exit 0
 elif [[ -n "$older_than" ]]; then
     days=$((10#$older_than))
-elif [[ "$configured_days" =~ ^[0-9]+$ ]] && (( 10#$configured_days > 0 )); then
+elif [[ -n "$configured_days" ]] && ! valid_days "$configured_days"; then
+    # Falling back to 14 here would prune far sooner than whatever an
+    # operator who wrote, say, a huge number meant.
+    die "$runs_env sets FORK_SANDBOX_RUN_RETENTION_DAYS='$configured_days', not a whole number of days from 0 to $MAX_DAYS; fix it or pass --older-than"
+elif [[ -n "$configured_days" ]] && (( 10#$configured_days > 0 )); then
     days=$((10#$configured_days))
 else
     days=$DEFAULT_DAYS

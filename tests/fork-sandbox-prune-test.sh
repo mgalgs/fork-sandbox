@@ -207,6 +207,16 @@ check '--older-than narrows the set' "$eligible_a" \
 
 "$prune" --older-than abc >/dev/null 2>&1
 check '--older-than must be a number' 2 "$?"
+# A retention so large that DAYS * 86400 overflows would wrap the cutoff
+# into the future and make every ended run eligible.
+out="$("$prune" --dry-run --older-than 999999999999999 2>&1)"
+check 'an overflowing --older-than is refused' 2 "$?"
+lacks 'and lists nothing' 'would prune  ' "$out"
+"$prune" --dry-run --older-than 36501 >/dev/null 2>&1
+check '--older-than above 36500 is refused' 2 "$?"
+out="$("$prune" --dry-run --older-than 36500 2>&1)"
+check '--older-than 36500 is accepted' 0 "$?"
+lacks 'and keeps every run' 'would prune  ' "$out"
 
 # ---------------------------------------------------------------------------
 printf '== a real prune ==\n'
@@ -328,6 +338,17 @@ printf 'FORK_SANDBOX_RUN_RETENTION_DAYS=60\n' > "$config/runs.env"
 [[ -d "$lockable/clone" ]] && ok 'retention 60 keeps a 30-day-old run' || no 'retention 60 keeps a 30-day-old run'
 out="$("$prune" --dry-run 2>&1)"
 has 'the configured retention is the verb default' 'older than 60 days' "$out"
+rm -f -- "$log"
+
+printf 'FORK_SANDBOX_RUN_RETENTION_DAYS=999999999999999\n' > "$config/runs.env"
+"$prune" --auto >/dev/null 2>&1
+[[ -d "$lockable/clone" ]] && ok 'an overflowing retention prunes nothing' || no 'an overflowing retention prunes nothing'
+has 'an overflowing retention is logged' "FORK_SANDBOX_RUN_RETENTION_DAYS='999999999999999'" "$(cat "$log" 2>/dev/null)"
+out="$("$prune" --dry-run 2>&1)"
+check 'the verb refuses an overflowing configured retention' 2 "$?"
+lacks 'and lists nothing' 'would prune  ' "$out"
+out="$("$prune" --dry-run --older-than 1 2>&1)"
+has 'unless --older-than is given' "would prune  $lockable  " "$out"
 rm -f -- "$log"
 
 printf 'FORK_SANDBOX_RUN_RETENTION_DAYS=7\n' > "$config/runs.env"

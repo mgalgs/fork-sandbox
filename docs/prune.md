@@ -103,8 +103,11 @@ FORK_SANDBOX_RUN_RETENTION_DAYS=14
 
 The retention, in whole days, for the automatic prune, and the verb's
 default when `--older-than` is not given. Missing means 14. `0` turns the
-automatic prune off (the verb then defaults to 14). A value that is not a
-whole number makes the automatic prune log that and do nothing.
+automatic prune off (the verb then defaults to 14). The largest accepted
+value is 36500 (about a century; anything larger would overflow the age
+arithmetic). A value that is not a whole number from 0 to 36500 makes the
+automatic prune log that and do nothing, and makes the verb refuse to run
+unless `--older-than` is given; `--older-than` has the same range.
 
 The Kubernetes path and the cluster postmaster keep their own retention;
 this touches neither.
