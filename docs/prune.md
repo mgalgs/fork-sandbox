@@ -92,6 +92,13 @@ prints nothing and appends one line about what it did to
 2026-01-31T12:00:00Z prune --auto (retention 14 days): pruned 3 run(s), freed 41.2 GiB; skipped 12 (live 1, too-recent 11)
 ```
 
+It starts only when the launch reads the login user's own
+`~/.config/fork-sandbox` (home taken from the password database, not
+`$HOME`). The forks root is machine-wide, so a launch whose config was
+moved elsewhere -- by `FORK_SANDBOX_CONFIG_DIR` or a different `$HOME`, as
+every test suite does -- starts no prune: it would otherwise prune the real
+root at a retention the operator never set.
+
 ## Configuration
 
 One per-machine key, in `~/.config/fork-sandbox/runs.env`

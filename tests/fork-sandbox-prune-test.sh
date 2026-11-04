@@ -26,6 +26,9 @@
 #   - a held lock makes a second prune exit 0 without doing anything.
 #   - --auto reads FORK_SANDBOX_RUN_RETENTION_DAYS from runs.env, prints
 #     nothing, logs one line, and does nothing at all with retention 0.
+#   - fork-sandbox run starts the automatic prune only when its config dir
+#     is the login user's own (fs_config_dir_is_machine_default), so a
+#     test's temp config never prunes the real forks root.
 #   - fs_auto_prune_start, which `fork-sandbox run` calls at launch, returns
 #     at once however slow the prune is, never fails the launch, leaves the
 #     launcher's fds behind, and starts nothing with retention 0.
@@ -422,12 +425,41 @@ fs_auto_prune_start "$config" "$stub_prune"
 if stub_ran; then no 'retention 0 starts no prune'; else ok 'retention 0 starts no prune'; fi
 stop_stub
 
-launcher="$repo_dir/scripts/fork-sandbox.sh"
-# shellcheck disable=SC2016  # the literal source line is what is matched
-if grep -q '^    fs_auto_prune_start "$config_dir" "$script_dir/fork-sandbox-prune.sh"$' "$launcher"; then
-    ok 'fork-sandbox run starts the automatic prune'
+# Only the machine's own config may start a prune of the machine-wide
+# forks root: every launcher test points the config at a temp dir (by
+# FORK_SANDBOX_CONFIG_DIR or HOME) and must not prune the real root.
+login_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+if [[ -n "$login_home" ]]; then
+    if fs_config_dir_is_machine_default "$login_home/.config/fork-sandbox"; then
+        ok 'the login user config dir is the machine default'
+    else
+        no 'the login user config dir is the machine default'
+    fi
+    if HOME="$config" fs_config_dir_is_machine_default "$login_home/.config/fork-sandbox"; then
+        ok 'a different HOME does not change the machine default'
+    else
+        no 'a different HOME does not change the machine default'
+    fi
+fi
+if fs_config_dir_is_machine_default "$config"; then
+    no 'a temp config dir is not the machine default'
 else
-    no 'fork-sandbox run starts the automatic prune'
+    ok 'a temp config dir is not the machine default'
+fi
+if HOME="$stub_bin" fs_config_dir_is_machine_default "$stub_bin/.config/fork-sandbox"; then
+    no 'a temp HOME config dir is not the machine default'
+else
+    ok 'a temp HOME config dir is not the machine default'
+fi
+
+launcher="$repo_dir/scripts/fork-sandbox.sh"
+# shellcheck disable=SC2016  # the literal source lines are what is matched
+if grep -q '^if \[\[ "$k8s_runner_mode" != true \]\] && fs_config_dir_is_machine_default "$config_dir"; then$' "$launcher" \
+    && grep -A1 'fs_config_dir_is_machine_default "$config_dir"; then$' "$launcher" \
+        | grep -q '^    fs_auto_prune_start "$config_dir" "$script_dir/fork-sandbox-prune.sh"$'; then
+    ok 'fork-sandbox run starts the automatic prune, only for the machine config'
+else
+    no 'fork-sandbox run starts the automatic prune, only for the machine config'
 fi
 
 printf '\n%d ok / %d fail\n' "$pass" "$fail"

@@ -25,6 +25,9 @@
 #                    nothing, and append one summary line to
 #                    <forks-root>/.fork-sandbox-prune.log. A retention of 0
 #                    makes it do nothing at all.
+#                    The launcher starts it only when its config dir is
+#                    the login user's own ~/.config/fork-sandbox, so a
+#                    test's temporary config never prunes the real root.
 # -h, --help         print this header and exit.
 #
 # Output: one line per run dir pruned (or, with --dry-run, that would be),

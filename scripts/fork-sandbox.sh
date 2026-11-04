@@ -4987,8 +4987,10 @@ mkdir -p /var/tmp/claude-scratch/forks
 # grow without bound: fork-sandbox-prune.sh --auto, detached and
 # best-effort (fs_auto_prune_start never waits for it and never fails), with
 # the retention in runs.env's FORK_SANDBOX_RUN_RETENTION_DAYS (0 disables
-# it). Not from inside a --k8s pod, which has no forks root of its own.
-if [[ "$k8s_runner_mode" != true ]]; then
+# it). Not from inside a --k8s pod, which has no forks root of its own,
+# and not when the config dir is anything but the login user's own: a test
+# suite points it at a temp dir, and must never prune the real forks root.
+if [[ "$k8s_runner_mode" != true ]] && fs_config_dir_is_machine_default "$config_dir"; then
     fs_auto_prune_start "$config_dir" "$script_dir/fork-sandbox-prune.sh"
 fi
 

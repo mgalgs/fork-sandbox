@@ -5580,6 +5580,28 @@ fs_k8s_driver_alive() {
     return 0
 }
 
+# True when CONFIG_DIR is the login user's own ~/.config/fork-sandbox, with
+# the home directory taken from the password database rather than from
+# $HOME. The forks root is machine-wide, so only the machine's own config
+# may govern the automatic prune of it: a launch whose config was moved
+# elsewhere -- every test suite does that, with FORK_SANDBOX_CONFIG_DIR or
+# a temporary HOME -- would otherwise prune the real root at a retention
+# the operator never set. Fails closed when the home cannot be found.
+fs_config_dir_is_machine_default() {
+    local config_dir="$1" user home="" want got
+    user="$(id -un 2>/dev/null)" || return 1
+    if command -v getent >/dev/null 2>&1; then
+        home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    elif [[ "$user" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]]; then
+        eval "home=~$user"
+        [[ "$home" == "~$user" ]] && home=""
+    fi
+    [[ "$home" == /* ]] || return 1
+    want="$("$FS_REALPATH" -m -- "$home/.config/fork-sandbox" 2>/dev/null)" || return 1
+    got="$("$FS_REALPATH" -m -- "$config_dir" 2>/dev/null)" || return 1
+    [[ "$want" == "$got" ]]
+}
+
 # Starts `fork-sandbox-prune.sh --auto` (PRUNE_BIN) detached, for
 # fork-sandbox.sh's launch: best-effort by construction, so it never delays
 # or fails the launch it rides on. CONFIG_DIR is the per-machine config
