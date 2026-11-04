@@ -26,6 +26,9 @@
 #   - a held lock makes a second prune exit 0 without doing anything.
 #   - --auto reads FORK_SANDBOX_RUN_RETENTION_DAYS from runs.env, prints
 #     nothing, logs one line, and does nothing at all with retention 0.
+#   - fs_auto_prune_start, which `fork-sandbox run` calls at launch, returns
+#     at once however slow the prune is, never fails the launch, leaves the
+#     launcher's fds behind, and starts nothing with retention 0.
 
 # ok always succeeds, so `test && ok .. || no ..` never runs both.
 # shellcheck disable=SC2015
@@ -59,6 +62,7 @@ lock_holder=""
 cleanup() {
     [[ -n "$sleeper" ]] && kill "$sleeper" 2>/dev/null
     [[ -n "$lock_holder" ]] && kill "$lock_holder" 2>/dev/null
+    [[ -s "$stub_bin/stub.pid" ]] && kill "$(cat "$stub_bin/stub.pid")" 2>/dev/null
     chmod -R u+rwx "$root" "$outside" 2>/dev/null
     rm -rf -- "$root" "$outside" "$config" "$stub_bin"
 }
@@ -335,6 +339,75 @@ has '--auto log line says what it did' 'prune --auto (retention 7 days): pruned 
 
 "$prune" --auto --dry-run >/dev/null 2>&1
 check '--auto takes no other option' 2 "$?"
+
+# ---------------------------------------------------------------------------
+printf '== the automatic prune at launch ==\n'
+
+# shellcheck source=../scripts/fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$repo_dir/scripts/fork-sandbox-lib.sh"
+
+# A stand-in prune: records its arguments, its config dir and whether it
+# inherited fd 7, then sleeps far longer than any launch may wait.
+stub_prune="$stub_bin/prune-stub"
+cat > "$stub_prune" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$\$" > "$stub_bin/stub.pid"
+printf 'args=%s\nconfig=%s\nfd7=%s\n' "\$*" "\$FORK_SANDBOX_CONFIG_DIR" \\
+    "\$( [[ -e /proc/self/fd/7 ]] && echo open || echo closed )" > "$stub_bin/stub.out"
+exec sleep 30
+EOF
+chmod +x "$stub_prune"
+stub_ran() {
+    local _
+    for _ in $(seq 50); do
+        [[ -s "$stub_bin/stub.out" ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+stop_stub() {
+    [[ -s "$stub_bin/stub.pid" ]] && kill "$(cat "$stub_bin/stub.pid")" 2>/dev/null
+    rm -f -- "$stub_bin/stub.pid" "$stub_bin/stub.out"
+}
+
+printf 'FORK_SANDBOX_RUN_RETENTION_DAYS=14\n' > "$config/runs.env"
+exec 7>>"$stub_bin/held-lock"
+flock 7
+start=$SECONDS
+# A command substitution waits for every holder of its pipe: a child that
+# kept stdout would hold this for the stub's full 30 seconds.
+out="$(fs_auto_prune_start "$config" "$stub_prune"; echo "rc=$?")"
+check 'a slow prune does not delay the launch' 1 "$(( SECONDS - start < 5 ))"
+check 'and the helper succeeds' 'rc=0' "$out"
+if stub_ran; then ok 'the prune was started'; else no 'the prune was started'; fi
+has 'it is started with --auto' 'args=--auto' "$(cat "$stub_bin/stub.out" 2>/dev/null)"
+has 'it reads the same config dir' "config=$config" "$(cat "$stub_bin/stub.out" 2>/dev/null)"
+if [[ -d /proc/self/fd ]]; then
+    has 'it holds none of the launcher fds' 'fd7=closed' "$(cat "$stub_bin/stub.out" 2>/dev/null)"
+fi
+exec 7>&-
+stop_stub
+
+out="$(fs_auto_prune_start "$config" "$stub_bin/missing-prune"; echo "rc=$?")"
+check 'a missing prune script is not an error' 'rc=0' "$out"
+printf '#!/usr/bin/env bash\nexit 3\n' > "$stub_bin/failing-prune"
+chmod +x "$stub_bin/failing-prune"
+out="$(fs_auto_prune_start "$config" "$stub_bin/failing-prune"; echo "rc=$?")"
+check 'a failing prune is not an error' 'rc=0' "$out"
+
+printf 'FORK_SANDBOX_RUN_RETENTION_DAYS=0\n' > "$config/runs.env"
+fs_auto_prune_start "$config" "$stub_prune"
+if stub_ran; then no 'retention 0 starts no prune'; else ok 'retention 0 starts no prune'; fi
+stop_stub
+
+launcher="$repo_dir/scripts/fork-sandbox.sh"
+# shellcheck disable=SC2016  # the literal source line is what is matched
+if grep -q '^    fs_auto_prune_start "$config_dir" "$script_dir/fork-sandbox-prune.sh"$' "$launcher"; then
+    ok 'fork-sandbox run starts the automatic prune'
+else
+    no 'fork-sandbox run starts the automatic prune'
+fi
 
 printf '\n%d ok / %d fail\n' "$pass" "$fail"
 (( fail == 0 ))

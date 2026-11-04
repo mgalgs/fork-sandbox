@@ -5579,3 +5579,42 @@ fs_k8s_driver_alive() {
     fi
     return 0
 }
+
+# Starts `fork-sandbox-prune.sh --auto` (PRUNE_BIN) detached, for
+# fork-sandbox.sh's launch: best-effort by construction, so it never delays
+# or fails the launch it rides on. CONFIG_DIR is the per-machine config
+# directory; its runs.env's FORK_SANDBOX_RUN_RETENTION_DAYS=0 means start
+# nothing at all (the prune itself reads the same key for any other value,
+# and logs its one line to the forks root -- see that script's header).
+#
+# The child gets its own session (setsid, where there is one) so a Ctrl-C
+# or a closing terminal aimed at the launcher does not reach it, no
+# stdin/stdout/stderr of the caller (a `$(fork-sandbox run ...)` would
+# otherwise wait for it to finish), and none of the caller's other open
+# fds: a --resume worker's state lock or a clone-dir lock inherited by a
+# long prune would hold that lock for as long as the prune runs. Always
+# returns 0.
+fs_auto_prune_start() {
+    local config_dir="$1" prune_bin="$2" days
+    days="$(fs_read_env_value "$config_dir/runs.env" FORK_SANDBOX_RUN_RETENTION_DAYS 2>/dev/null)" \
+        || days=""
+    [[ "$days" =~ ^0+$ ]] && return 0
+    [[ -x "$prune_bin" ]] || return 0
+    (
+        local fd_path fd
+        for fd_path in /proc/self/fd/* /dev/fd/*; do
+            fd="${fd_path##*/}"
+            [[ "$fd" =~ ^[0-9]+$ ]] || continue
+            (( fd > 2 )) || continue
+            { exec {fd}>&-; } 2>/dev/null || true
+        done
+        exec </dev/null >/dev/null 2>&1
+        if command -v setsid >/dev/null 2>&1; then
+            exec env FORK_SANDBOX_CONFIG_DIR="$config_dir" setsid nice -n 19 "$prune_bin" --auto
+        fi
+        trap '' HUP INT
+        exec env FORK_SANDBOX_CONFIG_DIR="$config_dir" nice -n 19 "$prune_bin" --auto
+    ) &
+    disown "$!" 2>/dev/null || true
+    return 0
+}

@@ -4983,6 +4983,15 @@ fi
 # UserPromptSubmit hook makes it too, but a script cannot assume the hook ran.
 mkdir -p /var/tmp/claude-scratch/forks
 
+# Reclaim finished runs' clones on the way in, so the forks root does not
+# grow without bound: fork-sandbox-prune.sh --auto, detached and
+# best-effort (fs_auto_prune_start never waits for it and never fails), with
+# the retention in runs.env's FORK_SANDBOX_RUN_RETENTION_DAYS (0 disables
+# it). Not from inside a --k8s pod, which has no forks root of its own.
+if [[ "$k8s_runner_mode" != true ]]; then
+    fs_auto_prune_start "$config_dir" "$script_dir/fork-sandbox-prune.sh"
+fi
+
 # One block per harness, each resolving its tool and filling the same
 # variables. Nothing after this knows which harness it is looking at, so a
 # fourth means writing another arm rather than threading one more
