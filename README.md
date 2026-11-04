@@ -33,6 +33,9 @@ installed and callable under its own name — `fork-sandbox status` and
 - `fork-sandbox say <run-dir> <text>` — steer a running agent
 - `fork-sandbox stop [--timeout SECS] <run-dir>` — abandon a local run,
   with a ledger trail
+- `fork-sandbox prune [--dry-run] [--older-than DAYS]` — reclaim the
+  clones of finished runs whose branch came home (also started at every
+  launch; see [docs/prune.md](docs/prune.md))
 - `fork-sandbox k8s submit|fetch --branch <name> ...` — start a cluster
   run from one machine, collect it from another
 - `fork-sandbox log list|stats` — the run ledger: harness, model, tokens,
@@ -912,6 +915,8 @@ what is mounted, what is not, and a numbered list of the gaps.
 - [docs/sandbox-services.md](docs/sandbox-services.md) — the committed
   contract a repo uses to declare its service stack.
 - [docs/permissions.md](docs/permissions.md) — running these without a prompt.
+- [docs/prune.md](docs/prune.md) — `fork-sandbox prune`: which finished
+  runs' clones are reclaimed, what stays, and the retention key.
 - [docs/sandbox-backend.md](docs/sandbox-backend.md) — the isolation contract
   and its two implementations.
 - [docs/kubernetes-runs.md](docs/kubernetes-runs.md) — running a whole run in a

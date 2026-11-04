@@ -12,13 +12,14 @@ anything:
 | `kit.env` | `AGENT_KIT_SKILLS`: extra skills for the agent kit, names separated by spaces and/or commas, each a directory under `$HOME/.claude/skills`. Every run on this machine binds them read-only into every seat, beside the review kit. `fork-sandbox.sh --kit-skill <name>` adds more for one launch. A missing file or key means an empty kit. `configure` does not write this file |
 | `coder-mode.env` | `CODER_MODE_*` — the `sandbox-coder-mode` skill's seats and ceiling: which harness and model each kind of leg uses (`CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_NETWORK`, the `REVIEW` and `MAINTAINER` sets), or `CODER_MODE_PRESET` naming one preset in place of all of them. A file with no composition keys means the skill routes every round adaptively. The skill owns the key list; these are read by the orchestrating session, not by any script, and `configure` does not write the file |
 | `limits.env` | `RUN_MEMORY_MAX`: caps the local runner's own process tree memory, a systemd size — digits with an optional `K`/`M`/`G`/`T` suffix, or a percentage from 1 to 100 like `60%` (e.g. `RUN_MEMORY_MAX=8G`). Anything else is refused at launch, naming the file and the key. Covers only the `bwrap` backend's process tree — under `FORK_SANDBOX_BACKEND=container` the agent and its tools run in docker's own cgroups, which this cap never reaches. `RUN_SCOPE=off` disables the per-run systemd scope entirely (see [below](#the-per-run-systemd-scope)) even where one is otherwise available; any other value for the key is refused at launch, the same way. A missing file or key means no cap and the scope left on. `configure` does not write this file |
+| `runs.env` | `FORK_SANDBOX_RUN_RETENTION_DAYS`: how many days after a local run ends before `fork-sandbox prune`, which every launch starts in the background, removes its `clone/`. Missing means 14; `0` turns the automatic prune off. See [docs/prune.md](prune.md). `configure` does not write this file |
 
 Assembling that by hand means copying key names out of docs and typing a
 `chmod 600`. `configure` does it instead: it discovers what is already on
 this machine — an `OPENROUTER_API_KEY` in your environment, a local model
 endpoint, a kubectl context — shows you what it found, and writes the
 pieces you pick into the files above, **except `coder-mode.env`,
-`claude.env`, `kit.env` and `limits.env`** -- none has a target on the
+`claude.env`, `kit.env`, `limits.env` and `runs.env`** -- none has a target on the
 allowlist a discoverer can write to, so `configure` never installs anything
 into them; see the rows above.
 
