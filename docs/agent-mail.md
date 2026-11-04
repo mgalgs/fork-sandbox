@@ -413,9 +413,16 @@ Handle the mail, mark it `lane-mail.sh seen <lane> <id>...`, then launch
 `--wait` again. Relaunching before marking fires again at once on the same
 messages.
 
-`lane-mail.sh lanes` lists the lanes there are: registered, mailbox-only,
-remote ones that have written here, and peer hosts, as
-`<source><TAB><lane><TAB><description>` lines. The `lane-mail-register`
+`lane-mail.sh lanes` lists the lanes there are: registered (`live` while a
+registering session's Claude Code process still runs, `stale` once none
+does), mailbox-only, remote ones that have written here, and peer hosts, as
+`<source><TAB><lane><TAB><description><TAB><last seen>` lines. Last seen is
+when the lane-mail hook last ran for one of the lane's sessions (it runs
+every turn), empty for unregistered lanes. Registrations are never cleaned
+up and a stale lane still takes mail: `send` and `reply` deliver to it and
+print `lane-mail: @x: registered but no live session (last seen <when>);
+mail will wait` on stderr, exit status unchanged, so the sender knows the
+mail may sit unread. The `lane-mail-register`
 skill wraps registration and explains the listing.
 
 `register <lane> --dir <abs-path>` also remembers `<lane>` as the lane for

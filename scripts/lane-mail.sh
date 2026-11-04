@@ -10,13 +10,23 @@
 #        lane-mail.sh send --to @lane:host ...     (another host, over ssh)
 #        lane-mail.sh lanes                        (the lanes there are)
 #
-# `lanes` prints one `<source><TAB><lane><TAB><description>` line per lane:
-# `live` (some session registered it -- registrations are never cleaned up,
-# so the session may be gone), `mailbox`, `remote` (`lane:host` that has
-# written here) and `peer` (a host). The third column is the lane's
+# `lanes` prints one `<source><TAB><lane><TAB><description><TAB><last seen>`
+# line per lane: `live` (a session that registered it is still running),
+# `stale` (registered, but no registering session is still running --
+# registrations are never cleaned up), `mailbox`, `remote` (`lane:host` that
+# has written here) and `peer` (a host). The third column is the lane's
 # description (below), empty when unset and always empty for `remote` and
-# `peer`; read the first two fields and ignore the rest if you do not want
-# it. `list` lists messages, not lanes.
+# `peer`. The fourth is when a session of a `live` or `stale` lane was last
+# seen (local `YYYY-MM-DD HH:MM`, the latest of its registrations), empty for
+# the other sources. Read the first fields and ignore the rest if you do not
+# want them. `list` lists messages, not lanes.
+#
+# `send` and `reply` never refuse or hold mail over liveness, but for each
+# local recipient lane (`@lane`, or `@lane:<this host>`) that is registered
+# with no live session they print, after delivering, one stderr line
+#   lane-mail: @x: registered but no live session (last seen <when>); mail will wait
+# with the exit status unchanged. A lane never registered (mailbox-only), a
+# remote `@lane:host`, @noreply and the sender's own lane are not checked.
 #
 # A lane may carry a one-line description of what it owns, so a name like
 # @alpha is not read as "anything alpha-related" when its owner means one
@@ -104,7 +114,12 @@
 # `register` maps the calling Claude Code session to its lane mailbox in
 # /tmp/claude-$UID/lane-mail-lanes/<session-id>; the unread-mail hooks
 # (lane-mail-hook.sh) read that mapping to surface inbox state between
-# turns. Sessions that never register are invisible to the hooks.
+# turns. Sessions that never register are invisible to the hooks. The file
+# also records the session's Claude Code process (the nearest ancestor that
+# is the CLI: its pid and start time, plus $TMUX_PANE when set), which is
+# what `live` means; the hook refreshes its last-seen time every turn and
+# re-records the process when it changed. Format and rules: "Session
+# registrations" in lane-mail-lib.sh. `registration` prints the lane alone.
 # `register noreply` is refused before anything is written: `@noreply` is
 # the store's one-way sender (`send` without --from), and no mailbox may
 # answer to it.

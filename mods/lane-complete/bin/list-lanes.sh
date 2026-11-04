@@ -3,9 +3,13 @@
 #
 # Usage: list-lanes.sh        (the mod runs it on a timer; --help prints this)
 #
-# One `<source><TAB><name><TAB><description>` line per candidate, most relevant source first:
+# One `<source><TAB><name><TAB><description><TAB><last seen>` line per
+# candidate, most relevant source first:
 #
-#   live     a lane some session registered (`lane-mail.sh register`)
+#   live     a lane registered (`lane-mail.sh register`) by a session whose
+#            Claude Code process still runs (same pid and start time)
+#   stale    a lane with registrations, none of them live; registrations are
+#            never cleaned up, so this is a session that has gone
 #   mailbox  a lane that only has a mailbox under the lane-mail root
 #   remote   a lane on another host that has written to this one: the `From:`
 #            address (`@lane:host`) of a message in the local thread store
@@ -13,8 +17,12 @@
 #
 # The third column is the lane's description (`lane-mail.sh describe`, stored
 # at <root>/agents/<lane>/about): its first line, empty when unset, and always
-# empty for `remote` and `peer` rows. A consumer that reads two fields is
-# unaffected.
+# empty for `remote` and `peer` rows. The fourth is when a `live` or `stale`
+# lane was last seen (local `YYYY-MM-DD HH:MM`: the newest mtime among its
+# registrations, which the lane-mail hook refreshes every turn), empty for
+# the other sources. A lane with several registrations is live if any one
+# is. A consumer that reads the first fields is unaffected. Registration
+# format and liveness: "Session registrations" in lane-mail-lib.sh.
 #
 # Every path comes from the lane-mail scripts themselves, so this never holds
 # a second copy of them: the root, the peers file and the name patterns from

@@ -10,6 +10,14 @@
 # registration exit silently -- the cost of these global hooks for an
 # ordinary session is one file stat.
 #
+# Every run by a registered session also marks it seen: the registration's
+# mtime is its last-seen time (`lane-mail.sh lanes`). A registration whose
+# recorded owner process is not alive -- one written before owners were
+# recorded, or a session resumed in a new process -- is rewritten with this
+# session's Claude Code process (see "Session registrations" in
+# lane-mail-lib.sh). Both are best-effort: a failure there never fails the
+# hook or changes what it prints.
+#
 # prompt mode emits a short banner (message count plus one line per unread
 # message) that Claude Code injects as context. Deliberately count+subjects
 # only, never bodies: the session pulls a thread with `lane-mail.sh tree`

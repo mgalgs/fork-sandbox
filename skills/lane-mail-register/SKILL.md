@@ -61,12 +61,14 @@ has drifted to.
 
 ## Finding lanes
 
-`lane-mail.sh lanes` lists them, one `<source><TAB><lane><TAB><description>` line each (the description
-is empty when unset, and always for `remote` and `peer`):
+`lane-mail.sh lanes` lists them, one `<source><TAB><lane><TAB><description><TAB><last seen>` line each
+(the description is empty when unset, and always for `remote` and `peer`;
+last seen is set only for `live` and `stale`):
 
 | source | meaning |
 |---|---|
-| `live` | some session registered it. Registrations are never cleaned up, so that session may be gone. |
+| `live` | a session that registered it is still running |
+| `stale` | registered, but every registering session has gone; mail waits for the next one (`send` says so on stderr) |
 | `mailbox` | has a mailbox here, no registration |
 | `remote` | `lane:host`, a lane on another host that has written here |
 | `peer` | a host from the peers file; its lanes are `@<lane>:<peer>` |

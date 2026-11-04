@@ -16,8 +16,9 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
   Claude Code's own menu over the picker; and the box must not be empty,
   because Claude Code sends no Enter or Backspace to a mod for an empty one.
 - The characters you type next filter the list: prefix matches first, then
-  substring matches. The list is live lanes (registered sessions), then lanes
-  that only have a mailbox, then remote lanes that have written to this host
+  substring matches. The list is live lanes (registered by a session
+  that is still running), then stale ones (registered, session gone), then
+  lanes that only have a mailbox, then remote lanes that have written to this host
   (see below), then each local lane qualified with each peer host from the
   peers file (`@lane:host`).
 - Enter inserts the highlighted match (the top one until you move it, see
