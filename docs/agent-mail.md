@@ -1603,14 +1603,22 @@ wake of the seat clears that seat's no-summary reasons and no other
 seat's, with a `clear` line and a `flag-clear` event with
 `reason=no-summary`.
 
-A dead run can also be harvested after a later wake of its seat on the
-same thread already exited 0: a k8s run adopted across a restart and only
-declared dead afterwards. Its harvest still does everything else (the
-outbox, the retry bookkeeping, the dead-seat teardown), but does not flag
-the thread for a failure the seat has recovered from; a `flag-skip` event
-reports it instead. Likewise the flag file never falls back to a
-no-summary reason whose seat has had a clean wake since, even one the
-journal has no `clear` line for.
+The flag file never falls back to a no-summary reason whose seat has had
+a clean wake since, even one the journal has no `clear` line for. Before
+no-summary flags were cleared, a seat's recovery left no `clear` line, so
+the next clear of anything else on the thread (another seat's wake-exit, a
+silent-wake reply, a no-grant release) rewrote the flag file to that
+still-open no-summary reason, re-flagging a thread whose seats had all
+recovered. Journals written then still hold such lines; they are read as
+answered.
+
+As a guard, a dead run harvested after a later wake of its seat on the
+same thread already exited 0 is not flagged either; its harvest still does
+everything else (the outbox, the retry bookkeeping, the dead-seat
+teardown), and a `flag-skip` event reports it. Normal operation never gets
+there: a run counts as live until it is harvested, and the postmaster
+never wakes a seat that has a live run, so this takes a store edited by
+hand or by another writer.
 
 ## The postmaster
 
@@ -1685,7 +1693,8 @@ released a held seat cleared its no-grant flag; `flagged` says whether the threa
 else; one line per cleared attempt), `flag-skip` (thread, agent,
 reason=no-summary, run=<dead run id>, by=<the seat's later clean run id> —
 a dead run was harvested after its seat had already recovered, so the
-thread was not flagged for it), `retry` (thread, agent, trigger=<short-id>,
+thread was not flagged for it; a guard that only a hand-edited store
+reaches), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; a discarded-reply retry has
 reason=malformed in place of attempt; see "Retrying a dead wake" below),
 `regate` (thread, agent, run=<harvested run id> — a deferred seat's wake gate

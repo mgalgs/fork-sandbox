@@ -117,6 +117,9 @@
 #                same thread already exited 0: its evidence, retry and
 #                teardown bookkeeping happen as usual, but the thread is
 #                not flagged for a failure its seat has recovered from.
+#                A guard only: an unharvested run counts as live, and no
+#                path spawns a seat's next wake while it has one, so this
+#                takes a store edited by hand or by another writer.
 #                See pm_seat_recovered_after.
 #   defer        thread, agent, reason=wake-when -- the seat's wake gate
 #                (rule 5) answered "not now": no spawn, no budget slot
@@ -2787,8 +2790,12 @@ pm_wake_exit_mark_cleared() {
 # cleared. And the reason the flag file falls back to is never a
 # no-summary one whose seat has had a clean wake on the thread since
 # (pm_seat_recovered_after): that failure is answered whether or not a
-# clear line says so -- a flag raised before no-summary flags were cleared
-# at all, say.
+# clear line says so. This fallback is how a stale no-summary flag came
+# back: before no-summary flags were cleared, the seat's clean wake left
+# no clear line, so any later clear on the thread (another seat's
+# wake-exit, a silent-wake reply, a no-grant release) rewrote the flag
+# file to that still-open no-summary reason. Journals written then still
+# hold such lines.
 PM_NO_SUMMARY_PREFIX="wake never produced summary.json: "
 pm_wake_exit_clear() {
     local tid="$1" agent="$2" rid="$3" key="${4:-wake-exit}"
@@ -6523,9 +6530,14 @@ pm_harvest_run() {
         # below. No summary.json means no evidence either way about the
         # session, so the prior recorded id (if any) is left standing
         # rather than cleared on nothing.
-        # Harvested late (an adoption, a restart), a dead run can come in
-        # after its seat has already had a clean wake on this thread: that
-        # wake answered it, so nothing is flagged for it.
+        # A guard, not a path normal operation takes: an unharvested run
+        # counts as live (fs_pm_find_live_run), and every spawn path checks
+        # for a live run of the seat first, so no later wake of this seat
+        # can exist yet. Should a hand-edited or foreign-written store
+        # produce one that exited 0, that wake answered this failure, and
+        # nothing is flagged for it. (A stale no-summary flag reappearing
+        # after recovery came from the flag file's fallback in
+        # pm_wake_exit_clear, not from here.)
         local recovered_by
         if recovered_by="$(pm_seat_recovered_after "$tid" "$agent" "$rid")"; then
             pm_event "flag-skip thread=${tid:0:8} agent=$agent reason=no-summary run=$rid by=$recovered_by"

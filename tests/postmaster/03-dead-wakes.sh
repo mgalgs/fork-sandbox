@@ -519,12 +519,14 @@ check "no-summary exhausted: the no-summary reason was still cleared under it" 1
     "$(ns_journal "$ns_tid" | grep -c "	clear	no-summary	.*$ns_r1 cleared by run ")"
 
 # ============================================================
-printf '\n== no-summary after recovery: a late harvest does not re-raise the flag ==\n'
+printf '\n== no-summary after recovery: the fallback, and the late-harvest guard ==\n'
 # ============================================================
 
-# A dead run harvested only after a later wake of its seat already exited
-# 0 (adopted across a restart, say): its evidence and bookkeeping happen,
-# the flag does not.
+# A guard, not the incident's path: a dead run harvested only after a later
+# wake of its seat already exited 0. Normal operation cannot get here (an
+# unharvested run is live, so the seat is never woken again), so the
+# fixture hides the run with a hand-written harvested/ marker. Its evidence
+# and bookkeeping happen, the flag does not.
 ns_root
 ns_mid="$(send_msg '@carol' '@alice' 'no-summary late harvest' 'body' 8)"
 ns_tid="$(thread_of "$ns_mid")"
@@ -558,9 +560,10 @@ ns_die alice >/dev/null
 check "late harvest, other seat: the thread is flagged as before" \
     "wake never produced summary.json: $ns_r1" "$(ns_cur "$ns_tid")"
 
-# A flag already on disk from before no-summary flags were cleared: the
-# seat's clean wake left no clear line. When another seat's flag is
-# cleared, the flag file must not fall back to the answered no-summary.
+# The path that re-raised a recovered seat's flag: a no-summary flag from
+# before no-summary flags were cleared, so the seat's clean wake left no
+# clear line. When another seat's flag is cleared, the flag file must not
+# fall back to the answered no-summary.
 ns_root
 ns_mid="$(send_msg '@carol' '@alice' 'no-summary stale fallback' 'body' 8)"
 ns_tid="$(thread_of "$ns_mid")"

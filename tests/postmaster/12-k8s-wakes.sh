@@ -923,9 +923,11 @@ adopt_reap_pending_case() {
 }
 adopt_reap_pending_case
 
-# A dead run harvested after a later wake of its seat exited 0 (the incident
-# shape: adopted across a restart, declared dead long after the seat's
-# retry recovered): torn down and harvested as before, but not flagged.
+# The late-harvest guard on the k8s path: a dead run harvested after a
+# later wake of its seat exited 0. Normal operation cannot produce this (an
+# unharvested run is live, so the seat is not woken again); the fixture
+# builds it by un-harvesting a finished run by hand. Torn down and
+# harvested as before, but not flagged.
 adopt_late_dead_case() {
     local mid tid env rid wake_dir rid2
     new_scratch_root FORK_SANDBOX_MAIL_ROOT
