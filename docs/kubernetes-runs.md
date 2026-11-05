@@ -2688,6 +2688,12 @@ A separate per-run proxy forwards only Responses and compaction requests to
 `ChatGPT-Account-Id` with the host sign-in access token and account id from
 its private key volume. The host keeper refreshes auth and pushes both values
 together; the per-run Secret seeds the proxy and is never mounted by the agent.
+With `FORK_SANDBOX_CODEX_AUTH_FILE` set, auth is read from that file instead
+of `${CODEX_HOME:-~/.codex}/auth.json` and never refreshed: launch refuses a
+file without an access token and account id, or whose token expires within
+15 minutes, and the keeper only re-reads it and pushes a rotated token. See
+"Codex seats in a cluster postmaster" in
+[cluster-postmaster.md](cluster-postmaster.md).
 The proxy and Secret are removed at run teardown. A mixed pipeline has
 separate Claude and Codex proxies and network policies.
 

@@ -8,13 +8,11 @@ does on a workstation.
 
 ## What it is not, yet
 
-- **No codex seats.** The cluster postmaster always refuses to wake a
-  `codex` seat; that harness needs a credential in the pod, and shipping
-  one is deferred.
-- **Claude seats need a credential installed.** A pi seat always works,
-  no credential needed. A `claude` seat is refused until a site installs
-  a claude credential -- see "Claude seats in a cluster postmaster"
-  below.
+- **Claude and codex seats need a credential installed.** A pi seat
+  always works, no credential needed. A `claude` seat is refused until a
+  site installs a claude credential, and a `codex` seat until it names a
+  managed codex login -- see "Claude seats in a cluster postmaster" and
+  "Codex seats in a cluster postmaster" below.
 - **No local or bwrap seats, no triage.** Only seats a pod can actually run
   get woken; anything else is refused rather than silently mis-scheduled.
 - **A fresh store.** The pod starts from an empty agent-mail store. Threads
@@ -132,9 +130,10 @@ Do these in order.
    --cluster` on the fleet it is about to ship (the `fleet.yaml`,
    `personas/`, `handlers/` and `presets/` under the config dir) and
    refuses a fleet the pod could not run: the postmaster runs the same
-   check at startup and would crash-loop on a local, triage or codex
-   seat, or a claude seat with no credential installed (see "Claude
-   seats in a cluster postmaster" below).
+   check at startup and would crash-loop on a local or triage seat, or a
+   claude or codex seat with no credential installed (see "Claude seats
+   in a cluster postmaster" and "Codex seats in a cluster postmaster"
+   below).
 
    It then applies the base cluster manifests exactly as plain `install`
    does, and renders and applies the postmaster's own pieces: a
@@ -446,6 +445,7 @@ them in `k8s.env`:
 |---|---|---|
 | `K8S_POSTMASTER_GIT_SECRET` | `K8S_POSTMASTER_GIT_KEY_FILE`, `K8S_POSTMASTER_KNOWN_HOSTS_FILE` | `deploy-key`, `known_hosts` |
 | `K8S_POSTMASTER_CLAUDE_SECRET` | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` | `credentials.json` |
+| `K8S_POSTMASTER_CODEX_SECRET` | (no file form) | `auth.json` |
 | `K8S_MAIL_API_TOKENS_SECRET` | `K8S_MAIL_API_TOKENS_FILE` | `tokens` |
 | `K8S_POSTMASTER_HOOKS_SECRET` | (no file form) | whatever your hooks read |
 
@@ -464,7 +464,9 @@ Deployment. That has consequences:
   `fork-sandbox-mail-api.py check`. Run those before you load the Secret.
 - **Changing a referenced Secret does not roll the pod.** It is not in
   `checksum/pm-config`. After a rotation, run
-  `kubectl rollout restart deployment/fork-sandbox-postmaster`.
+  `kubectl rollout restart deployment/fork-sandbox-postmaster`. The codex
+  Secret is the exception: it is meant to rotate under a running pod (see
+  "Codex seats in a cluster postmaster" below).
 - **A missing Secret or key is a pod that never starts**, not an install
   error. Wait for `kubectl rollout status` after installing.
 - **The team token's hash** lives in `fork-sandbox-mail-api-team-hash`, a
@@ -484,8 +486,8 @@ the namespace. Delete it once the new pod is up.
 
 ## Claude seats in a cluster postmaster
 
-By default the cluster postmaster refuses to wake a `claude` seat, the
-same as a `codex` seat: nothing in the pod holds a claude credential. A
+By default the cluster postmaster refuses to wake a `claude` seat:
+nothing in the pod holds a claude credential. A
 site that wants claude seats installs one long-lived credential that every
 claude seat in the pod shares.
 
@@ -541,6 +543,65 @@ changed file rolls the pod. For a pool, replace one account's file and rerun
 install; its Secret key updates and the pod rolls. A leak of the Claude Secret
 exposes every account in the pool, while a leak of one source file exposes
 that account. Limit access to the Secret and source files accordingly.
+
+## Codex seats in a cluster postmaster
+
+By default the cluster postmaster refuses to wake a `codex` seat. A site
+that wants codex seats gives the pod one codex login that some other
+process keeps fresh, and every codex seat in the pod shares it.
+
+**The seat.** Spell it with the full model slug, on the cluster backend:
+
+```yaml
+agents:
+  reviewer:
+    harness: codex
+    model: <full codex model slug>
+    backend: k8s
+```
+
+A wake runs `fork-sandbox.sh --k8s --harness codex --model <slug>`, which
+is a one-step composed run: one codex code step, the same run an inline
+one-step codex `--pipeline` builds. There is no codex model cache in the
+pod, so the slug is sent as written, with a warning. `thinking` and
+`refresh-at` are not forwarded to a codex seat (they are claude-only on
+`--k8s`). A codex seat starts each wake fresh, with no session resume: a
+composed run has no transcript store for a codex seat.
+
+**The Secret.** Set `K8S_POSTMASTER_CODEX_SECRET` in `k8s.env` to the name
+of a Secret in the namespace with one key, `auth.json`: a codex
+`auth.json` whose `tokens` carry `access_token` and `account_id`. It must
+hold **no refresh token**. Install takes it by reference only (see
+"Secrets by reference" above): it never creates, reads or prints it. It
+mounts the Secret read-only, as a directory, at `/etc/fork-sandbox/codex`
+in the postmaster container alone, and sets
+`FORK_SANDBOX_CODEX_AUTH_FILE=/etc/fork-sandbox/codex/auth.json` and
+`FORK_SANDBOX_CLUSTER_CODEX=1` there, so `fleet check --cluster` (in the
+pod and in install's own pre-flight) accepts codex seats.
+
+**The maintainer.** Something outside fork-sandbox keeps that Secret's
+`auth.json` current, and it must be the login's **only** refresher. Codex
+refresh tokens are single-use: two processes refreshing one login
+invalidate each other and log its owner out. So the login behind the
+Secret must not be one a person also uses from their own codex CLI, and
+nothing in fork-sandbox ever refreshes it. With
+`FORK_SANDBOX_CODEX_AUTH_FILE` set, `fork-sandbox-k8s.sh` reads the file
+and never runs `fork-sandbox-codex-refresh.py` against it, at launch or in
+the per-run keeper.
+
+**What reaches a run.** At launch, `fork-sandbox-k8s.sh` refuses a file
+that is missing, lacks the access token or account id, or whose access
+token expires within 15 minutes. Each run gets its own codex proxy, which
+holds the access token and account id in a per-run Secret; the agent pod
+gets only a placeholder bearer and never sees the token. The per-run
+keeper re-reads the mounted file every 30 seconds and pushes a changed
+token to the proxy. That is why the mount is a directory and never
+`subPath`: a `subPath` mount never sees the Secret's updates.
+
+**Expiry mid-run is the maintainer's to prevent.** The keeper only warns
+when it sees the token within 15 minutes of expiry; it cannot refresh it.
+A maintainer that rotates well ahead of expiry keeps every run in flight
+working.
 
 ## Operators
 
