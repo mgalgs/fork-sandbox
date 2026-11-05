@@ -1780,7 +1780,7 @@ has ended, without the postmaster knowing why.
 |---|---|
 | `on-harvest` | after a harvest of one run posted at least one message |
 | `on-target` | when a thread's review target is set or moves: the kickoff's `send --review-target` is version 1, and a `review-target: sets` seat's `Version:` reply moves it (see "The review target") |
-| `on-quiescent` | once per quiescence of a thread |
+| `on-quiescent` | once per quiescence of a thread, and once more when a quiet thread's flag state changes |
 
 A hook is an executable in `$FORK_SANDBOX_HOOKS_DIR` (default
 `~/.config/fork-sandbox/hooks`; the handlers dir,
@@ -1857,7 +1857,8 @@ fire time, not at reap time.
 are detected by a pass that runs after the harvest pass, in both `--once`
 and the loop. That pass compares the store with markers under
 `hook-marks/`: `target/<thread-id>` holds `<VERSION> <SHA>`, and
-`quiescent/<thread-id>` holds the thread's message count. A marker is
+`quiescent/<thread-id>` holds the thread's message count and whether it
+was flagged (`<count> <1|0>`). A marker is
 written BEFORE its hook fires, so a crash loses at most one event and never
 repeats one.
 
@@ -1890,6 +1891,20 @@ decides what to do with it.
 from the marker and the thread is quiescent. Messages are append-only, so
 new activity raises the count, and the hook fires again after the next
 message cycle settles.
+
+It also fires once when only the thread's flag state changed: a quiescent
+thread that is now flagged where the last fire saw it unflagged, or the
+other way round, whatever changed it (an operator's `unflag` or `flag`, a
+seat's clean wake clearing its flag, a pass raising one). A hook that
+publishes `FS_HOOK_FLAGGED` never keeps a stale value. A new reason on a
+thread that stays flagged does not refire. A marker written before the
+flag state was kept holds the count alone; the first pass that finds it
+on a quiescent thread works out the flag state its fire saw from the flag
+journal (the last `flag` or `unflag` line stamped at or before the
+marker's mtime), fires once if that differs from now, and rewrites the
+marker either way. When the journal cannot tell (no such line, or one in
+the marker's own second), the marker is taken to match the current state
+and nothing fires.
 
 Quiescent means nothing is running on the thread, NOT that its
 participants agreed. A thread where every seat went quiet without a
@@ -2518,7 +2533,7 @@ own thread scans never see it:
 | `fetch-wait/<thread-id>/<agent>` | a wake deferred because its sha (upstream head or review target) is not on `origin` yet: `TRIGGER`, `RETRY`, `KIND`, `KEY` (`<branch> <sha>`), `SINCE`, `ATTEMPTS`, `NOT_BEFORE` — see "Upstream moved" step 3 |
 | `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |
-| `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
+| `hook-marks/quiescent/<thread-id>` | `<count> <1|0>`: the message count and flag state the last `on-quiescent` pass saw, written before the hook fires (a count alone is an older marker; see "Hooks") |
 | `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, `file`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
 | `hooks/logs/<id>.log` | a reaped hook's stdout and stderr, and a wake gate's (`<time>-wake-when-<thread>-<agent>-<n>.log`); the newest 100 are kept |
 | `wake-threads/<run-id>.message-ids` | the Message-ID of every message in that wake's thread snapshot, one per line, listed just before the render and written only beside a snapshot that was; outside the mounted dir. A pending message on the list is not followed up (rule 4) |

@@ -275,6 +275,90 @@ check "seeding: new activity then a harvest fires on-quiescent" 1 "$(hk_count on
 check "seeding: and still no on-target" 0 "$(hk_count on-target)"
 hk_uninstall
 
+# A change in the flag state alone fires on-quiescent again, once, whatever
+# changed it; a new reason on a thread that stays flagged does not.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+HK_ST="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+hk_install on-quiescent
+once
+hk_mid="$(send_msg '@alice' '@carol' 'hook flag state' 'body' 8)"
+hk_tid="$(thread_of "$hk_mid")"
+once
+hk_finish_runs
+once
+check "flag state: the settled thread fired once" 1 "$(hk_count on-quiescent)"
+check "flag state: the marker records the count and the flag state" "1 0" \
+    "$(cat "$HK_ST/hook-marks/quiescent/$hk_tid")"
+"$postmaster" flag "$hk_tid" "look at this" >/dev/null 2>&1
+once
+check "flag state: a flag refires it" 2 "$(hk_count on-quiescent)"
+check "flag state: ...with FS_HOOK_FLAGGED=1" 1 "$(hk_env on-quiescent FS_HOOK_FLAGGED)"
+check "flag state: ...and the reason" "look at this" "$(hk_env on-quiescent FS_HOOK_FLAG_REASON)"
+once
+check "flag state: once" 2 "$(hk_count on-quiescent)"
+"$postmaster" flag "$hk_tid" "look at this instead" >/dev/null 2>&1
+once
+check "flag state: a new reason while flagged does not refire" 2 "$(hk_count on-quiescent)"
+"$postmaster" unflag "$hk_tid" >/dev/null 2>&1
+once
+check "flag state: the operator's unflag refires it" 3 "$(hk_count on-quiescent)"
+check "flag state: ...with FS_HOOK_FLAGGED=0" 0 "$(hk_env on-quiescent FS_HOOK_FLAGGED)"
+check "flag state: ...and no reason" "" "$(hk_env on-quiescent FS_HOOK_FLAG_REASON)"
+once
+check "flag state: once again" 3 "$(hk_count on-quiescent)"
+
+# A change while the thread is busy waits for it to settle, and fires once.
+mkdir -p "$HK_ST/held/$hk_tid"; printf 'TRIGGER=x\n' > "$HK_ST/held/$hk_tid/carol"
+"$postmaster" flag "$hk_tid" "busy" >/dev/null 2>&1
+once
+check "flag state: not while the thread is busy" 3 "$(hk_count on-quiescent)"
+rm -rf "$HK_ST/held/$hk_tid"
+once
+check "flag state: once it settles" 4 "$(hk_count on-quiescent)"
+"$postmaster" unflag "$hk_tid" >/dev/null 2>&1
+
+# A count-only marker from before the flag state was kept: the state its
+# fire saw is read back from the flag journal, and refires only where it
+# differs from now; where it cannot be known, nothing fires.
+hk_mark="$HK_ST/hook-marks/quiescent/$hk_tid"
+hk_jf="$HK_ST/needs-operator-journal/$hk_tid"
+hk_old_mark() {   # hk_old_mark <journal lines...>: count-only marker stamped 01:00
+    printf '1\n' > "$hk_mark"
+    touch -d '2026-01-01T01:00:00Z' "$hk_mark"
+    : > "$hk_jf"
+    local l
+    for l in "$@"; do printf '%s\n' "$l" >> "$hk_jf"; done
+}
+hk_n="$(hk_count on-quiescent)"
+hk_old_mark $'2026-01-01T00:00:00Z\tflag\tother\tstuck' $'2026-01-01T02:00:00Z\tunflag\t\t'
+once
+check "old marker: flagged when it fired, unflagged now: refires once" $(( hk_n + 1 )) "$(hk_count on-quiescent)"
+check "old marker: ...with FS_HOOK_FLAGGED=0" 0 "$(hk_env on-quiescent FS_HOOK_FLAGGED)"
+check "old marker: rewritten with the flag state" "1 0" "$(cat "$hk_mark")"
+once
+check "old marker: once" $(( hk_n + 1 )) "$(hk_count on-quiescent)"
+hk_n="$(hk_count on-quiescent)"
+hk_old_mark $'2026-01-01T00:00:00Z\tflag\tother\tstuck' $'2026-01-01T00:30:00Z\tunflag\t\t'
+once
+check "old marker: unflagged then and now: no refire" "$hk_n" "$(hk_count on-quiescent)"
+check "old marker: upgraded in place" "1 0" "$(cat "$hk_mark")"
+hk_old_mark
+once
+check "old marker, empty journal: not knowable, no refire" "$hk_n" "$(hk_count on-quiescent)"
+check "old marker, empty journal: upgraded to the current state" "1 0" "$(cat "$hk_mark")"
+hk_old_mark $'2026-01-01T01:00:00Z\tflag\tother\tstuck'
+once
+check "old marker, a flag in the marker's own second: not knowable, no refire" "$hk_n" "$(hk_count on-quiescent)"
+hk_old_mark
+rm -f "$hk_jf"
+"$postmaster" flag "$hk_tid" "from before the journal" >/dev/null 2>&1
+sed -i '/from before the journal/d' "$hk_jf"
+once
+check "old marker, a flag with no journal behind it: no refire" "$hk_n" "$(hk_count on-quiescent)"
+check "old marker, a flag with no journal behind it: upgraded as flagged" "1 1" "$(cat "$hk_mark")"
+hk_uninstall
+
 # ============================================================
 printf '\n== wake gate: wake-when.<suffix> guards a seat spawn ==\n'
 # ============================================================

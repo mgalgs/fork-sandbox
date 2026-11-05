@@ -409,7 +409,8 @@
 # The postmaster emits three generic events and runs site-supplied
 # executables on them: on-harvest (a harvest of one run posted at least one
 # message), on-target (a thread's review target was set or moved) and
-# on-quiescent (a thread went quiet). They live in
+# on-quiescent (a thread went quiet, or a quiet thread's flag state
+# changed). They live in
 # $FORK_SANDBOX_HOOKS_DIR (default ~/.config/fork-sandbox/hooks): the file
 # named exactly on-<event> and every file named on-<event>.<anything>, each
 # executable, fired independently in name order. A missing hook is silent.
@@ -7349,7 +7350,11 @@ pm_fetch_wait_pass() {
 # this script never sees happen, and quiescence is a state, not an action.
 # A marker is written BEFORE its hook fires (a crash loses at most one event
 # and never repeats one) and is kept whether or not a hook exists, so
-# installing a hook later replays no history.
+# installing a hook later replays no history. The quiescent marker holds
+# `<count> <flagged 1|0>`: a quiescent thread fires again when either
+# differs, so a flag raised or cleared after the last fire (by `unflag`, a
+# seat's recovery, a pass) never leaves FS_HOOK_FLAGGED stale. A count-only
+# marker predates that; see pm_hook_pass.
 HOOK_MARKS="$STATE/hook-marks"
 
 pm_hook_mark() {
@@ -7473,7 +7478,7 @@ pm_hook_pass() {
             count="$(pm_thread_message_count "$tid")"
             (( count > 0 )) || continue
             pm_thread_is_quiescent "$tid" || continue
-            pm_hook_mark "$seed/quiescent" "$tid" "$count"
+            pm_hook_mark "$seed/quiescent" "$tid" "$count $(pm_thread_flagged "$tid")"
         done
         mkdir -p -- "$seed/target" "$seed/quiescent"
         mv -- "$seed" "$HOOK_MARKS"
@@ -7494,17 +7499,56 @@ pm_hook_pass() {
         pm_hook_fire on-target "$tid" "FS_TARGET_SHA_PRESENT=$present"
     done
 
+    local m_count m_flag flagged mark
     for d in "$MAIL_ROOT/threads"/*/; do
         [[ -d "$d" ]] || continue
         tid="$(basename -- "$d")"
         count="$(pm_thread_message_count "$tid")"
         (( count > 0 )) || continue
-        [[ "$(cat -- "$HOOK_MARKS/quiescent/$tid" 2>/dev/null)" == "$count" ]] && continue
+        flagged="$(pm_thread_flagged "$tid")"
+        m_count="" m_flag=""
+        mark="$HOOK_MARKS/quiescent/$tid"
+        { read -r m_count m_flag < "$mark"; } 2>/dev/null || true
+        [[ "$m_count" == "$count" && "$m_flag" == "$flagged" ]] && continue
         pm_thread_is_quiescent "$tid" || continue
-        pm_hook_mark "$HOOK_MARKS/quiescent" "$tid" "$count"
+        if [[ "$m_count" == "$count" && -z "$m_flag" ]]; then
+            # A count-only marker, from before the flag state was kept: the
+            # state its fire saw, read back from the flag journal; when that
+            # is not knowable, the current one (no refire).
+            m_flag="$(pm_thread_flagged_at "$tid" "$mark")" || m_flag="$flagged"
+            if [[ "$m_flag" == "$flagged" ]]; then
+                pm_hook_mark "$HOOK_MARKS/quiescent" "$tid" "$count $flagged"
+                continue
+            fi
+        fi
+        pm_hook_mark "$HOOK_MARKS/quiescent" "$tid" "$count $flagged"
         pm_hook_quiescent_env "$tid" "$count"
         pm_hook_fire on-quiescent "$tid" "${PM_HOOK_QUIESCENT[@]}"
     done
+}
+
+# 1 when thread $1 is flagged needs-operator, else 0.
+pm_thread_flagged() {
+    if [[ -e "$NEEDS_OPERATOR/$1" ]]; then printf 1; else printf 0; fi
+}
+
+# Whether thread $1 was flagged (1 or 0) when file $2 was last written, read
+# from the flag journal: the last `flag` or `unflag` line stamped at or
+# before the file's mtime decides (a `clear` that unflags writes its own
+# `unflag` line). Fails when that is not knowable: no such line, or a stamp
+# in the same second as the file, which could fall either side of it.
+pm_thread_flagged_at() {
+    local tid="$1" file="$2" mtime at
+    mtime="$("$FS_STAT" -c %Y -- "$file" 2>/dev/null)" || return 1
+    at="$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ)" || return 1
+    [[ -f "$NEEDS_OPERATOR_JOURNAL/$tid" ]] || return 1
+    awk -F'\t' -v at="$at" '
+        $1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:]+Z$/ { next }
+        $1 > at { next }
+        $1 == at && ($2 == "flag" || $2 == "unflag") { tie = 1 }
+        $2 == "flag" { st = 1 }
+        $2 == "unflag" { st = 0 }
+        END { if (st == "" || tie) exit 1; print st }' "$NEEDS_OPERATOR_JOURNAL/$tid"
 }
 
 # `hook fire --thread <tid> --event on-target|on-quiescent [--project <path>]`:
