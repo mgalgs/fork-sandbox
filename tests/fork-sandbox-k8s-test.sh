@@ -21448,6 +21448,52 @@ sed -i '/^K8S_POSTMASTER_GIT_SECRET=/d' "$pm_cfg_ref_nogit/k8s.env"
 pm_api_refused "by reference: neither git Secret nor key file refuses, naming both" \
     "K8S_POSTMASTER_GIT_SECRET" "$pm_cfg_ref_nogit"
 
+# K8S_POSTMASTER_CODEX_SECRET: the managed codex login, by reference only.
+# Mounted into the postmaster container alone, as a directory (a subPath
+# mount would never see the Secret's rotations), with the env that points
+# the keeper at it and admits codex seats to the fleet check.
+pm_cfg_codex="$(pm_ref_cfg K8S_POSTMASTER_CODEX_SECRET=site-codex)"
+printf 'agents:\n  alpha: {harness: claude, backend: k8s}\n  beta: {harness: codex, backend: k8s}\n' \
+    > "$pm_cfg_codex/fleet.yaml"
+printf 'Standing instructions.\n' > "$pm_cfg_codex/personas/beta.md"
+pm_api_install "$pm_cfg_codex"
+check "codex secret: install exits 0 with a codex seat in the fleet" "0" "$pm_api_rc"
+check "codex secret: the codex volume names the site's Secret's auth.json" "site-codex:auth.json:auth.json" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "codex-credentials") | "\(.secret.secretName):\(.secret.items[0].key):\(.secret.items[0].path)"')"
+check "codex secret: mounted read-only as a directory in the postmaster container" \
+    "codex-credentials /etc/fork-sandbox/codex true" \
+    "$(pm_hooks_mounts_of postmaster | grep '^codex-credentials ')"
+check "codex secret: the mount has no subPath" "0" \
+    "$(pm_api_dep '[.spec.template.spec.containers[].volumeMounts[]? | select(.name == "codex-credentials") | select(.subPath != null)] | length')"
+check "codex secret: no other container mounts it" "postmaster" \
+    "$(pm_api_dep '.spec.template.spec | [.containers[], (.initContainers // [])[]] | .[] | select([.volumeMounts[]?.name] | index("codex-credentials")) | .name' | paste -sd' ')"
+check "codex secret: the postmaster container points the keeper at the mount" \
+    "FORK_SANDBOX_CODEX_AUTH_FILE=/etc/fork-sandbox/codex/auth.json" \
+    "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_CODEX_AUTH_FILE=')"
+check "codex secret: the postmaster container admits codex seats" "FORK_SANDBOX_CLUSTER_CODEX=1" \
+    "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_CLUSTER_CODEX=')"
+check "codex secret: no other container gets the codex env" "0" \
+    "$(pm_hooks_env_of mail-api | grep -c 'CODEX')"
+check "codex secret: install never renders or reads it" "0" "$(grep -c 'site-codex' "$pm_api_log")"
+check "codex secret: no leftover placeholders" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    check "yamllint: codex secret by reference" "" "$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+fi
+pm_cfg_nocodex="$(pm_ref_cfg)"
+pm_api_install "$pm_cfg_nocodex"
+check "codex secret unset: no codex volume, mount or env" "0" \
+    "$(pm_api_dep '.spec.template.spec' | grep -cE 'codex-credentials|FORK_SANDBOX_CODEX_AUTH_FILE|FORK_SANDBOX_CLUSTER_CODEX|/etc/fork-sandbox/codex')"
+cp "$pm_cfg_codex/fleet.yaml" "$pm_cfg_nocodex/fleet.yaml"
+cp "$pm_cfg_codex/personas/beta.md" "$pm_cfg_nocodex/personas/beta.md"
+pm_api_refused "codex secret unset: install's fleet check refuses a codex seat" \
+    "K8S_POSTMASTER_CODEX_SECRET" "$pm_cfg_nocodex"
+pm_api_refused "codex secret: in the by-reference distinct-name check" \
+    "K8S_POSTMASTER_CLAUDE_SECRET and K8S_POSTMASTER_CODEX_SECRET both name Secret 'site-claude'" \
+    "$(pm_ref_cfg K8S_POSTMASTER_CODEX_SECRET=site-claude)"
+pm_api_refused "codex secret: an installer-owned name refuses" \
+    "K8S_POSTMASTER_CODEX_SECRET='fork-sandbox-postmaster-git' is one of" \
+    "$(pm_ref_cfg K8S_POSTMASTER_CODEX_SECRET=fork-sandbox-postmaster-git)"
+
 printf '\n== install --postmaster: K8S_AGENT_* keys reach a postmaster-launched seat ==\n'
 # The postmaster pod's own k8s.env IS the laptop's, shipped whole as a
 # ConfigMap, and a seat the pod launches reads it like a laptop run does. So

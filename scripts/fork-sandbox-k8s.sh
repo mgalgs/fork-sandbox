@@ -1158,6 +1158,22 @@
 #                         both, or this and the pool, is refused). Mounted
 #                         and announced to `fleet check` exactly as the
 #                         file is; the 7-day expiry check is yours to make.
+#   K8S_POSTMASTER_CODEX_SECRET=
+#                         name of a Secret YOU keep in K8S_NAMESPACE with
+#                         key auth.json: a codex auth.json carrying the
+#                         access token and account id, and NO refresh
+#                         token. Its maintainer, outside fork-sandbox, must
+#                         be the login's only refresher. By reference only:
+#                         install never creates, reads or prints it. It is
+#                         mounted read-only at /etc/fork-sandbox/codex in
+#                         the postmaster container only, as a directory
+#                         (never subPath, so a rotated token shows up),
+#                         with FORK_SANDBOX_CODEX_AUTH_FILE pointing at its
+#                         auth.json and FORK_SANDBOX_CLUSTER_CODEX=1 so
+#                         `fleet check --cluster` accepts codex seats.
+#                         Unset: no codex seats in the cluster. See
+#                         docs/cluster-postmaster.md, "Codex seats in a
+#                         cluster postmaster".
 #
 #   Secrets by reference (the three *_SECRET keys above and
 #   K8S_POSTMASTER_HOOKS_SECRET): install never creates, reads or prints a
@@ -1547,6 +1563,7 @@ K8S_MAIL_API_TOKENS_FILE="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_FILE |
 K8S_MAIL_API_TOKENS_SECRET="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_SECRET || true)"
 K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE || true)"
 K8S_POSTMASTER_CLAUDE_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_SECRET || true)"
+K8S_POSTMASTER_CODEX_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_CODEX_SECRET || true)"
 K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL || true)"
 K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK || true)"
 K8S_POSTMASTER_HEADROOM_DIR="$(read_env_value "$k8s_env" K8S_POSTMASTER_HEADROOM_DIR || true)"
@@ -1823,6 +1840,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_OPERATORS" "$K8S_POSTMASTER_HOOKS_SECRET" \
         "$K8S_MAIL_API_TOKENS_FILE" "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
         "$K8S_POSTMASTER_GIT_SECRET" "$K8S_POSTMASTER_CLAUDE_SECRET" \
+        "$K8S_POSTMASTER_CODEX_SECRET" \
         "$K8S_MAIL_API_TOKENS_SECRET" \
         "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" "$K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK" \
         "$K8S_POSTMASTER_HEADROOM_DIR" \
@@ -4120,6 +4138,7 @@ cmd_install() {
             "K8S_POSTMASTER_HOOKS_SECRET=$K8S_POSTMASTER_HOOKS_SECRET" \
             "K8S_POSTMASTER_GIT_SECRET=$K8S_POSTMASTER_GIT_SECRET" \
             "K8S_POSTMASTER_CLAUDE_SECRET=$K8S_POSTMASTER_CLAUDE_SECRET" \
+            "K8S_POSTMASTER_CODEX_SECRET=$K8S_POSTMASTER_CODEX_SECRET" \
             "K8S_MAIL_API_TOKENS_SECRET=$K8S_MAIL_API_TOKENS_SECRET" \
             "K8S_PROXY_KEYS_SECRET=$K8S_PROXY_KEYS_SECRET"; do
             pm_ref_key="${pm_ref_pair%%=*}"
@@ -4156,7 +4175,8 @@ cmd_install() {
     local pm_git_secret="${K8S_POSTMASTER_GIT_SECRET:-fork-sandbox-postmaster-git}"
     local pm_claude_secret="${K8S_POSTMASTER_CLAUDE_SECRET:-fork-sandbox-postmaster-claude}"
     local pm_tokens_secret="${K8S_MAIL_API_TOKENS_SECRET:-fork-sandbox-mail-api-tokens}"
-    local pm_have_claude=false pm_have_mail_api=false
+    local pm_have_claude=false pm_have_mail_api=false pm_have_codex=false
+    [[ -z "$K8S_POSTMASTER_CODEX_SECRET" ]] || pm_have_codex=true
     [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL$K8S_POSTMASTER_CLAUDE_SECRET" ]] \
         || pm_have_claude=true
     [[ -z "$K8S_MAIL_API_TOKENS_FILE$K8S_MAIL_API_TOKENS_SECRET" ]] || pm_have_mail_api=true
@@ -4260,7 +4280,8 @@ cmd_install() {
         # env var the manifest sets on the postmaster container (below) when
         # a claude credential is being shipped, so this gate and the pod's
         # own `deliver --cluster` startup check agree on whether claude
-        # seats are accepted.
+        # seats are accepted. FORK_SANDBOX_CLUSTER_CODEX does the same for
+        # codex seats and K8S_POSTMASTER_CODEX_SECRET.
         local -a pm_fleet_env=(
             FORK_SANDBOX_FLEET_FILE="$pm_fleet_file"
             FORK_SANDBOX_PERSONAS_DIR="$pm_personas_dir"
@@ -4270,6 +4291,9 @@ cmd_install() {
         )
         if $pm_have_claude; then
             pm_fleet_env+=(FORK_SANDBOX_CLUSTER_CLAUDE=1)
+        fi
+        if $pm_have_codex; then
+            pm_fleet_env+=(FORK_SANDBOX_CLUSTER_CODEX=1)
         fi
         if ! env "${pm_fleet_env[@]}" "$script_dir/fork-sandbox-fleet.sh" check --cluster; then
             echo "Error: the cluster postmaster would crash-loop on this fleet" >&2
@@ -5082,6 +5106,7 @@ cmd_install() {
             -e "s|__PM_HOOKS_SECRET__|${K8S_POSTMASTER_HOOKS_SECRET:-(none)}|g" \
             -e "s|__PM_GIT_SECRET__|$pm_git_secret|g" \
             -e "s|__PM_CLAUDE_SECRET__|$pm_claude_secret|g" \
+            -e "s|__PM_CODEX_SECRET__|${K8S_POSTMASTER_CODEX_SECRET:-(none)}|g" \
             -e "s|__PM_TOKENS_SECRET__|$pm_tokens_secret|g" \
             -e "s|__PM_TEAM_HASH_SECRET__|$pm_team_hash_secret|g" \
             "$manifests_dir/40-postmaster.yaml")"
@@ -5141,6 +5166,11 @@ cmd_install() {
         fi
         if [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL" ]]; then
             pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "claude-pool env")" || exit 1
+        fi
+        if ! $pm_have_codex; then
+            for tag in "codex-credentials env" "codex-credentials volumeMount" "codex-credentials volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
         fi
         if ! $pm_have_presets; then
             for tag in "presets env" "presets volumeMount" "presets volume"; do
