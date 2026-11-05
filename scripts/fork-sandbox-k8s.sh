@@ -1198,6 +1198,20 @@
 # back to $config_dir, unchanged from before this pair of keys existed.
 # Every other install-time dir (prompts, handlers, hooks, presets) still
 # reads only $config_dir; see docs/cluster-postmaster.md.
+#
+# FORK_SANDBOX_CODEX_AUTH_FILE=<path>, when set, is a MANAGED codex
+# auth.json: a composed run's codex seats read their access token and
+# account id from it instead of ${CODEX_HOME:-~/.codex}/auth.json, and
+# nothing here ever refreshes it -- not at submit, not in the per-run
+# keeper. Its maintainer, outside fork-sandbox, is the login's only
+# refresher (codex refresh tokens are single-use, so a second refresher
+# would log the first out); the file is expected to carry no refresh
+# token. Submit refuses a file that is missing, lacks an access token or
+# account id, or whose access token expires within 15 minutes; the keeper
+# still re-reads it every 30 s and pushes a rotated token to the proxy,
+# and only warns if it sees the token near expiry mid-run. install
+# --postmaster sets it from K8S_POSTMASTER_CODEX_SECRET; see
+# docs/cluster-postmaster.md.
 
 set -euo pipefail
 
@@ -2049,6 +2063,27 @@ k8s_render_codex_key_conf() {
     # shellcheck disable=SC2016  # nginx variables are literal config text
     printf 'set $upstream_key "%s";\nset $upstream_account_id "%s";\n' \
         "$token" "$account_id"
+}
+
+# The access token's exp (epoch seconds) from a codex auth.json, or nothing
+# when the token is absent or its JWT payload will not decode.
+k8s_codex_token_exp() {
+    local payload
+    payload="$(jq -r '.tokens.access_token // empty' "$1" 2>/dev/null \
+        | cut -d. -f2 | tr '_-' '/+')"
+    [[ -n "$payload" ]] || return 0
+    while (( ${#payload} % 4 )); do payload+="="; done
+    printf '%s' "$payload" | base64 -d 2>/dev/null \
+        | jq -r '.exp | select(type == "number") | floor' 2>/dev/null || true
+}
+
+# Whether a codex auth.json's access token outlives the next 15 minutes --
+# the margin fork-sandbox-codex-refresh.py refreshes inside. An exp that
+# will not decode counts as expiring.
+k8s_codex_token_fresh() {
+    local exp
+    exp="$(k8s_codex_token_exp "$1")"
+    [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) + 900 ))
 }
 
 # Builds the fork-sandbox-upstream-key Secret manifest from the finished
@@ -7014,8 +7049,30 @@ cmd_submit() {
     # duplicated rather than factored into a second shared function (see
     # fs_balance_claude_credential's own header comment).
     local claude_cred_json="" claude_access_token="" claude_configmap_cred=""
-    local codex_key_conf="" codex_auth_path=""
-    if (( pipeline_has_codex )); then
+    local codex_key_conf="" codex_auth_path="" codex_auth_managed=0
+    if (( pipeline_has_codex )) && [[ -n "${FORK_SANDBOX_CODEX_AUTH_FILE:-}" ]]; then
+        # A managed file (see the header): read, never refreshed, so the
+        # checks a refresh would have made good are refusals here.
+        codex_auth_path="$FORK_SANDBOX_CODEX_AUTH_FILE"
+        codex_auth_managed=1
+        if [[ ! -f "$codex_auth_path" ]]; then
+            echo "Error: FORK_SANDBOX_CODEX_AUTH_FILE names '$codex_auth_path'," >&2
+            echo "which does not exist." >&2
+            exit 1
+        fi
+        if ! codex_key_conf="$(k8s_render_codex_key_conf "$codex_auth_path")"; then
+            echo "Error: the managed Codex auth file '$codex_auth_path' needs an" >&2
+            echo "access token and an account id." >&2
+            exit 1
+        fi
+        if ! k8s_codex_token_fresh "$codex_auth_path"; then
+            echo "Error: the managed Codex auth file '$codex_auth_path' holds an" >&2
+            echo "access token that expires within 15 minutes (or whose expiry" >&2
+            echo "cannot be read). fork-sandbox never refreshes a managed login;" >&2
+            echo "its maintainer has to rotate the token first." >&2
+            exit 1
+        fi
+    elif (( pipeline_has_codex )); then
         codex_auth_path="${CODEX_HOME:-$HOME/.codex}/auth.json"
         if [[ ! -f "$codex_auth_path" ]]; then
             echo "Error: a composed Codex seat needs host Codex sign-in." >&2
@@ -8843,6 +8900,10 @@ EOF
         fi
         if (( pipeline_has_codex )); then
             printf 'CODEX_AUTH_PATH=%s\n' "$codex_auth_path"
+            # Read back by cmd_wait's keeper, which may run in another
+            # process with another environment: a managed file is never
+            # refreshed, whoever keeps it.
+            (( codex_auth_managed )) && printf 'CODEX_AUTH_MANAGED=1\n'
         fi
         # Read back by cmd_collect, before cmd_fetch, so a standalone
         # collect (no run.env in scope of the calling process) still
@@ -10157,19 +10218,29 @@ fi'
 }
 
 K8S_CODEX_KEEPER_PID=""
+# $3 is 1 for a managed auth file (CODEX_AUTH_MANAGED in run.env): its
+# maintainer is the login's only refresher, so the keeper only re-reads it
+# and pushes a rotated token, warning once per token it sees near expiry.
 k8s_codex_keeper_start() {
-    local auth_path="$1" safe_name="$2" parent_pid=$BASHPID
+    local auth_path="$1" safe_name="$2" managed="${3:-0}" parent_pid=$BASHPID
     (
         exec >/dev/null
         [[ -z "$K8S_DRIVER_LOCK_FD" ]] || exec {K8S_DRIVER_LOCK_FD}>&-
-        last_hash=""
+        last_hash="" warned_hash=""
         while kill -0 "$parent_pid" 2>/dev/null; do
-            if ! python3 "$script_dir/fork-sandbox-codex-refresh.py" "$auth_path"; then
+            if [[ "$managed" != 1 ]] \
+                && ! python3 "$script_dir/fork-sandbox-codex-refresh.py" "$auth_path"; then
                 echo "fork-sandbox-k8s: warning: host Codex token refresh failed." >&2
             fi
             key_conf="$(k8s_render_codex_key_conf "$auth_path")" || key_conf=""
             if [[ -n "$key_conf" ]]; then
                 hash="$(printf '%s' "$key_conf" | sha256sum | cut -d' ' -f1)"
+                if [[ "$managed" == 1 && "$hash" != "$warned_hash" ]] \
+                    && ! k8s_codex_token_fresh "$auth_path"; then
+                    echo "fork-sandbox-k8s: warning: the managed Codex token expires within" >&2
+                    echo "15 minutes; its maintainer has not rotated it yet." >&2
+                    warned_hash="$hash"
+                fi
                 if [[ "$hash" != "$last_hash" ]]; then
                     if printf '%s\n' "$key_conf" | k8s_push_codex_key "$safe_name"; then
                         last_hash="$hash"
@@ -10428,10 +10499,12 @@ cmd_wait() {
             echo "(a Keychain-backed credential, or a run submitted before this" >&2
             echo "feature existed) -- the pod's access token will not be kept alive." >&2
         fi
-        local codex_auth_path_wait
+        local codex_auth_path_wait codex_auth_managed_wait
         codex_auth_path_wait="$(read_env_value "$run_dir/run.env" CODEX_AUTH_PATH || true)"
+        codex_auth_managed_wait="$(read_env_value "$run_dir/run.env" CODEX_AUTH_MANAGED || true)"
         if [[ -n "$codex_auth_path_wait" ]]; then
-            k8s_codex_keeper_start "$codex_auth_path_wait" "$safe_name"
+            k8s_codex_keeper_start "$codex_auth_path_wait" "$safe_name" \
+                "${codex_auth_managed_wait:-0}"
         fi
     elif [[ "$probe" != true ]]; then
         # No --run-dir at all (a hand-run `wait --branch X` that did not

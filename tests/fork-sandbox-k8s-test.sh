@@ -10247,6 +10247,22 @@ fi
 printf '0\n' > "$keeper_mixed_sentinel"
 wait "$keeper_wait_pid" || true
 
+# A python3 in front of the real one that records every
+# fork-sandbox-codex-refresh.py invocation (and runs none) and passes every
+# other call through, so a test can say whether anything tried a refresh.
+codex_refresh_stub="$(newdir)"; tmpdirs+=("$codex_refresh_stub")
+codex_refresh_log="$codex_refresh_stub/refresh.log"
+: > "$codex_refresh_log"
+cat > "$codex_refresh_stub/python3" <<STUB
+#!/usr/bin/env bash
+if [[ "\${1:-}" == */fork-sandbox-codex-refresh.py ]]; then
+    printf '%s\n' "\$*" >> "$codex_refresh_log"
+    exit 0
+fi
+exec "$(command -v python3)" "\$@"
+STUB
+chmod +x "$codex_refresh_stub/python3"
+
 keeper_codex_dir="$(newdir)"; tmpdirs+=("$keeper_codex_dir")
 keeper_codex_auth="$keeper_codex_dir/auth.json"
 printf '{"tokens":{"access_token":"fixture-one.%s.sig","account_id":"acct-fixture-keeper"}}\n' \
@@ -10255,7 +10271,7 @@ printf 'harness=codex\nCODEX_AUTH_PATH=%s\n' "$keeper_codex_auth" \
     > "$keeper_codex_dir/run.env"
 keeper_codex_sentinel="$(newdir)/sentinel"
 tmpdirs+=("$(dirname "$keeper_codex_sentinel")")
-K8S_STUB_SENTINEL_FILE="$keeper_codex_sentinel" \
+PATH="$codex_refresh_stub:$PATH" K8S_STUB_SENTINEL_FILE="$keeper_codex_sentinel" \
     keeper_run "$keeper_codex_dir" fs-k8s-test-keeper-codex 80
 sleep 1.5
 keeper_codex_conf="$(jq -r '.data["upstream-key.conf"]' "$keeper_apply_capture" \
@@ -10284,6 +10300,65 @@ else
     no "Codex token refresh preserves the account id in both key pushes"
 fi
 printf '0\n' > "$keeper_codex_sentinel"
+wait "$keeper_wait_pid" || true
+if grep -qF "$keeper_codex_auth" "$codex_refresh_log"; then
+    ok "an unmanaged Codex keeper still refreshes the host auth file"
+else
+    no "an unmanaged Codex keeper still refreshes the host auth file" \
+        "refresh log: $(cat "$codex_refresh_log")"
+fi
+
+# A managed auth file (CODEX_AUTH_MANAGED=1, which submit records when
+# FORK_SANDBOX_CODEX_AUTH_FILE is set) is never refreshed: its maintainer
+# is the login's only refresher. The keeper still re-reads it and pushes a
+# rotated token, and only warns about a token near expiry -- here one a
+# refresh would otherwise have been tried for on every pass.
+: > "$codex_refresh_log"
+keeper_managed_dir="$(newdir)"; tmpdirs+=("$keeper_managed_dir")
+keeper_managed_auth="$keeper_managed_dir/auth.json"
+keeper_managed_payload="$(printf '{"exp":%s}' "$(( $(date +%s) + 300 ))" | base64 | tr -d '\n')"
+printf '{"tokens":{"access_token":"managed-one.%s.sig","account_id":"acct-fixture-managed"}}\n' \
+    "$keeper_managed_payload" > "$keeper_managed_auth"
+printf 'harness=codex\nCODEX_AUTH_PATH=%s\nCODEX_AUTH_MANAGED=1\n' "$keeper_managed_auth" \
+    > "$keeper_managed_dir/run.env"
+keeper_managed_sentinel="$(newdir)/sentinel"
+tmpdirs+=("$(dirname "$keeper_managed_sentinel")")
+PATH="$codex_refresh_stub:$PATH" K8S_STUB_SENTINEL_FILE="$keeper_managed_sentinel" \
+    keeper_run "$keeper_managed_dir" fs-k8s-test-keeper-managed 80
+sleep 1.5
+keeper_managed_conf="$(jq -r '.data["upstream-key.conf"]' "$keeper_apply_capture" \
+    | base64 -d)"
+if grep -qF 'set $upstream_key "managed-one.' <<< "$keeper_managed_conf"; then
+    ok "a managed Codex keeper pushes the file's token on start"
+else
+    no "a managed Codex keeper pushes the file's token on start" "$keeper_managed_conf"
+fi
+if grep -qF 'managed Codex token expires within' "$keeper_err"; then
+    ok "a managed Codex keeper only warns about a token near expiry"
+else
+    no "a managed Codex keeper only warns about a token near expiry" "$(cat "$keeper_err")"
+fi
+keeper_managed_payload="$(printf '{"exp":%s}' "$(( $(date +%s) + 7200 ))" | base64 | tr -d '\n')"
+printf '{"tokens":{"access_token":"managed-two.%s.sig","account_id":"acct-fixture-managed"}}\n' \
+    "$keeper_managed_payload" > "$keeper_managed_auth.new"
+mv -f "$keeper_managed_auth.new" "$keeper_managed_auth"
+sleep 31
+keeper_managed_conf="$(jq -r '.data["upstream-key.conf"]' "$keeper_apply_capture" \
+    | base64 -d)"
+if grep -qF 'set $upstream_key "managed-two.' <<< "$keeper_managed_conf" \
+    && grep -qF 'set $upstream_account_id "acct-fixture-managed";' <<< "$keeper_managed_conf" \
+    && [[ "$(grep -c -- '-codex-proxy -- sh -c' "$keeper_log")" == 2 ]]; then
+    ok "a managed Codex keeper pushes a token rotated in the file to the proxy"
+else
+    no "a managed Codex keeper pushes a token rotated in the file to the proxy" \
+        "conf=$keeper_managed_conf log=$(cat "$keeper_log")"
+fi
+if [[ ! -s "$codex_refresh_log" ]]; then
+    ok "a managed Codex keeper never runs the refresh script"
+else
+    no "a managed Codex keeper never runs the refresh script" "$(cat "$codex_refresh_log")"
+fi
+printf '0\n' > "$keeper_managed_sentinel"
 wait "$keeper_wait_pid" || true
 
 # 2. A failed nginx -t (K8S_STUB_EXEC_RC=1) must leave the wait running --
@@ -21674,6 +21749,94 @@ refuses "a Codex token Secret cannot be mounted as context" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-codex-context --harness pi --model z-ai/glm-4.6 \
     --context-secret sbx-foo-codex-token "$proj_dir" "$handoff_file"
+
+# FORK_SANDBOX_CODEX_AUTH_FILE: a managed auth file is read, never
+# refreshed. A real (non-dry) submit gets as far as its first kubectl call,
+# which the stub fails -- past the point where the launch refresh runs --
+# with the python3 stub recording any refresh.
+managed_kubectl_stub="$(newdir)"; tmpdirs+=("$managed_kubectl_stub")
+printf '#!/bin/sh\nexit 1\n' > "$managed_kubectl_stub/kubectl"
+chmod +x "$managed_kubectl_stub/kubectl"
+managed_auth_dir="$(newdir)"; tmpdirs+=("$managed_auth_dir")
+managed_auth_write() {
+    # $1 = exp offset in seconds from now; $2/$3 = token prefix / account id
+    # (empty to leave the key out).
+    local payload
+    payload="$(printf '{"exp":%s}' "$(( $(date +%s) + $1 ))" | base64 | tr -d '\n')"
+    jq -n --arg t "${2:+$2.$payload.sig}" --arg a "${3:-}" \
+        '{tokens: ({} + (if $t == "" then {} else {access_token: $t} end)
+                       + (if $a == "" then {} else {account_id: $a} end))}' \
+        > "$managed_auth_dir/auth.json"
+}
+managed_submit() {
+    # $1 = dry or real; $2 = branch. Prints the run dir.
+    local rd
+    rd="$(rd_make_fixture codex)"
+    local -a dry=()
+    [[ "$1" == dry ]] && dry=(--dry-run)
+    PATH="$codex_refresh_stub:$managed_kubectl_stub:$PATH" \
+        CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "${managed_env[@]}" \
+        "$k8s_sh" submit "${dry[@]}" --branch "$2" --harness codex --model gpt-5.6-sol \
+        --run-dir "$rd" "$proj_dir" "$handoff_file" > "$rd/submit.out" 2>&1 || true
+    printf '%s' "$rd"
+}
+: > "$codex_refresh_log"
+managed_env=(env)
+managed_rd="$(managed_submit real fs-k8s-test-codex-unmanaged)"; tmpdirs+=("$managed_rd")
+if grep -qF "$rd_codex_home/auth.json" "$codex_refresh_log" \
+    && ! grep -q '^CODEX_AUTH_MANAGED=' "$managed_rd/run.env"; then
+    ok "unset FORK_SANDBOX_CODEX_AUTH_FILE: submit still refreshes the host auth.json"
+else
+    no "unset FORK_SANDBOX_CODEX_AUTH_FILE: submit still refreshes the host auth.json" \
+        "refresh log: $(cat "$codex_refresh_log") out: $(cat "$managed_rd/submit.out")"
+fi
+: > "$codex_refresh_log"
+managed_auth_write 3600 managed-fresh acct-fixture-managed
+managed_env=(env FORK_SANDBOX_CODEX_AUTH_FILE="$managed_auth_dir/auth.json")
+managed_rd="$(managed_submit real fs-k8s-test-codex-managed)"; tmpdirs+=("$managed_rd")
+if [[ ! -s "$codex_refresh_log" ]]; then
+    ok "a managed Codex auth file is never refreshed at submit"
+else
+    no "a managed Codex auth file is never refreshed at submit" "$(cat "$codex_refresh_log")"
+fi
+check "submit records the managed file as the keeper's auth path" \
+    "$managed_auth_dir/auth.json" "$(sed -n 's/^CODEX_AUTH_PATH=//p' "$managed_rd/run.env")"
+check "submit marks the managed file for the keeper" \
+    "1" "$(sed -n 's/^CODEX_AUTH_MANAGED=//p' "$managed_rd/run.env")"
+managed_rd="$(managed_submit dry fs-k8s-test-codex-managed-dry)"; tmpdirs+=("$managed_rd")
+if grep -q 'codex-proxy' "$managed_rd/submit.out" && ! grep -qF 'managed-fresh' "$managed_rd/submit.out"; then
+    ok "a managed Codex auth file renders the per-run proxy, never the token"
+else
+    no "a managed Codex auth file renders the per-run proxy, never the token" "$(cat "$managed_rd/submit.out")"
+fi
+managed_refusal() {
+    local label="$1" needle="$2" rd
+    : > "$codex_refresh_log"
+    rd="$(managed_submit dry fs-k8s-test-codex-managed-refused)"; tmpdirs+=("$rd")
+    if grep -qF -- "$needle" "$rd/submit.out" && ! grep -q 'codex-proxy' "$rd/submit.out" \
+        && [[ ! -s "$codex_refresh_log" ]]; then
+        ok "$label"
+    else
+        no "$label" "out: $(cat "$rd/submit.out") refresh: $(cat "$codex_refresh_log")"
+    fi
+}
+managed_env=(env FORK_SANDBOX_CODEX_AUTH_FILE="$managed_auth_dir/missing.json")
+managed_refusal "a missing managed Codex auth file is refused" "which does not exist"
+managed_env=(env FORK_SANDBOX_CODEX_AUTH_FILE="$managed_auth_dir/auth.json")
+managed_auth_write 3600 managed-noacct ""
+managed_refusal "a managed Codex auth file with no account id is refused" \
+    "access token and an account id."
+managed_auth_write 3600 "" acct-fixture-managed
+managed_refusal "a managed Codex auth file with no access token is refused" \
+    "access token and an account id."
+managed_auth_write 600 managed-stale acct-fixture-managed
+managed_refusal "a managed Codex token expiring within 15 minutes is refused" \
+    "expires within 15 minutes"
+jq -n '{tokens: {access_token: "not-a-jwt", account_id: "acct-fixture-managed"}}' \
+    > "$managed_auth_dir/auth.json"
+managed_refusal "a managed Codex token with no readable expiry is refused" \
+    "expires within 15 minutes"
 rd_mixed_dry="$(rd_make_fixture mixed)"; tmpdirs+=("$rd_mixed_dry")
 rd_mixed_out="$(newdir)/mixed.yaml"; tmpdirs+=("$(dirname "$rd_mixed_out")")
 CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
