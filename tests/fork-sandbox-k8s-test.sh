@@ -13254,10 +13254,10 @@ refuses "--k8s --harness pi --network sealed is refused" \
     "--network sealed is not supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --network sealed unused-project unused-handoff
-refuses "--k8s --harness codex is refused" \
-    "only supports --harness pi" \
+refuses "--k8s --harness codex --effort is refused by name" \
+    "--effort cannot be combined with --k8s --harness codex" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness codex unused-project unused-handoff
+    --harness codex --effort high unused-project unused-handoff
 
 refuses "--k8s --sandbox-args is refused" \
     "--sandbox-args is not supported with --k8s" \

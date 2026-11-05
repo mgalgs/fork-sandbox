@@ -543,7 +543,9 @@
 #                        --harness claude is also accepted, talking through
 #                        a per-run proxy that swaps in the operator's own
 #                        token. Composed codex seats use their own per-run
-#                        proxy; legacy --harness codex remains refused. Most other
+#                        proxy, and --harness codex [--model M] runs as a
+#                        one-step composed run (one codex code step), the
+#                        same run --pipeline would build. Most other
 #                        flags describe LOCAL sandbox machinery this run
 #                        never touches and are refused by name rather than
 #                        silently dropped -- see
@@ -2314,6 +2316,62 @@ preset_ro_review=false
 preset_ro_multi=false
 # Whether --review-only itself was given, before a read-only preset sets it.
 review_only_flag="$review_only"
+# --k8s --harness codex[/<model>] [--model M], with no preset: a cluster
+# codex run only exists as a composed run (its per-run proxy holds the
+# token), so this is translated into a one-step composed pipeline -- one
+# code step, codex with model M -- the same document an inline one-step
+# codex --pipeline compiles to, but naming M verbatim (a full model slug
+# the spec grammar has no letters for). From here it runs the --preset path
+# unchanged, so every flag reaches it exactly as it would a composed codex
+# run, and every flag a composed run refuses is refused below by name.
+# --codex-args is left untranslated: the --k8s block's own refusal of it
+# names the flag's real problem (no route on any --k8s run).
+preset_synth_doc=""
+if [[ "$k8s_mode" == true && "$harness_given" == true && -z "$preset_name" \
+    && -z "$pipeline_spec" && -z "$codex_extra_args" \
+    && ( "$harness_spec" == codex || "$harness_spec" == codex/* ) ]]; then
+    k8s_codex_model=""
+    [[ "$harness_spec" == codex/* ]] && k8s_codex_model="${harness_spec#codex/}"
+    if [[ "$model_given" == true ]]; then
+        if [[ -n "$k8s_codex_model" && "$k8s_codex_model" != "$model_option" ]]; then
+            echo "Error: --harness $harness_spec and --model $model_option name two" >&2
+            echo "different models; give the model once." >&2
+            exit 1
+        fi
+        k8s_codex_model="$model_option"
+    fi
+    k8s_codex_refused=""
+    if [[ -n "$review_loop_arg" ]]; then k8s_codex_refused="--review-loop"
+    elif [[ -n "$review_model" ]]; then k8s_codex_refused="--review-model"
+    elif [[ "$review_harness_given" == true ]]; then k8s_codex_refused="--review-harness"
+    elif [[ -n "$maintainer_loop_arg" ]]; then k8s_codex_refused="--maintainer-loop"
+    elif [[ -n "$maintainer_model" ]]; then k8s_codex_refused="--maintainer-model"
+    elif [[ "$maintainer_harness_given" == true ]]; then k8s_codex_refused="--maintainer-harness"
+    elif [[ "$review_only" == true ]]; then k8s_codex_refused="--review-only"
+    elif [[ -n "$claude_extra_args" ]]; then k8s_codex_refused="--claude-args"
+    elif [[ -n "$effort_arg" ]]; then k8s_codex_refused="--effort"
+    elif [[ -n "$pi_extra_args" ]]; then k8s_codex_refused="--pi-args"
+    elif [[ -n "$session_state" ]]; then k8s_codex_refused="--session-state"
+    elif [[ -n "$resume_session" ]]; then k8s_codex_refused="--resume-session"
+    elif [[ -n "$session_id_arg" ]]; then k8s_codex_refused="--session-id"
+    fi
+    if [[ -n "$k8s_codex_refused" ]]; then
+        echo "Error: $k8s_codex_refused cannot be combined with --k8s --harness codex." >&2
+        echo "A cluster codex run is a one-step composed pipeline (a single codex" >&2
+        echo "code step), and a composed run has no seat for that flag." >&2
+        exit 1
+    fi
+    preset_synth_doc="$(jq -n --arg model "$k8s_codex_model" '{
+        agents: {coder: ({harness: "codex"} + (if $model == "" then {} else {model: $model} end))},
+        pipeline: [{action: "code", agent: "coder"}]}')"
+    preset_name="k8s-harness-codex"
+    preset_label="--k8s --harness codex"
+    harness_spec="claude"
+    harness_given=false
+    model_option=""
+    model_given=false
+    unset k8s_codex_model k8s_codex_refused
+fi
 # --pipeline is a preset written inline in the composition-name grammar: it
 # is compiled to a preset document and from there runs the --preset path
 # unchanged, named by its spec.
@@ -2326,7 +2384,7 @@ if [[ -n "$pipeline_spec" ]]; then
     preset_name="$pipeline_spec"
     preset_label="--pipeline"
 fi
-if [[ -n "$preset_name" && -z "$pipeline_spec" ]]; then
+if [[ -n "$preset_name" && -z "$pipeline_spec" && -z "$preset_synth_doc" ]]; then
     preset_dir="${FORK_SANDBOX_PRESETS_DIR:-$config_dir/presets}"
     # The same single-path-component rule discoverer ids follow: with no
     # slash and no leading dot, the name cannot climb out of the presets
@@ -2454,6 +2512,8 @@ if [[ -n "$preset_name" ]]; then
         # The compiler writes its own error to stderr on failure.
         python3 "$script_dir/fork-sandbox-pipeline-spec.py" "$pipeline_spec" \
             > "$preset_staged_bytes" || exit 1
+    elif [[ -n "$preset_synth_doc" ]]; then
+        printf '%s\n' "$preset_synth_doc" > "$preset_staged_bytes"
     else
         cp -- "$preset_file" "$preset_staged_bytes"
     fi
@@ -3730,10 +3790,12 @@ if [[ "$k8s_mode" == true ]]; then
         done
     fi
     if [[ "$k8s_runner_mode" != true && "$harness" != "pi" && "$harness" != "claude" ]]; then
-        echo "Error: --k8s only supports --harness pi or claude. A cluster run" >&2
-        echo "is pi talking to a model proxy that holds the provider key, or" >&2
-        echo "claude talking through a per-run proxy. Legacy --harness codex" >&2
-        echo "does not use the composed run's per-run Codex proxy path." >&2
+        # Only a preset's --harness override lands here: a bare
+        # --k8s --harness codex was already translated into a one-step
+        # composed run above.
+        echo "Error: --harness $harness cannot override preset '$preset_name' on" >&2
+        echo "--k8s. A codex seat on a cluster runs only in a composed run;" >&2
+        echo "seat codex in the preset's own agent instead." >&2
         exit 1
     fi
     # A cluster pod still reaches the in-cluster model proxy regardless of

@@ -2698,9 +2698,16 @@ an isolated home, the bearer and account header, and a normal `turn.completed`.
 See [the feasibility note](codex-k8s-feasibility.md).
 
 Legacy-shaped presets containing a Codex seat use the composed runner on
-`--k8s`. Bare `--k8s --harness codex` remains refused; its single-leg path
-does not use the proxy. The top-level `--codex-args` flag remains refused;
-a composed agent's `codex-args` key is passed to its seat.
+`--k8s`. `--k8s --harness codex [--model M]` works too: it runs as a
+one-step composed run, one Codex code step with model `M`, the same run an
+inline one-step Codex `--pipeline` builds. `M` is passed verbatim, so a full
+model slug works. Flags a composed run has no seat for (`--effort`,
+`--claude-args`, `--pi-args`, `--session-state`, the review and maintainer
+flags) are refused by name, and `--network sealed` is refused as for every
+`--k8s` run. A preset's own `--harness codex` override is refused on
+`--k8s`; seat Codex in the preset's agent instead. The top-level
+`--codex-args` flag remains refused; a composed agent's `codex-args` key is
+passed to its seat.
 
 ### 2. direct — **Status: designed, not built.**
 
@@ -3752,8 +3759,6 @@ Scoped out of v1 on purpose, not overlooked:
   `docs/k8s-platform.md`.
 - **`--review-only` on Kubernetes.** It is refused with `--k8s` until the
   cluster path can review an existing checkout.
-- **Legacy `--k8s --harness codex`.** The composed-run Codex proxy does not
-  change the single-harness entrypoint, so this command stays refused.
 - **The tidy-history leg in a pod.** A composed `--k8s` run's own fetch
   seam means the pod never reaches it; see "Composed pipelines on
   `--k8s`" above for the recorded skip and why publishing a rewrite from a

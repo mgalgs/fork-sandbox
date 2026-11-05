@@ -690,6 +690,54 @@ for codex_spec in csol csol-rsonnet1 csol-rsonnet1-mastra1; do
     k8s_composed_dryrun "Codex pipeline $codex_spec uses the composed cluster runner" \
         --pipeline "$codex_spec" --k8s
 done
+
+# --k8s --harness codex [--model M] runs as a one-step composed run: the
+# dry-run lists the same run an inline one-step codex pipeline does, line
+# for line apart from the provenance line naming what built it. Every flag
+# a postmaster k8s wake passes rides along unchanged.
+k8s_codex_flags=(--k8s --network pinned --branch fs-preset-k8s-codex
+    --timeout 100 --checkout HEAD --services-trust-ref HEAD
+    --extra-ref upstream=HEAD --no-services
+    --outbox-dir "$k8s_dryrun_home/outbox")
+k8s_codex_spec_out="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run --pipeline csol \
+    "${k8s_codex_flags[@]}" "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>/dev/null \
+    | grep -v '^pipeline=')" || true
+for k8s_codex_spelling in "--harness codex --model sol" "--harness codex/sol"; do
+    # shellcheck disable=SC2086  # the spelling is two or four words
+    if k8s_codex_out="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run $k8s_codex_spelling \
+        "${k8s_codex_flags[@]}" "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>"$err")"; then
+        contains "--k8s $k8s_codex_spelling records what built it" \
+            "$k8s_codex_out" "preset=k8s-harness-codex"
+        check "--k8s $k8s_codex_spelling builds the run --pipeline csol does" \
+            "$k8s_codex_spec_out" "$(grep -v '^preset=' <<< "$k8s_codex_out")"
+    else
+        no "--k8s $k8s_codex_spelling dry-runs" "$(cat "$err")"
+    fi
+done
+# A full model slug, which the spec grammar has no letters for, lands as
+# itself on the one step.
+k8s_codex_out="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run --k8s \
+    --harness codex --model gpt-5.6-astra \
+    "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>"$err")" || true
+contains "--k8s --harness codex --model <slug> seats the slug on step 1" \
+    "$k8s_codex_out" "k8s_step_1=code codex gpt-5.6-astra"
+contains "--k8s --harness codex runs in runner mode" "$k8s_codex_out" "k8s=runner"
+for k8s_codex_refused in "--effort high" "--claude-args --verbose" \
+    "--pi-args --verbose" "--review-loop 2" "--maintainer-loop 1" \
+    "--session-state $k8s_dryrun_home" "--resume-session 0123"; do
+    # shellcheck disable=SC2086  # flag and value
+    refuses "--k8s --harness codex refuses ${k8s_codex_refused%% *} by name" \
+        "${k8s_codex_refused%% *} cannot be combined with --k8s --harness codex" \
+        --k8s --harness codex --model sol $k8s_codex_refused
+done
+refuses "--k8s --harness codex --network sealed stays refused" \
+    "--network sealed is not supported with --k8s" \
+    --k8s --harness codex --model sol --network sealed
+refuses "--k8s --harness codex/a --model b names two models" \
+    "name two" --k8s --harness codex/sol --model terra
+refuses "a preset's --harness codex override is refused on --k8s" \
+    "--harness codex cannot override preset" \
+    --k8s --preset fast --harness codex
 run --preset composed --review-only --checkout HEAD >/dev/null 2>"$err" || true
 contains "--review-only accepts a preset whose remaining steps are several read-only steps" \
     "$(cat "$err")" "composed pipeline, 3 steps, read-only"
