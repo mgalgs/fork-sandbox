@@ -130,7 +130,10 @@
 #                  by `install --postmaster` once
 #                  K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE, the pool or
 #                  K8S_POSTMASTER_CLAUDE_SECRET names a
-#                  credential); `codex` is always refused. A harness is
+#                  credential); `codex` only when
+#                  FORK_SANDBOX_CLUSTER_CODEX=1 (set by `install
+#                  --postmaster` once K8S_POSTMASTER_CODEX_SECRET names
+#                  the managed codex login's Secret). A harness is
 #                  compared by its part before any `/` (a preset may
 #                  write `codex/<model>`); presets are read with
 #                  fork-sandbox-preset-parse.py, never a second parser.
@@ -422,6 +425,28 @@ cmd_check() {
 }
 
 # The extra refusals of `check --cluster` (see the header). $1 is the fleet
+# Whether a cluster postmaster can run a seat on harness $1 (the part
+# before any `/`): pi always; claude and codex only once install
+# --postmaster has given the container that harness's credential, which it
+# says with FORK_SANDBOX_CLUSTER_CLAUDE=1 / FORK_SANDBOX_CLUSTER_CODEX=1.
+cluster_harness_ok() {
+    case "$1" in
+        pi) return 0 ;;
+        claude) [[ "${FORK_SANDBOX_CLUSTER_CLAUDE:-}" == 1 ]] ;;
+        codex) [[ "${FORK_SANDBOX_CLUSTER_CODEX:-}" == 1 ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Why cluster_harness_ok refused harness $1, as the tail of an error line.
+cluster_harness_refusal() {
+    case "$1" in
+        claude) echo "claude seats need a claude credential installed -- set K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE (or K8S_POSTMASTER_CLAUDE_SECRET) and re-run install --postmaster" ;;
+        codex) echo "codex seats need a managed codex login installed -- set K8S_POSTMASTER_CODEX_SECRET and re-run install --postmaster" ;;
+        *) echo "a cluster postmaster runs only pi, claude or codex seats" ;;
+    esac
+}
+
 # dump, the rest are every agent name. Prints every error found, not just
 # the first.
 check_cluster() {
@@ -443,13 +468,8 @@ check_cluster() {
             rc=1
         fi
         local eff_harness="${harness:-claude}"
-        if [[ "${eff_harness%%/*}" != pi ]] \
-            && { [[ "${eff_harness%%/*}" != claude ]] || [[ "${FORK_SANDBOX_CLUSTER_CLAUDE:-}" != 1 ]]; }; then
-            if [[ "${eff_harness%%/*}" == claude ]]; then
-                echo "Error: agents.$name.harness: claude seats need a claude credential installed -- set K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE (or K8S_POSTMASTER_CLAUDE_SECRET) and re-run install --postmaster." >&2
-            else
-                echo "Error: agents.$name.harness: codex seats are not supported in a cluster postmaster; only pi, or claude with a credential installed (resolved harness '$eff_harness')." >&2
-            fi
+        if ! cluster_harness_ok "${eff_harness%%/*}"; then
+            echo "Error: agents.$name.harness: $(cluster_harness_refusal "${eff_harness%%/*}") (resolved harness '$eff_harness')." >&2
             rc=1
         fi
         [[ -n "$preset" ]] || continue
@@ -463,13 +483,8 @@ check_cluster() {
         while IFS=$'\t' read -r preset_kind preset_agent preset_field preset_value; do
             [[ "$preset_kind" == agent && "$preset_field" == harness ]] || continue
             local preset_leg="${preset_value%%/*}"
-            if [[ "$preset_leg" != pi ]] \
-                && { [[ "$preset_leg" != claude ]] || [[ "${FORK_SANDBOX_CLUSTER_CLAUDE:-}" != 1 ]]; }; then
-                if [[ "$preset_leg" == claude ]]; then
-                    echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; claude seats need a claude credential installed -- set K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE (or K8S_POSTMASTER_CLAUDE_SECRET) and re-run install --postmaster." >&2
-                else
-                    echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; codex seats are not supported in a cluster postmaster; only pi, or claude with a credential installed." >&2
-                fi
+            if ! cluster_harness_ok "$preset_leg"; then
+                echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; $(cluster_harness_refusal "$preset_leg")." >&2
                 rc=1
             fi
         done <<< "$preset_out"

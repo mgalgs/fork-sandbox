@@ -988,18 +988,10 @@ def cmd_check(fleet_file, label, personas_dir):
                 agent["thinking"] or fm["thinking"],
                 resolved_presets[name], f"agents.{name}", errors)
             if agent["backend"] == "k8s":
-                # Unlike check_network_harness_pair's own no-defaulting
-                # rule above, this check judges the RESOLVED value a k8s
-                # seat actually spawns with, and postmaster.sh's
-                # harness="${harness:-claude}" is that default -- so an
-                # empty harness here means claude, not "no harness".
-                resolved_harness = agent["harness"] or fm["harness"] or "claude"
+                # Every harness (claude, pi, codex) has a k8s path; whether
+                # a CLUSTER postmaster holds the credential a claude or
+                # codex seat needs is `check --cluster`'s question.
                 resolved_network = agent["network"] or fm["network"]
-                if resolved_harness not in ("claude", "pi"):
-                    errors.append(
-                        f"agents.{name}: backend 'k8s' seat: the cluster "
-                        f"path runs only claude or pi, not "
-                        f"'{resolved_harness}'")
                 if resolved_network == "sealed":
                     errors.append(
                         f"agents.{name}: backend 'k8s' seat: a pod's "

@@ -163,6 +163,50 @@ once
 check "k8s case4b: a pi k8s seat with refresh-at gets no --refresh-at" 0 \
     "$(grep -c -- '^--refresh-at$' "$STUB_ARGV_LOG")"
 
+# ---- case 4c: a codex k8s seat wakes as --k8s --harness codex ----
+# kit carries thinking and refresh-at, both claude-only on a k8s wake, and
+# a full model slug. It gets no session args: a codex seat's one-step
+# composed run has no transcript store, and fork-sandbox.sh refuses one.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@kit' 'codex topic' 'hello kit' 8 >/dev/null
+once
+check "k8s case4c: a codex k8s seat is woken on k8s" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s case4c: --harness codex" codex "$(argv_after --harness "$STUB_ARGV_LOG")"
+check "k8s case4c: the model slug is passed verbatim" gpt-9.9-fixture-codex \
+    "$(argv_after --model "$STUB_ARGV_LOG")"
+for k4c_flag in --effort --refresh-at --pi-args --session-state --resume-session --session-id; do
+    check "k8s case4c: a codex seat gets no $k4c_flag" 0 \
+        "$(grep -c -- "^$k4c_flag\$" "$STUB_ARGV_LOG")"
+done
+# The same argv, flags only (the stub's positionals are this suite's
+# project and handoff), is one the real launcher's --k8s dry-run accepts.
+k4c_home="$(mktemp -d)"; tmpdirs+=("$k4c_home")
+k4c_proj="$k4c_home/src/proj"
+mkdir -p "$k4c_proj" "$k4c_home/codex"
+git -C "$k4c_proj" init -q
+git -C "$k4c_proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit -q --allow-empty -m init
+k4c_handoff="$(mktemp /var/tmp/claude-scratch/pm-k8s-codex-handoff.XXXXXX)"
+tmpdirs+=("$k4c_handoff")
+printf 'do the task\n' > "$k4c_handoff"
+mapfile -t k4c_argv < <(sed '1d' "$STUB_ARGV_LOG")
+k4c_argv=("${k4c_argv[@]:0:${#k4c_argv[@]}-2}")
+if k4c_out="$(HOME="$k4c_home" CODEX_HOME="$k4c_home/codex" \
+    FORK_SANDBOX_CONFIG_DIR="$k4c_home/config" \
+    "$repo_dir/scripts/fork-sandbox.sh" --dry-run "${k4c_argv[@]}" \
+    "$k4c_proj" "$k4c_handoff" 2>&1)"; then
+    contains "k8s case4c: the wake argv dry-runs as a one-step composed codex run" \
+        "$k4c_out" "k8s_step_1=code codex gpt-9.9-fixture-codex"
+else
+    no "k8s case4c: the wake argv dry-runs as a one-step composed codex run" \
+        "argv=${k4c_argv[*]} out=$k4c_out"
+fi
+
 # ---- case 5: rc 2 (dead pod), no k8s summary -> flagged, retried, retry handoff ----
 
 export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0

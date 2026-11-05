@@ -1319,13 +1319,16 @@ agents:
 EOF
 printf '%s\n' "$saved_riffler_md_for_backend" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
 
-bad "backend k8s seat with harness codex is refused" \
-    "the cluster path runs only claude or pi" <<'EOF'
+# A codex k8s seat runs as a one-step composed --k8s run, so plain check
+# accepts it; check --cluster gates it on FORK_SANDBOX_CLUSTER_CODEX.
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
   riffler:
     harness: codex
     backend: k8s
 EOF
+check "backend k8s seat with harness codex passes plain check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
 
 # tuner.md carries no frontmatter at all, so a bare `backend: k8s` here
 # leaves harness unset on both sides -- the resolved value the postmaster
@@ -1907,7 +1910,8 @@ YAML
 }
 cl_run() {
     # $1 = "--cluster" or "" (plain check); $2 = "1" to set
-    # FORK_SANDBOX_CLUSTER_CLAUDE=1, else unset. Sets cl_out and cl_rc. Not
+    # FORK_SANDBOX_CLUSTER_CLAUDE=1, else unset; $3 the same for
+    # FORK_SANDBOX_CLUSTER_CODEX. Sets cl_out and cl_rc. Not
     # run in a command substitution, or cl_rc would be lost with the
     # subshell.
     cl_out="$(FORK_SANDBOX_FLEET_FILE="$cl_dir/fleet.yaml" \
@@ -1915,6 +1919,7 @@ cl_run() {
         FORK_SANDBOX_PRESETS_DIR="$cl_dir/presets" \
         FORK_SANDBOX_HANDLERS_DIR="$cl_dir/handlers" \
         FORK_SANDBOX_CLUSTER_CLAUDE="${2:-}" \
+        FORK_SANDBOX_CLUSTER_CODEX="${3:-}" \
         "$fleet" check ${1:+"$1"} 2>&1)"
     cl_rc=$?
 }
@@ -2003,6 +2008,33 @@ EOF
 cl_run --cluster
 check "cluster: a seat with no harness anywhere (claude by default) is refused" "1" "$cl_rc"
 
+# A codex seat mirrors the claude gate: refused until install --postmaster
+# has given the container a managed codex login (FORK_SANDBOX_CLUSTER_CODEX=1),
+# and the claude gate alone does not let it through.
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, backend: k8s}
+  beta: {harness: codex, model: gpt-9.9-fixture, backend: k8s}
+EOF
+cl_run --cluster
+check "cluster: a codex seat is refused without the codex var" "1" "$cl_rc"
+contains "cluster: the codex harness error names the agent" "$cl_out" "agents.beta.harness"
+contains "cluster: the codex harness error names the k8s.env key" "$cl_out" \
+    "K8S_POSTMASTER_CODEX_SECRET"
+cl_run --cluster 1
+check "cluster: the claude var alone does not admit a codex seat" "1" "$cl_rc"
+cl_run "" ""
+check "cluster: the same codex fleet passes plain check" "0" "$cl_rc"
+cl_run --cluster "" 1
+check "cluster: a codex seat is accepted with the codex var" "0" "$cl_rc"
+check "cluster: ... and prints nothing" "" "$cl_out"
+cl_fleet <<'EOF'
+agents:
+  beta: {harness: claude, backend: k8s}
+EOF
+cl_run --cluster "" 1
+check "cluster: the codex var alone does not admit a claude seat" "1" "$cl_rc"
+
 cl_fleet <<'EOF'
 agents:
   alpha: {harness: pi, preset: has-codex}
@@ -2015,6 +2047,11 @@ cl_run "" ""
 check "cluster: the same preset fleet passes plain check" "0" "$cl_rc"
 cl_run --cluster 1
 check "cluster: a codex preset leg is refused even with the credential var" "1" "$cl_rc"
+contains "cluster: the codex preset error names the codex key" "$cl_out" \
+    "K8S_POSTMASTER_CODEX_SECRET"
+cl_run --cluster "" 1
+lacks "cluster: a preset naming a codex agent adds no preset error with the codex var" \
+    "$cl_out" "agents.alpha.preset"
 
 cl_fleet <<'EOF'
 agents:
@@ -2058,6 +2095,9 @@ cl_run "" ""
 check "cluster: the same spec-preset fleet passes plain check" "0" "$cl_rc"
 cl_run --cluster 1
 check "cluster: a codex spec-preset leg is refused even with the credential var" "1" "$cl_rc"
+cl_run --cluster "" 1
+lacks "cluster: a codex spec-preset adds no preset error with the codex var" \
+    "$cl_out" "agents.alpha.preset"
 
 cl_fleet <<'EOF'
 agents:

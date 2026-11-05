@@ -164,6 +164,13 @@ thinking: medium
 ---
 Kim is a pi/k8s seat with an endpoint, used by the endpoint/pi-args tests.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/kit.md" <<'EOF'
+---
+thinking: high
+---
+Kit is a codex/k8s seat with a full model slug and refresh-at, used by the
+codex wake tests.
+EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/ken.md" <<'EOF'
 Ken is the review-target: sets backend: k8s seat, used by the review-target tests.
 EOF
@@ -207,6 +214,11 @@ agents:
     refresh-at: 0.4
   kara:
     harness: claude
+    backend: k8s
+    refresh-at: 0.4
+  kit:
+    harness: codex
+    model: gpt-9.9-fixture-codex
     backend: k8s
     refresh-at: 0.4
   ken:

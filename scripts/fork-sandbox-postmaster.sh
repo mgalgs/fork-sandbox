@@ -4837,7 +4837,9 @@ pm_spawn_wake() {
         # never lets a k8s seat carry a preset -- a persistent per-seat
         # clone on k8s is later work (see the brief's Out of scope).
         # --refresh-at is forwarded for claude seats, as the local branch
-        # does below.
+        # does below. A codex seat (harness codex, its model as the full
+        # slug) runs as a one-step composed run; --effort and --refresh-at
+        # stay claude-only.
         local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
         [[ -n "$model" ]] && spawn_args+=(--model "$model")
         if [[ "$harness" == pi && -n "$thinking" ]]; then
@@ -4853,12 +4855,18 @@ pm_spawn_wake() {
         [[ -n "$endpoint" ]] && spawn_args+=(--endpoint "$endpoint")
         spawn_args+=(--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}")
 
+        # A codex seat runs as a one-step composed --k8s run, which has
+        # no transcript store for a codex seat (fork-sandbox.sh refuses
+        # --session-state there), so it starts each wake fresh rather than
+        # have every wake refused.
         local resumed=""
-        local -a session_lines=()
-        mapfile -t session_lines < <(pm_session_spawn_args "$harness" "$tid" "$agent")
-        local session_last=$(( ${#session_lines[@]} - 1 ))
-        resumed="${session_lines[session_last]#RESUMED=}"
-        spawn_args+=("${session_lines[@]:0:session_last}")
+        if [[ "$harness" != codex ]]; then
+            local -a session_lines=()
+            mapfile -t session_lines < <(pm_session_spawn_args "$harness" "$tid" "$agent")
+            local session_last=$(( ${#session_lines[@]} - 1 ))
+            resumed="${session_lines[session_last]#RESUMED=}"
+            spawn_args+=("${session_lines[@]:0:session_last}")
+        fi
 
         # Lineage: pick up where the same agent's own most recent run on
         # this thread left off (either backend) instead of always starting
