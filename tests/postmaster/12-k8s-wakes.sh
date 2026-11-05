@@ -923,6 +923,44 @@ adopt_reap_pending_case() {
 }
 adopt_reap_pending_case
 
+# A dead run harvested after a later wake of its seat exited 0 (the incident
+# shape: adopted across a restart, declared dead long after the seat's
+# retry recovered): torn down and harvested as before, but not flagged.
+adopt_late_dead_case() {
+    local mid tid env rid wake_dir rid2
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    mid="$(send_msg '@carol' '@karen' 'adopt topic: late dead' 'first' 8)"
+    tid="$(thread_of "$mid")"
+    STUB_K8S_NO_REPLY=1 once
+    env="$(latest_env_for_agent karen)"
+    rid="$(basename "$env" .env)"
+    wake_dir="$(env_val "$env" RUN_DIR)"
+    reply_msg '@carol' "$mid" 'second' --to '@karen' >/dev/null
+    STUB_K8S_NO_REPLY=1 once
+    rid2="$(tail -n1 "$PM_STATE_DIR/seq/$tid")"
+    check "k8s late dead fixture: the seat's later wake ran clean" clean \
+        "$(env_val "$PM_STATE_DIR/runs/$rid2.env" OUTCOME)"
+    rm -f -- "$PM_STATE_DIR/harvested/$rid" "$wake_dir/summary.json" "$wake_dir/exit-code" \
+        "$wake_dir/k8s-run-dir" "$wake_dir/k8s-timeout" "$wake_dir/pid-identity"
+    dead_pid_of > "$wake_dir/pid"
+    printf '2\n' > "$K8S_WAKE_BIN/probe-rc"
+    rm -f -- "$K8S_WAKE_BIN/rm-calls.log"
+    FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+    check "k8s late dead: harvested" 1 \
+        "$( [[ -e "$PM_STATE_DIR/harvested/$rid" ]] && echo 1 || echo 0 )"
+    check "k8s late dead: its cluster objects are removed by its branch" \
+        "rm --branch $(env_val "$env" BRANCH)" "$(grep '^rm --branch ' "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"
+    contains "k8s late dead: k8s-dead-reaped names the run" "$(cat "$work/once.out")" \
+        "pm k8s-dead-reaped run=$rid "
+    check "k8s late dead: the thread is not flagged" 0 \
+        "$( [[ -e "$PM_STATE_DIR/needs-operator/$tid" ]] && echo 1 || echo 0 )"
+    contains "k8s late dead: the skipped flag is an event" "$(cat "$work/once.out")" \
+        "pm flag-skip thread=${tid:0:8} agent=karen reason=no-summary run=$rid by=$rid2"
+}
+adopt_late_dead_case
+
 # A teardown that fails never blocks the harvest, is logged naming the run,
 # and is retried next pass until it succeeds.
 printf '1\n' > "$K8S_WAKE_BIN/rm-rc"

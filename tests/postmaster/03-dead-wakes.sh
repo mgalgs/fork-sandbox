@@ -408,4 +408,172 @@ once
 check "resume: a session id with a leading hyphen leaves the earlier valid id standing" \
     "$new_crash_sid" "$(cat "$res_sessions" 2>/dev/null)"
 
+# ============================================================
+printf '\n== no-summary clear: a clean wake of the seat clears its dead wake flag ==\n'
+# ============================================================
+
+ns_st() { printf '%s' "$FORK_SANDBOX_MAIL_ROOT/.postmaster"; }
+ns_cur() { cat "$(ns_st)/needs-operator/$1" 2>/dev/null || true; }
+ns_journal() { cat "$(ns_st)/needs-operator-journal/$1" 2>/dev/null || true; }
+# ns_die <agent>: the agent's live wake dies with no summary.json, and a
+# pass harvests it. Prints the dead run's id.
+ns_die() {
+    local env_f run_dir
+    env_f="$(live_env_for_agent "$1")"
+    run_dir="$(sed -n 's/^RUN_DIR=//p' "$env_f")"
+    printf '%s\n' "$(dead_pid_of)" > "$run_dir/pid"
+    FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+    basename -- "$env_f" .env
+}
+# ns_clean <agent> <first-msg>: a new message wakes <agent>, whose wake
+# exits 0 with no reply. Prints the clean run's id.
+ns_clean() {
+    local rid
+    reply_msg '@carol' "$2" "wake $1 again" --to "@$1" >/dev/null
+    once
+    rid="$(basename -- "$(live_env_for_agent "$1")" .env)"
+    finish_run "$1" 0
+    once
+    printf '%s' "$rid"
+}
+
+# ns_root: a fresh mail root, for live_env_for_agent too.
+ns_root() {
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+}
+
+ns_root
+ns_mid="$(send_msg '@carol' '@alice' 'no-summary clear' 'body' 8)"
+ns_tid="$(thread_of "$ns_mid")"
+once
+ns_r1="$(ns_die alice)"
+check "no-summary clear: the dead wake flagged the thread" \
+    "wake never produced summary.json: $ns_r1" "$(ns_cur "$ns_tid")"
+ns_r2="$(ns_clean alice "$ns_mid")"
+check "no-summary clear: the seat's clean wake unflags the thread" "" "$(ns_cur "$ns_tid")"
+check "no-summary clear: one flag-clear event naming both runs" \
+    "pm flag-clear thread=${ns_tid:0:8} agent=alice reason=no-summary run=$ns_r1 by=$ns_r2 flagged=no" \
+    "$(grep '^pm flag-clear ' "$work/once.out")"
+check "no-summary clear: the journal keeps the original flag" 1 \
+    "$(ns_journal "$ns_tid" | grep -c "	flag	no-summary	wake never produced summary.json: $ns_r1\$")"
+check "no-summary clear: and records the clear" 1 \
+    "$(ns_journal "$ns_tid" | grep -c "	clear	no-summary	wake never produced summary.json: $ns_r1 cleared by run $ns_r2\$")"
+check "no-summary clear: status reads the thread as unflagged" None \
+    "$(we_py "$(we_json "$ns_tid")" 'd["flag"]')"
+ns_clean alice "$ns_mid" >/dev/null
+check "no-summary clear: a later clean wake clears nothing more" 0 "$(grep -c '^pm flag-clear ' "$work/once.out")"
+
+# The reason carries a suffix when adopting the run's Job failed; it still
+# names only the run, and clears the same way.
+ns_root
+ns_mid="$(send_msg '@carol' '@alice' 'no-summary clear: suffix' 'body' 8)"
+ns_tid="$(thread_of "$ns_mid")"
+once
+ns_r1="$(ns_die alice)"
+ns_sfx=" (adopting its still-live Job failed: could not launch fork-sandbox-k8s-wake.sh --adopt)"
+sed -i "s/summary.json: $ns_r1\$/&$ns_sfx/" "$(ns_st)/needs-operator-journal/$ns_tid"
+printf 'wake never produced summary.json: %s%s\n' "$ns_r1" "$ns_sfx" > "$(ns_st)/needs-operator/$ns_tid"
+ns_clean alice "$ns_mid" >/dev/null
+check "no-summary clear: a reason with the adoption suffix clears too" "" "$(ns_cur "$ns_tid")"
+
+# Two seats died; only one recovers. The other's flag stays, and so does a
+# retry-exhausted flag of the recovering seat itself.
+ns_root
+ns_mid="$(send_msg '@carol' '@alice,@bob' 'no-summary clear: two seats' 'body' 8)"
+ns_tid="$(thread_of "$ns_mid")"
+once
+for ns_a in alice bob; do
+    ns_env="$(live_env_for_agent "$ns_a")"
+    printf '%s\n' "$(dead_pid_of)" > "$(sed -n 's/^RUN_DIR=//p' "$ns_env")/pid"
+    eval "ns_rid_$ns_a=\$(basename -- \"\$ns_env\" .env)"
+done
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+# shellcheck disable=SC2154  # set by the eval above
+{ ns_ra="$ns_rid_alice"; ns_rb="$ns_rid_bob"; }
+check "no-summary 2seat: both dead wakes were flagged" 2 \
+    "$(ns_journal "$ns_tid" | grep -c '	flag	no-summary	')"
+printf 'wake never produced summary.json: %s\n' "$ns_ra" > "$(ns_st)/needs-operator/$ns_tid"
+printf '2026-01-01T00:00:00Z\tflag\tno-summary\twake never produced summary.json: %s\n' "$ns_ra" \
+    >> "$(ns_st)/needs-operator-journal/$ns_tid"   # alice's failed last
+ns_clean alice "$ns_mid" >/dev/null
+check "no-summary 2seat: still flagged, for the seat that did not recover" \
+    "wake never produced summary.json: $ns_rb" "$(ns_cur "$ns_tid")"
+check "no-summary 2seat: the event says the thread is still flagged" 1 \
+    "$(grep -c "^pm flag-clear thread=${ns_tid:0:8} agent=alice reason=no-summary run=$ns_ra by=.* flagged=yes\$" "$work/once.out")"
+check "no-summary 2seat: only alice's clear is journaled" "$ns_ra" \
+    "$(ns_journal "$ns_tid" | awk -F'\t' '$2=="clear"{sub(/^wake never produced summary.json: /,"",$4); sub(/ .*/,"",$4); print $4}' | sort -u)"
+
+ns_root
+ns_mid="$(send_msg '@carol' '@alice' 'no-summary clear: exhausted' 'body' 8)"
+ns_tid="$(thread_of "$ns_mid")"
+once
+ns_r1="$(ns_die alice)"
+ns_ex="wake for alice failed after 2 retries (trigger ${ns_mid:0:8})"
+printf '2026-01-01T00:00:00Z\tflag\tretry-exhausted\t%s\n' "$ns_ex" >> "$(ns_st)/needs-operator-journal/$ns_tid"
+printf '%s\n' "$ns_ex" > "$(ns_st)/needs-operator/$ns_tid"
+ns_clean alice "$ns_mid" >/dev/null
+check "no-summary exhausted: the retry-exhausted flag stays" "$ns_ex" "$(ns_cur "$ns_tid")"
+check "no-summary exhausted: the no-summary reason was still cleared under it" 1 \
+    "$(ns_journal "$ns_tid" | grep -c "	clear	no-summary	.*$ns_r1 cleared by run ")"
+
+# ============================================================
+printf '\n== no-summary after recovery: a late harvest does not re-raise the flag ==\n'
+# ============================================================
+
+# A dead run harvested only after a later wake of its seat already exited
+# 0 (adopted across a restart, say): its evidence and bookkeeping happen,
+# the flag does not.
+ns_root
+ns_mid="$(send_msg '@carol' '@alice' 'no-summary late harvest' 'body' 8)"
+ns_tid="$(thread_of "$ns_mid")"
+once
+ns_r1="$(basename -- "$(live_env_for_agent alice)" .env)"
+: > "$(ns_st)/harvested/$ns_r1"   # out of the way while the later wake runs
+ns_r2="$(ns_clean alice "$ns_mid")"
+check "late harvest fixture: the later wake was harvested clean" clean \
+    "$(env_val "$(ns_st)/runs/$ns_r2.env" OUTCOME)"
+rm -f -- "$(ns_st)/harvested/$ns_r1"
+ns_die alice >/dev/null
+check "late harvest: the dead run is harvested" 1 \
+    "$([[ -e "$(ns_st)/harvested/$ns_r1" ]] && echo 1 || echo 0)"
+check "late harvest: its outcome is recorded as failed" failed \
+    "$(env_val "$(ns_st)/runs/$ns_r1.env" OUTCOME)"
+check "late harvest: the thread is not flagged" "" "$(ns_cur "$ns_tid")"
+check "late harvest: nothing is journaled" 0 "$(ns_journal "$ns_tid" | grep -c '	flag	')"
+check "late harvest: a flag-skip event names both runs" \
+    "pm flag-skip thread=${ns_tid:0:8} agent=alice reason=no-summary run=$ns_r1 by=$ns_r2" \
+    "$(grep '^pm flag-skip ' "$work/once.out")"
+
+# The same dead run with no later clean wake of its seat flags as before,
+# even when another seat recovered after it.
+ns_root
+ns_mid="$(send_msg '@carol' '@alice' 'no-summary late harvest, other seat' 'body' 8)"
+ns_tid="$(thread_of "$ns_mid")"
+once
+ns_r1="$(basename -- "$(live_env_for_agent alice)" .env)"
+ns_clean bob "$ns_mid" >/dev/null
+ns_die alice >/dev/null
+check "late harvest, other seat: the thread is flagged as before" \
+    "wake never produced summary.json: $ns_r1" "$(ns_cur "$ns_tid")"
+
+# A flag already on disk from before no-summary flags were cleared: the
+# seat's clean wake left no clear line. When another seat's flag is
+# cleared, the flag file must not fall back to the answered no-summary.
+ns_root
+ns_mid="$(send_msg '@carol' '@alice' 'no-summary stale fallback' 'body' 8)"
+ns_tid="$(thread_of "$ns_mid")"
+once
+ns_r1="$(ns_die alice)"
+ns_clean alice "$ns_mid" >/dev/null
+sed -i '/	clear	no-summary	/d' "$(ns_st)/needs-operator-journal/$ns_tid"
+ns_bob_reason="wake for bob exited 1 (run bobrun1); outbox may be incomplete"
+printf '2026-01-01T00:00:00Z\tflag\twake-exit\t%s\n' "$ns_bob_reason" >> "$(ns_st)/needs-operator-journal/$ns_tid"
+printf '%s\n' "$ns_bob_reason" > "$(ns_st)/needs-operator/$ns_tid"
+ns_clean bob "$ns_mid" >/dev/null
+check "stale fallback: bob's clear does not resurrect alice's answered no-summary" "" "$(ns_cur "$ns_tid")"
+check "stale fallback: the event says the thread is unflagged" 1 \
+    "$(grep -c "^pm flag-clear thread=${ns_tid:0:8} agent=bob reason=wake-exit run=bobrun1 by=.* flagged=no\$" "$work/once.out")"
+
 finish_suite
