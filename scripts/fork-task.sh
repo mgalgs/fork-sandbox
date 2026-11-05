@@ -35,6 +35,9 @@
 #                         dir). Claude harness only; not with --sandboxed — a
 #                         sandbox mounts no host config dir, use
 #                         fork-sandbox's --claude-credentials there.
+#                         Defaults to the caller's $CLAUDE_CONFIG_DIR, so a
+#                         fork stays on the caller's account; pass the
+#                         default login's dir to switch back.
 # --codex-args "...":     extra arguments passed verbatim to the codex CLI
 # --sandboxed:            run the session inside claude-sandboxed, with every
 #                         permission check bypassed. Clones the repo first;
@@ -409,6 +412,14 @@ if [[ -n "$permission_mode" && "$sandboxed" == true ]]; then
     echo "Error: --permission-mode is meaningless with --sandboxed, which runs" >&2
     echo "--dangerously-skip-permissions; drop one of the two." >&2
     exit 1
+fi
+
+# A fork keeps the caller's Claude account: the new tmux window gets the
+# tmux server's environment, not ours, so without this a session running on
+# a second login would fork onto the default one.
+if [[ -z "$claude_config_dir" && -n "${CLAUDE_CONFIG_DIR:-}" \
+    && "$harness" == "claude" && "$sandboxed" != true ]]; then
+    claude_config_dir="$CLAUDE_CONFIG_DIR"
 fi
 
 if [[ -n "$claude_config_dir" ]]; then

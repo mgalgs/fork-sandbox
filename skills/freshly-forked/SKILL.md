@@ -85,6 +85,13 @@ writing a detailed handoff so nothing gets dropped.
    Only if the stash file is missing (the status line never ran) and the
    user named no model, omit `--model` and say so in the launch report.
 
+   **The Claude account carries over too.** fork-task.sh passes the
+   caller's `$CLAUDE_CONFIG_DIR` on by default. When the user has said
+   which login a chain runs on, also pass `--claude-config-dir <dir>`
+   explicitly, write that instruction into the handoff, and check the
+   registry line's `claude_config_dir` after launch: a session started
+   without the variable has nothing to pass on.
+
    **Orchestrator-lane continuations start in Auto mode.** When the
    session being refreshed is a long-horizon orchestrator (sandbox-coder-
    mode on, or a numbered chain name like `frontend-14`), add

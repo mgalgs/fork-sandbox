@@ -360,6 +360,67 @@ else
         "occurrences=$occurrences registry session_id='$reg_id': $(cat "$err")"
 fi
 
+printf '\n== fork-task.sh: a fork keeps the caller'"'"'s Claude account ==\n'
+
+acct_a="$tmp/claude-acct-a"
+acct_b="$tmp/claude-acct-b"
+mkdir -p "$acct_a" "$acct_b"
+acct_a="$(realpath "$acct_a")"
+acct_b="$(realpath "$acct_b")"
+
+# With no --claude-config-dir, a caller's $CLAUDE_CONFIG_DIR carries over to
+# the new session: it is recorded and reaches the launch command.
+reg="$tmp/registry-config-inherit.jsonl"
+: > "$tmux_log"
+CLAUDE_CONFIG_DIR="$acct_a" FORK_TASK_REGISTRY="$reg" \
+    "$launcher" "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
+got="$(jq -r '.claude_config_dir' "$reg" 2>/dev/null)"
+if [[ "$got" == "$acct_a" ]] && grep -q -- "CLAUDE_CONFIG_DIR=$acct_a" "$tmux_log"; then
+    ok "a claude fork inherits the caller's CLAUDE_CONFIG_DIR"
+else
+    no "a claude fork inherits the caller's CLAUDE_CONFIG_DIR" \
+        "registry claude_config_dir='$got': $(cat "$err")"
+fi
+
+# An explicit --claude-config-dir still wins over the caller's own.
+reg="$tmp/registry-config-explicit.jsonl"
+: > "$tmux_log"
+CLAUDE_CONFIG_DIR="$acct_a" FORK_TASK_REGISTRY="$reg" \
+    "$launcher" --claude-config-dir "$acct_b" "$lineage_project" "$lineage_handoff" \
+    > /dev/null 2>"$err"
+got="$(jq -r '.claude_config_dir' "$reg" 2>/dev/null)"
+if [[ "$got" == "$acct_b" ]] && ! grep -q -- "CLAUDE_CONFIG_DIR=$acct_a" "$tmux_log"; then
+    ok "an explicit --claude-config-dir overrides the inherited one"
+else
+    no "an explicit --claude-config-dir overrides the inherited one" \
+        "registry claude_config_dir='$got': $(cat "$err")"
+fi
+
+# A codex fork has no Claude account to keep: the caller's variable is not
+# an error there and is not recorded.
+reg="$tmp/registry-config-codex.jsonl"
+CLAUDE_CONFIG_DIR="$acct_a" FORK_TASK_REGISTRY="$reg" \
+    "$launcher" --harness codex "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
+got="$(jq -r '.claude_config_dir' "$reg" 2>/dev/null)"
+if [[ "$got" == "" ]]; then
+    ok "a codex fork ignores the caller's CLAUDE_CONFIG_DIR"
+else
+    no "a codex fork ignores the caller's CLAUDE_CONFIG_DIR" \
+        "registry claude_config_dir='$got': $(cat "$err")"
+fi
+
+# No variable, no flag: nothing is recorded, as before.
+reg="$tmp/registry-config-unset.jsonl"
+env -u CLAUDE_CONFIG_DIR FORK_TASK_REGISTRY="$reg" \
+    "$launcher" "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
+got="$(jq -r '.claude_config_dir' "$reg" 2>/dev/null)"
+if [[ "$got" == "" ]]; then
+    ok "with no CLAUDE_CONFIG_DIR, a claude fork records no config dir"
+else
+    no "with no CLAUDE_CONFIG_DIR, a claude fork records no config dir" \
+        "registry claude_config_dir='$got': $(cat "$err")"
+fi
+
 printf '\n== fork-task.sh --ack: launch handshake ==\n'
 
 # Without --ack the prompt header and output are exactly what they were.
