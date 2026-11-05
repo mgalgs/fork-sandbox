@@ -424,7 +424,6 @@ cmd_check() {
     return "$rc"
 }
 
-# The extra refusals of `check --cluster` (see the header). $1 is the fleet
 # Whether a cluster postmaster can run a seat on harness $1 (the part
 # before any `/`): pi always; claude and codex only once install
 # --postmaster has given the container that harness's credential, which it
@@ -447,6 +446,7 @@ cluster_harness_refusal() {
     esac
 }
 
+# The extra refusals of `check --cluster` (see the header). $1 is the fleet
 # dump, the rest are every agent name. Prints every error found, not just
 # the first.
 check_cluster() {

@@ -29,8 +29,9 @@
 # things. At startup, deliver runs `fork-sandbox-fleet.sh check --cluster`
 # (a fleet.yaml is required) and refuses to start when the fleet holds a
 # seat a pod cannot run: a local (non-k8s) seat, a top-level `triage:`
-# block, or a claude/codex seat -- see that script's header for the exact
-# refusals. And every k8s wake (normal and --adopt) is launched detached
+# block, or a claude/codex seat whose credential gate
+# (FORK_SANDBOX_CLUSTER_CLAUDE / FORK_SANDBOX_CLUSTER_CODEX) is unset -- see
+# that script's header for the exact refusals. And every k8s wake (normal and --adopt) is launched detached
 # with `setsid` (stdin /dev/null, output to the wake dir's wake.out)
 # instead of a tmux session, via fork-sandbox-k8s-wake.sh --detach-mode
 # setsid; a pod has no tmux.
@@ -765,7 +766,9 @@
 # forwarded now, the same way and via the same pm_session_spawn_args the
 # local branch below uses: a k8s seat keeps its conversation across wakes
 # exactly like a local one, bound into the pod's own transcript store by
-# fork-sandbox-k8s-entrypoint.sh. A k8s seat's wake also gets a
+# fork-sandbox-k8s-entrypoint.sh. The exception is a codex k8s seat: it runs
+# as a one-step composed run, which refuses --session-state, so it skips
+# pm_session_spawn_args and starts fresh on every wake. A k8s seat's wake also gets a
 # --checkout when pm_lineage_checkout finds one (see its own comment) --
 # a local wake gets this for free from its own persistent --clone-dir,
 # but a k8s wake's clone is fresh every time, so lineage has to be found
@@ -4832,6 +4835,7 @@ pm_spawn_wake() {
         # same pm_session_spawn_args -- fork-sandbox.sh accepts all three
         # with --k8s now, and fork-sandbox-k8s-entrypoint.sh binds the same
         # host-side transcript store into the pod that a local wake gets.
+        # Except for a codex seat, which starts fresh every wake (below).
         # --clone-dir and --preset are still dropped outright:
         # fork-sandbox.sh refuses the first with --k8s, and `fleet check`
         # never lets a k8s seat carry a preset -- a persistent per-seat
