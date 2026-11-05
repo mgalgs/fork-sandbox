@@ -9714,6 +9714,10 @@ if [[ "$k8s_runner_mode" == true ]]; then
     # cmd_submit's own fs_check_branch_free refuses the reused branch
     # name outright, on every composed run, --resume or not.
     $allow_existing_branch && k8s_argv+=(--allow-existing-branch)
+    # cmd_submit decides on the per-run service sidecars from its own
+    # argv, so a postmaster seat's --no-services has to ride along here
+    # exactly as the legacy dispatch above forwards it.
+    $no_services && k8s_argv+=(--no-services)
     [[ -n "$services_trust_ref" ]] && k8s_argv+=(--services-trust-ref "$services_trust_ref")
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")

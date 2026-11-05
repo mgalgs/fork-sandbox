@@ -693,8 +693,9 @@ done
 
 # --k8s --harness codex [--model M] runs as a one-step composed run: the
 # dry-run lists the same run an inline one-step codex pipeline does, line
-# for line apart from the provenance line naming what built it. Every flag
-# a postmaster k8s wake passes rides along unchanged.
+# for line apart from the provenance line naming what built it. What
+# actually reaches fork-sandbox-k8s.sh is checked further down, against a
+# stub, since both of these dry-runs share the runner-mode exec block.
 k8s_codex_flags=(--k8s --network pinned --branch fs-preset-k8s-codex
     --timeout 100 --checkout HEAD --services-trust-ref HEAD
     --extra-ref upstream=HEAD --no-services
@@ -730,6 +731,35 @@ for k8s_codex_refused in "--effort high" "--claude-args --verbose" \
         "${k8s_codex_refused%% *} cannot be combined with --k8s --harness codex" \
         --k8s --harness codex --model sol $k8s_codex_refused
 done
+# The flags a postmaster k8s wake passes must reach `fork-sandbox-k8s.sh
+# run` itself, not just the dry-run listing: a copy of scripts/ whose
+# fork-sandbox-k8s.sh only records its argv shows what the runner-mode
+# exec hands over.
+k8s_codex_stub_dir="$(mktemp -d)"; tmpdirs+=("$k8s_codex_stub_dir")
+cp -a "$repo_dir/scripts" "$k8s_codex_stub_dir/scripts"
+cat > "$k8s_codex_stub_dir/scripts/fork-sandbox-k8s.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$K8S_ARGV_LOG"
+STUB
+k8s_codex_argv_log="$k8s_codex_stub_dir/argv"
+if K8S_ARGV_LOG="$k8s_codex_argv_log" HOME="$k8s_dryrun_home" \
+    "$k8s_codex_stub_dir/scripts/fork-sandbox.sh" --k8s --harness codex \
+    --model gpt-5.6-astra --network pinned --branch fs-preset-k8s-codex-wake \
+    --no-services "$k8s_dryrun_proj" "$k8s_dryrun_handoff" >/dev/null 2>"$err"; then
+    k8s_codex_argv="$(cat "$k8s_codex_argv_log" 2>/dev/null)"
+    k8s_codex_run_dir="$(sed -n 3p <<< "$k8s_codex_argv")"
+    [[ "$k8s_codex_run_dir" == /var/tmp/claude-scratch/* ]] \
+        && tmpdirs+=("$k8s_codex_run_dir")
+    check "--k8s --harness codex execs fork-sandbox-k8s.sh run" \
+        "run" "$(head -1 <<< "$k8s_codex_argv")"
+    for k8s_codex_fwd in --no-services "--harness codex" \
+        "--model gpt-5.6-astra" "--branch fs-preset-k8s-codex-wake"; do
+        contains "--k8s --harness codex hands ${k8s_codex_fwd%% *} to fork-sandbox-k8s.sh run" \
+            "$(tr '\n' ' ' <<< "$k8s_codex_argv")" "$k8s_codex_fwd "
+    done
+else
+    no "--k8s --harness codex with a postmaster wake's flags launches" "$(cat "$err")"
+fi
 refuses "--k8s --harness codex --network sealed stays refused" \
     "--network sealed is not supported with --k8s" \
     --k8s --harness codex --model sol --network sealed

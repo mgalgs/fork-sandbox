@@ -1175,7 +1175,7 @@
 #                         docs/cluster-postmaster.md, "Codex seats in a
 #                         cluster postmaster".
 #
-#   Secrets by reference (the three *_SECRET keys above and
+#   Secrets by reference (the four *_SECRET keys above and
 #   K8S_POSTMASTER_HOOKS_SECRET): install never creates, reads or prints a
 #   referenced Secret, and it is not in the pod's config checksum, so
 #   changing its content does not roll the pod -- run `kubectl rollout

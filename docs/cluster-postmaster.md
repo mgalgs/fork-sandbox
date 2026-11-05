@@ -82,6 +82,7 @@ Do these in order.
    | `K8S_POSTMASTER_CLAUDE_CREDENTIAL_POOL` | no | colon-separated absolute laptop paths to Claude credential files; set with `K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK` instead of the single file. |
    | `K8S_POSTMASTER_CLAUDE_HEADROOM_HOOK` | no | plugin name selected from `K8S_POSTMASTER_HEADROOM_DIR`; required with the pool. |
    | `K8S_POSTMASTER_HEADROOM_DIR` | no | laptop directory of executable headroom plugins, shipped as a ConfigMap and put on the postmaster's `PATH`. |
+   | `K8S_POSTMASTER_CODEX_SECRET` | no | name of a Secret you create with key `auth.json` (access token and account id, no refresh token); when set, codex seats are accepted in the cluster. By reference only. See "Codex seats in a cluster postmaster". |
 
    For review seats that do not need the project's per-run services, set
    `services: false` on each k8s agent in `fleet.yaml`, or set
