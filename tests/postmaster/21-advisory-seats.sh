@@ -16,15 +16,17 @@ set -uo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 # nora is advisory, fred is the same seat flagging; both retry a discarded
-# reply. hank and hal are the handler pair, both exiting 1.
-for as_seat in nora fred; do
+# reply. hank and hal are the handler pair, both exiting 1. kora is an
+# advisory k8s seat (karen, from lib.sh, its flagging twin) and kody an
+# advisory grant: required one (karl its twin).
+for as_seat in nora fred kora kody; do
     printf 'Advisory fixture seat.\n' > "$FORK_SANDBOX_PERSONAS_DIR/$as_seat.md"
 done
 new_root AS_HANDLERS_DIR
 printf '#!/bin/sh\necho handler failed >&2\nexit 1\n' > "$AS_HANDLERS_DIR/failing-handler"
 chmod +x "$AS_HANDLERS_DIR/failing-handler"
 export FORK_SANDBOX_HANDLERS_DIR="$AS_HANDLERS_DIR"
-sed -i 's/^agents:$/agents:\n  nora:\n    on-failure: note\n    on-silence: retry\n  fred:\n    on-failure: flag\n    on-silence: retry\n  hank:\n    handler: exec\n    command: failing-handler\n    on-failure: note\n  hal:\n    handler: exec\n    command: failing-handler/' "$FORK_SANDBOX_FLEET_FILE"
+sed -i 's/^agents:$/agents:\n  nora:\n    on-failure: note\n    on-silence: retry\n  fred:\n    on-failure: flag\n    on-silence: retry\n  hank:\n    handler: exec\n    command: failing-handler\n    on-failure: note\n  hal:\n    handler: exec\n    command: failing-handler\n  kora:\n    backend: k8s\n    on-failure: note\n  kody:\n    backend: k8s\n    grant: required\n    on-failure: note/' "$FORK_SANDBOX_FLEET_FILE"
 "$FLEET" check >/dev/null 2>&1 || { echo "FATAL: advisory fixture fleet fails check" >&2; "$FLEET" check >&2; exit 1; }
 
 as_store() {
@@ -173,6 +175,86 @@ as_start hank
 as_noted "handler exit" hank handler-exit
 as_start hal
 as_flagged "handler exit" "handler 'failing-handler' for hal exited 1"
+
+# ============================================================
+printf '\n== advisory seat: a run dir that vanishes ==\n'
+# ============================================================
+
+as_rm_rundir() { rm -rf -- "$(sed -n 's/^RUN_DIR=//p' "$(env_file_for_agent "$1")")"; }
+
+as_start nora
+as_rm_rundir nora
+as_once
+as_noted "run vanished" nora run-vanished
+
+as_start fred
+as_rm_rundir fred
+as_once
+as_flagged "run vanished" "run dir for fred vanished"
+
+# ---- the k8s seats: this section owns its k8s seams, as 14-wake-exit.sh does ----
+k8s_wake_fixture
+export FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline
+export FORK_SANDBOX_POSTMASTER_K8S="$K8S_WAKE_BIN/fork-sandbox-k8s.sh"
+new_root FORK_SANDBOX_CONFIG_DIR
+export FORK_SANDBOX_CONFIG_DIR
+
+# ============================================================
+printf '\n== advisory seat: a k8s wake that timed out on its Job ==\n'
+# ============================================================
+
+as_timeout() {
+    STUB_K8S_EXIT=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_NO_REPLY=1 STUB_K8S_TIMEOUT_MSG=1 as_start "$1"
+}
+as_timeout kora
+as_noted "k8s timeout" kora k8s-timeout
+as_timeout karen
+as_flagged "k8s timeout" "k8s wake for karen timed out waiting on its Job"
+
+# ============================================================
+printf '\n== advisory seat: a k8s seat stopped after a failure streak ==\n'
+# ============================================================
+
+# Each failure carries Kubernetes evidence, and each lands on a new
+# trigger, so the per-trigger retry cap (2) never stops the seat: the
+# streak does, on the third. The two passes after it re-run the streak
+# check before a spawn that never happens, and must not note again.
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+as_k8s_status="$work/as-status-evicted.json"
+printf '%s\n' '{"pod_phase":"Failed","pod_reason":"Evicted","pod_message":"node low on ephemeral-storage"}' > "$as_k8s_status"
+as_streak() {
+    local seat="$1" n
+    as_store
+    as_mid="$(send_msg '@dana' "@$seat" 'advisory streak' 'first' 8)"
+    as_tid="$(thread_of "$as_mid")"
+    for n in 1 2 3 4 5; do
+        (( n == 1 )) || reply_msg '@dana' "$as_mid" "trigger $n" --to "@$seat" >/dev/null
+        STUB_K8S_EXIT=2 STUB_K8S_NO_REPLY=1 STUB_K8S_TERMINAL_JSON="$as_k8s_status" as_once
+    done
+}
+as_streak kora
+as_noted "k8s streak" kora k8s-failure-streak
+check "k8s streak: the seat is still stopped (retry state exhausted)" exhausted \
+    "$(env_val "$PM_STATE_DIR/retries/$as_tid/kora" STATE)"
+check "k8s streak: no launch past the streak" 3 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+as_streak karen
+as_flagged "k8s streak" "wake for karen stopped after 3 consecutive Kubernetes failures"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# ============================================================
+printf '\n== advisory seat: a grant: required k8s seat with no grant ==\n'
+# ============================================================
+
+as_start kody
+as_noted "no grant" kody no-grant
+check "no grant: the seat is still held" 1 \
+    "$([[ -f "$PM_STATE_DIR/held/$as_tid/kody" ]] && echo 1 || echo 0)"
+as_once
+check "no grant: a second pass notes nothing more" 1 \
+    "$(grep -c -- "^pm note thread=${as_tid:0:8} agent=kody reason=no-grant\$" "$work/events.out")"
+as_start karl
+as_flagged "no grant" "no grant for k8s seat karl"
 
 # ============================================================
 printf '\n== advisory seat: thread-level flags stay flags ==\n'
