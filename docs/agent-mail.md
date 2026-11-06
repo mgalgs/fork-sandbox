@@ -716,6 +716,8 @@ agents:
     wake-when: ready            # a spawn of alice asks wake-when.ready first (rule 5)
   auditor:
     on-silence: flag            # a clean wake that posts nothing flags the thread
+  second-opinion:
+    on-failure: note            # advisory: its failures are noted, never flagged
   notifier:
     handler: exec              # a deterministic script seat, not an LLM
     command: notify-slack       # bare name, resolved under $FORK_SANDBOX_HANDLERS_DIR
@@ -846,6 +848,15 @@ file naming it is refused as an unknown key, and so is a handler seat
 carrying it. `flag` and `retry` are the values; `retry` does what `flag`
 does and adds the one re-wake described under "Silent wakes".
 
+A per-agent `on-failure: note` makes a seat advisory: a failure the
+postmaster attributes to that seat (a crashed, dead or silent wake, a
+discarded reply, crash-retry exhaustion, a failed spawn) emits a `note`
+event and adds a line to the thread's "seat notes:" in `status` instead
+of flagging the thread, while retries and budgets run exactly as before;
+thread-level flags (hops, budget, review target) still flag. `flag`, the
+default, keeps today's behaviour. It is fleet.yaml-only, any seat may
+carry it, and operator mail clears a thread's notes along with its flag.
+
 An optional top-level `budget-reserve:` block holds back the last spawns
 of a thread's budget for named seats (routing rule 3 below):
 
@@ -875,6 +886,8 @@ fork-sandbox fleet resolve <name>     # twenty lines: harness, model, thinking,
                                       # endpoint, grant, review-target,
                                       # wake-when, services, on-silence,
                                       # protocol
+fork-sandbox fleet resolve-on-failure <name>
+                                      # one line: flag or note (flag when unset)
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -1699,6 +1712,9 @@ attempt=<n> — a deferred retry firing; a discarded-reply retry has
 reason=malformed in place of attempt; see "Retrying a dead wake" below),
 `regate` (thread, agent, run=<harvested run id> — a deferred seat's wake gate
 re-run after that run posted no reply; see rule 5),
+`note` (thread, agent, reason=<keyword> — an `on-failure: note` seat failed
+where another seat would have flagged the thread; the keyword is the one the
+flag would have carried),
 `silent` (thread, agent, reason=replied-on-target — an `on-silence` seat's
 clean wake posted nothing on a review target it had already replied on, so
 the thread was not flagged; see "Silent wakes"),
@@ -2534,6 +2550,7 @@ own thread scans never see it:
 | `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
+| `seat-notes/<thread-id>/<agent>` | one `<UTC time>\t<keyword>` line per failure of an `on-failure: note` seat on that thread; listed by `status` under "seat notes:" and removed when operator mail (or `unflag`) clears the thread |
 | `discards/<thread-id>/<agent>` | one line per reply file of a clean wake that the postmaster discarded (or the single `no-reply-file` sentinel line for a wake that wrote none), kept for the `on-silence: retry` handoff and removed when that handoff is written |
 | `discards/<thread-id>/<agent>.spent` | the trigger message id whose one malformed retry has been scheduled; never reopened by a crash retry |
 | `discards/<thread-id>/<agent>.prior` | the seat's crash-retry record set aside while a malformed schedule is pending; put back when that schedule ends |
