@@ -159,6 +159,14 @@
 #                  the fleet file, empty when unset. protocol, the
 #                  twentieth, is the bare name (not a path), fleet.yaml
 #                  over frontmatter like the first ten.
+#   resolve-on-failure <name>
+#                  Print one line for one agent: its fleet.yaml
+#                  `on-failure` value, `flag` or `note`, `flag` when unset
+#                  (fleet.yaml-only, no persona fallback). Refuses an
+#                  unknown agent exactly as `resolve` does. A verb of its
+#                  own rather than a 21st `resolve` line: `resolve`'s
+#                  twenty-line shape is a contract positional readers
+#                  depend on.
 #   resolve-triage Print exactly two lines for the wake classifier's own
 #                  sandbox seat: harness, model. Reads only the fleet
 #                  file's top-level `triage` block (no persona fallback --
@@ -509,7 +517,7 @@ fleet_read_agent() {
     fleet_preset="" fleet_handler="" fleet_command=""
     fleet_backend="" fleet_endpoint="" fleet_grant=""
     fleet_review_target="" fleet_wake_when="" fleet_services=""
-    fleet_on_silence="" fleet_protocol=""
+    fleet_on_silence="" fleet_protocol="" fleet_on_failure=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -536,6 +544,7 @@ fleet_read_agent() {
             services) fleet_services="$value" ;;
             on-silence) fleet_on_silence="$value" ;;
             protocol) fleet_protocol="$value" ;;
+            on-failure) fleet_on_failure="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -631,6 +640,15 @@ cmd_resolve() {
     local name="${1:?Usage: fork-sandbox-fleet.sh resolve <name>}"
     local dump; dump="$(fleet_dump)"
     resolve_with_dump "$dump" "$name"
+}
+
+# resolve_with_dump does the unknown-agent refusal and leaves the fleet_*
+# globals of this agent behind (fleet_read_agent); only on-failure is kept.
+cmd_resolve_on_failure() {
+    local name="${1:?Usage: fork-sandbox-fleet.sh resolve-on-failure <name>}"
+    local dump; dump="$(fleet_dump)"
+    resolve_with_dump "$dump" "$name" >/dev/null || return 1
+    printf '%s\n' "${fleet_on_failure:-flag}"
 }
 
 # Populates triage_<field> globals (harness/model) for the wake
@@ -1034,6 +1052,7 @@ case "${1-}" in
     -h|--help) usage; exit 0 ;;
     check) shift; cmd_check "$@" ;;
     resolve) shift; cmd_resolve "$@" ;;
+    resolve-on-failure) shift; cmd_resolve_on_failure "$@" ;;
     resolve-triage) shift; cmd_resolve_triage "$@" ;;
     resolve-budget-reserve) shift; cmd_resolve_budget_reserve "$@" ;;
     expand) shift; cmd_expand "$@" ;;

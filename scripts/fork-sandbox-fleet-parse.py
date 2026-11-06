@@ -88,6 +88,14 @@ file it wrote was discarded as malformed, or when it wrote none and has no
 reply yet on its review target (see docs/agent-mail.md). Leave
 it unset on a seat whose protocol allows a silent wake.
 
+`on-failure` is fleet.yaml-only: `flag` (the default, the same as leaving
+it unset) or `note`. A `note` seat is advisory: a failure the postmaster
+attributes to it (a crashed or silent wake, a discarded reply, retry
+exhaustion) is recorded as a per-thread seat note and a `note` event
+instead of flagging the thread needs-operator. Unlike `on-silence` it is
+legal on a handler seat: a handler can fail on a thread just as an LLM
+seat can.
+
 `review-target` is fleet.yaml-only too, same reason as `backend`: a seat
 must not know it is the one moving a review thread's shared target.
 Value is the literal string `sets` or `follow` (see docs/agent-mail.md
@@ -130,7 +138,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (twenty lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (21 lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -150,6 +158,7 @@ routine instead of two.
     agent\t<name>\tservices\t<value>
     agent\t<name>\ton-silence\t<value>
     agent\t<name>\tprotocol\t<value>
+    agent\t<name>\ton-failure\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -214,7 +223,7 @@ FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
           "handler", "command", "backend", "endpoint", "grant",
           "review-target", "wake-when", "services", "on-silence",
-          "protocol")
+          "protocol", "on-failure")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
@@ -626,6 +635,14 @@ def check_on_silence(value, path, errors):
     return value
 
 
+def check_on_failure(value, path, errors):
+    """Accepted values are 'flag' (the default) and 'note'."""
+    if value not in ("flag", "note"):
+        errors.append(f"{path}: takes 'flag' or 'note', not '{value}'")
+        return ""
+    return value
+
+
 def check_backend_fields_pair(backend, endpoint, grant, path, errors):
     """endpoint/grant only mean anything to the k8s spawn path; on any
     other backend they would silently do nothing, so refuse the
@@ -765,6 +782,10 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["on-silence"] = check_on_silence(v, path, errors)
+            elif prop == "on-failure":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["on-failure"] = check_on_failure(v, path, errors)
             elif prop == "protocol":
                 v = scalar(value, path, errors)
                 if v is not None:

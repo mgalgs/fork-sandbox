@@ -1573,6 +1573,55 @@ EOF
 printf '%s\n' "$saved_riffler_persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
 printf '%s\n' "$saved_fleet_for_on_silence" > "$FORK_SANDBOX_FLEET_FILE"
 
+printf '\n== on-failure ==\n'
+
+saved_fleet_for_on_failure="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    on-failure: note
+  drummer:
+    persona: tuner.md
+    on-failure: flag
+  hooky:
+    handler: exec
+    command: real-handler
+    on-failure: note
+  tuner: {}
+EOF
+check "on-failure: note and flag pass check, on a handler seat too" "" \
+    "$(FORK_SANDBOX_HANDLERS_DIR="$HANDLERS_TEST_DIR" "$fleet" check 2>&1 >/dev/null)"
+check "on-failure: note resolves" note "$("$fleet" resolve-on-failure riffler)"
+check "on-failure: flag resolves" flag "$("$fleet" resolve-on-failure drummer)"
+check "on-failure: a handler seat's note resolves" note "$("$fleet" resolve-on-failure hooky)"
+check "on-failure: unset resolves as flag" flag "$("$fleet" resolve-on-failure tuner)"
+printf 'A bare persona, no fleet.yaml entry.\n' > "$FORK_SANDBOX_PERSONAS_DIR/soloist.md"
+check "on-failure: a bare persona seat resolves as flag" flag "$("$fleet" resolve-on-failure soloist 2>/dev/null || echo refused)"
+rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/soloist.md"
+check "on-failure: resolve keeps its twenty lines" 20 "$("$fleet" resolve riffler | wc -l)"
+refuses_rc=0
+"$fleet" resolve-on-failure no-such-seat >/dev/null 2>&1 || refuses_rc=$?
+check "on-failure: an unknown agent is refused" 1 "$refuses_rc"
+bad "on-failure: any other value is refused" "agents.riffler.on-failure: takes 'flag' or 'note', not 'ignore'" <<'EOF'
+agents:
+  riffler:
+    on-failure: ignore
+EOF
+bad "on-failure: a non-scalar value is refused" "agents.riffler.on-failure" <<'EOF'
+agents:
+  riffler:
+    on-failure: [note]
+EOF
+saved_riffler_persona="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+printf '%s\n' "---" "on-failure: note" "---" "persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+bad "on-failure: persona frontmatter refuses it as an unknown key" \
+    "frontmatter.on-failure: unknown key" <<'EOF'
+agents:
+  riffler: {}
+EOF
+printf '%s\n' "$saved_riffler_persona" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+printf '%s\n' "$saved_fleet_for_on_failure" > "$FORK_SANDBOX_FLEET_FILE"
+
 printf '\n== expand ==\n'
 
 check "expand: single agent passes through" "@riffler" "$("$fleet" expand @riffler)"
