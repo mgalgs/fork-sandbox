@@ -298,6 +298,7 @@ PORCELAIN=(
     context-usage.sh
     ensure-scratch-dirs.sh    # UserPromptSubmit hook command: settings.json invokes it by bare name
     fork-sandbox
+    fork-sandbox-aux-jobs     # postmaster hooks exec it by bare name (docs/aux-jobs.md)
     fork-sandbox-fleet.sh
     fork-sandbox-k8s.sh
     fork-sandbox-mail-api.py
