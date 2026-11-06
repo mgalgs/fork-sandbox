@@ -101,6 +101,10 @@
 #                the thread snapshot that run was given at spawn (the
 #                message ids listed beside it), so no follow-up wake is
 #                spawned for it; one line per dropped message
+#   note         thread, agent, reason=<fixed keyword> -- an advisory
+#                (`on-failure: note`) seat failed where any other seat
+#                would have flagged the thread; the keyword is the one the
+#                flag would have carried (see SEAT NOTES below)
 #   flag-clear   thread, agent, reason=wake-exit|no-summary|silent-wake|no-grant,
 #                run=<failed run id> (all but no-grant),
 #                by=<recovering run id>, flagged=yes|no -- a wake of the
@@ -999,6 +1003,20 @@
 # ends any way: it fires, a newer message supersedes it, or the thread closes
 # (pm_retry_restore_prior).
 #
+# SEAT NOTES. A seat with `on-failure: note` in fleet.yaml (fleet
+# resolve-on-failure) is advisory: every failure the postmaster attributes to
+# it -- a non-zero exit, no summary.json, a vanished run dir, a k8s timeout
+# or failure streak, a silent wake under on-silence, a discarded reply,
+# crash-retry exhaustion, a spawn, snapshot, handoff, grant or handler
+# failure, an interrupted route -- is recorded instead of flagged
+# (pm_seat_flag): a `note` event and a line on seat-notes/<tid>/<agent>,
+# which `status` lists under "seat notes:". Retries, budgets and routing are
+# unchanged, and the thread's flag file is never touched, so an existing
+# reason survives. Thread-level flags (hops, budget, reserve, deferral,
+# review-target, cluster-probe, unresolvable To/Cc) still flag whatever seat
+# was waking. Operator mail (rule 1), an upstream-head reset and `unflag`
+# clear the thread's notes with its flag.
+#
 # RE-GATE. After any run is harvested with replies=0, the wake-when gate of
 # each seat with a wake-deferred line on the thread is re-run through the
 # normal spawn path (pm_regate_deferred), AFTER the run's durable record
@@ -1170,6 +1188,9 @@
 #                                   exited ` prefix and its `(run <id>)`
 #                                   shape -- keep them when pruning,
 #                                   rotating or rewording
+#   seat-notes/<thread-id>/<agent>  one `<UTC time>\t<keyword>` line per
+#                                   failure of an advisory seat (see SEAT
+#                                   NOTES); cleared with the thread's flag
 #   wake-exits/<thread-id>/<agent>/<run-id>.json  one failed wake's
 #                                   evidence: agent, run id, exit code, an
 #                                   optional Kubernetes terminal status and
@@ -1432,6 +1453,10 @@ UNRESOLVED_TO="$STATE/unresolved-to"
 # `wake never produced summary.json: ` prefix and the run id after it. Pruning, rotating or rewording any of those
 # silently stops successful retries from clearing their flags.
 NEEDS_OPERATOR_JOURNAL="$STATE/needs-operator-journal"
+# Per-thread, per-seat notes of advisory-seat failures (see SEAT NOTES in
+# the header): $SEAT_NOTES/<thread-id>/<agent>, one `<UTC time>\t<keyword>`
+# line per noted failure. Cleared with the thread's flag by operator mail.
+SEAT_NOTES="$STATE/seat-notes"
 # Per-thread evidence for a wake that exited non-zero, one JSON record per
 # failed attempt at $WAKE_EXITS/<thread-id>/<agent>/<run-id>.json (see
 # pm_wake_exit_record). Never read back by routing; `status --thread --json`
@@ -2413,6 +2438,67 @@ pm_flag_unless_current() {
     local tid="$1" reason="$2"
     [[ "$(cat -- "$NEEDS_OPERATOR/$tid" 2>/dev/null)" == "$reason" ]] && return 0
     pm_flag "$tid" "$reason"
+}
+
+# Whether seat $1 is advisory (`on-failure: note`, see SEAT NOTES in the
+# header). A seat that does not resolve is not: its failure flags.
+pm_seat_advisory() {
+    [[ "$("$FLEET" resolve-on-failure "$1" 2>/dev/null)" == note ]]
+}
+
+# The note keyword for a seat-failure reason: pm_flag_keyword's, except for
+# the reasons that keyword set leaves at `other`, which a note names here
+# instead (the flag keyword itself stays as it was). Same closed,
+# start-anchored match over reasons this script builds.
+pm_seat_note_keyword() {
+    case "$1" in
+        "k8s wake for "*" timed out waiting on its Job"*) printf 'k8s-timeout' ;;
+        "wake for "*" stopped after "*" consecutive Kubernetes failures"*) printf 'k8s-failure-streak' ;;
+        "wake for "*" failed: headroom: no candidate"*) printf 'wake-exit' ;;
+        "wake thread snapshot failed for"*) printf 'snapshot-failed' ;;
+        *) pm_flag_keyword "$1" ;;
+    esac
+}
+
+# Records a failure of advisory seat $2 on thread $1: one line, UTC time and
+# keyword, on $SEAT_NOTES/<tid>/<agent>, and one `note` event. Never the
+# reason text: the keyword is all a note carries.
+pm_seat_note() {
+    local tid="$1" agent="$2" keyword="$3"
+    mkdir -p -- "$SEAT_NOTES/$tid"
+    printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$keyword" >> "$SEAT_NOTES/$tid/$agent"
+    pm_event "note thread=${tid:0:8} agent=$agent reason=$keyword"
+}
+
+pm_seat_notes_clear() {
+    rm -rf -- "${SEAT_NOTES:?}/$1"
+}
+
+# pm_flag on seat $2's behalf: `pm_seat_flag <tid> <agent> <reason>
+# [keyword] [extra]`, pm_flag's own arguments with the agent added. An
+# advisory seat notes instead, and so never touches the thread's flag (an
+# existing reason survives); any other seat flags exactly as pm_flag does.
+pm_seat_flag() {
+    local tid="$1" agent="$2" reason="$3" keyword="${4:-}" extra="${5:-}"
+    if pm_seat_advisory "$agent"; then
+        [[ -n "$keyword" ]] || keyword="$(pm_seat_note_keyword "$reason")"
+        pm_seat_note "$tid" "$agent" "$keyword"
+        return 0
+    fi
+    pm_flag "$tid" "$reason" "$keyword" "$extra"
+}
+
+# pm_flag_unless_current for a seat: a standing condition notes once, while
+# the seat's newest note is not already this keyword.
+pm_seat_flag_unless_current() {
+    local tid="$1" agent="$2" reason="$3" keyword last
+    if pm_seat_advisory "$agent"; then
+        keyword="$(pm_seat_note_keyword "$reason")"
+        last="$(tail -n1 -- "$SEAT_NOTES/$tid/$agent" 2>/dev/null | cut -f2)"
+        [[ "$last" == "$keyword" ]] || pm_seat_note "$tid" "$agent" "$keyword"
+        return 0
+    fi
+    pm_flag_unless_current "$tid" "$reason"
 }
 
 pm_unflag() {
@@ -3984,6 +4070,11 @@ pm_flag_unless_closed() {
     pm_upstream_closed "$1" || pm_flag "$@"
 }
 
+# The same for a failure attributed to seat $2 (see pm_seat_flag).
+pm_seat_flag_unless_closed() {
+    pm_upstream_closed "$1" || pm_seat_flag "$@"
+}
+
 # Moves thread <tid> to upstream state <closed|open> on message <mid>. A
 # redundant transition changes nothing and emits nothing. Closing clears the
 # thread's needs-operator flag (journaled by pm_unflag like any other clear).
@@ -4242,20 +4333,20 @@ pm_exec_wake() {
     # swapped from underneath this process (R9d decision 1: both
     # checkpoints, on purpose).
     if [[ "$command" == */* ]]; then
-        pm_flag "$tid" "handler command '$command' for $agent contains a path separator: $mid"
+        pm_seat_flag "$tid" "$agent" "handler command '$command' for $agent contains a path separator: $mid"
         return 0
     fi
     local handler_path="$HANDLERS_DIR/$command"
     if [[ ! -e "$handler_path" ]]; then
-        pm_flag "$tid" "handler '$handler_path' for $agent does not exist: $mid"
+        pm_seat_flag "$tid" "$agent" "handler '$handler_path' for $agent does not exist: $mid"
         return 0
     fi
     if [[ ! -f "$handler_path" ]]; then
-        pm_flag "$tid" "handler '$handler_path' for $agent is not a regular file: $mid"
+        pm_seat_flag "$tid" "$agent" "handler '$handler_path' for $agent is not a regular file: $mid"
         return 0
     fi
     if [[ ! -x "$handler_path" ]]; then
-        pm_flag "$tid" "handler '$handler_path' for $agent is not executable: $mid"
+        pm_seat_flag "$tid" "$agent" "handler '$handler_path' for $agent is not executable: $mid"
         return 0
     fi
 
@@ -4267,7 +4358,7 @@ pm_exec_wake() {
     rendered="$(mktemp "$MAIL_ROOT/.postmaster.handler.XXXXXX")"
     if ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" > "$rendered"; then
         rm -f -- "$rendered"
-        pm_flag "$tid" "thread render failed for handler $agent: $mid"
+        pm_seat_flag "$tid" "$agent" "thread render failed for handler $agent: $mid"
         return 0
     fi
 
@@ -4323,7 +4414,7 @@ pm_exec_wake() {
         # stderr tail ($err_out) -- so a handler that writes e.g. "does not
         # exist" to its own stderr on a plain exit-1 would otherwise supply
         # those patterns' second literal and be mis-flagged as handler-missing.
-        pm_flag "$tid" "handler '$command' for $agent $cause: $mid$err_out" "$keyword"
+        pm_seat_flag "$tid" "$agent" "handler '$command' for $agent $cause: $mid$err_out" "$keyword"
     fi
     rm -f -- "$stderr_capture"
 
@@ -4742,7 +4833,7 @@ pm_spawn_wake() {
             else
                 pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
                 if [[ "$old_trigger" != "$mid" || "$old_quiet" == 1 ]]; then
-                    pm_flag "$tid" "no grant for k8s seat $agent: $mid"
+                    pm_seat_flag "$tid" "$agent" "no grant for k8s seat $agent: $mid"
                 fi
             fi
             return 0
@@ -4775,11 +4866,11 @@ pm_spawn_wake() {
     # pm_pending_unshown). It lands only beside a snapshot that did, and
     # beside the snapshot dir rather than in it: the dir is the wake's mount.
     if ! mkdir -p -- "$snap_dir" 2>/dev/null; then
-        pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (mkdir)"
+        pm_seat_flag "$tid" "$agent" "wake thread snapshot failed for $agent: $mid (mkdir)"
     elif ! pm_thread_message_ids "$tid" > "$snap_dir.message-ids.part" 2>/dev/null \
         || ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" > "$snap_dir/thread.txt.part" 2>/dev/null; then
         rm -f -- "$snap_dir/thread.txt.part" "$snap_dir.message-ids.part"
-        pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (render)"
+        pm_seat_flag "$tid" "$agent" "wake thread snapshot failed for $agent: $mid (render)"
     else
         chmod 644 -- "$snap_dir/thread.txt.part" 2>/dev/null
         if mv -- "$snap_dir/thread.txt.part" "$snap_dir/thread.txt" 2>/dev/null; then
@@ -4788,7 +4879,7 @@ pm_spawn_wake() {
                 || rm -f -- "$snap_dir.message-ids.part"
         else
             rm -f -- "$snap_dir/thread.txt.part" "$snap_dir.message-ids.part"
-            pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (move)"
+            pm_seat_flag "$tid" "$agent" "wake thread snapshot failed for $agent: $mid (move)"
         fi
     fi
     # A hook may inspect the root message's headers, but the postmaster
@@ -4811,7 +4902,7 @@ pm_spawn_wake() {
 
     local handoff_file="$HANDOFFS/$run_id.md"
     if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$is_retry" "$protocol"; then
-        pm_flag "$tid" "handoff render failed for $agent: $mid"
+        pm_seat_flag "$tid" "$agent" "handoff render failed for $agent: $mid"
         return 0
     fi
     rm -f -- "$DISCARDS/$tid/$agent"
@@ -5004,7 +5095,7 @@ pm_spawn_wake() {
         pm_k8s_wake_launch "$wake_dir" 0 || launch_failed=1
         if (( launch_failed )); then
             echo "Error: postmaster: launching $agent for thread $tid (k8s) failed" >&2
-            pm_flag "$tid" "spawn failed for $agent: $mid"
+            pm_seat_flag "$tid" "$agent" "spawn failed for $agent: $mid"
             rm -rf -- "$wake_dir"
             return 0
         fi
@@ -5127,7 +5218,7 @@ pm_spawn_wake() {
     if (( rc != 0 )) || [[ -z "$run_dir" ]]; then
         echo "Error: postmaster: launching $agent for thread $tid failed:" >&2
         printf '%s\n' "$launch_out" >&2
-        pm_flag "$tid" "spawn failed for $agent: $mid"
+        pm_seat_flag "$tid" "$agent" "spawn failed for $agent: $mid"
         return 0
     fi
 
@@ -5256,6 +5347,7 @@ pm_process_message() {
             operator_mail=1
             # rule 1: operator/external mail resets the thread before rules 2-3.
             pm_unflag "$tid"
+            pm_seat_notes_clear "$tid"
             mkdir -p -- "$SPAWNS"
             : > "$SPAWNS/$tid"
         else
@@ -5270,6 +5362,7 @@ pm_process_message() {
     local uh_recorded=0 us_applied=0
     if [[ -n "$uh_value" ]] && pm_record_upstream_head "$tid" "$mid" "$from_name" "$uh_value" "$project"; then
         pm_unflag "$tid"
+        pm_seat_notes_clear "$tid"
         mkdir -p -- "$SPAWNS"
         : > "$SPAWNS/$tid"
         uh_recorded=1
@@ -5675,7 +5768,7 @@ pm_route_resume() {
             if pm_seat_has_run_for "$tid" "$agent" "$mid"; then
                 pm_route_plan_pop "$dir"
             elif [[ "$attempts" =~ ^[0-9]+$ ]] && (( attempts >= 2 )); then
-                pm_flag "$tid" "routing interrupted: woke no run for $agent on $mid after $attempts attempts" route-interrupted
+                pm_seat_flag "$tid" "$agent" "routing interrupted: woke no run for $agent on $mid after $attempts attempts" route-interrupted
                 pm_route_plan_pop "$dir"
             fi
         fi
@@ -5798,9 +5891,9 @@ pm_flag_quote_line() {
 # for the harvest's own use (an `on-silence: retry` seat is shown it in its
 # retry handoff). Whitespace runs are flattened so one reason is one line.
 pm_harvest_discard() {
-    local tid="$1" reason="$2" keyword="${3:-}"
+    local tid="$1" agent="$2" reason="$3" keyword="${4:-}"
     PM_HARVEST_DISCARDS+=("${reason//[$'\n\r\t']/ }")
-    pm_flag "$tid" "$reason" "$keyword"
+    pm_seat_flag "$tid" "$agent" "$reason" "$keyword"
 }
 
 pm_harvest_one_file() {
@@ -5821,7 +5914,7 @@ pm_harvest_one_file() {
         local reason
         reason="malformed reply file $(basename -- "$mf"): unparseable header stanza"
         [[ -n "$bad_line" ]] && reason+=": $(pm_flag_quote_line "$bad_line")"
-        pm_harvest_discard "$tid" "$reason"
+        pm_harvest_discard "$tid" "$agent" "$reason"
         return 1
     fi
     unset PM_PARSE_BAD_LINE_FILE
@@ -5840,7 +5933,7 @@ pm_harvest_one_file() {
     # malformed as any other reply this store refuses to post).
     if [[ -n "$version" && "$review_target_key" != sets ]]; then
         rm -f -- "$body_file"
-        pm_harvest_discard "$tid" "malformed reply file $(basename -- "$mf"): Version: header from a seat without review-target: sets"
+        pm_harvest_discard "$tid" "$agent" "malformed reply file $(basename -- "$mf"): Version: header from a seat without review-target: sets"
         return 1
     fi
 
@@ -5892,7 +5985,7 @@ pm_harvest_one_file() {
             done
             local reason
             reason="malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject (missing: $missing_joined)"
-            pm_harvest_discard "$tid" "$reason"
+            pm_harvest_discard "$tid" "$agent" "$reason"
             return 1
         fi
         cmd=("$MAIL" send --from "@$agent" --to "$to" --subject "$subject" --body "$body_file" --hops "$decremented")
@@ -5942,13 +6035,13 @@ pm_harvest_one_file() {
                 rt_new_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
             else
                 rm -f -- "$body_file"
-                pm_harvest_discard "$tid" "Version: $version but the wake's branch $wake_branch did not come back"
+                pm_harvest_discard "$tid" "$agent" "Version: $version but the wake's branch $wake_branch did not come back"
                 return 1
             fi
         fi
         if [[ "$rt_current" =~ ^[0-9]+$ ]] && (( version <= rt_current )); then
             rm -f -- "$body_file"
-            pm_harvest_discard "$tid" "Version: $version does not advance the review target (at $rt_current)"
+            pm_harvest_discard "$tid" "$agent" "Version: $version does not advance the review target (at $rt_current)"
             return 1
         fi
         cmd+=(--header "X-Review-Target-Set: $rt_new_branch $rt_new_sha")
@@ -5981,7 +6074,7 @@ pm_harvest_one_file() {
         # "handler "-prefixed patterns, so $err_out (the mail command's own
         # stderr) can't supply a false second literal the way it can at the
         # pm_exec_wake call site above (see pm_flag_keyword's own comment).
-        pm_harvest_discard "$tid" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply"
+        pm_harvest_discard "$tid" "$agent" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply"
         return 1
     fi
 
@@ -6179,7 +6272,7 @@ pm_retry_schedule() {
     cap="${#PM_RETRY_BACKOFF[@]}"
     if (( attempt >= cap )); then
         pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "" exhausted "$cap" "$rid" ""
-        pm_flag "$tid" "wake for $agent failed after $cap retries (trigger ${trigger:0:8})"
+        pm_seat_flag "$tid" "$agent" "wake for $agent failed after $cap retries (trigger ${trigger:0:8})"
         return 0
     fi
     local not_before
@@ -6226,7 +6319,7 @@ pm_k8s_streak_exhausted() {
     if [[ "$(fs_pm_env_get "$retry_file" STATE)" != exhausted || "$on_trigger" != "$trigger" ]]; then
         pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "" exhausted "$cap" "$last" ""
     fi
-    pm_flag_unless_current "$tid" "wake for $agent stopped after $count consecutive Kubernetes failures (run $last)"
+    pm_seat_flag_unless_current "$tid" "$agent" "wake for $agent stopped after $count consecutive Kubernetes failures (run $last)"
     return 0
 }
 
@@ -6503,7 +6596,7 @@ pm_harvest_run() {
         # a timeout or a tracked pid (see LIMITATIONS), so it is treated
         # as a terminal failure: flag the thread and unblock the agent
         # instead of leaving fs_pm_find_live_run wedged on it forever.
-        pm_flag_unless_closed "$tid" "run dir for $agent vanished (run $rid)"
+        pm_seat_flag_unless_closed "$tid" "$agent" "run dir for $agent vanished (run $rid)"
         [[ "$backend" == k8s ]] && pm_k8s_dead_reap_mark "$rid" "$branch"
         # Session state lives under this script's own state dir, not the
         # run dir that just vanished -- it is unaffected, so it is left
@@ -6554,7 +6647,7 @@ pm_harvest_run() {
         if recovered_by="$(pm_seat_recovered_after "$tid" "$agent" "$rid")"; then
             pm_event "flag-skip thread=${tid:0:8} agent=$agent reason=no-summary run=$rid by=$recovered_by"
         else
-            pm_flag_unless_closed "$tid" "$PM_NO_SUMMARY_PREFIX$rid$adopt_failed"
+            pm_seat_flag_unless_closed "$tid" "$agent" "$PM_NO_SUMMARY_PREFIX$rid$adopt_failed"
         fi
         was_failure=1
     else
@@ -6580,7 +6673,7 @@ pm_harvest_run() {
             # retry is ever scheduled on this path, and the still-running
             # Job is left alone for an operator to fetch or remove by
             # hand.
-            pm_flag_unless_closed "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job was still running, and the cluster stops it about 600s past the run's TIMEOUT -- until then fetch it with fork-sandbox-k8s.sh fetch --branch $branch; remove it with fork-sandbox-k8s.sh rm --branch $branch"
+            pm_seat_flag_unless_closed "$tid" "$agent" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job was still running, and the cluster stops it about 600s past the run's TIMEOUT -- until then fetch it with fork-sandbox-k8s.sh fetch --branch $branch; remove it with fork-sandbox-k8s.sh rm --branch $branch"
             k8s_still_running=1
         elif [[ "$exit_code" != "0" ]]; then
             # Harvest whatever outbox there is (a crash mid-reply may still
@@ -6605,7 +6698,7 @@ pm_harvest_run() {
             if [[ -f "$run_dir/launch.log" ]] && grep -q 'headroom: no candidate' "$run_dir/launch.log"; then
                 failure_reason="wake for $agent failed: headroom: no candidate (run $rid)"
             fi
-            pm_flag_unless_closed "$tid" "$failure_reason" "" "$log_key"
+            pm_seat_flag_unless_closed "$tid" "$agent" "$failure_reason" "" "$log_key"
             # A crash's own summary.json, when present and id-shaped, is
             # exactly as trustworthy as the success path's (it may be the
             # id a --refresh-at mid-run credential rollover resumed onto) --
@@ -6710,7 +6803,7 @@ pm_harvest_run() {
         if pm_run_target_answered "$f" "$tid" "$agent"; then
             pm_event "silent thread=${tid:0:8} agent=$agent reason=replied-on-target"
         else
-            pm_flag_unless_closed "$tid" "wake for $agent posted no reply (run $rid)" silent-wake
+            pm_seat_flag_unless_closed "$tid" "$agent" "wake for $agent posted no reply (run $rid)" silent-wake
         fi
     fi
 
@@ -7291,7 +7384,7 @@ pm_held_pass() {
                     pm_held_write "$tid" "$agent" "$q_trigger" "$(fs_pm_env_get "$f" SINCE)" \
                         "$(fs_pm_env_get "$f" RETRY)" 0
                     pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
-                    pm_flag_unless_closed "$tid" "no grant for k8s seat $agent: $q_trigger"
+                    pm_seat_flag_unless_closed "$tid" "$agent" "no grant for k8s seat $agent: $q_trigger"
                 fi
                 continue
             fi
@@ -8073,6 +8166,20 @@ cmd_status() {
     done
     (( any_flag )) || printf '  (none)\n'
 
+    # Only when there is one, so a store with no advisory-seat failure
+    # prints exactly what it always did.
+    local any_note=0 nf nagent ntime nkey
+    for nf in "$SEAT_NOTES"/*/*; do
+        [[ -f "$nf" ]] || continue
+        (( any_note )) || printf '\nseat notes:\n'
+        tid_f="$(basename -- "$(dirname -- "$nf")")"
+        nagent="$(basename -- "$nf")"
+        while IFS=$'\t' read -r ntime nkey; do
+            printf '  %s: %s %s at %s\n' "$tid_f" "$nagent" "$nkey" "$ntime"
+        done < "$nf"
+        any_note=1
+    done
+
     printf '\nspawns per thread:\n'
     local any_spawn=0 n
     for f in "$SPAWNS"/*; do
@@ -8174,6 +8281,7 @@ cmd_unflag() {
     local tid="${1:?Usage: fork-sandbox-postmaster.sh unflag <thread-id>}"
     mkdir -p -- "$STATE"
     pm_unflag "$tid"
+    pm_seat_notes_clear "$tid"
 }
 
 # Sourced (the test suite calls pm_hook_fire/pm_hook_reap directly): define
