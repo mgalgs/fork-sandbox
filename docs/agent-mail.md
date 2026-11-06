@@ -1714,7 +1714,9 @@ reason=malformed in place of attempt; see "Retrying a dead wake" below),
 re-run after that run posted no reply; see rule 5),
 `note` (thread, agent, reason=<keyword> — an `on-failure: note` seat failed
 where another seat would have flagged the thread; the keyword is the one the
-flag would have carried),
+flag would have carried, or a more specific one where the flag's would be
+`other`: `k8s-timeout`, `k8s-failure-streak`, `snapshot-failed`, and
+`wake-exit` for a headroom refusal),
 `silent` (thread, agent, reason=replied-on-target — an `on-silence` seat's
 clean wake posted nothing on a review target it had already replied on, so
 the thread was not flagged; see "Silent wakes"),

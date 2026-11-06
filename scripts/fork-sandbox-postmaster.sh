@@ -104,7 +104,10 @@
 #   note         thread, agent, reason=<fixed keyword> -- an advisory
 #                (`on-failure: note`) seat failed where any other seat
 #                would have flagged the thread; the keyword is the one the
-#                flag would have carried (see SEAT NOTES below)
+#                flag would have carried, or a more specific one where
+#                the flag's would be `other`: k8s-timeout,
+#                k8s-failure-streak, snapshot-failed, and wake-exit for a
+#                headroom refusal (see SEAT NOTES below)
 #   flag-clear   thread, agent, reason=wake-exit|no-summary|silent-wake|no-grant,
 #                run=<failed run id> (all but no-grant),
 #                by=<recovering run id>, flagged=yes|no -- a wake of the
