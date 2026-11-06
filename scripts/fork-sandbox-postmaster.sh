@@ -2465,11 +2465,13 @@ pm_seat_note_keyword() {
 
 # Records a failure of advisory seat $2 on thread $1: one line, UTC time and
 # keyword, on $SEAT_NOTES/<tid>/<agent>, and one `note` event. Never the
-# reason text: the keyword is all a note carries.
+# reason text: the keyword is all a note carries. $4, when given, is the
+# failed run's id, stored as a third column (`status --thread --json`'s
+# seat_notes run_id); the caller passes it, it is never parsed from text.
 pm_seat_note() {
-    local tid="$1" agent="$2" keyword="$3"
+    local tid="$1" agent="$2" keyword="$3" rid="${4:-}"
     mkdir -p -- "$SEAT_NOTES/$tid"
-    printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$keyword" >> "$SEAT_NOTES/$tid/$agent"
+    printf '%s\t%s%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$keyword" "${rid:+$'\t'$rid}" >> "$SEAT_NOTES/$tid/$agent"
     pm_event "note thread=${tid:0:8} agent=$agent reason=$keyword"
 }
 
@@ -2478,27 +2480,29 @@ pm_seat_notes_clear() {
 }
 
 # pm_flag on seat $2's behalf: `pm_seat_flag <tid> <agent> <reason>
-# [keyword] [extra]`, pm_flag's own arguments with the agent added. An
-# advisory seat notes instead, and so never touches the thread's flag (an
+# [keyword] [extra] [run-id]`, pm_flag's own arguments with the agent added,
+# and the failed run's id where the caller has one. An advisory seat notes
+# instead (with that run id), and so never touches the thread's flag (an
 # existing reason survives); any other seat flags exactly as pm_flag does.
 pm_seat_flag() {
-    local tid="$1" agent="$2" reason="$3" keyword="${4:-}" extra="${5:-}"
+    local tid="$1" agent="$2" reason="$3" keyword="${4:-}" extra="${5:-}" rid="${6:-}"
     if pm_seat_advisory "$agent"; then
         [[ -n "$keyword" ]] || keyword="$(pm_seat_note_keyword "$reason")"
-        pm_seat_note "$tid" "$agent" "$keyword"
+        pm_seat_note "$tid" "$agent" "$keyword" "$rid"
         return 0
     fi
     pm_flag "$tid" "$reason" "$keyword" "$extra"
 }
 
 # pm_flag_unless_current for a seat: a standing condition notes once, while
-# the seat's newest note is not already this keyword.
+# the seat's newest note is not already this keyword. $4 is the run id, as
+# for pm_seat_flag.
 pm_seat_flag_unless_current() {
-    local tid="$1" agent="$2" reason="$3" keyword last
+    local tid="$1" agent="$2" reason="$3" rid="${4:-}" keyword last
     if pm_seat_advisory "$agent"; then
         keyword="$(pm_seat_note_keyword "$reason")"
         last="$(tail -n1 -- "$SEAT_NOTES/$tid/$agent" 2>/dev/null | cut -f2)"
-        [[ "$last" == "$keyword" ]] || pm_seat_note "$tid" "$agent" "$keyword"
+        [[ "$last" == "$keyword" ]] || pm_seat_note "$tid" "$agent" "$keyword" "$rid"
         return 0
     fi
     pm_flag_unless_current "$tid" "$reason"
@@ -6275,7 +6279,7 @@ pm_retry_schedule() {
     cap="${#PM_RETRY_BACKOFF[@]}"
     if (( attempt >= cap )); then
         pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "" exhausted "$cap" "$rid" ""
-        pm_seat_flag "$tid" "$agent" "wake for $agent failed after $cap retries (trigger ${trigger:0:8})"
+        pm_seat_flag "$tid" "$agent" "wake for $agent failed after $cap retries (trigger ${trigger:0:8})" "" "" "$rid"
         return 0
     fi
     local not_before
@@ -6322,7 +6326,7 @@ pm_k8s_streak_exhausted() {
     if [[ "$(fs_pm_env_get "$retry_file" STATE)" != exhausted || "$on_trigger" != "$trigger" ]]; then
         pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "" exhausted "$cap" "$last" ""
     fi
-    pm_seat_flag_unless_current "$tid" "$agent" "wake for $agent stopped after $count consecutive Kubernetes failures (run $last)"
+    pm_seat_flag_unless_current "$tid" "$agent" "wake for $agent stopped after $count consecutive Kubernetes failures (run $last)" "$last"
     return 0
 }
 
@@ -6599,7 +6603,7 @@ pm_harvest_run() {
         # a timeout or a tracked pid (see LIMITATIONS), so it is treated
         # as a terminal failure: flag the thread and unblock the agent
         # instead of leaving fs_pm_find_live_run wedged on it forever.
-        pm_seat_flag_unless_closed "$tid" "$agent" "run dir for $agent vanished (run $rid)"
+        pm_seat_flag_unless_closed "$tid" "$agent" "run dir for $agent vanished (run $rid)" "" "" "$rid"
         [[ "$backend" == k8s ]] && pm_k8s_dead_reap_mark "$rid" "$branch"
         # Session state lives under this script's own state dir, not the
         # run dir that just vanished -- it is unaffected, so it is left
@@ -6650,7 +6654,7 @@ pm_harvest_run() {
         if recovered_by="$(pm_seat_recovered_after "$tid" "$agent" "$rid")"; then
             pm_event "flag-skip thread=${tid:0:8} agent=$agent reason=no-summary run=$rid by=$recovered_by"
         else
-            pm_seat_flag_unless_closed "$tid" "$agent" "$PM_NO_SUMMARY_PREFIX$rid$adopt_failed"
+            pm_seat_flag_unless_closed "$tid" "$agent" "$PM_NO_SUMMARY_PREFIX$rid$adopt_failed" "" "" "$rid"
         fi
         was_failure=1
     else
@@ -6676,7 +6680,7 @@ pm_harvest_run() {
             # retry is ever scheduled on this path, and the still-running
             # Job is left alone for an operator to fetch or remove by
             # hand.
-            pm_seat_flag_unless_closed "$tid" "$agent" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job was still running, and the cluster stops it about 600s past the run's TIMEOUT -- until then fetch it with fork-sandbox-k8s.sh fetch --branch $branch; remove it with fork-sandbox-k8s.sh rm --branch $branch"
+            pm_seat_flag_unless_closed "$tid" "$agent" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job was still running, and the cluster stops it about 600s past the run's TIMEOUT -- until then fetch it with fork-sandbox-k8s.sh fetch --branch $branch; remove it with fork-sandbox-k8s.sh rm --branch $branch" "" "" "$rid"
             k8s_still_running=1
         elif [[ "$exit_code" != "0" ]]; then
             # Harvest whatever outbox there is (a crash mid-reply may still
@@ -6701,7 +6705,7 @@ pm_harvest_run() {
             if [[ -f "$run_dir/launch.log" ]] && grep -q 'headroom: no candidate' "$run_dir/launch.log"; then
                 failure_reason="wake for $agent failed: headroom: no candidate (run $rid)"
             fi
-            pm_seat_flag_unless_closed "$tid" "$agent" "$failure_reason" "" "$log_key"
+            pm_seat_flag_unless_closed "$tid" "$agent" "$failure_reason" "" "$log_key" "$rid"
             # A crash's own summary.json, when present and id-shaped, is
             # exactly as trustworthy as the success path's (it may be the
             # id a --refresh-at mid-run credential rollover resumed onto) --
@@ -6806,7 +6810,7 @@ pm_harvest_run() {
         if pm_run_target_answered "$f" "$tid" "$agent"; then
             pm_event "silent thread=${tid:0:8} agent=$agent reason=replied-on-target"
         else
-            pm_seat_flag_unless_closed "$tid" "$agent" "wake for $agent posted no reply (run $rid)" silent-wake
+            pm_seat_flag_unless_closed "$tid" "$agent" "wake for $agent posted no reply (run $rid)" silent-wake "" "$rid"
         fi
     fi
 
@@ -7973,6 +7977,17 @@ cmd_status_json() {
             [[ "$hsince" =~ ^[0-9]+$ ]] || hsince=0
             printf '%s\0' held "$(basename -- "$hf")" "$(fs_pm_env_get "$hf" TRIGGER)" "$(( now - hsince ))"
         done
+
+        # A two-column line (written before notes carried a run id) reads
+        # with an empty run id.
+        local nf nagent ntime nkey nrid
+        for nf in "$SEAT_NOTES/$tid"/*; do
+            [[ -f "$nf" ]] || continue
+            nagent="${nf##*/}"
+            while IFS=$'\t' read -r ntime nkey nrid; do
+                printf '%s\0' seat_note "$nagent" "$nkey" "$ntime" "$nrid"
+            done < "$nf"
+        done
     } | python3 -c '
 import json, sys
 
@@ -7983,10 +7998,11 @@ out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
        "review_target": None,
        "spawns": 0, "runs": [], "retries": [], "held": [],
        "budget": None, "budget_source": None, "spawns_total": 0,
-       "grant_mode": "missing", "wake_deferred": []}
+       "grant_mode": "missing", "wake_deferred": [], "seat_notes": []}
 arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "upstream_state": 3,
          "review_target": 5, "spawns": 1, "budget": 2, "spawns_total": 1, "grant_mode": 1,
-         "run": 13, "retry": 5, "held": 3, "wake_exit": 3, "wake_deferred": 2}
+         "run": 13, "retry": 5, "held": 3, "wake_exit": 3, "wake_deferred": 2,
+         "seat_note": 4}
 wake_exits = []
 i = 0
 while i < len(tok):
@@ -8037,6 +8053,9 @@ while i < len(tok):
                                "reason": a[4] or "failed"})
     elif tag == "held":
         out["held"].append({"agent": a[0], "trigger": a[1], "age_s": int(a[2])})
+    elif tag == "seat_note":
+        out["seat_notes"].append({"agent": a[0], "reason": a[1], "at": a[2],
+                                  "run_id": a[3] or None})
     elif tag == "wake_exit":
         # The record is a file under the state dir, so rebuild it field by
         # field rather than pass it through: only these keys, only these
@@ -8072,6 +8091,9 @@ while i < len(tok):
             wake_exits.append(rec)
         except (ValueError, KeyError, TypeError):
             pass
+# Oldest first across seats; a stable sort keeps the same-second notes of
+# one seat in the order they were written.
+out["seat_notes"].sort(key=lambda n: n["at"])
 if wake_exits:
     wake_exits.sort(key=lambda r: (r["at"], r["run_id"]))
     out["wake_failures"] = wake_exits
@@ -8177,7 +8199,7 @@ cmd_status() {
         (( any_note )) || printf '\nseat notes:\n'
         tid_f="$(basename -- "$(dirname -- "$nf")")"
         nagent="$(basename -- "$nf")"
-        while IFS=$'\t' read -r ntime nkey; do
+        while IFS=$'\t' read -r ntime nkey _; do
             printf '  %s: %s %s at %s\n' "$tid_f" "$nagent" "$nkey" "$ntime"
         done < "$nf"
         any_note=1

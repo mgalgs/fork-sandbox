@@ -341,7 +341,7 @@ bad = []
 def want(label, got, exp):
     if got != exp:
         bad.append(f"{label}: expected {exp!r}, got {got!r}")
-want("keys", sorted(d), ["budget", "budget_source", "flag", "grant", "grant_mode", "held", "retries", "review_target", "runs", "spawns", "spawns_total", "thread", "unrouted", "wake_deferred"])
+want("keys", sorted(d), ["budget", "budget_source", "flag", "grant", "grant_mode", "held", "retries", "review_target", "runs", "seat_notes", "spawns", "spawns_total", "thread", "unrouted", "wake_deferred"])
 want("budget", [d["budget"], d["budget_source"], d["spawns_total"]], [96, "global", 0])
 want("grant_mode", d["grant_mode"], "file")
 want("thread", d["thread"], t)
@@ -379,7 +379,7 @@ check "status --json: a flag without its journal has events null" \
 
 sfx_empty="$(sfx_pm status --thread "ffffffff-4444-4444-8444-000000000009" --json)"
 check "status --json: a thread with no state is all empty or zero" \
-    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": [], "budget": 96, "budget_source": "global", "spawns_total": 0, "grant_mode": "missing", "wake_deferred": []}' \
+    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": [], "budget": 96, "budget_source": "global", "spawns_total": 0, "grant_mode": "missing", "wake_deferred": [], "seat_notes": []}' \
     "$sfx_empty"
 
 sfx_rc=0; sfx_out="$(sfx_pm status --json 2>&1)" || sfx_rc=$?

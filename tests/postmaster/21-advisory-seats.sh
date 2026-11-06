@@ -58,6 +58,9 @@ as_noted() {
     contains "$label: status has a seat notes section" "$st" $'\nseat notes:\n'
     contains "$label: status lists the note" "$st" "  $as_tid: $seat $kw at "
 }
+# as_notes_py <expr>: <expr> over `status --thread --json` (as d) for the
+# current thread.
+as_notes_py() { we_py "$("$postmaster" status --thread "$as_tid" --json)" "$1"; }
 # as_flagged <label> <reason substring>: the flag seat's thread is flagged.
 as_flagged() {
     contains "$1: the flag seat flags the thread" "$(as_flag "$as_tid")" "$2"
@@ -83,9 +86,21 @@ printf '\n== advisory seat: a wake that exits non-zero ==\n'
 # ============================================================
 
 as_start nora
+check "seat_notes: an empty list on a thread with no notes" '[]' \
+    "$(as_notes_py 'json.dumps(d["seat_notes"])')"
+as_rid="$(basename -- "$(env_file_for_agent nora)" .env)"
 finish_run nora 1
 as_once
 as_noted "wake exit" nora wake-exit
+check "seat_notes: one note after the failed wake" 1 "$(as_notes_py 'len(d["seat_notes"])')"
+check "seat_notes: the note names the bare seat" nora "$(as_notes_py 'd["seat_notes"][0]["agent"]')"
+check "seat_notes: the note's reason is its keyword" wake-exit "$(as_notes_py 'd["seat_notes"][0]["reason"]')"
+check "seat_notes: a harvest-path note carries the failed run's id" "$as_rid" \
+    "$(as_notes_py 'd["seat_notes"][0]["run_id"]')"
+check "seat_notes: at is the stored time" "$(cut -f1 "$PM_STATE_DIR/seat-notes/$as_tid/nora")" \
+    "$(as_notes_py 'd["seat_notes"][0]["at"]')"
+contains "seat_notes: the text status shows no run id" "$("$postmaster" status 2>&1)" \
+    $'  '"$as_tid: nora wake-exit at $(cut -f1 "$PM_STATE_DIR/seat-notes/$as_tid/nora")"$'\n'
 check "wake exit: the crash retry is still scheduled" pending \
     "$(env_val "$PM_STATE_DIR/retries/$as_tid/nora" STATE)"
 check "wake exit: the wake-exit record is still kept" 1 \
@@ -248,6 +263,8 @@ printf '\n== advisory seat: a grant: required k8s seat with no grant ==\n'
 
 as_start kody
 as_noted "no grant" kody no-grant
+check "seat_notes: a note from a non-run path has run_id null" None \
+    "$(as_notes_py 'd["seat_notes"][0]["run_id"]')"
 check "no grant: the seat is still held" 1 \
     "$([[ -f "$PM_STATE_DIR/held/$as_tid/kody" ]] && echo 1 || echo 0)"
 as_once
@@ -293,6 +310,8 @@ check "operator mail: the note is there first" 1 \
     "$(wc -l < "$PM_STATE_DIR/seat-notes/$as_tid/nora")"
 reply_msg '@operator' "$as_mid" 'seen it' --to '@operator' >/dev/null
 as_once
+check "operator mail: seat_notes is empty again" '[]' \
+    "$(as_notes_py 'json.dumps(d["seat_notes"])')"
 check "operator mail: the thread's notes are gone" no \
     "$([[ -e "$PM_STATE_DIR/seat-notes/$as_tid" ]] && echo yes || echo no)"
 not_contains "operator mail: status lists no seat notes" "$("$postmaster" status 2>&1)" "seat notes:"
@@ -303,5 +322,27 @@ as_once
 "$postmaster" unflag "$as_tid" >/dev/null 2>&1
 check "unflag: the operator verb clears the notes too" no \
     "$([[ -e "$PM_STATE_DIR/seat-notes/$as_tid" ]] && echo yes || echo no)"
+
+# ============================================================
+printf '\n== advisory seat: seat_notes order and the two-column line ==\n'
+# ============================================================
+
+# Hand-written lines: the seat whose file globs first holds the newer note,
+# and one line is the two-column shape written before notes carried a run id.
+as_start nora
+mkdir -p -- "$PM_STATE_DIR/seat-notes/$as_tid"
+printf '2026-01-02T00:00:00Z\tspawn-failed\n' > "$PM_STATE_DIR/seat-notes/$as_tid/aria"
+printf '2026-01-01T00:00:00Z\twake-exit\trun-older\n2026-01-03T00:00:00Z\tno-summary\trun-newer\n' \
+    > "$PM_STATE_DIR/seat-notes/$as_tid/zed"
+check "seat_notes: oldest first across seats" "zed aria zed" \
+    "$(as_notes_py '" ".join(n["agent"] for n in d["seat_notes"])')"
+check "seat_notes: a two-column line reads with run_id null" None \
+    "$(as_notes_py 'd["seat_notes"][1]["run_id"]')"
+check "seat_notes: three-column lines keep their run ids" "run-older run-newer" \
+    "$(as_notes_py '" ".join(d["seat_notes"][i]["run_id"] for i in (0, 2))')"
+check "seat_notes: exactly the agreed keys" "agent at reason run_id" \
+    "$(as_notes_py '" ".join(sorted(d["seat_notes"][0]))')"
+contains "seat_notes: the text status reads the three-column line unchanged" \
+    "$("$postmaster" status 2>&1)" "  $as_tid: zed no-summary at 2026-01-03T00:00:00Z"$'\n'
 
 finish_suite
