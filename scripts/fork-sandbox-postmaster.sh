@@ -46,8 +46,11 @@
 # no flag), whether it has a grant, its spawn count, every run recorded for
 # it (harvested ones too, state "harvested" or "live"), every retry record
 # (all states, state as recorded, due_s floored at 0) and every held seat
-# (the full trigger id). Agent names are as stored, without the '@'. A thread
-# where a wake exited non-zero also carries `wake_failures` (the key is absent
+# (the full trigger id). Agent names are as stored, without the '@'.
+# `seat_notes` is always present: one {agent, reason, at, run_id} entry per
+# note of an advisory seat (see SEAT NOTES), oldest first, [] when none;
+# reason is the note keyword and run_id the failed run's id, or null when
+# the failure belongs to no run. A thread where a wake exited non-zero also carries `wake_failures` (the key is absent
 # otherwise, so a thread of clean wakes prints exactly what it always did):
 # one {run_id, agent, exit_code, at, log, cleared[, kubernetes]} entry per failed attempt,
 # oldest first, where log is {state, source[, lines, truncated, tail]} -- the
@@ -1013,7 +1016,9 @@
 # crash-retry exhaustion, a spawn, snapshot, handoff, grant or handler
 # failure, an interrupted route -- is recorded instead of flagged
 # (pm_seat_flag): a `note` event and a line on seat-notes/<tid>/<agent>,
-# which `status` lists under "seat notes:". Retries, budgets and routing are
+# which `status` lists under "seat notes:" and `status --thread --json`
+# serves as seat_notes (the keyword set is listed in docs/agent-mail.md
+# under on-failure). Retries, budgets and routing are
 # unchanged, and the thread's flag file is never touched, so an existing
 # reason survives. Thread-level flags (hops, budget, reserve, deferral,
 # review-target, cluster-probe, unresolvable To/Cc) still flag whatever seat
@@ -1191,9 +1196,12 @@
 #                                   exited ` prefix and its `(run <id>)`
 #                                   shape -- keep them when pruning,
 #                                   rotating or rewording
-#   seat-notes/<thread-id>/<agent>  one `<UTC time>\t<keyword>` line per
-#                                   failure of an advisory seat (see SEAT
-#                                   NOTES); cleared with the thread's flag
+#   seat-notes/<thread-id>/<agent>  one `<UTC time>\t<keyword>[\t<run id>]`
+#                                   line per failure of an advisory seat
+#                                   (see SEAT NOTES), the run id only when
+#                                   the caller had one; served as
+#                                   seat_notes by `status --thread --json`;
+#                                   cleared with the thread's flag
 #   wake-exits/<thread-id>/<agent>/<run-id>.json  one failed wake's
 #                                   evidence: agent, run id, exit code, an
 #                                   optional Kubernetes terminal status and
@@ -1457,8 +1465,8 @@ UNRESOLVED_TO="$STATE/unresolved-to"
 # silently stops successful retries from clearing their flags.
 NEEDS_OPERATOR_JOURNAL="$STATE/needs-operator-journal"
 # Per-thread, per-seat notes of advisory-seat failures (see SEAT NOTES in
-# the header): $SEAT_NOTES/<thread-id>/<agent>, one `<UTC time>\t<keyword>`
-# line per noted failure. Cleared with the thread's flag by operator mail.
+# the header): $SEAT_NOTES/<thread-id>/<agent>, one
+# `<UTC time>\t<keyword>[\t<run id>]` line per noted failure. Cleared with the thread's flag by operator mail.
 SEAT_NOTES="$STATE/seat-notes"
 # Per-thread evidence for a wake that exited non-zero, one JSON record per
 # failed attempt at $WAKE_EXITS/<thread-id>/<agent>/<run-id>.json (see

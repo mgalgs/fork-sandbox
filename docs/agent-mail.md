@@ -857,6 +857,28 @@ thread-level flags (hops, budget, review target) still flag. `flag`, the
 default, keeps today's behaviour. It is fleet.yaml-only, any seat may
 carry it, and operator mail clears a thread's notes along with its flag.
 
+A note carries a keyword, never the reason text; it is the `reason` of the
+note's `note` event, its "seat notes:" line and its `seat_notes` entry in
+`status --thread --json` (see "Status"). The set is stable:
+
+- `wake-exit` — the wake exited non-zero (or found no credential headroom)
+- `no-summary` — the wake died without a `summary.json`
+- `run-vanished` — the run dir disappeared
+- `silent-wake` — an `on-silence` seat's clean wake posted nothing
+- `malformed-reply` — a reply file was discarded as malformed
+- `review-target` — a reply's `Version:` was refused
+- `retry-exhausted` — the crash retries ran out
+- `k8s-timeout` — a Kubernetes wake timed out waiting on its Job
+- `k8s-failure-streak` — the seat stopped after consecutive Kubernetes failures
+- `no-grant` — a `grant: required` Kubernetes seat had no grant
+- `spawn-failed` — the wake could not be launched
+- `snapshot-failed` — the wake's thread snapshot could not be written
+- `handoff-render-failed` — the wake's handoff could not be rendered
+- `route-interrupted` — routing woke no run for the seat after its attempts
+- `handler-exit`, `handler-timeout` — a handler seat's command failed or timed out
+- `handler-bad-command`, `handler-missing`, `handler-not-regular`,
+  `handler-not-executable`, `render-failed` — a handler seat could not be run
+
 An optional top-level `budget-reserve:` block holds back the last spawns
 of a thread's budget for named seats (routing rule 3 below):
 
@@ -1531,6 +1553,22 @@ absent on a thread that never did, so its output is unchanged. The plain
 (human) `status` ends with an `upstream closed:` section, one
 `<thread-id>: CLOSED at <time> (msg <id>)` line per closed thread, printed
 only when there is one.
+
+It also includes a `seat_notes` list, always present (`[]` when the thread
+has none): one entry per note of an `on-failure: note` seat, oldest first,
+
+```json
+{"agent": "<seat>", "reason": "<note keyword>", "at": "<UTC timestamp>",
+ "run_id": "<run id>"}
+```
+
+where `agent` is the bare seat name (as in `runs[].agent`), `reason` is one
+of the keywords listed under the fleet's `on-failure` key, and `run_id`
+names the failed run when the failure belongs to one (a harvested wake,
+crash-retry exhaustion, a Kubernetes failure streak) and is `null`
+otherwise (a spawn, grant, handler or snapshot failure, a discarded
+reply). It is what tells an advisory seat that failed from one still at
+work; operator mail and `unflag` empty it.
 
 It also includes a `wake_failures` list, present only on a thread where a
 wake has exited non-zero (a thread whose wakes all succeeded has no such
@@ -2552,7 +2590,7 @@ own thread scans never see it:
 | `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
-| `seat-notes/<thread-id>/<agent>` | one `<UTC time>\t<keyword>` line per failure of an `on-failure: note` seat on that thread; listed by `status` under "seat notes:" and removed when operator mail (or `unflag`) clears the thread |
+| `seat-notes/<thread-id>/<agent>` | one `<UTC time>\t<keyword>[\t<run id>]` line per failure of an `on-failure: note` seat on that thread (the run id only when the failure belongs to a run); listed by `status` under "seat notes:", served as `seat_notes` by `status --thread --json`, and removed when operator mail (or `unflag`) clears the thread |
 | `discards/<thread-id>/<agent>` | one line per reply file of a clean wake that the postmaster discarded (or the single `no-reply-file` sentinel line for a wake that wrote none), kept for the `on-silence: retry` handoff and removed when that handoff is written |
 | `discards/<thread-id>/<agent>.spent` | the trigger message id whose one malformed retry has been scheduled; never reopened by a crash retry |
 | `discards/<thread-id>/<agent>.prior` | the seat's crash-retry record set aside while a malformed schedule is pending; put back when that schedule ends |
