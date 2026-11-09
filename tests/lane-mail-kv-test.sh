@@ -248,6 +248,40 @@ kv get --json race
 jv="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["value"], d["version"])' "$scratch/out")"
 check "the stored value and version are the winner's" test "$jv" = "writer-$winner $(cat "$scratch/race/$winner.out" 2>/dev/null)"
 
+printf '== list ==\n'
+
+# A fresh store, so the expected listings are exact.
+rm -rf -- "$store"
+kv list
+if (( rc == 0 )) && [[ ! -s "$scratch/out" ]]; then
+    ok "list with no store yet prints nothing and exits 0"
+else
+    no "list with no store yet prints nothing and exits 0" "rc=$rc"
+fi
+kv set 'pr:org/b#2' '@beta'
+kv set 'pr:org/a#10' $'@alpha\n'
+kv set 'owner:x' 'x'
+kv list
+check "list prints every key, sorted, one per line" out_is $'owner:x\npr:org/a#10\npr:org/b#2\n'
+kv list --prefix pr:org/
+check "list --prefix keeps only matching keys" out_is $'pr:org/a#10\npr:org/b#2\n'
+kv list --prefix nomatch
+check "list --prefix with no match prints nothing" out_is ''
+kv list --json
+json_ok="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1])) == {"owner:x": "x", "pr:org/a#10": "@alpha\n", "pr:org/b#2": "@beta"})
+' "$scratch/out" 2>&1)"
+check "list --json maps every key to its value" test "$json_ok" = True
+kv list --json --prefix pr:
+json_ok="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1])) == {"pr:org/a#10": "@alpha\n", "pr:org/b#2": "@beta"})
+' "$scratch/out" 2>&1)"
+check "list --json --prefix maps only matching keys" test "$json_ok" = True
+kv list extra
+check "list with a stray argument is a usage error" test "$rc" = 2
+
 leftovers="$(find "$store" -name '.tmp-*' | wc -l)"
 check "no temp files are left in the store" test "$leftovers" = 0
 

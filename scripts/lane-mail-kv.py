@@ -4,6 +4,7 @@
 Usage: lane-mail-kv.py <store-dir> get [--json] <key>
        lane-mail-kv.py <store-dir> set <key> <value|-> [--if-version <v> | --if-absent]
        lane-mail-kv.py <store-dir> del <key> [--if-version <v>]
+       lane-mail-kv.py <store-dir> list [--json] [--prefix <p>]
 
 Plumbing: run it through `lane-mail.sh kv`, which passes the store
 directory (<LANE_MAIL_ROOT>/kv) itself. The verbs, exit codes, key and
@@ -219,12 +220,35 @@ def cmd_del(store, args):
         os.unlink(os.path.join(store, file_name(key)))
 
 
-VERBS = {"get": cmd_get, "set": cmd_set, "del": cmd_del}
+def cmd_list(store, args):
+    pos, opts = parse(args, {"--json"}, {"--prefix"})
+    if pos:
+        usage("usage: kv list [--json] [--prefix <p>]")
+    prefix = opts.get("--prefix", "")
+    try:
+        names = os.listdir(store)
+    except FileNotFoundError:
+        names = []
+    keys = sorted(k for k in (key_of(n) for n in names if not n.startswith("."))
+                  if k.startswith(prefix))
+    if "--json" not in opts:
+        for k in keys:
+            print(k)
+        return
+    out = {}
+    for k in keys:
+        rec = read_record(store, k)
+        if rec is not None:  # deleted since the listing
+            out[k] = as_text(rec[1])
+    print(json.dumps(out, sort_keys=True))
+
+
+VERBS = {"get": cmd_get, "set": cmd_set, "del": cmd_del, "list": cmd_list}
 
 
 def main(argv):
     if len(argv) < 3 or argv[2] not in VERBS:
-        sys.stderr.write("lane-mail: usage: kv get|set|del ... (see lane-mail.sh --help)\n")
+        sys.stderr.write("lane-mail: usage: kv get|set|del|list ... (see lane-mail.sh --help)\n")
         return EXIT_USAGE
     try:
         VERBS[argv[2]](argv[1], argv[3:])
