@@ -358,7 +358,7 @@ echo 1 > "$PS_OUT/verdict"
 ps_mid="$(send_msg '@alice' '@wanda, @rita' 'panel topic' 'review please' 8)"
 ps_tid="$(thread_of "$ps_mid")"; ps_short="${ps_tid:0:8}"
 once
-check "re-gate: the gate deferred wanda on arrival" "wanda $ps_mid" "$(cat "$PM_STATE_DIR/wake-deferred/$ps_tid")"
+check "re-gate: the gate deferred wanda on arrival" "wanda $ps_mid" "$(deferral_seats "$PM_STATE_DIR/wake-deferred/$ps_tid")"
 check "re-gate: status wake_deferred lists the deferral" "[{'agent': 'wanda', 'message_id': '$ps_mid'}]" \
     "$(we_py "$(we_json "$ps_tid")" 'd["wake_deferred"]')"
 check "re-gate: rita (no gate) spawned" 1 "$(ps_spawns rita)"
@@ -390,7 +390,7 @@ finish_run rita 0
 once
 check "re-gate: the gate ran a second time" 2 "$(wc -l < "$PS_OUT/calls")"
 check "re-gate: exit 1 left no wanda spawn" 0 "$(ps_spawns wanda)"
-check "re-gate: and the same deferral line" "wanda $ps_mid" "$(cat "$PM_STATE_DIR/wake-deferred/$ps_tid")"
+check "re-gate: and the same deferral line" "wanda $ps_mid" "$(deferral_seats "$PM_STATE_DIR/wake-deferred/$ps_tid")"
 contains "re-gate: the quiescence flag fires as before" "$(cat "$PM_STATE_DIR/needs-operator/$ps_tid")" \
     "wake deferred: @wanda at $ps_mid and nothing woke it"
 

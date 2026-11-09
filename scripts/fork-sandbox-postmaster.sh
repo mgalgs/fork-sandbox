@@ -1494,11 +1494,15 @@ PM_WAKE_EXIT_TAIL_BYTES=8192
 # directory and file: both come from this script's own registry and uuid
 # generator, so this only guards the path against a corrupted run record.
 PM_WAKE_EXIT_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
-# Per-thread seat records, one `<agent> <message-id>` line per seat: a wake
-# the seat's wake-when gate deferred and that nothing has since replaced.
-# A seat's line goes when that seat actually spawns on the thread, by any
-# path. A thread that goes quiescent with a record still standing is
-# flagged once per message count (DEFERRAL_MARKS) -- see pm_deferral_pass.
+# Per-thread seat records, one `<agent> <message-id> <due> <attempt>` line
+# per seat: a wake the seat's wake-when gate deferred and that nothing has
+# since replaced. <due> is when its next timed re-gate falls (epoch seconds)
+# and <attempt> how many timed re-gates have run for it (pm_deferral_set); a
+# line of the older two-field shape reads as due now, attempt 0
+# (pm_deferral_parse). A seat's line goes when that seat actually spawns on
+# the thread, by any path. A thread that goes quiescent with a record still
+# standing is flagged once per message count (DEFERRAL_MARKS) -- see
+# pm_deferral_pass.
 WAKE_DEFERRED="$STATE/wake-deferred"
 # The same shape for a seat the budget reserve refused (see pm_in_reserve_band);
 # it flags at quiescence too, never at the moment of refusal.
@@ -4517,17 +4521,72 @@ pm_held_write() {
     mv -- "$tmp" "$STATE/held/$tid/$agent"
 }
 
-# Replaces seat $3's line in per-thread record $1/$2 with `<agent> <mid>`
-# (full-file tmp+mv: a reader never sees a partial write).
+# Replaces seat $3's line in per-thread record $1/$2 with `<agent> <mid>`,
+# followed by any further arguments as more fields (full-file tmp+mv: a
+# reader never sees a partial write).
 pm_seat_record_set() {
     local dir="$1" tid="$2" agent="$3" mid="$4" tmp
+    shift 4
     mkdir -p -- "$dir"
     tmp="$(mktemp "$dir/.tmp.XXXXXX")"
     {
         [[ ! -f "$dir/$tid" ]] || awk -v a="$agent" '$1 != a' "$dir/$tid"
-        printf '%s %s\n' "$agent" "$mid"
+        printf '%s %s' "$agent" "$mid"
+        (( $# == 0 )) || printf ' %s' "$@"
+        printf '\n'
     } > "$tmp"
     mv -- "$tmp" "$dir/$tid"
+}
+
+# Now, in epoch seconds. The timed re-gate's clock (deferral due times and
+# the check against them) and nothing else reads it, so a test can move that
+# clock with $FORK_SANDBOX_POSTMASTER_TEST_NOW instead of sleeping. Not an
+# operator knob.
+pm_now() {
+    printf '%s\n' "${FORK_SANDBOX_POSTMASTER_TEST_NOW:-$(date +%s)}"
+}
+
+# A non-negative integer env value: $1's value when it is one, else the
+# default $2. Unset or empty takes the default too.
+pm_env_uint() {
+    local raw="${!1-}"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$((10#$raw))"
+    else
+        printf '%s\n' "$2"
+    fi
+}
+
+# The timed re-gate schedule (see rule 5 in the header): interval n is
+# base * 2^n seconds, and a deferral is re-gated at most ATTEMPTS times.
+pm_regate_base() { pm_env_uint FORK_SANDBOX_WAKE_REGATE_BASE 300; }
+pm_regate_attempts() { pm_env_uint FORK_SANDBOX_WAKE_REGATE_ATTEMPTS 4; }
+
+# Records seat $2's deferral on thread $1 for message $3 after $4 timed
+# re-gates: due one interval $4 from now (base * 2^$4). Every path but a
+# timed re-gate passes 0 -- a defer on fresh information starts the count
+# again.
+pm_deferral_set() {
+    local tid="$1" agent="$2" mid="$3" attempt="$4" base
+    base="$(pm_regate_base)"
+    # The exponent is capped only so a huge ATTEMPTS cannot overflow the
+    # shift; no real schedule gets near it.
+    pm_seat_record_set "$WAKE_DEFERRED" "$tid" "$agent" "$mid" \
+        "$(( $(pm_now) + base * (1 << (attempt < 32 ? attempt : 32)) ))" "$attempt"
+}
+
+# Splits wake-deferred line $1 into PM_DEF_AGENT, PM_DEF_MID, PM_DEF_DUE and
+# PM_DEF_ATTEMPT; false for a line naming no seat and message. A missing or
+# malformed due or attempt (the older `<agent> <message-id>` shape) reads as
+# 0: due now, no timed re-gate spent.
+pm_deferral_parse() {
+    local due attempt
+    read -r PM_DEF_AGENT PM_DEF_MID due attempt _ <<< "$1"
+    [[ "$due" =~ ^[0-9]+$ ]] || due=0
+    [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+    # shellcheck disable=SC2034  # read by pm_regate_deferred and pm_deferral_pass
+    PM_DEF_DUE="$((10#$due))" PM_DEF_ATTEMPT="$((10#$attempt))"
+    [[ -n "$PM_DEF_AGENT" && -n "$PM_DEF_MID" ]]
 }
 
 # Drops seat $3's line from per-thread seat record $1/$2; a record left
@@ -4607,7 +4666,7 @@ pm_require_budget_reserve() {
 # `@a <verb> <mid>, @b <verb> <mid>` for record file $1.
 pm_seat_record_text() {
     local agent mid out=""
-    while read -r agent mid; do
+    while read -r agent mid _; do
         [[ -n "$agent" ]] || continue
         out+="${out:+, }@$agent ${2:-at} $mid"
     done < "$1"
@@ -4671,7 +4730,7 @@ pm_wake_gate() {
     case "$rc" in
         0) return 0 ;;
         1)
-            pm_seat_record_set "$WAKE_DEFERRED" "$tid" "$agent" "$mid"
+            pm_deferral_set "$tid" "$agent" "$mid" "${PM_REGATE_ATTEMPT:-0}"
             pm_event "defer thread=${tid:0:8} agent=$agent reason=wake-when"
             return 1 ;;
         3)
@@ -6584,8 +6643,8 @@ pm_regate_deferred() {
     mapfile -t records < "$WAKE_DEFERRED/$tid"
     local rec
     for rec in "${records[@]}"; do
-        read -r agent mid <<< "$rec"
-        [[ -n "$agent" && -n "$mid" ]] || continue
+        pm_deferral_parse "$rec" || continue
+        agent="$PM_DEF_AGENT" mid="$PM_DEF_MID"
         fs_pm_find_live_run "$agent" "$tid" >/dev/null && continue
         pm_event "regate thread=${tid:0:8} agent=$agent run=$rid"
         pm_followup_wake "$project" "$agent" "$tid" "$mid" || true
@@ -7975,7 +8034,7 @@ cmd_status_json() {
 
         local wda wdm
         if [[ -s "$WAKE_DEFERRED/$tid" ]]; then
-            while read -r wda wdm; do
+            while read -r wda wdm _; do
                 [[ -n "$wda" ]] || continue
                 printf '%s\0' wake_deferred "$wda" "$wdm"
             done < "$WAKE_DEFERRED/$tid"

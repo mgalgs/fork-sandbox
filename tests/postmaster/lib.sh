@@ -682,6 +682,10 @@ k8s_origin_mirror_seed() {
     git -C "$PROJECT_DIR" remote add origin "$UH_ORIGIN_BARE"
 }
 
+# deferral_seats <file>: the `<agent> <message-id>` fields of each line of a
+# wake-deferred record (its due time and attempt count are tested apart).
+deferral_seats() { cut -d' ' -f1,2 -- "$1" 2>/dev/null; }
+
 # The last line of every test file: its summary, which the runner parses.
 finish_suite() {
     printf '\n%s passed, %s failed\n' "$pass" "$fail"

@@ -460,7 +460,7 @@ mid="$(send_msg '@alice' '@hana, @hedy' 'gate skip clears' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
 check "wake gate: both seats deferred on the root" "hana $mid|hedy $mid" \
-    "$(paste -sd'|' "$WG_STATE/wake-deferred/$tid")"
+    "$(deferral_seats "$WG_STATE/wake-deferred/$tid" | paste -sd'|')"
 # shellcheck disable=SC2016  # expands in the gate, not here
 wg_gate '[[ "$FS_HOOK_AGENT" == hana ]] && exit 3; exit 1'
 mid2="$(reply_msg '@alice' "$mid" 'last positive reply' --to '@hana')"
@@ -468,7 +468,7 @@ once
 contains "wake gate: the later skip emits its event" "$(cat "$work/once.out")" \
     "pm skip thread=$short agent=hana reason=wake-when"
 check "wake gate: the skip dropped hana's standing deferral, kept hedy's" "hedy $mid" \
-    "$(cat "$WG_STATE/wake-deferred/$tid")"
+    "$(deferral_seats "$WG_STATE/wake-deferred/$tid")"
 check "wake gate: nothing spawned" "0 0" "$(wg_spawns hana) $(wg_spawns hedy)"
 check "wake gate: the skip of a reply spends no budget slot" 0 "$(spawn_count_of "$tid")"
 [[ -n "$mid2" ]] || no "wake gate: the reply was sent"
@@ -485,7 +485,7 @@ wg_gate 'exit 1'
 mid="$(send_msg '@alice' '@hana, @carol' 'regate skip' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
-check "wake gate: re-gate fixture: hana deferred" "hana $mid" "$(cat "$WG_STATE/wake-deferred/$tid")"
+check "wake gate: re-gate fixture: hana deferred" "hana $mid" "$(deferral_seats "$WG_STATE/wake-deferred/$tid")"
 wg_gate 'exit 3'
 PM_STATE_DIR="$WG_STATE" finish_run carol 0
 once
@@ -693,7 +693,7 @@ mid="$(send_msg '@alice' '@hana' 'deferral record' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
 check "wake-deferred: a defer writes the seat's record" "hana $mid" \
-    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+    "$(deferral_seats "$WG_STATE/wake-deferred/$tid")"
 check "wake-deferred: a quiescent thread with an outstanding defer is flagged" \
     "wake deferred: @hana at $mid and nothing woke it" "$(wg_flag_file)"
 contains "wake-deferred: the flag event carries the fixed keyword" "$(cat "$work/once.out")" \
@@ -705,7 +705,7 @@ not_contains "wake-deferred: no repeat flag event" "$(cat "$work/once.out")" "re
 mid2="$(reply_msg '@alice' "$mid" 'again' --to '@hana')"
 once
 check "wake-deferred: a later defer replaces the seat's line" "hana $mid2" \
-    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+    "$(deferral_seats "$WG_STATE/wake-deferred/$tid")"
 check "wake-deferred: a new message re-arms the flag" 2 "$(wg_flags)"
 contains "wake-deferred: the re-flag names the newer message" "$(wg_flag_file)" "@hana at $mid2"
 wg_gate 'exit 0'
@@ -723,7 +723,7 @@ mid="$(send_msg '@alice' '@hana,@carol' 'busy thread' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
 check "wake-deferred: the busy thread's deferral is recorded" "hana $mid" \
-    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+    "$(deferral_seats "$WG_STATE/wake-deferred/$tid")"
 check "wake-deferred: a thread with a live run is not flagged" "" "$(wg_flag_file)"
 wg_gate 'exit 0'
 mid2="$(reply_msg '@alice' "$mid" 'now' --to '@hana')"
@@ -751,7 +751,7 @@ mid="$(send_msg '@alice' '@hana' 'cleared by retry' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
 check "wake-deferred: the retry thread's deferral is recorded" "hana $mid" \
-    "$(cat "$WG_STATE/wake-deferred/$tid" 2>/dev/null)"
+    "$(deferral_seats "$WG_STATE/wake-deferred/$tid")"
 mkdir -p -- "$WG_STATE/retries/$tid"
 printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$mid" > "$WG_STATE/retries/$tid/hana"
 once
