@@ -1750,7 +1750,9 @@ reaches), `retry` (thread, agent, trigger=<short-id>,
 attempt=<n> — a deferred retry firing; a discarded-reply retry has
 reason=malformed in place of attempt; see "Retrying a dead wake" below),
 `regate` (thread, agent, run=<harvested run id> — a deferred seat's wake gate
-re-run after that run posted no reply; see rule 5),
+re-run after that run posted no reply; or thread, agent, source=timer,
+attempt=<n> — the timed re-gate's n-th ask of a standing deferral; see
+rule 5),
 `note` (thread, agent, reason=<keyword> — an `on-failure: note` seat failed
 where another seat would have flagged the thread; the keyword is the one the
 flag would have carried, or a more specific one where the flag's would be
@@ -2196,17 +2198,26 @@ thread routes it.
      returns, on every path. A gate is thereby pinned to the view the
      postmaster decides on.
    - **A deferral is remembered.** `wake-deferred/<thread-id>` holds one
-     `<agent> <message-id>` line per deferred seat (a later defer of the
-     same seat replaces its line); a seat's line is removed when it
+     `<agent> <message-id> <due> <attempt>` line per deferred seat (a
+     later defer of the same seat replaces its line): `<due>` is when its
+     next timed re-gate falls (epoch seconds) and `<attempt>` how many
+     timed re-gates have run for it (see "A deferral is re-asked on a
+     timer" below). A line of the older `<agent> <message-id>` shape
+     reads as due now, attempt 0. A seat's line is removed when it
      actually spawns on the thread, by any path — new message, follow-up,
      retry or operator. A thread that goes quiescent with a line still
      standing is flagged once per message count, reason `wake deferred:
      @a at <message-id>[, @b at <message-id>] and nothing woke it`,
      keyword `wake-deferred`, so a deferred seat nothing ever wakes is
-     visible. Every thread with a record is checked, not only those with
-     a review target. If a thread has both a `wake-deferred` and a
-     `budget-reserved` record, it gets one flag with both reasons joined
-     by `; ` and the keyword `wake-deferred,budget-reserved`.
+     visible — but not while every standing line still has timed re-gates
+     left: the flag waits until at least one line has spent its attempts
+     (at once with `FORK_SANDBOX_WAKE_REGATE_ATTEMPTS=0`). Every thread
+     with a record is checked, not only those with a review target. If a
+     thread has both a `wake-deferred` and a `budget-reserved` record, it
+     gets one flag with both reasons joined by `; ` and the keyword
+     `wake-deferred,budget-reserved`; a `budget-reserved` record flags at
+     quiescence as it always did, so that flag names a deferral whose
+     re-gates are still running too.
    - **A deferral is re-asked.** The gate runs when a message arrives, so
      nothing would ask again if the seat the author is waiting on then
      wakes, posts nothing usable and the thread goes quiet. After any run
@@ -2221,7 +2232,31 @@ thread routes it.
      seat and the harvested run. The harvested run's record is written
      first, so the gate (whose `status --thread <tid> --json` takes no
      lock) sees that run as harvested with `replies: 0`. If the gate still
-     defers, the quiescence flag above fires as it always did.
+     defers, the line is recorded afresh (attempt 0, see below).
+   - **A deferral is re-asked on a timer.** A gate may defer for a reason
+     that clears with time (capacity, say) on a thread where nothing will
+     be harvested again. Each deliver pass, every `wake-deferred` line
+     whose due time has passed and whose attempts are not spent is
+     re-gated exactly as above — the same spawn path, trigger, exit codes,
+     closed-thread skip and hops/budget/reserve — with a `regate` event
+     naming the thread, the seat, `source=timer` and `attempt=<n>`. Before
+     the gate runs, the line is rewritten at attempt n, due one interval
+     n out, so a refused spawn leaves the line standing (as the harvest
+     re-gate does) but still spends that attempt; exit 1 records the same
+     values again. Interval n (n = 0, 1, …) is `base * 2^n` seconds: a
+     defer from any other path (a new message, a follow-up wake, the
+     harvest re-gate) is fresh information, so it writes attempt 0, due
+     one base interval out. `$FORK_SANDBOX_WAKE_REGATE_BASE` (default
+     300) sets the base and `$FORK_SANDBOX_WAKE_REGATE_ATTEMPTS` (default
+     4) the number of timed re-gates, so by default a deferral is
+     re-asked about 5, 15, 35 and 75 minutes after it was recorded. A
+     value that is not a non-negative integer falls back to the default.
+     `ATTEMPTS=0` turns timed re-gates off and the flag fires at
+     quiescence, exactly as before. A line whose attempts are spent stays
+     on disk, so the flag and `status` keep showing it, and is never
+     timed-re-gated again; a later defer on fresh information resets it.
+     Each timed re-gate runs the gate inline under the store lock like
+     any other, at most once per deferred seat per interval.
 
 Together with "a Cc-only wake replies only when something genuinely
 matters, not routinely", those rules are the stop rules. Hops bound the
@@ -2617,7 +2652,7 @@ own thread scans never see it:
 | `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, `file`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
 | `hooks/logs/<id>.log` | a reaped hook's stdout and stderr, and a wake gate's (`<time>-wake-when-<thread>-<agent>-<n>.log`); the newest 100 are kept |
 | `wake-threads/<run-id>.message-ids` | the Message-ID of every message in that wake's thread snapshot, one per line, listed just before the render and written only beside a snapshot that was; outside the mounted dir. A pending message on the list is not followed up (rule 4) |
-| `wake-deferred/<thread-id>` | one `<agent> <message-id>` line per seat whose spawn its `wake-when` gate deferred; cleared per seat when it spawns or its gate skips (exit 3) — see rule 5 |
+| `wake-deferred/<thread-id>` | one `<agent> <message-id> <due> <attempt>` line per seat whose spawn its `wake-when` gate deferred: `<due>` is the epoch second its next timed re-gate falls due, `<attempt>` the timed re-gates run so far (a two-field line from before these fields reads as due now, attempt 0); cleared per seat when it spawns or its gate skips (exit 3), kept once its attempts are spent — see rule 5 |
 | `budget-reserved/<thread-id>` | the same shape, for a seat the budget reserve refused — see rule 3 |
 | `deferral-marks/<thread-id>` | the message count at which the thread's seat records were last flagged, so a quiescent state flags once |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |

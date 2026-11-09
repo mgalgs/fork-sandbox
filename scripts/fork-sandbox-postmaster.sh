@@ -593,18 +593,30 @@
 #      a message whose From is an operator (rule 1's test). Exit 0 wakes;
 #      exit 1 defers -- no spawn, no budget slot, `defer` event, the
 #      trigger dropped, the seat recorded in $STATE/wake-deferred/<tid>
-#      (`<agent> <message-id>`, cleared when it spawns by any path; a
-#      quiescent thread with a line standing is flagged once per message
-#      count, keyword wake-deferred, "wake deferred: @a at <mid> and
-#      nothing woke it"; with a budget-reserved record too, one flag,
-#      reasons joined by "; ", keyword wake-deferred,budget-reserved).
+#      (`<agent> <message-id> <due> <attempt>`, cleared when it spawns by
+#      any path; a quiescent thread with a line standing is flagged once
+#      per message count, keyword wake-deferred, "wake deferred: @a at
+#      <mid> and nothing woke it" -- but only once a line has spent its
+#      timed re-gates, below; with a budget-reserved record too, one flag
+#      at once, reasons joined by "; ", keyword
+#      wake-deferred,budget-reserved).
 #      Exit 3 skips -- the seat owes nothing on this message: no spawn, no
 #      budget slot, no wake-deferred line, a `skip` event, and the seat's
 #      wake-deferred line on the thread, if one stands, is dropped (an
 #      author deferred mid-round whose gate says "converged" on the last
 #      reply must not leave that older deferral to flag the thread).
 #      The same answer holds on every path that asks the gate: a new
-#      message, a pending message's follow-up, and the re-gate below.
+#      message, a pending message's follow-up, and the re-gates below.
+#      TIMED RE-GATE: each deliver pass re-gates every line whose <due>
+#      has passed and whose <attempt> is below
+#      $FORK_SANDBOX_WAKE_REGATE_ATTEMPTS (default 4; 0 turns it off and
+#      the flag fires at quiescence), exactly as the RE-GATE below does,
+#      event `regate thread=<t> agent=<a> source=timer attempt=<n>`.
+#      Interval n is $FORK_SANDBOX_WAKE_REGATE_BASE (default 300) * 2^n
+#      seconds: a timed re-gate writes attempt n, due interval n out; a
+#      defer on any other path writes attempt 0, due one base interval
+#      out. A spent line stays on disk and is never timed-re-gated again.
+#      A non-integer value of either variable takes its default.
 #      Anything else fails open (wake + `wake-gate-error`): another exit
 #      status, a timeout ($FORK_SANDBOX_WAKE_GATE_TIMEOUT, default 30 s),
 #      a missing or non-executable hook, or a failure to build its
@@ -1036,6 +1048,8 @@
 # normal spawn path (pm_regate_deferred), AFTER the run's durable record
 # (HARVESTED_AT, REPLIES, REPLY_FILES, OUTCOME) and harvested marker are
 # written, so the gate's `status --thread --json` sees the run harvested.
+# The timed re-gate (rule 5) is the same code, pm_regate_deferred, called
+# each pass by pm_regate_timer_pass with no run.
 # A malformed reply file (bad address, unparseable stanza, or a
 # `mail.sh` call that itself fails) is skipped and flags the thread with
 # the filename and the reason -- it never costs the run's other,
