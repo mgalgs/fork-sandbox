@@ -1532,6 +1532,7 @@ field: an object with `branch`, `sha`, `version`, `set_by`, `set_at`, or
 | `trigger` | message id the wake was for; `null` on a record that predates the key |
 | `review_target_sha` | the thread's review-target sha when the wake spawned, for every seat whenever the thread has a target; `null` otherwise |
 | `review_target_version` | the same target's version (an integer), same rule |
+| `spawned_at` | ISO-8601 UTC time the run record was written (for a k8s seat, the Job's submission, not the container's start; for a handler seat, after its handler ran); `null` on a record that predates the key |
 | `harvested_at` | ISO-8601 UTC time the run was harvested; `null` while live |
 | `replies` | replies actually posted; `null` while live |
 | `reply_files` | reply files found, malformed ones included; `null` while live |
@@ -1837,12 +1838,13 @@ becomes a field value on one of these lines.
 ### Hooks
 
 The postmaster knows harvests, not rounds: a round is a peer's protocol.
-It emits three generic events and runs site-supplied executables on them,
+It emits four generic events and runs site-supplied executables on them,
 so a site can deploy a preview, publish a bundle, or decide a review round
 has ended, without the postmaster knowing why.
 
 | Event | Fires |
 |---|---|
+| `on-spawn` | once for every run record written: a new message's wake, a pending message's follow-up, a retry, a held seat's release, and a handler seat's run |
 | `on-harvest` | after a harvest of one run posted at least one message |
 | `on-target` | when a thread's review target is set or moves: the kickoff's `send --review-target` is version 1, and a `review-target: sets` seat's `Version:` reply moves it (see "The review target") |
 | `on-quiescent` | once per quiescence of a thread, and once more when a quiet thread's flag state changes |
@@ -1869,7 +1871,7 @@ A hook inherits the postmaster's own environment, plus:
 
 | Variable | Set when | Value |
 |---|---|---|
-| `FS_HOOK_EVENT` | always | `on-harvest`, `on-target` or `on-quiescent` |
+| `FS_HOOK_EVENT` | always | `on-spawn`, `on-harvest`, `on-target` or `on-quiescent` |
 | `FS_HOOK_THREAD` | always | the full thread id |
 | `FS_HOOK_MAIL_ROOT` | always | the mail root |
 | `FS_HOOK_REPO` | always | the `deliver --project` repo path |
@@ -1877,14 +1879,24 @@ A hook inherits the postmaster's own environment, plus:
 | `FS_TARGET_BRANCH`, `FS_TARGET_SHA`, `FS_TARGET_VERSION`, `FS_TARGET_SET_BY`, `FS_TARGET_SET_AT` | the thread has a review target, on every event | the fields of the thread's review target |
 | `FS_TARGET_REPO` | the thread has a review target, on every event | same value as `FS_HOOK_REPO` |
 | `FS_HOOK_MESSAGES` | `on-harvest` | ids of the messages that run's harvest posted, space-separated, in posting order |
-| `FS_HOOK_RUN` | `on-harvest` | the run id |
+| `FS_HOOK_RUN` | `on-spawn`, `on-harvest` | the run id |
 | `FS_HOOK_BRANCH` | `on-harvest` | the wake's branch; empty for a handler seat |
-| `FS_HOOK_AGENT` | `on-harvest`, and the wake gate | the resolved fleet name |
+| `FS_HOOK_AGENT` | `on-spawn`, `on-harvest`, and the wake gate | the resolved fleet name |
+| `FS_HOOK_MESSAGE` | `on-spawn` | the run's trigger message id |
+| `FS_HOOK_VIA` | `on-spawn` | `to` or `cc`, exactly as the run record's `VIA` |
+| `FS_HOOK_RETRY_OF` | `on-spawn` | the run record's `RETRY_OF` (the run this one retries); empty when it has none |
 | `FS_TARGET_SHA_PRESENT` | `on-target` | `1` or `0`: whether the sha is present in the repo. The postmaster first tries to fetch `origin` for it, and fires either way |
 | `FS_HOOK_MESSAGE_COUNT` | `on-quiescent` | the thread's message count |
 | `FS_HOOK_FLAGGED` | `on-quiescent` | `1` or `0` |
 | `FS_HOOK_FLAG_REASON` | `on-quiescent` | the needs-operator flag file's content; empty when not flagged |
 | `FS_HOOK_SECRET_DIR` | cluster only, when `K8S_POSTMASTER_HOOKS_SECRET` is set | `/etc/fork-sandbox/hook-secret` (the postmaster's environment passes through to hooks) |
+
+`on-spawn` fires once per run record, right after the record is written
+and indexed, so a hook that reads `status --thread <tid> --json` already
+sees the run in `runs[]`, with its `spawned_at`. For a k8s seat that is
+the Job's submission, not the container's start. A handler seat's run is
+recorded only once its handler has finished, so its `on-spawn` comes then,
+just before its `on-harvest`.
 
 `on-harvest` fires once per run, after everything else that run's harvest
 does, including the review-target write, so the target variables a hook
@@ -1918,7 +1930,9 @@ fire time, not at reap time.
 
 #### At most once, and seeding
 
-`on-harvest` fires from the harvest itself. `on-target` and `on-quiescent`
+`on-spawn` fires from the spawn itself and keeps no marker: a fire that a
+crash loses stays lost, and nothing replays it. `on-harvest` fires from the
+harvest itself. `on-target` and `on-quiescent`
 are detected by a pass that runs after the harvest pass, in both `--once`
 and the loop. That pass compares the store with markers under
 `hook-marks/`: `target/<thread-id>` holds `<VERSION> <SHA>`, and
@@ -1990,8 +2004,8 @@ target and, for `on-quiescent`, the current message count, flag state and
 flag reason. It ignores the markers and does not touch them. It runs every
 matching hook file in the FOREGROUND under the same timeout, prints one
 line per file (`file=<basename> exit=<n>`), and exits non-zero if any hook
-failed. It takes no store lock and writes no hook record. `on-harvest` is
-refused, because it needs a run's context. In the cluster postmaster's
+failed. It takes no store lock and writes no hook record. `on-harvest` and
+`on-spawn` are refused, because they need a run's context. In the cluster postmaster's
 container it works from any shell (`kubectl exec`): when `GIT_SSH_COMMAND`
 is unset and the deploy key and `known_hosts` that pod-init installs are in
 `$HOME/.ssh`, it sets `GIT_SSH_COMMAND` exactly as pod-init sets it for
@@ -2574,7 +2588,7 @@ own thread scans never see it:
 | `lock` | a `flock`'d file; the pid inside is for messages only — the mutual exclusion is the kernel's advisory lock, so a killed postmaster cannot leave a stale hold |
 | `routed/<message-id>` | routing already decided for this message |
 | `route-pending/<message-id>/` | the message's seats not yet handed to a wake: `thread`, `band` (the reserve-band verdict it was judged under), `seats` (one per line, in order) and `inflight` (`<agent> <attempts>`, the seat in hand). Removed once the last seat is handled — see "A message's seats survive a restart" |
-| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake), `ON_SILENCE` (the seat's `on-silence` at spawn, read back at harvest); `WOKEN_AT_SHA`/`WOKEN_AT_VERSION` (the thread's review target at spawn, for every seat when the thread has one — unlike `REVIEW_TARGET_SHA`/`_VERSION`, written only for a seat moved to the target and read back by a local follow seat to decide whether to re-checkout); `RETRY_KIND` (`failed` or `malformed`) and `RETRY_OF` (the seat's previous run) on a retry wake; and, written at harvest, `HARVESTED_AT` (UTC), `REPLIES`, `REPLY_FILES` and `OUTCOME` (`clean` or `failed`). A run record is durable: it lives in the state dir, which is on a persistent volume in the cluster, unlike the event log |
+| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake), `ON_SILENCE` (the seat's `on-silence` at spawn, read back at harvest); `WOKEN_AT_SHA`/`WOKEN_AT_VERSION` (the thread's review target at spawn, for every seat when the thread has one — unlike `REVIEW_TARGET_SHA`/`_VERSION`, written only for a seat moved to the target and read back by a local follow seat to decide whether to re-checkout); `RETRY_KIND` (`failed` or `malformed`) and `RETRY_OF` (the seat's previous run) on a retry wake; `SPAWNED_AT` (UTC, when the record was written: a k8s seat's submission, not its container start); and, written at harvest, `HARVESTED_AT` (UTC), `REPLIES`, `REPLY_FILES` and `OUTCOME` (`clean` or `failed`). A run record is durable: it lives in the state dir, which is on a persistent volume in the cluster, unlike the event log |
 | `handler-outbox/<run-id>` | a handler wake's outbox; unlike an LLM wake's (part of its ephemeral scratch run dir), this sits under this same persistent state tree, so the postmaster removes it itself once harvested — nothing here outlives its own wake |
 | `harvested/<run-id>` | this run's outbox is collected |
 | `run-index/` | derived from `runs/` and `harvested/`, never the record of anything: `live/<run-id>.env` per unharvested run, `thread/<thread-id>/<run-id>.env` per run of that thread, and `complete`, stamped once a full build finished. It lets the hot paths (live-run lookups, quiescence, `status`) read one thread's runs or the live ones instead of every record the store has ever kept. It is trusted only while `complete` exists and is no older than `runs/` and `harvested/`, so a record or marker written by anything that does not keep the index (an older postmaster, a hand edit) makes it stale; readers then fall back to the full scan, and the next pass rebuilds it. Safe to delete at any time |
@@ -2832,7 +2846,7 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT` | `120` (seconds) | Cc triage classifier call |
 | `FORK_SANDBOX_HANDLERS_DIR` | `~/.config/fork-sandbox/handlers` | registry, router (`handler: exec` seats) |
 | `FORK_SANDBOX_HANDLER_TIMEOUT` | `300` (seconds) | router (`handler: exec` wake) |
-| `FORK_SANDBOX_HOOKS_DIR` | `~/.config/fork-sandbox/hooks` | router (`on-harvest`, `on-target`, `on-quiescent` hooks) |
+| `FORK_SANDBOX_HOOKS_DIR` | `~/.config/fork-sandbox/hooks` | router (`on-spawn`, `on-harvest`, `on-target`, `on-quiescent` hooks) |
 | `FORK_SANDBOX_HOOK_TIMEOUT` | `300` (seconds) | router (each hook; SIGTERM, then SIGKILL 10 s later) |
 
 The registry needs PyYAML, as the preset parser does. A machine without

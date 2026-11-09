@@ -420,11 +420,17 @@
 #
 # HOOKS
 #
-# The postmaster emits three generic events and runs site-supplied
-# executables on them: on-harvest (a harvest of one run posted at least one
-# message), on-target (a thread's review target was set or moved) and
-# on-quiescent (a thread went quiet, or a quiet thread's flag state
-# changed). They live in
+# The postmaster emits four generic events and runs site-supplied
+# executables on them: on-spawn (a run record was written: a new message's
+# wake, a follow-up, a retry, a held seat's release, a handler seat's run),
+# on-harvest (a harvest of one run posted at least one message), on-target
+# (a thread's review target was set or moved) and on-quiescent (a thread
+# went quiet, or a quiet thread's flag state changed). on-spawn fires after
+# the record is written, so `status --thread --json` already lists the run,
+# and adds FS_HOOK_RUN, FS_HOOK_AGENT, FS_HOOK_MESSAGE (the trigger),
+# FS_HOOK_VIA (the record's VIA) and FS_HOOK_RETRY_OF (the record's
+# RETRY_OF, empty when none) to the standard set; it keeps no marks and
+# never replays, so a fire lost to a crash stays lost. They live in
 # $FORK_SANDBOX_HOOKS_DIR (default ~/.config/fork-sandbox/hooks): the file
 # named exactly on-<event> and every file named on-<event>.<anything>, each
 # executable, fired independently in name order. A missing hook is silent.
@@ -1525,8 +1531,8 @@ PM_DRAIN_RECORD_KEEP=5
 # subprocess via $FLEET, never sourced), so this is its own copy of the
 # identical line.
 HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
-# Where the three hook executables (on-harvest, on-target, on-quiescent)
-# live -- see HOOKS in the header. Same shape as HANDLERS_DIR; hooks are
+# Where the four hook executables (on-spawn, on-harvest, on-target,
+# on-quiescent) live -- see HOOKS in the header. Same shape as HANDLERS_DIR; hooks are
 # looked up by their fixed event name, never from anything in the store.
 HOOKS_DIR="${FORK_SANDBOX_HOOKS_DIR:-$HOME/.config/fork-sandbox/hooks}"
 # Same reasoning, same duplication, for fleet.sh's own FLEET_FILE
