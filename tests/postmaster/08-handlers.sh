@@ -303,6 +303,8 @@ hr_env="$(grep -l "^THREAD=$tid\$" "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.
 check "no-reply: the handler run record carries its harvest outcome" "0 0 clean" \
     "$(env_val "$hr_env" REPLIES) $(env_val "$hr_env" REPLY_FILES) $(env_val "$hr_env" OUTCOME)"
 check "no-reply: and a harvested_at" 1 "$([[ -n "$(env_val "$hr_env" HARVESTED_AT)" ]] && echo 1 || echo 0)"
+check "no-reply: and an ISO-8601 UTC SPAWNED_AT" 1 \
+    "$([[ "$(env_val "$hr_env" SPAWNED_AT)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && echo 1 || echo 0)"
 
 # --- scenario: a malformed reply file flags the thread ---
 mid="$(send_msg '@carol' '@malformed' 'Bad reply' 'trigger')"

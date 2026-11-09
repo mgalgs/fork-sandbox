@@ -1118,14 +1118,19 @@
 #                                   thread's target at spawn, for EVERY
 #                                   seat; REVIEW_TARGET_SHA keeps its
 #                                   follow-seat meaning), RETRY_KIND and
-#                                   RETRY_OF (a retry wake only), and, at
-#                                   harvest, HARVESTED_AT, REPLIES,
+#                                   RETRY_OF (a retry wake only),
+#                                   SPAWNED_AT (UTC ISO-8601, when the
+#                                   record was written: for a k8s seat the
+#                                   submission, not container start), and,
+#                                   at harvest, HARVESTED_AT, REPLIES,
 #                                   REPLY_FILES, OUTCOME (clean|failed).
 #                                   A handler seat's
 #                                   run (see THE WAKE's handler variant)
 #                                   writes a deliberately minimal record
 #                                   instead: AGENT, THREAD, TRIGGER,
-#                                   KIND=exec, VIA -- no RUN_DIR, HARNESS,
+#                                   KIND=exec, VIA, SPAWNED_AT (written
+#                                   after the handler has run, so later
+#                                   than its start) -- no RUN_DIR, HARNESS,
 #                                   MODEL, NETWORK, RESUMED, BRANCH, INBOX,
 #                                   or PENDING_MSGS, since none of those
 #                                   apply to a script that never had a
@@ -4467,6 +4472,7 @@ pm_exec_wake() {
         printf 'TRIGGER=%s\n' "$mid"
         printf 'KIND=exec\n'
         printf 'VIA=%s\n' "$via"
+        printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         [[ -z "$woken_sha" ]] || printf 'WOKEN_AT_SHA=%s\nWOKEN_AT_VERSION=%s\n' "$woken_sha" "$woken_version"
     } > "$RUNS/$run_id.env"
     pm_harvest_record "$RUNS/$run_id.env" "$(( rc == 0 ))" "$replies" "$reply_files"
@@ -5131,6 +5137,7 @@ pm_spawn_wake() {
             printf 'RESUMED=%s\n' "$resumed"
             printf 'PENDING_MSGS=\n'
             printf 'VIA=%s\n' "$via"
+            printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             printf 'BACKEND=k8s\n'
             printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
             printf 'ON_SILENCE=%s\n' "$on_silence"
@@ -5253,6 +5260,7 @@ pm_spawn_wake() {
         printf 'RESUMED=%s\n' "$resumed"
         printf 'PENDING_MSGS=\n'
         printf 'VIA=%s\n' "$via"
+        printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'BACKEND=local\n'
         printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
         printf 'ON_SILENCE=%s\n' "$on_silence"
@@ -7943,7 +7951,7 @@ cmd_status_json() {
                 "$(fs_pm_env_get "$f" TRIGGER)" "$rsha" "$rver" \
                 "$(fs_pm_env_get "$f" HARVESTED_AT)" "$(fs_pm_env_get "$f" REPLIES)" \
                 "$(fs_pm_env_get "$f" REPLY_FILES)" "$(fs_pm_env_get "$f" OUTCOME)" \
-                "$(fs_pm_env_get "$f" RETRY_OF)"
+                "$(fs_pm_env_get "$f" RETRY_OF)" "$(fs_pm_env_get "$f" SPAWNED_AT)"
         done
 
         local wda wdm
@@ -8009,7 +8017,7 @@ out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
        "grant_mode": "missing", "wake_deferred": [], "seat_notes": []}
 arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "upstream_state": 3,
          "review_target": 5, "spawns": 1, "budget": 2, "spawns_total": 1, "grant_mode": 1,
-         "run": 13, "retry": 5, "held": 3, "wake_exit": 3, "wake_deferred": 2,
+         "run": 14, "retry": 5, "held": 3, "wake_exit": 3, "wake_deferred": 2,
          "seat_note": 4}
 wake_exits = []
 i = 0
@@ -8052,7 +8060,8 @@ while i < len(tok):
                             "review_target_version": num(a[7]),
                             "harvested_at": a[8] or None,
                             "replies": num(a[9]), "reply_files": num(a[10]),
-                            "outcome": a[11] or None, "retry_of": a[12] or None})
+                            "outcome": a[11] or None, "retry_of": a[12] or None,
+                            "spawned_at": a[13] or None})
     elif tag == "wake_deferred":
         out["wake_deferred"].append({"agent": a[0], "message_id": a[1]})
     elif tag == "retry":

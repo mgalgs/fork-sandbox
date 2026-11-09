@@ -374,6 +374,8 @@ check "k8s case6: no retry schedule (a clean exit)" 0 \
 k6_env="$(latest_env_for_agent karen)"
 k6_rundir="$(env_val "$k6_env" RUN_DIR)"
 k6_branch="$(env_val "$k6_env" BRANCH)"
+check "k8s case6: the k8s record carries an ISO-8601 UTC SPAWNED_AT" 1 \
+    "$([[ "$(env_val "$k6_env" SPAWNED_AT)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && echo 1 || echo 0)"
 check "k8s case6: recorded exit-code normalized to 0" 0 "$(cat "$k6_rundir/exit-code" 2>/dev/null)"
 check "k8s case6: the stub fork-sandbox-k8s.sh was called with rm --branch" \
     "rm --branch $k6_branch" "$(cat "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"

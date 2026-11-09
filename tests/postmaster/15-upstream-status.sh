@@ -356,12 +356,12 @@ want("live run", runs["run-live"], {"run_id": "run-live", "agent": "bob", "state
                                      "run_dir": "/runs/one", "resumed": "sess-1234abcd",
                                      "trigger": None, "review_target_sha": None, "review_target_version": None,
                                      "harvested_at": None, "replies": None, "reply_files": None,
-                                     "outcome": None, "retry_of": None})
+                                     "outcome": None, "retry_of": None, "spawned_at": None})
 want("harvested run", runs["run-done"], {"run_id": "run-done", "agent": "carol", "state": "harvested",
                                           "run_dir": "/runs/two", "resumed": None,
                                           "trigger": None, "review_target_sha": None, "review_target_version": None,
                                           "harvested_at": None, "replies": None, "reply_files": None,
-                                          "outcome": None, "retry_of": None})
+                                          "outcome": None, "retry_of": None, "spawned_at": None})
 rt = {r["agent"]: r for r in d["retries"]}
 want("pending retry", rt["bob"], {"agent": "bob", "state": "pending", "attempt": 1, "due_s": 30, "reason": "failed"})
 want("exhausted retry is listed too", rt["carol"], {"agent": "carol", "state": "exhausted", "attempt": 3, "due_s": 0, "reason": "failed"})

@@ -426,6 +426,10 @@ check "record: live run has null harvest fields" "[None, None, None, None]" \
     "$(we_py "$ps_live" '[d["runs"][0][k] for k in ("harvested_at","replies","reply_files","outcome")]')"
 check "record: live run carries trigger and target" "['$ps_mid', '$rt1_sha']" \
     "$(we_py "$ps_live" '[d["runs"][0]["trigger"], d["runs"][0]["review_target_sha"]]')"
+check "record: a new run's SPAWNED_AT is ISO-8601 UTC" 1 \
+    "$([[ "$(env_val "$ps_env" SPAWNED_AT)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && echo 1 || echo 0)"
+check "record: status --json spawned_at is the record's SPAWNED_AT" "$(env_val "$ps_env" SPAWNED_AT)" \
+    "$(we_py "$ps_live" 'd["runs"][0]["spawned_at"]')"
 rd="$(env_val "$ps_env" RUN_DIR)"
 printf '0\n' > "$rd/exit-code"; printf '{}\n' > "$rd/summary.json"
 printf 'Subject: ok\n\nfine\n' > "$rd/outbox/mail-1.md"
@@ -447,5 +451,9 @@ printf 'AGENT=carol\nTHREAD=%s\nRUN_DIR=/runs/old\nREVIEW_TARGET_SHA=abc123\nREV
 check "record: an old run falls back to REVIEW_TARGET_SHA/VERSION, nulls elsewhere" \
     "['abc123', 4, None, None, None, None, None]" \
     "$(we_py "$(we_json "$ps_tid")" '[ [r for r in d["runs"] if r["run_id"]=="old-run"][0][k] for k in ("review_target_sha","review_target_version","trigger","harvested_at","replies","outcome","retry_of")]')"
+check "record: a run recorded without SPAWNED_AT has spawned_at null" "None" \
+    "$(we_py "$(we_json "$ps_tid")" '[r for r in d["runs"] if r["run_id"]=="old-run"][0]["spawned_at"]')"
+check "record: and spawned_at survives harvest" 1 \
+    "$(we_py "$(we_json "$ps_tid")" '1 if [r for r in d["runs"] if r["run_id"]!="old-run"][0]["spawned_at"] else 0')"
 
 finish_suite
