@@ -4487,6 +4487,7 @@ pm_exec_wake() {
 
     (( replies > 0 )) || pm_regate_deferred "$PM_PROJECT" "$tid" "$run_id"
 
+    pm_hook_on_spawn "$tid" "$run_id" "$agent" "$mid" "$via" ""
     pm_hook_on_harvest "$tid" "$run_id" "" "$agent" "${PM_HARVEST_POSTED[@]}"
 }
 
@@ -5155,6 +5156,7 @@ pm_spawn_wake() {
         pm_seat_records_clear "$tid" "$agent"
         printf '%s\n' "$run_id" >> "$SEQ/$tid"
         pm_event "spawn thread=${tid:0:8} agent=$agent run=$(basename -- "$wake_dir") via=$via"
+        pm_hook_on_spawn "$tid" "$run_id" "$agent" "$mid" "$via" "$retry_of"
         return 0
     fi
 
@@ -5278,6 +5280,7 @@ pm_spawn_wake() {
     pm_seat_records_clear "$tid" "$agent"
     printf '%s\n' "$run_id" >> "$SEQ/$tid"
     pm_event "spawn thread=${tid:0:8} agent=$agent run=$(basename -- "$run_dir") via=$via"
+    pm_hook_on_spawn "$tid" "$run_id" "$agent" "$mid" "$via" "$retry_of"
 }
 
 pm_wake_or_pend() {
@@ -5896,6 +5899,16 @@ pm_hook_on_harvest() {
     local IFS=' '
     pm_hook_fire on-harvest "$tid" "FS_HOOK_MESSAGES=$*" "FS_HOOK_RUN=$run" \
         "FS_HOOK_BRANCH=$branch" "FS_HOOK_AGENT=$agent"
+}
+
+# Fires on-spawn once for one run record just written, by every path that
+# writes one, after the record and the run index are settled so a hook that
+# reads `status --thread --json` sees the run. No marks, no replay: a fire a
+# crash loses stays lost.
+# pm_hook_on_spawn <tid> <run-id> <agent> <trigger-id> <via> <retry-of>
+pm_hook_on_spawn() {
+    pm_hook_fire on-spawn "$1" "FS_HOOK_RUN=$2" "FS_HOOK_AGENT=$3" \
+        "FS_HOOK_MESSAGE=$4" "FS_HOOK_VIA=$5" "FS_HOOK_RETRY_OF=$6"
 }
 
 # Sanitizes one line of message-body-controlled text for embedding in a

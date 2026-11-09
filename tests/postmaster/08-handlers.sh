@@ -247,10 +247,17 @@ check "happy: thread is not flagged" 0 \
 # --- on-harvest from a handler seat: empty branch, one posted id ---
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
-hk_install on-harvest
+hk_install on-harvest on-spawn
 hkm_mid="$(send_msg '@carol' '@happy' 'Hook handler' 'do the hooked thing')"
 hkm_tid="$(thread_of "$hkm_mid")"
 once
+hkm_env="$(grep -l "^THREAD=$hkm_tid\$" "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env | head -n1)"
+check "on-spawn (handler): fires once" 1 "$(hk_count on-spawn)"
+check "on-spawn (handler): FS_HOOK_RUN is the handler's run id" "$(basename -- "$hkm_env" .env)" \
+    "$(hk_env on-spawn FS_HOOK_RUN)"
+check "on-spawn (handler): FS_HOOK_AGENT, FS_HOOK_MESSAGE, FS_HOOK_VIA, FS_HOOK_RETRY_OF" \
+    "happy $hkm_mid to " \
+    "$(hk_env on-spawn FS_HOOK_AGENT) $(hk_env on-spawn FS_HOOK_MESSAGE) $(hk_env on-spawn FS_HOOK_VIA) $(hk_env on-spawn FS_HOOK_RETRY_OF)"
 check "on-harvest (handler): fires once" 1 "$(hk_count on-harvest)"
 check "on-harvest (handler): FS_HOOK_BRANCH is empty" "" "$(hk_env on-harvest FS_HOOK_BRANCH)"
 check "on-harvest (handler): FS_HOOK_AGENT is the seat" "happy" "$(hk_env on-harvest FS_HOOK_AGENT)"
