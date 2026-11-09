@@ -127,6 +127,10 @@ no check that the caller holds the lane. The lane-complete prompt hook shows
 that text to every session that mentions the lane, so under this approval one
 session can change what others are told a lane owns. That stays inside the
 fixed root, and mail is already a cross-session channel.
+The `kv` store is shared the same way: `kv set` and `kv del` write
+`<root>/kv` for any key, with no notion of who owns one, so one session can
+overwrite or delete state another depends on. Keys are never paths (a `/`
+in a key is encoded away), so that write also stays inside the fixed root.
 
 Another write is shared across sessions and lies outside that fixed root:
 `register <lane> --dir <abs-path>` records `<abs-path> -> <lane>` in

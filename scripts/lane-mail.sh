@@ -9,6 +9,7 @@
 #        lane-mail.sh send|reply|show|tree|list|inbox|seen [args...]
 #        lane-mail.sh send --to @lane:host ...     (another host, over ssh)
 #        lane-mail.sh lanes                        (the lanes there are)
+#        lane-mail.sh kv get|set|del|list ...      (shared key/value store)
 #
 # `lanes` prints one `<source><TAB><lane><TAB><description><TAB><last seen>`
 # line per lane: `live` (a session that registered it is still running),
@@ -39,6 +40,55 @@
 # (<root>/agents/<lane>/about), not with the session registration, so it
 # survives a handoff replacing the session. Only local lanes have one: a
 # `lane:host` is refused, and nothing is synced between hosts.
+#
+# Key/value store. Sessions on this host sometimes need shared state that
+# is not a message ("which lane owns this pull request"). `kv` keeps it,
+# under a key-naming convention of the caller's own; lane mail never
+# interprets a key or a value.
+#
+#   kv get <key>              print the value's bytes exactly as stored, no
+#                             newline added
+#   kv get --json <key>       print {"key":..,"value":..,"version":..}; value
+#                             and version come from ONE read of the record,
+#                             so the version is safe to pass to --if-version
+#   kv set <key> <value>      store; a value of `-` is read from stdin.
+#                             Prints the new version.
+#   kv set ... --if-version <v>   write only if the key exists at version <v>
+#   kv set ... --if-absent        write only if the key does not exist
+#                             (the two are mutually exclusive)
+#   kv del <key> [--if-version <v>]
+#   kv list [--prefix <p>]    the matching keys, sorted, one per line
+#   kv list --json [--prefix <p>] one JSON object, key -> value
+#
+# `--` ends the options, for a value that starts with `--`.
+#
+# Exit codes: 0 success; 1 the key is absent (get, del; nothing on stdout);
+# 2 usage or validation error (bad key, NUL or oversize value, conflicting
+# flags); 3 precondition failed (--if-version on a missing key or another
+# version, --if-absent on an existing key): stderr names which, and nothing
+# was written.
+#
+# A key matches ^[A-Za-z0-9@][A-Za-z0-9._:/#@+=-]{0,199}$, so
+# `pr:org/repo#2778` and `owner:@lane:host` are keys; a '/' is just a
+# character, never a directory. A value is any bytes but NUL, at most 64 KiB
+# (65536 bytes). `--json` output decodes values as UTF-8, invalid bytes
+# replaced by U+FFFD; plain `get` is the byte-exact read.
+#
+# A version is an opaque token the store issues, new and unique on every
+# write (time plus random), never a per-key counter, so deleting and
+# re-creating a key never reissues a version a stale client still holds.
+# Never compute one: take it from `set` or `get --json`. The pattern for a
+# safe read-modify-write is `get --json`, then `set ... --if-version <v>`,
+# retrying from the `get` on exit 3.
+#
+# The store is <root>/kv (created on first write): one file per key holding
+# version and value, named by the key with '/' replaced by '%'. Writes run
+# under one exclusive flock on the store -- a conditional write's check and
+# its write under the same hold -- and land by temp-file-then-rename, so the
+# lock-free reads never see a torn record. Per-host only: no `@lane:host`
+# addressing (a value may contain one as text), no expiry, and no access
+# control beyond the filesystem's -- any session can overwrite any key. The
+# work is done by lane-mail-kv.py, which this script hands the store path.
 #
 # `~/.local/state/fork-sandbox/lanes.json` remembers, per project directory,
 # the lane last used there: a flat JSON object mapping an absolute directory
@@ -72,7 +122,8 @@
 # never pass it, so the approved invocation surface cannot be pointed at
 # another store, and no env-var prefix (which would defeat allowlist
 # matching) is ever needed. Writes are bounded to the mail root (including
-# the scratch files of an in-flight cross-host send, under it), the
+# the scratch files of an in-flight cross-host send and the `kv` store, both
+# under it), the
 # per-user lane registry below, and the directory->lane table (lanes.json,
 # above).
 #

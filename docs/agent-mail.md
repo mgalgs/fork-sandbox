@@ -446,6 +446,20 @@ registration, so it survives a handoff. It is the third `lanes` column
 are not synced between hosts), and the lane-complete mod's prompt note
 repeats it for each described lane a prompt mentions.
 
+Sessions on one host can also share small pieces of state that are not
+messages, such as which lane owns a pull request, through `lane-mail.sh
+kv`: `get <key>` (`--json` adds the version), `set <key> <value>`
+(`--if-version <v>` or `--if-absent` makes it conditional), `del <key>`
+and `list [--prefix <p>]` (`--json` for key -> value). Lane mail never
+interprets a key or a value, so a consumer brings its own key convention,
+for example `pr:<org>/<repo>#<n>` -> `@<lane>`. Every write gets a new,
+store-issued version; read with `get --json` and write back with
+`--if-version` to change a value without losing a concurrent writer's
+update (exit 3 means someone got there first: read again). Exit 1 means
+the key is absent, 2 a usage or validation error. The store lives in
+`<root>/kv`, is per host, and has no expiry or access control: any session
+can overwrite any key. `lane-mail.sh --help` has the key and value rules.
+
 ### Lane mail between hosts
 
 Sessions on different machines can mail each other's lanes, over the ssh
