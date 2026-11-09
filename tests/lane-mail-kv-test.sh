@@ -168,6 +168,86 @@ kv set dashval -- --x
 kv get dashval
 check "-- lets a value start with --" out_is --x
 
+printf '== conditional writes ==\n'
+
+kv set cond one
+cv1="$(out_text)"
+kv set cond two --if-version "$cv1"
+cv2="$(out_text)"
+check "--if-version with the current version succeeds" test "$rc" = 0
+kv get cond
+check "--if-version wrote the new value" out_is two
+kv set cond three --if-version "$cv1"
+if (( rc == 3 )) && [[ "$err" == *"--if-version"* ]]; then
+    ok "--if-version with a stale version fails with 3, naming the precondition"
+else
+    no "--if-version with a stale version fails with 3, naming the precondition" "rc=$rc: $err"
+fi
+kv get --json cond
+jv="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["value"], d["version"])' "$scratch/out")"
+check "a failed --if-version leaves value and version unchanged" test "$jv" = "two $cv2"
+kv set nosuch x --if-version "$cv2"
+check "--if-version on an absent key fails with 3" test "$rc" = 3
+kv get nosuch
+check "a failed --if-version on an absent key creates nothing" test "$rc" = 1
+
+kv set fresh first --if-absent
+check "--if-absent on a new key succeeds" test "$rc" = 0
+kv set fresh second --if-absent
+if (( rc == 3 )) && [[ "$err" == *"--if-absent"* ]]; then
+    ok "--if-absent on an existing key fails with 3, naming the precondition"
+else
+    no "--if-absent on an existing key fails with 3, naming the precondition" "rc=$rc: $err"
+fi
+kv get fresh
+check "a failed --if-absent leaves the value unchanged" out_is first
+kv set fresh x --if-absent --if-version "$cv2"
+check "--if-absent with --if-version is a usage error" test "$rc" = 2
+kv set fresh x --if-version
+check "--if-version without a value is a usage error" test "$rc" = 2
+
+kv del cond --if-version "$cv1"
+check "del --if-version with a stale version fails with 3" test "$rc" = 3
+kv get cond
+check "a failed del --if-version leaves the key" out_is two
+kv del cond --if-version "$cv2"
+check "del --if-version with the current version succeeds" test "$rc" = 0
+kv del cond --if-version "$cv2"
+check "del --if-version of an absent key exits 1" test "$rc" = 1
+
+# Every writer holds the same version; exactly one may win.
+kv set race start
+rv="$(out_text)"
+n=12
+mkdir -p "$scratch/race"
+# A start barrier: each writer blocks reading the fifo until it is opened
+# and closed below, so all of them start at once rather than staggered by
+# their launch, and their check-then-write windows overlap.
+mkfifo "$scratch/race/go"
+for (( i = 0; i < n; i++ )); do
+    ( read -r _ < "$scratch/race/go"
+      r=0; "$lm" kv set race "writer-$i" --if-version "$rv" > "$scratch/race/$i.out" 2>/dev/null || r=$?
+      echo "$r" > "$scratch/race/$i.rc" ) &
+done
+sleep 0.5
+: > "$scratch/race/go"
+wait
+wins=0 losses=0 winner=""
+for (( i = 0; i < n; i++ )); do
+    case "$(cat "$scratch/race/$i.rc")" in
+        0) wins=$(( wins + 1 )); winner="$i" ;;
+        3) losses=$(( losses + 1 )) ;;
+    esac
+done
+if (( wins == 1 && losses == n - 1 )); then
+    ok "$n concurrent --if-version writers: exactly one exits 0, the rest 3"
+else
+    no "$n concurrent --if-version writers: exactly one exits 0, the rest 3" "wins=$wins losses=$losses"
+fi
+kv get --json race
+jv="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["value"], d["version"])' "$scratch/out")"
+check "the stored value and version are the winner's" test "$jv" = "writer-$winner $(cat "$scratch/race/$winner.out" 2>/dev/null)"
+
 leftovers="$(find "$store" -name '.tmp-*' | wc -l)"
 check "no temp files are left in the store" test "$leftovers" = 0
 

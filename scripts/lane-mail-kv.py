@@ -2,8 +2,8 @@
 """lane-mail-kv.py -- the key/value store behind `lane-mail.sh kv`.
 
 Usage: lane-mail-kv.py <store-dir> get [--json] <key>
-       lane-mail-kv.py <store-dir> set <key> <value|->
-       lane-mail-kv.py <store-dir> del <key>
+       lane-mail-kv.py <store-dir> set <key> <value|-> [--if-version <v> | --if-absent]
+       lane-mail-kv.py <store-dir> del <key> [--if-version <v>]
 
 Plumbing: run it through `lane-mail.sh kv`, which passes the store
 directory (<LANE_MAIL_ROOT>/kv) itself. The verbs, exit codes, key and
@@ -24,8 +24,9 @@ verbatim. A write builds the record in a temp file in the same
 directory and renames it over the key's file, so a reader -- which
 takes no lock -- sees either the old record or the new one, never a mix.
 
-Writes. Every set and del runs under one exclusive flock on
-<store-dir>/.lock.
+Writes. Every set and del, including the precondition check of a
+conditional one, runs under one exclusive flock on <store-dir>/.lock;
+the check and the write happen under the same hold.
 
 Versions. '<ns since epoch, hex>-<16 random hex digits>', new on every
 write and never derived from the key or value, so deleting and
@@ -47,6 +48,7 @@ LOCK_NAME = ".lock"
 
 EXIT_ABSENT = 1
 EXIT_USAGE = 2
+EXIT_PRECONDITION = 3
 
 
 class Fail(Exception):
@@ -123,6 +125,14 @@ def write_record(store, key, version, value):
         raise
 
 
+def check_version(store, key, want, verb):
+    rec = read_record(store, key)
+    if rec is None:
+        raise Fail(EXIT_PRECONDITION, "%s %s: --if-version %s failed: the key does not exist" % (verb, key, want))
+    if rec[0] != want:
+        raise Fail(EXIT_PRECONDITION, "%s %s: --if-version %s failed: the current version is %s" % (verb, key, want, rec[0]))
+
+
 def parse(args, flags, valued):
     """Splits args into positionals and a dict of flags. `flags` are
     switches, `valued` take one argument; `--` ends flag parsing."""
@@ -166,9 +176,11 @@ def cmd_get(store, args):
 
 
 def cmd_set(store, args):
-    pos, _ = parse(args, set(), set())
+    pos, opts = parse(args, {"--if-absent"}, {"--if-version"})
     if len(pos) != 2:
-        usage("usage: kv set <key> <value|->")
+        usage("usage: kv set <key> <value|-> [--if-version <v> | --if-absent]")
+    if "--if-absent" in opts and "--if-version" in opts:
+        usage("--if-version and --if-absent are mutually exclusive")
     key = pos[0]
     check_key(key)
     if pos[1] == "-":
@@ -180,15 +192,21 @@ def cmd_set(store, args):
     if b"\0" in value:
         usage("value contains a NUL byte")
     with Locked(store):
+        if "--if-absent" in opts:
+            rec = read_record(store, key)
+            if rec is not None:
+                raise Fail(EXIT_PRECONDITION, "set %s: --if-absent failed: the key exists (version %s)" % (key, rec[0]))
+        elif "--if-version" in opts:
+            check_version(store, key, opts["--if-version"], "set")
         version = new_version()
         write_record(store, key, version, value)
     print(version)
 
 
 def cmd_del(store, args):
-    pos, _ = parse(args, set(), set())
+    pos, opts = parse(args, set(), {"--if-version"})
     if len(pos) != 1:
-        usage("usage: kv del <key>")
+        usage("usage: kv del <key> [--if-version <v>]")
     key = pos[0]
     check_key(key)
     if not os.path.isdir(store):
@@ -196,6 +214,8 @@ def cmd_del(store, args):
     with Locked(store):
         if read_record(store, key) is None:
             raise Fail(EXIT_ABSENT)
+        if "--if-version" in opts:
+            check_version(store, key, opts["--if-version"], "del")
         os.unlink(os.path.join(store, file_name(key)))
 
 
