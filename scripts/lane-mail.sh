@@ -66,7 +66,9 @@
 # 2 usage or validation error (bad key, NUL or oversize value, conflicting
 # flags); 3 precondition failed (--if-version on a missing key or another
 # version, --if-absent on an existing key): stderr names which, and nothing
-# was written.
+# was written; 4 the store could not be read or written (a permission or
+# disk error, a damaged record): stderr says why, and the outcome of a
+# write is unknown, so read again before relying on it.
 #
 # A key matches ^[A-Za-z0-9@][A-Za-z0-9._:/#@+=-]{0,199}$, so
 # `pr:org/repo#2778` and `owner:@lane:host` are keys; a '/' is just a
@@ -82,7 +84,9 @@
 # retrying from the `get` on exit 3.
 #
 # The store is <root>/kv (created on first write): one file per key holding
-# version and value, named by the key with '/' replaced by '%'. Writes run
+# version and value, named by the key lower-cased with '/' replaced by '%',
+# plus '~' and a hex mask of its upper-case positions, so keys that differ
+# only in case stay apart on a case-insensitive file system. Writes run
 # under one exclusive flock on the store -- a conditional write's check and
 # its write under the same hold -- and land by temp-file-then-rename, so the
 # lock-free reads never see a torn record. Per-host only: no `@lane:host`

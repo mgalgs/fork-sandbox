@@ -136,11 +136,27 @@ kv set 'a/../b' traversal
 check "a/../b is accepted as a key" test "$rc" = 0
 after="$(find "$scratch" -path "$store" -prune -o -print | sort)"
 check "a/../b writes no file outside the store" test "$before" = "$after"
-check "a/../b is one plain file directly in the store" test -f "$store/a%..%b"
+check "a/../b is one plain file directly in the store" test -f "$store/a%..%b~0"
 kv get 'b'
 check "a/../b does not alias the key b" test "$rc" = 1
 kv get 'a/../b'
 check "a/../b reads back" out_is traversal
+
+# A case-insensitive file system (macOS's default) folds names that differ
+# only in case, so on-disk names must carry no upper case of their own.
+kv set 'pr:Org/Repo#1' '@upper'
+kv set 'pr:org/repo#1' '@lower'
+kv get 'pr:Org/Repo#1'
+check "keys differing only in case are distinct" out_is '@upper'
+upper_names="$(find "$store" -mindepth 1 -name '*[A-Z]*' | wc -l)"
+check "no on-disk name holds an upper-case letter" test "$upper_names" = 0
+kv list --prefix pr:
+check "list keeps the case of both keys" out_is $'pr:Org/Repo#1\npr:org/repo#1\npr:org/repo#2778\n'
+upper200="K$(printf 'A%.0s' {1..199})"
+kv set "$upper200" x
+kv get "$upper200"
+check "a 200-character all-upper-case key fits a file name" out_is x
+kv del 'pr:Org/Repo#1'; kv del 'pr:org/repo#1'; kv del "$upper200"
 
 printf 'a\0b' | "$lm" kv set nul - >/dev/null 2>&1; rc=$?
 check "a value with a NUL is refused with 2" test "$rc" = 2
@@ -281,6 +297,28 @@ print(json.load(open(sys.argv[1])) == {"pr:org/a#10": "@alpha\n", "pr:org/b#2": 
 check "list --json --prefix maps only matching keys" test "$json_ok" = True
 kv list extra
 check "list with a stray argument is a usage error" test "$rc" = 2
+
+printf '== store errors ==\n'
+
+# A record the store cannot read or replace is exit 4, never the 1 that
+# means "absent". A directory in a record's place fails even for root.
+mkdir "$store/broken~0"
+kv get broken
+check "get of an unreadable record exits 4" test "$rc" = 4
+if [[ -n "$err" && "$err" != *Traceback* ]]; then
+    ok "an unreadable record is reported on stderr, without a traceback"
+else
+    no "an unreadable record is reported on stderr, without a traceback" "$err"
+fi
+kv set broken x
+check "set over an unreplaceable record exits 4" test "$rc" = 4
+kv del broken
+check "del of an unremovable record exits 4" test "$rc" = 4
+rmdir "$store/broken~0"
+printf 'v\xff\nx' > "$store/badver~0"
+kv get badver
+check "a record with a non-ASCII version exits 4" test "$rc" = 4
+rm -f "$store/badver~0"
 
 leftovers="$(find "$store" -name '.tmp-*' | wc -l)"
 check "no temp files are left in the store" test "$leftovers" = 0

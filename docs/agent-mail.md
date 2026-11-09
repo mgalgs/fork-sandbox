@@ -456,7 +456,8 @@ for example `pr:<org>/<repo>#<n>` -> `@<lane>`. Every write gets a new,
 store-issued version; read with `get --json` and write back with
 `--if-version` to change a value without losing a concurrent writer's
 update (exit 3 means someone got there first: read again). Exit 1 means
-the key is absent, 2 a usage or validation error. The store lives in
+the key is absent, 2 a usage or validation error, 4 a store I/O error
+(never read 4 as "absent"). The store lives in
 `<root>/kv`, is per host, and has no expiry or access control: any session
 can overwrite any key. `lane-mail.sh --help` has the key and value rules.
 

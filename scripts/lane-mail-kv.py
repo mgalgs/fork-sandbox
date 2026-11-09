@@ -12,13 +12,17 @@ value rules and version semantics are documented in lane-mail.sh's
 header; this one only records how the store is laid out.
 
 Layout. One file per key, directly in <store-dir>. Its name is the key
-with every '/' replaced by '%': '%' is not in the key alphabet, so the
-mapping is injective and reversible, and since a key cannot start with
-'.', no name is '.', '..' or a dot-file. Keys never become paths with
-more than one component, so no key can address anything outside the
-store. Hex was not used because a 200-character key would hex-encode to
-400 bytes, past the 255-byte file-name limit. Dot-files are the store's
-own: '.lock' and '.tmp-*' temp files.
+lower-cased with every '/' replaced by '%', then '~' and, in lower-case
+hex, a mask with bit i set when character i of the key is upper case:
+'pr:Org/x' is 'pr:org%x~2'. The name holds no upper-case letter, so a
+case-insensitive file system (macOS's default) cannot fold two keys
+into one file; '%' and '~' are not in the key alphabet, so the mapping
+is injective and reversible. A key cannot start with '.', so no name is
+'.', '..' or a dot-file, and keys never become paths with more than one
+component, so no key can address anything outside the store. Hex was
+not used because a 200-character key would hex-encode to 400 bytes,
+past the 255-byte file-name limit; the longest name here is 251.
+Dot-files are the store's own: '.lock' and '.tmp-*' temp files.
 
 Record. The file holds '<version>\\n' followed by the value's bytes
 verbatim. A write builds the record in a temp file in the same
@@ -50,6 +54,7 @@ LOCK_NAME = ".lock"
 EXIT_ABSENT = 1
 EXIT_USAGE = 2
 EXIT_PRECONDITION = 3
+EXIT_ERROR = 4  # the store could not be read or written
 
 
 class Fail(Exception):
@@ -69,11 +74,18 @@ def check_key(key):
 
 
 def file_name(key):
-    return key.replace("/", "%")
+    mask = sum(1 << i for i, c in enumerate(key) if c.isupper())
+    return "%s~%x" % (key.lower().replace("/", "%"), mask)
 
 
 def key_of(name):
-    return name.replace("%", "/")
+    """The key file `name` holds, or None for a name that is not one."""
+    base, sep, mask = name.rpartition("~")
+    if not sep or not re.fullmatch(r"[0-9a-f]+", mask):
+        return None
+    mask = int(mask, 16)
+    return "".join(c.upper() if mask >> i & 1 else c
+                   for i, c in enumerate(base.replace("%", "/")))
 
 
 def read_record(store, key):
@@ -230,7 +242,7 @@ def cmd_list(store, args):
     except FileNotFoundError:
         names = []
     keys = sorted(k for k in (key_of(n) for n in names if not n.startswith("."))
-                  if k.startswith(prefix))
+                  if k is not None and k.startswith(prefix))
     if "--json" not in opts:
         for k in keys:
             print(k)
@@ -256,6 +268,11 @@ def main(argv):
         if e.msg:
             sys.stderr.write("lane-mail: kv: %s\n" % e.msg)
         return e.code
+    except Exception as e:
+        # An I/O failure must not surface as a traceback's exit 1, which
+        # a caller would read as "the key is absent".
+        sys.stderr.write("lane-mail: kv: store error: %s: %s\n" % (type(e).__name__, e))
+        return EXIT_ERROR
     return 0
 
 
