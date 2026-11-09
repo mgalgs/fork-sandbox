@@ -6629,25 +6629,68 @@ pm_retry_malformed_schedule() {
 }
 
 # Re-runs the wake-when gate of every seat the thread has a wake-deferred
-# record for, after run $3 was harvested having posted nothing: the gate only
-# ever ran when a message arrived, and nothing else would retry it. Through
-# the ordinary spawn path, with the deferred message as the trigger: exit 0
-# wakes the seat, exit 1 records the same deferral again, exit 3 drops it,
-# anything else fails open. A closed thread is skipped, and hops/budget/reserve apply as to any
-# follow-up wake.
+# record for. Two triggers share it, so their semantics cannot drift:
+#   - run $3 was harvested having posted nothing (the gate only ever ran
+#     when a message arrived, and nothing else would retry it): every line
+#     is re-gated, `regate ... run=<run id>`;
+#   - $3 is empty, the timed re-gate (pm_regate_timer_pass): only a line
+#     whose due time has passed and whose attempts are not spent
+#     ($FORK_SANDBOX_WAKE_REGATE_ATTEMPTS) is re-gated, `regate ...
+#     source=timer attempt=<n>`. The line is first rewritten at attempt n,
+#     due one interval n out, so a refused spawn (hops, budget, reserve),
+#     which leaves the line standing exactly as for the harvest trigger,
+#     still spends that attempt instead of re-gating every pass; a defer
+#     writes the same values again (PM_REGATE_ATTEMPT).
+# Either way through the ordinary spawn path, with the deferred message as
+# the trigger: exit 0 wakes the seat, exit 1 records the deferral again (at
+# attempt 0 from a harvest, at n from the timer), exit 3 drops it, anything
+# else fails open. A closed thread is skipped, a seat with a live run on the
+# thread is left alone, and hops/budget/reserve apply as to any follow-up
+# wake.
+PM_REGATE_ATTEMPT=""
 pm_regate_deferred() {
-    local project="$1" tid="$2" rid="$3" agent mid
+    local project="$1" tid="$2" rid="$3" agent mid max=0 now=0 next
     [[ -s "$WAKE_DEFERRED/$tid" ]] || return 0
     pm_upstream_closed "$tid" && return 0
+    if [[ -z "$rid" ]]; then
+        max="$(pm_regate_attempts)"
+        (( max > 0 )) || return 0
+        now="$(pm_now)"
+    fi
     local -a records=()
     mapfile -t records < "$WAKE_DEFERRED/$tid"
     local rec
     for rec in "${records[@]}"; do
         pm_deferral_parse "$rec" || continue
         agent="$PM_DEF_AGENT" mid="$PM_DEF_MID"
+        if [[ -z "$rid" ]]; then
+            (( PM_DEF_ATTEMPT < max && PM_DEF_DUE <= now )) || continue
+        fi
         fs_pm_find_live_run "$agent" "$tid" >/dev/null && continue
-        pm_event "regate thread=${tid:0:8} agent=$agent run=$rid"
+        if [[ -n "$rid" ]]; then
+            pm_event "regate thread=${tid:0:8} agent=$agent run=$rid"
+        else
+            next=$(( PM_DEF_ATTEMPT + 1 ))
+            pm_deferral_set "$tid" "$agent" "$mid" "$next"
+            pm_event "regate thread=${tid:0:8} agent=$agent source=timer attempt=$next"
+            PM_REGATE_ATTEMPT="$next"
+        fi
         pm_followup_wake "$project" "$agent" "$tid" "$mid" || true
+        PM_REGATE_ATTEMPT=""
+    done
+}
+
+# The timed re-gate: every thread with a wake-deferred record, through
+# pm_regate_deferred's timer trigger. Runs after pm_harvest_pass in
+# cmd_deliver, so a harvest re-gate this pass (fresh information, which
+# resets the line) is seen first, and before pm_deferral_pass, so a line
+# spent this pass flags this pass.
+pm_regate_timer_pass() {
+    local project="$1" f
+    (( $(pm_regate_attempts) > 0 )) || return 0
+    for f in "$WAKE_DEFERRED"/*; do
+        [[ -s "$f" ]] || continue
+        pm_regate_deferred "$project" "${f##*/}" ""
     done
 }
 
@@ -7890,6 +7933,7 @@ cmd_deliver() {
         pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
+        pm_regate_timer_pass "$project"
         pm_k8s_dead_reap_pass
         pm_k8s_retention_pass
         pm_deferral_pass
@@ -7916,6 +7960,7 @@ cmd_deliver() {
         (( stop )) || pm_fetch_wait_pass "$project"
         (( stop )) || pm_retry_pass "$project"
         (( stop )) || pm_harvest_pass "$project"
+        (( stop )) || pm_regate_timer_pass "$project"
         (( stop )) || pm_k8s_dead_reap_pass
         (( stop )) || pm_k8s_retention_pass
         (( stop )) || pm_deferral_pass
