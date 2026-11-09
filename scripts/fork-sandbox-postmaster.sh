@@ -7666,8 +7666,10 @@ pm_thread_is_quiescent() {
 # both records standing the flag is one, reasons joined by "; ", and its
 # keyword is built from the two booleans, never by matching the text.
 # Runs before pm_hook_pass so on-quiescent reads the flag this sets.
+# wake-deferred lines alone flag only once one of them has spent its timed
+# re-gates (pm_deferral_spent); a budget-reserved record flags at once.
 pm_deferral_pass() {
-    local f tid count reason keyword
+    local f tid count reason keyword deferred
     local -A seen=()
     for f in "$WAKE_DEFERRED"/* "$BUDGET_RESERVED"/*; do
         [[ -s "$f" ]] || continue
@@ -7681,6 +7683,13 @@ pm_deferral_pass() {
         pm_upstream_closed "$tid" && continue
         [[ "$(cat -- "$DEFERRAL_MARKS/$tid" 2>/dev/null)" == "$count" ]] && continue
         pm_thread_is_quiescent "$tid" || continue
+        deferred=0
+        [[ -s "$WAKE_DEFERRED/$tid" ]] && pm_deferral_spent "$tid" && deferred=1
+        # Deferrals the timer will still re-gate are not stranded yet: no
+        # flag and no mark, so the pass that spends them flags. A thread
+        # flagged anyway (a budget-reserved record) names every standing
+        # deferral, as before: its mark would hide them later.
+        (( deferred )) || [[ -s "$BUDGET_RESERVED/$tid" ]] || continue
         pm_hook_mark "$DEFERRAL_MARKS" "$tid" "$count"
         reason="" keyword=""
         if [[ -s "$WAKE_DEFERRED/$tid" ]]; then
@@ -7693,6 +7702,20 @@ pm_deferral_pass() {
         fi
         pm_flag "$tid" "$reason" "$keyword"
     done
+}
+
+# True when thread $1 has a wake-deferred line the timer will not re-gate
+# again: its attempts spent, or timed re-gates off
+# ($FORK_SANDBOX_WAKE_REGATE_ATTEMPTS=0).
+pm_deferral_spent() {
+    local max rec
+    max="$(pm_regate_attempts)"
+    (( max > 0 )) || return 0
+    while IFS= read -r rec; do
+        pm_deferral_parse "$rec" || continue
+        (( PM_DEF_ATTEMPT < max )) || return 0
+    done < "$WAKE_DEFERRED/$1"
+    return 1
 }
 
 # The budget-reserved flag reason for thread $1, built from the record and

@@ -680,6 +680,9 @@ check "wake gate: a context failure leaves no temp dir" 0 \
     "$(find "$WG_STATE" -maxdepth 1 -name 'wake-gate.*' | wc -l)"
 
 # ---- the durable deferral record and its quiescent flag ----
+# The flag fires at once only with timed re-gates off (23-timed-regate.sh
+# covers the flag that waits for them).
+export FORK_SANDBOX_WAKE_REGATE_ATTEMPTS=0
 wg_flag_file() { cat "$WG_STATE/needs-operator/$tid" 2>/dev/null || true; }
 wg_flags() {
     local n
@@ -758,6 +761,8 @@ once
 check "wake-deferred: a retry spawns the seat" 1 "$(wg_spawns hana)"
 check "wake-deferred: and clears its record" 0 \
     "$( [[ -e "$WG_STATE/wake-deferred/$tid" ]] && echo 1 || echo 0 )"
+
+unset FORK_SANDBOX_WAKE_REGATE_ATTEMPTS
 
 # ---- the per-thread budget (X-Thread-Budget on the root) ----
 # bt_send <budget> <to> <subject>: a root carrying `send --budget`.
@@ -997,10 +1002,12 @@ export FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline
 wg_new_store
 wg_gate 'exit 1'
 wg_qhook
+export FORK_SANDBOX_WAKE_REGATE_ATTEMPTS=0
 once
 mid="$(send_msg '@dana' '@hana' 'quiescent sees defer' 'body' 8)"
 tid="$(thread_of "$mid")"; short="${tid:0:8}"
 once
+unset FORK_SANDBOX_WAKE_REGATE_ATTEMPTS
 check "quiescent hook: sees FS_HOOK_FLAGGED=1 for a standing defer" 1 "$(wg_qseen 1)"
 check "quiescent hook: sees the wake-deferred reason" \
     "wake deferred: @hana at $mid and nothing woke it" "$(wg_qseen 2)"

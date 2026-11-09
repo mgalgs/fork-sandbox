@@ -266,4 +266,48 @@ FORK_SANDBOX_WAKE_REGATE_ATTEMPTS=0 once
 check "off: the gate ran only on arrival" 1 "$(tr_calls)"
 not_contains "off: no regate event" "$(cat "$work/once.out")" "pm regate"
 
+tr_store
+tr_send
+FORK_SANDBOX_WAKE_REGATE_ATTEMPTS=0 once
+check "off: the quiescence flag fires at once" "wake deferred: @tess at $tr_mid and nothing woke it" "$(tr_flag)"
+
+# ============================================================
+printf '\n== quiescence flag: waits until the timed re-gates are spent ==\n'
+# ============================================================
+
+tr_store
+tr_send
+once
+check "wait: a quiet thread with attempts left is not flagged" "" "$(tr_flag)"
+for tr_n in 1 2 3; do
+    tr_at "$(tr_field 3)"
+    once
+    check "wait: still not flagged after re-gate $tr_n" 0 "$(tr_flags)"
+done
+tr_at "$(tr_field 3)"
+once
+check "wait: flagged once the last attempt is spent" "wake deferred: @tess at $tr_mid and nothing woke it" "$(tr_flag)"
+contains "wait: with the unchanged keyword" "$(cat "$work/once.out")" "pm flag thread=$tr_short reason=wake-deferred"
+check "wait: flagged once" 1 "$(tr_flags)"
+tr_at $(( T0 + 1000000 ))
+once
+check "wait: not flagged again" 1 "$(tr_flags)"
+check "wait: the spent line still shows in status --json" "[{'agent': 'tess', 'message_id': '$tr_mid'}]" \
+    "$(we_py "$(we_json "$tr_tid")" 'd["wake_deferred"]')"
+
+# A fresh defer after the flag starts the count again.
+tr_mid2="$(reply_msg '@alice' "$tr_mid" 'again' --to '@tess')"
+once
+check "wait: a new message's defer resets the spent line" "tess $tr_mid2 $(( T0 + 1000300 )) 0" "$(tr_line)"
+check "wait: and the new count is not flagged yet" 1 "$(tr_flags)"
+
+# A legacy line has no attempt spent, so it waits too.
+tr_store
+tr_send
+once
+printf 'tess %s\n' "$tr_mid" > "$PM_STATE_DIR/wake-deferred/$tr_tid"
+once
+check "wait: the legacy line is re-gated, not flagged" "" "$(tr_flag)"
+check "wait: and now records attempt 1" 1 "$(tr_field 4)"
+
 finish_suite

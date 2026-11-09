@@ -380,6 +380,8 @@ r = [r for r in d["runs"] if r["run_id"] == sys.argv[2]][0]
 print([r["replies"], bool(r["harvested_at"]), r["outcome"]])' "$PS_OUT/status.2" "$ps_rita_rid")"
 
 printf '\n== re-gate: exit 1 re-defers, and the quiescence flag still fires ==\n'
+# At once only with timed re-gates off.
+export FORK_SANDBOX_WAKE_REGATE_ATTEMPTS=0
 ps_store
 : > "$PS_OUT/calls"
 echo 1 > "$PS_OUT/verdict"
@@ -393,6 +395,7 @@ check "re-gate: exit 1 left no wanda spawn" 0 "$(ps_spawns wanda)"
 check "re-gate: and the same deferral line" "wanda $ps_mid" "$(deferral_seats "$PM_STATE_DIR/wake-deferred/$ps_tid")"
 contains "re-gate: the quiescence flag fires as before" "$(cat "$PM_STATE_DIR/needs-operator/$ps_tid")" \
     "wake deferred: @wanda at $ps_mid and nothing woke it"
+unset FORK_SANDBOX_WAKE_REGATE_ATTEMPTS
 
 printf '\n== re-gate: a closed thread is skipped ==\n'
 ps_store
