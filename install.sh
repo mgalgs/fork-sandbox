@@ -356,6 +356,7 @@ PLUMBING=(
     fork-sandbox-resume-lib.sh  # sourced by fork-sandbox.sh for --resume
     fork-sandbox-runner.sh
     fork-sandbox-stop-guard.sh
+    lane-mail-kv.py           # run by lane-mail.sh kv
     lane-mail-lib.sh          # sourced by lane-mail.sh, lane-mail-serve and fork-sandbox-mail.sh
     sandbox-backend-bwrap
     sandbox-backend-container

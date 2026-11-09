@@ -613,6 +613,11 @@ case "$cmd" in
         export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
         exec "$mail_bin" "$@"
         ;;
+    kv)
+        # The store sits under the fixed root like everything else written
+        # here; the helper is given its directory, never the caller.
+        exec python3 "$script_dir/lane-mail-kv.py" "$LANE_MAIL_ROOT/kv" "${@:2}"
+        ;;
     lanes)
         # The lane-complete mod's lister already merges every source and
         # reads its paths from these scripts; one lister, two callers.
