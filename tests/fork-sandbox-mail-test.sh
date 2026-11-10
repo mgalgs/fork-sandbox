@@ -128,6 +128,22 @@ case "$raw3" in
 esac
 check "grandchild lands as 003" "1" "$(find "$thread_dir" -maxdepth 1 -name "003-*.msg" | wc -l)"
 
+printf '\n== lookup by id ==\n'
+
+# The lookup opens only files named for the id, so a store of thousands of
+# messages answers in one glob instead of a header read per file.
+fid_id="$("$mail" send --from @alice --to @bob --subject "Find" --body - <<< "x" 2>diag.txt)"
+fid_dir="$FORK_SANDBOX_MAIL_ROOT/threads/$fid_id"
+fid_stray="$(cat /proc/sys/kernel/random/uuid)"
+sed "s/^Message-ID: .*/Message-ID: $fid_stray/" "$fid_dir/001-$fid_id.msg" > "$fid_dir/099-misnamed.msg"
+refuses "a message whose file is not named for its id is not found" "$mail" show "$fid_stray"
+rm -f -- "$fid_dir/099-misnamed.msg"
+refuses "an id matching only the tail of a file name is not found" "$mail" show "${fid_id: -12}"
+refuses "a glob-shaped id is not found" "$mail" show '*'
+refuses "a path-shaped id is not found" "$mail" show "../$fid_id"
+refuses "reply to a glob-shaped id is refused" "$mail" reply --from @bob --reply-to '*' --body - <<< "x"
+contains "the id itself is still found" "$("$mail" show "$fid_id")" "Message-ID: $fid_id"
+
 printf '\n== reply-all and explicit --to ==\n'
 
 id_multi="$("$mail" send --from @alice --to @bob,@dave --cc @carol --subject "Group" --body - <<< "hi all" 2>diag.txt)"

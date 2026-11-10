@@ -600,11 +600,16 @@ mail_count_header() {
 
 # Finds the message file whose Message-ID equals $1, across every thread.
 # Prints its path on stdout, or returns 1 if there is no such message.
+# Every writer names a message "<NNN>-<Message-ID>.msg", so the glob below
+# opens only candidate files; the header check still decides, since a short
+# id can match the tail of a longer one. The id is shape-checked first
+# because it becomes part of a glob pattern.
 mail_find_by_id() {
     local id="$1" dir f
+    [[ "$id" =~ $MAIL_ID_RE ]] || return 1
     dir="$(mail_threads_dir)"
     [[ -d "$dir" ]] || return 1
-    for f in "$dir"/*/*.msg; do
+    for f in "$dir"/*/[0-9]*-"$id".msg; do
         [[ -e "$f" ]] || continue
         if [[ "$(mail_header "$f" Message-ID)" == "$id" ]]; then
             printf '%s' "$f"
@@ -616,9 +621,9 @@ mail_find_by_id() {
 
 # Confirms $1 names an existing thread ROOT (a message whose own
 # Message-ID equals its Thread-ID) without ever building a path from the
-# caller-supplied id directly: mail_find_by_id locates the file by
-# scanning and comparing header content, so an id shaped like a path
-# traversal can't escape the store.
+# caller-supplied id directly: mail_find_by_id refuses an id not shaped
+# like one this store issues and confirms the match by header content, so
+# an id shaped like a path traversal can't escape the store.
 mail_thread_root_exists() {
     local tid="$1" f
     f="$(mail_find_by_id "$tid")" || return 1
@@ -628,7 +633,7 @@ mail_thread_root_exists() {
 # Rejects a thread id that isn't shaped like a Message-ID this store would
 # ever generate (mail_new_uuid) -- required before the id is ever used to
 # build a path directly (the grant file, e.g.) rather than routed through
-# mail_find_by_id's scan-and-compare, since mail_thread_root_exists above
+# mail_find_by_id's header-checked lookup, since mail_thread_root_exists above
 # only confirms a message with that id-as-header-text exists, not that the
 # id is itself path-safe.
 mail_validate_thread_id() {

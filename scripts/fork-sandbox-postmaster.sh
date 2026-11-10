@@ -1685,9 +1685,12 @@ pm_thread_budget() {
     fi
 }
 
+# Same lookup as mail_find_by_id in fork-sandbox-mail.sh: candidates by
+# file name, decided by the Message-ID header.
 pm_find_by_id() {
     local id="$1" f
-    for f in "$MAIL_ROOT"/threads/*/*.msg; do
+    [[ "$id" =~ $PM_THREAD_ID_RE ]] || return 1
+    for f in "$MAIL_ROOT"/threads/*/[0-9]*-"$id".msg; do
         [[ -e "$f" ]] || continue
         if [[ "$(pm_header "$f" Message-ID)" == "$id" ]]; then
             printf '%s' "$f"
