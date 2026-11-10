@@ -147,7 +147,7 @@ is a verb that ran past its timeout and was killed.
 basename: non-empty, no `/`, no leading `.`, not `.` or `..`, no NUL or
 newline. The server writes each uploaded file into a fresh temporary
 directory, substitutes the real path into argv, and removes the directory
-once the call returns. At most 16 files per request, 4 MiB decoded per
+once the call returns. At most 256 files per request, 4 MiB decoded per
 file, 4 MiB decoded for `stdin_b64`.
 
 The server logs one line per request to stderr: time, label (or `-` when

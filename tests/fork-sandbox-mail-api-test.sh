@@ -527,10 +527,20 @@ head -c 4194305 /dev/zero | tr '\0' a > "$work/stdin.big"
 check "stdin over 4 MiB: 413" "413" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin-file "$work/stdin.big" -- send --from @ci-kickoff --to @x --subject s --body -)"
 many_files=()
-for i in $(seq 17); do echo "$i" > "$work/f$i"; many_files+=(--file "f$i=$work/f$i"); done
 many_argv=(send --from @ci-kickoff --to @x --subject s --body -)
-for i in $(seq 17); do many_argv+=(--attach "f$i"); done
-check "17 attachments: 413" "413" \
+for i in $(seq 201); do
+    echo "$i" > "$work/f$i"
+    many_files+=(--file "f$i=$work/f$i")
+    many_argv+=(--attach "f$i")
+done
+check "201 attachments: 200" "200" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi "${many_files[@]}" -- "${many_argv[@]}")"
+for i in $(seq 202 257); do
+    echo "$i" > "$work/f$i"
+    many_files+=(--file "f$i=$work/f$i")
+    many_argv+=(--attach "f$i")
+done
+check "257 attachments: 413" "413" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi "${many_files[@]}" -- "${many_argv[@]}")"
 
 printf '== 2. the client shim: send with a body file and an attachment ==\n'

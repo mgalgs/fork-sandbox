@@ -127,7 +127,7 @@ from mail send --budget, X-Grant only from mail send --no-grant or
 apply to an operator token too. An operator passes every other check.
 --body must be '-': the
 body comes in stdin_b64. --attach names a key of "files" (a plain basename,
-at most 4 MiB decoded, at most 16 files, no unreferenced keys); the server
+at most 4 MiB decoded, at most 256 files, no unreferenced keys); the server
 writes each file to a private temp directory and deletes it after the call.
 stdin_b64 is at most 4 MiB decoded and stdin is empty when it is absent.
 
@@ -166,7 +166,7 @@ TEAM_HASH_FILE = "team-token-sha256"
 MAX_BODY = 24 * 1024 * 1024
 MAX_FILE = 4 * 1024 * 1024
 MAX_STDIN = 4 * 1024 * 1024
-MAX_FILES = 16
+MAX_FILES = 256
 MAX_ARGV = 1024
 EXEC_TIMEOUT = 60
 IDEM_HEADER = "Idempotency-Key"
