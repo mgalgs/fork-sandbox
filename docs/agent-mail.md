@@ -425,6 +425,27 @@ mail will wait` on stderr, exit status unchanged, so the sender knows the
 mail may sit unread. The `lane-mail-register`
 skill wraps registration and explains the listing.
 
+Mail that concerns every session on the host (a full `/tmp`, a change of
+account for new sessions) goes to `@all`, in `--to` or `--cc`:
+
+```
+lane-mail.sh send --from @ops --to @all --subject '/tmp is full' --body -
+```
+
+`@all` reaches every lane `lanes` lists as `live`, `stale` or `mailbox`,
+except the sender's own lane and `@noreply`; never a remote lane or a peer.
+The lanes are fixed when the message is sent and recorded in an
+`X-Lane-Broadcast` header, while To/Cc keep the literal `@all`. Each lane's
+`inbox`, watcher and hook see the message as if it named that lane, once
+even when the lane is also named explicitly. A plain `reply` (reply-all)
+drops `@all` and goes to the sender plus anyone the message named
+explicitly; to answer everyone, reply with `--to @all` or `--cc @all`.
+`@all` is local-only: `@all:<host>` is refused, and a message naming
+`@all` and a remote `@lane:host` still reaches that lane, which does not
+expand it. `register all` is refused. This is lane mail's `@all` only; the
+fleet store's `@all` is the fleet's own list (below), and lane mail's rules
+never apply there.
+
 `register <lane> --dir <abs-path>` also remembers `<lane>` as the lane for
 that project directory, and `lane-mail.sh lane-for <abs-path>` reads it
 back. It prints nothing and exits 1 when no lane is remembered. The table

@@ -8,6 +8,7 @@
 #        lane-mail.sh lane-for <abs-path>           (the directory->lane table)
 #        lane-mail.sh send|reply|show|tree|list|inbox|seen [args...]
 #        lane-mail.sh send --to @lane:host ...     (another host, over ssh)
+#        lane-mail.sh send --to @all ...           (every lane on this host)
 #        lane-mail.sh lanes                        (the lanes there are)
 #        lane-mail.sh kv get|set|del|list ...      (shared key/value store)
 #
@@ -28,6 +29,26 @@
 #   lane-mail: @x: registered but no live session (last seen <when>); mail will wait
 # with the exit status unchanged. A lane never registered (mailbox-only), a
 # remote `@lane:host`, @noreply and the sender's own lane are not checked.
+#
+# Broadcast. `@all` in --to or --cc of `send` or `reply` reaches every local
+# lane that `lanes` lists as `live`, `stale` or `mailbox` -- a parked lane
+# sees it when its next session resumes -- except @noreply and the sender's
+# own lane; never a `remote` or `peer` row. The stored To/Cc keeps the
+# literal `@all`, so a reader sees it was a broadcast; the lanes it reached
+# are fixed at send time (a lane that appears later does not get it) and
+# recorded in an `X-Lane-Broadcast: @b, @c` header, which only this command
+# writes (`--header` naming it is refused). Each recipient's `inbox` lists
+# the message as if it had been addressed to it, so the watcher and the
+# unread-mail hook wake it unchanged, and a lane named explicitly as well
+# gets it once. After delivering, stderr says `lane-mail: @all reached
+# <lanes>`. Replies go to the sender: reply-all (a `reply` with no --to)
+# drops `@all` from the inherited recipients, so a plain reply reaches the
+# broadcast's sender plus anyone it named explicitly; a reply meant for
+# every lane says `--to @all` or `--cc @all`. Broadcast is local-only:
+# `@all:<host>` is refused, while a message naming `@all` and a remote
+# `@lane:host` still delivers to that lane as usual (the peer never
+# expands it). `register all` is refused. Only this root has it: in the
+# fleet store, `@all` is the fleet's own address (docs/agent-mail.md).
 #
 # A lane may carry a one-line description of what it owns, so a name like
 # @alpha is not read as "anything alpha-related" when its owner means one
@@ -177,7 +198,8 @@
 # registrations" in lane-mail-lib.sh. `registration` prints the lane alone.
 # `register noreply` is refused before anything is written: `@noreply` is
 # the store's one-way sender (`send` without --from), and no mailbox may
-# answer to it.
+# answer to it. `register all` (or `@all`) is refused the same way: `@all`
+# is the broadcast address.
 
 set -euo pipefail
 
