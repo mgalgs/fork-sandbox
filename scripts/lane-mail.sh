@@ -207,7 +207,8 @@ die() {
 # Also sets `recip_addrs` (every recipient, trimmed), `recip_from` (the
 # --from value), `recip_self` (this host's peer name, or empty),
 # `recip_all` (1 when --to or --cc names @all) and `recip_all_host` (an
-# `@all:<host>` given in --to or --cc, or empty).
+# `@all:<host>` given in --to or --cc, or empty). An @all inherited by
+# reply-all is dropped, as the store drops it.
 find_remote_hosts() {
     local verb="$1"; shift
     local -a recips=() parts=()
@@ -242,7 +243,10 @@ find_remote_hosts() {
             case "$name" in
                 From|To|Cc)
                     IFS=',' read -ra parts <<<"${line#"$name":}"
-                    recips+=("${parts[@]:-}")
+                    for p in "${parts[@]:-}"; do
+                        h="${p//[[:space:]]/}"
+                        [[ "$h" == "$BROADCAST" || "$h" == "$BROADCAST":* ]] || recips+=("$p")
+                    done
                     ;;
             esac
         done < <(FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT" "$mail_bin" show "$reply_to" 2>/dev/null || true)
@@ -604,6 +608,11 @@ case "$cmd" in
             esac
         done
         [[ -n "$lane" ]] || { echo "Usage: lane-mail.sh register <lane> [--about \"<text>\"] [--dir <abs-path>]" >&2; exit 2; }
+        # @all is the broadcast address; no one mailbox may answer to it.
+        if [[ "$lane" == all || "$lane" == "$BROADCAST" ]]; then
+            echo "lane-mail: 'all' is reserved for broadcast (send --to @all) and cannot be registered" >&2
+            exit 2
+        fi
         if [[ ! "$lane" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
             echo "lane-mail: bad lane name '$lane' (want ^[a-z0-9][a-z0-9-]*$, no leading @)" >&2
             exit 2

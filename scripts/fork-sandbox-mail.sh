@@ -283,7 +283,7 @@
 # `X-Lane-Broadcast: @b, @c` header. `inbox <name>` there also lists a
 # message whose To or Cc names `@all`, whose From is a lane on this host,
 # and whose X-Lane-Broadcast names @<name> (position: wherever `@all`
-# stands). In every other
+# stands), and reply-all drops `@all` (bare or `@all:host`). In every other
 # store, the fleet store included, `@all` is an ordinary address and
 # X-Lane-Broadcast an ordinary header.
 #
@@ -469,6 +469,9 @@ mail_is_noreply() {
 MAIL_BROADCAST="@all"
 mail_is_lane_root() {
     [[ "$MAIL_ROOT" == "$LANE_MAIL_ROOT" ]]
+}
+mail_is_broadcast() {
+    mail_is_lane_root && [[ "$1" == "$MAIL_BROADCAST" || "$1" == "$MAIL_BROADCAST":* ]]
 }
 
 # Prints To or Cc when message file $1 reaches address $2 by lane broadcast
@@ -1550,8 +1553,9 @@ cmd_reply() {
     p_references="$(mail_header "$parent_file" References)"
 
     if [[ -z "$to_norm" ]]; then
-        # reply-all: dedup(parent's From + To + Cc) minus the sender and
-        # the one-way sentinel, which has no mailbox to answer.
+        # reply-all: dedup(parent's From + To + Cc) minus the sender, the
+        # one-way sentinel, which has no mailbox to answer, and (lane-mail
+        # root only) the broadcast address: replies go to the sender.
         local -a candidates=() seen_addr=() result=()
         [[ -n "$p_from" ]] && candidates+=("$p_from")
         local rest="$p_to${p_cc:+, $p_cc}"
@@ -1568,6 +1572,7 @@ cmd_reply() {
         for c in "${candidates[@]}"; do
             [[ "$c" == "$from" ]] && continue
             mail_is_noreply "$c" && continue
+            mail_is_broadcast "$c" && continue
             dup=0
             for a in "${seen_addr[@]:-}"; do
                 [[ "$a" == "$c" ]] && { dup=1; break; }

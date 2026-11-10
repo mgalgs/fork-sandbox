@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # lane-mail-broadcast-test.sh -- Exercise `@all`, lane mail's local
-# broadcast address: who it reaches, the literal header, the local-only
-# refusal, and that the fleet store does not apply it.
+# broadcast address: who it reaches, the literal header, reply-all, the
+# local-only and reserved-name refusals, and that the fleet store does not
+# apply it.
 #
 # No real lane-mail root and no real registry. The scripts run from a
 # scratch copy whose fixed LANE_MAIL_ROOT line (lane-mail-lib.sh) points at
@@ -130,6 +131,25 @@ check "@b gets one copy" "1" "$(has b "$out")"
 out="$(printf 'one-way\n' | lm send --to @all --subject oneway --body - 2>"$scratch/err")"; rc=$?
 check "a one-way @all (no --from) reaches every lane, @a too" "0 1 1" "$rc $(has a "$out") $(has d "$out")"
 
+echo "== replies =="
+out="$(printf 'ack\n' | lm reply --from @b --reply-to "$id1" --body - 2>/dev/null)"; rc=$?
+r1="$out"
+check "a plain reply from @b succeeds" "0" "$rc"
+contains "it is addressed to the sender only" "$(lm show "$r1")" $'\nTo: @a\n'
+check "@a has the reply" "1" "$(has a "$r1")"
+for l in b c d; do check "@$l does not" "0" "$(has "$l" "$r1")"; done
+out="$(printf 'everyone\n' | lm reply --from @b --reply-to "$id1" --cc @all --body - 2>/dev/null)"; rc=$?
+r2="$out"
+check "reply --cc @all from @b succeeds" "0" "$rc"
+for l in a c d; do check "@$l has the reply --cc @all" "1" "$(has "$l" "$r2")"; done
+check "@b, its sender, does not" "0" "$(has b "$r2")"
+out="$(printf 'everyone\n' | lm reply --from @b --reply-to "$id1" --to @all --body - 2>/dev/null)"; rc=$?
+check "reply --to @all reaches @a, @c and @d, not @b" "0 1 1 1 0" \
+    "$rc $(has a "$out") $(has c "$out") $(has d "$out") $(has b "$out")"
+err="$(printf 'self\n' | lm reply --from @a --reply-to "$id1" --body - 2>&1)"; rc=$?
+check "the sender's own reply-all to a pure broadcast has no one left" "1" "$rc"
+contains "and says to pass --to" "$err" "pass --to explicitly"
+
 echo "== refusals =="
 before="$(find "$root/threads" -name '*.msg' | wc -l)"
 err="$(printf 'x\n' | lm send --from @a --to @all:beta --subject s --body - 2>&1)"; rc=$?
@@ -140,6 +160,16 @@ check "@all naming this host is refused too" "1" "$rc"
 err="$(printf 'x\n' | lm send --from @a --to @b --header 'X-Lane-Broadcast: @c' --subject s --body - 2>&1)"; rc=$?
 check "a hand-written X-Lane-Broadcast header is refused" "1" "$rc"
 check "nothing was stored by the refusals" "$before" "$(find "$root/threads" -name '*.msg' | wc -l)"
+for name in all @all; do
+    err="$(env CLAUDE_CODE_SESSION_ID=sess-new HOME="$scratch/alpha/home" "$scratch/alpha/scripts/lane-mail.sh" \
+        register "$name" --about x --dir /tmp/x 2>&1)"; rc=$?
+    check "register $name is refused" "2" "$rc"
+    contains "register $name says the name is reserved" "$err" "reserved for broadcast"
+done
+check "the refused registers wrote no registration" "0" "$(find "$reg_dir" -name 'sess-new' | wc -l)"
+check "nor a description or lanes.json" "0 0" \
+    "$([[ -e "$root/agents/all" ]] && echo 1 || echo 0) $([[ -e "$scratch/alpha/home/.local/state/fork-sandbox/lanes.json" ]] && echo 1 || echo 0)"
+
 echo "== @all with a remote lane =="
 out="$(printf 'both\n' | lm send --from @a --to @all,@x:beta --subject both --body - 2>"$scratch/err")"; rc=$?
 check "@all plus @x:beta succeeds" "0" "$rc"
@@ -149,18 +179,24 @@ contains "the local copy keeps @all literal" "$(lm show "$out")" $'\nTo: @all, @
 mkdir -p "$scratch/beta/root/agents/b"
 check "the peer does not expand @all for a lane of its own" "" \
     "$(lm_beta inbox b | cut -f1)"
+out2="$(printf 'back\n' | lm_beta reply --from @x --reply-to "$out" --body - 2>/dev/null)"; rc=$?
+check "the remote lane's reply-all succeeds" "0" "$rc"
+contains "it goes to the sender only" "$(lm_beta show "$out2")" $'\nTo: @a:alpha\n'
+check "it reaches @a, not the lanes @all reached" "1 0" "$(has a "$out2") $(has b "$out2")"
 
 echo "== the fleet store has no lane broadcast =="
 # The fleet has an @all of its own (every fleet agent, resolved by the
 # postmaster through `fork-sandbox-fleet.sh expand`). The store under it
 # must not also apply lane mail's rules: no X-Lane-Broadcast inbox
-# matching.
+# matching, and reply-all keeps @all.
 fleet="$scratch/fleet"
 mkdir -p "$fleet"
 fm() { env FORK_SANDBOX_MAIL_ROOT="$fleet" "$repo_dir/scripts/fork-sandbox-mail.sh" "$@"; }
 fid="$(printf 'x\n' | fm send --from @a --to @all --header 'X-Lane-Broadcast: @b' --subject s --body - 2>/dev/null)"
 check "X-Lane-Broadcast puts nothing in an inbox there" "" "$(fm inbox b | cut -f1)"
 check "the store matches @all only as the literal name all" "$fid" "$(fm inbox all | cut -f1)"
+frid="$(printf 'y\n' | fm reply --from @b --reply-to "$fid" --body - 2>/dev/null)"
+contains "reply-all there keeps @all" "$(fm show "$frid")" $'\nTo: @a, @all\n'
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
