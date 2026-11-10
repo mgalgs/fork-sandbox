@@ -277,6 +277,16 @@
 # refused as before; the mail API sets it on every store it runs, so a
 # remote client cannot post anonymously.
 #
+# Lane broadcast. In the lane-mail root (LANE_MAIL_ROOT) only, `@all` is
+# lane-mail.sh's broadcast address: the header keeps the literal `@all`,
+# and lane-mail.sh records the lanes it expanded to at send time in an
+# `X-Lane-Broadcast: @b, @c` header. `inbox <name>` there also lists a
+# message whose To or Cc names `@all`, whose From is a lane on this host,
+# and whose X-Lane-Broadcast names @<name> (position: wherever `@all`
+# stands). In every other
+# store, the fleet store included, `@all` is an ordinary address and
+# X-Lane-Broadcast an ordinary header.
+#
 # Privacy is addressing, not access control. This store has no ACLs at all:
 # `show`, `tree`, `list` and a raw grep of the store see every message
 # regardless of who it was addressed to -- they are host-side operator
@@ -453,6 +463,33 @@ mail_trim() {
 MAIL_NOREPLY="@noreply"
 mail_is_noreply() {
     [[ "$1" == "$MAIL_NOREPLY" || "$1" == "$MAIL_NOREPLY":* ]]
+}
+
+# Lane broadcast (see the header): only the lane-mail root has it.
+MAIL_BROADCAST="@all"
+mail_is_lane_root() {
+    [[ "$MAIL_ROOT" == "$LANE_MAIL_ROOT" ]]
+}
+
+# Prints To or Cc when message file $1 reaches address $2 by lane broadcast
+# ($3 and $4 are its To and Cc), nothing otherwise. The From must be a lane
+# on this host: a peer's message is never expanded here.
+mail_broadcast_position() {
+    local f="$1" addr="$2" to="$3" cc="$4" from list
+    mail_is_lane_root || return 0
+    from="$(mail_header "$f" From)"
+    [[ -n "$from" && "$from" != *:* ]] || return 0
+    list="$(mail_header "$f" X-Lane-Broadcast)"
+    case ",$list," in
+        *", $addr,"* | ",$addr,"*) ;;
+        *) return 0 ;;
+    esac
+    case ",$to," in
+        *", $MAIL_BROADCAST,"* | ",$MAIL_BROADCAST,"*) printf 'To'; return 0 ;;
+    esac
+    case ",$cc," in
+        *", $MAIL_BROADCAST,"* | ",$MAIL_BROADCAST,"*) printf 'Cc' ;;
+    esac
 }
 
 # Refuses a normalized ", "-joined recipient list ($1) that names the
@@ -2246,6 +2283,9 @@ cmd_inbox() {
             case ",$cc," in
                 *", $addr,"* | ",$addr,"*) position="Cc" ;;
             esac
+        fi
+        if [[ -z "$position" && "$to,$cc" == *"$MAIL_BROADCAST"* ]] && mail_is_lane_root; then
+            position="$(mail_broadcast_position "$f" "$addr" "$to" "$cc")"
         fi
         [[ -n "$position" ]] || continue
 

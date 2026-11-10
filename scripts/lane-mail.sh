@@ -189,6 +189,7 @@ mail_bin="$script_dir/fork-sandbox-mail.sh"
 
 LANES_DIR="/tmp/claude-$(id -u)/lane-mail-lanes"
 LANES_JSON="$HOME/.local/state/fork-sandbox/lanes.json"
+BROADCAST="@all"   # the local broadcast address; see the header
 work=""    # scratch dir of an in-flight cross-host send; removed on exit
 
 usage() {
@@ -204,18 +205,25 @@ die() {
 # named by the recipients of a `send`/`reply` invocation (args: verb, then the
 # store's arguments). A reply with no --to inherits the parent's From/To/Cc.
 # Also sets `recip_addrs` (every recipient, trimmed), `recip_from` (the
-# --from value) and `recip_self` (this host's peer name, or empty).
+# --from value), `recip_self` (this host's peer name, or empty),
+# `recip_all` (1 when --to or --cc names @all) and `recip_all_host` (an
+# `@all:<host>` given in --to or --cc, or empty).
 find_remote_hosts() {
     local verb="$1"; shift
     local -a recips=() parts=()
-    local reply_to="" have_to=0 line name self="" addr host seen h
-    remote_hosts=() recip_addrs=() recip_from=""
+    local reply_to="" have_to=0 line name self="" addr host seen h p
+    remote_hosts=() recip_addrs=() recip_from="" recip_all=0 recip_all_host=""
     while (( $# )); do
         case "$1" in
             --to|--cc)
                 [[ "$1" == --to ]] && have_to=1
                 IFS=',' read -ra parts <<<"${2:-}"
                 recips+=("${parts[@]:-}")
+                for p in "${parts[@]:-}"; do
+                    p="${p//[[:space:]]/}"
+                    [[ "$p" == "$BROADCAST" ]] && recip_all=1
+                    [[ "$p" == "$BROADCAST":* && -z "$recip_all_host" ]] && recip_all_host="$p"
+                done
                 shift $(( $# >= 2 ? 2 : 1 ))
                 ;;
             --reply-to) reply_to="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
@@ -245,7 +253,7 @@ find_remote_hosts() {
         addr="${addr#"${addr%%[![:space:]]*}"}"
         addr="${addr%"${addr##*[![:space:]]}"}"
         [[ -n "$addr" ]] && recip_addrs+=("$addr")
-        [[ "$addr" == @*:* ]] || continue
+        [[ "$addr" == @*:* && "$addr" != "$BROADCAST":* ]] || continue
         host="${addr#*:}"
         [[ "$host" == "$self" ]] && continue
         seen=0
@@ -289,6 +297,25 @@ find_stale_lanes() {
         if (( best > 0 )); then t="$(lane_mail_when "$best" age)"; else t="unknown"; fi
         stale_warnings+=("lane-mail: @$lane: registered but no live session (last seen $t); mail will wait")
     done
+}
+
+# Prints the `@all` expansion for the recipients last parsed by
+# find_remote_hosts, ", "-joined: every lane `lanes` lists as live, stale or
+# mailbox, except @noreply, @all and the sender's own lane. Empty when there
+# is none.
+broadcast_lanes() {
+    local lister listing src lane from_lane out=""
+    lister="$script_dir/../mods/lane-complete/bin/list-lanes.sh"
+    [[ -x "$lister" ]] || die "@all: $lister not found, so the lanes cannot be listed; nothing was sent"
+    listing="$("$lister")" || die "@all: listing the lanes failed; nothing was sent"
+    from_lane="${recip_from#@}"
+    from_lane="${from_lane%%:*}"
+    while IFS=$'\t' read -r src lane _; do
+        case "$src" in live|stale|mailbox) ;; *) continue ;; esac
+        [[ "$lane" =~ $LANE_MAIL_LANE_RE && "$lane" != noreply && "@$lane" != "$BROADCAST" && "$lane" != "$from_lane" ]] || continue
+        out="${out:+$out, }@$lane"
+    done <<<"$listing"
+    printf '%s' "$out"
 }
 
 # Prints one header's value from a message file ($1), or nothing.
@@ -651,15 +678,30 @@ case "$cmd" in
         export FORK_SANDBOX_MAIL_ROOT="$LANE_MAIL_ROOT"
         remote_hosts=()
         find_remote_hosts "$cmd" "${@:2}"
+        [[ -z "$recip_all_host" ]] || die "$recip_all_host: broadcast is local-only; @all takes no host (name a remote lane as @lane:host); nothing was sent"
+        args=("${@:2}")
+        for (( i = 0; i < ${#args[@]}; i++ )); do
+            if [[ "${args[i]}" == --header && "${args[i+1]:-}" =~ ^[[:space:]]*[Xx]-[Ll][Aa][Nn][Ee]-[Bb][Rr][Oo][Aa][Dd][Cc][Aa][Ss][Tt][[:space:]]*: ]]; then
+                die "--header may not set X-Lane-Broadcast; address the message to @all instead"
+            fi
+        done
+        broadcast=""
+        if (( recip_all )); then
+            broadcast="$(broadcast_lanes)" || exit $?
+            [[ -z "$broadcast" ]] || args+=(--header "X-Lane-Broadcast: $broadcast")
+        fi
         find_stale_lanes
         rc=0
         if (( ${#remote_hosts[@]} > 0 )); then
-            cross_host "$cmd" "${@:2}"
+            cross_host "$cmd" "${args[@]}"
         else
-            "$mail_bin" "$@" || rc=$?
+            "$mail_bin" "$cmd" "${args[@]}" || rc=$?
         fi
         # Delivered: say which local recipients have no session to read it.
         if (( rc == 0 )); then
+            if (( recip_all )); then
+                echo "lane-mail: @all reached ${broadcast:-no other local lane}" >&2
+            fi
             for w in "${stale_warnings[@]:-}"; do [[ -z "$w" ]] || echo "$w" >&2; done
         fi
         exit "$rc"
