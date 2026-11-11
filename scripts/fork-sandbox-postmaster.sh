@@ -3930,9 +3930,14 @@ pm_review_history_pin() {
 }
 
 # Atomic tmp+mv write of one pending fetch-miss record (see FETCH MISS in the
-# header), $FETCH_WAIT/<tid>/<agent>.
+# header), $FETCH_WAIT/<tid>/<agent>. <size> and <floor> (optional) are a
+# composed seat's admitted row and finalize floor: the re-dispatch skips the
+# gate, so it reuses them. Only the record's own seat's values belong here,
+# passed explicitly; a record with none re-dispatches on `default` and no
+# floor.
 pm_fetch_wait_write() {
     local tid="$1" agent="$2" trigger="$3" retry="$4" kind="$5" key="$6" since="$7" attempts="$8" not_before="$9"
+    local size="${10:-}" floor="${11:-}"
     mkdir -p -- "$FETCH_WAIT/$tid"
     local tmp
     tmp="$(mktemp "$FETCH_WAIT/$tid/.tmp.XXXXXX")"
@@ -3944,11 +3949,8 @@ pm_fetch_wait_write() {
         printf 'SINCE=%s\n' "$since"
         printf 'ATTEMPTS=%s\n' "$attempts"
         printf 'NOT_BEFORE=%s\n' "$not_before"
-        # A composed seat's admitted row and floor, from pm_spawn_wake's own
-        # scope (this is only ever called beneath it): the re-dispatch
-        # skips the gate, so it reuses these.
-        [[ -z "${pm_wake_size:-}" ]] || printf 'SIZE=%s\n' "$pm_wake_size"
-        [[ -z "${pm_wake_floor:-}" ]] || printf 'FLOOR=%s\n' "$pm_wake_floor"
+        [[ -z "$size" ]] || printf 'SIZE=%s\n' "$size"
+        [[ -z "$floor" ]] || printf 'FLOOR=%s\n' "$floor"
     } > "$tmp"
     mv -- "$tmp" "$FETCH_WAIT/$tid/$agent"
 }
@@ -3963,9 +3965,11 @@ pm_fetch_wait_drop() {
 # when the wake may go ahead; 1 when it may not -- either deferred (a pending
 # record is written or kept; pm_fetch_wait_pass re-dispatches it) or, once the
 # window has passed, flagged exactly as a miss always was. Never sleeps. See
-# FETCH MISS in the header.
+# FETCH MISS in the header. <size> and <floor> are the waking seat's own
+# admitted row and floor, kept on the record (see pm_fetch_wait_write).
 pm_fetch_wait_gate() {
     local project="$1" tid="$2" agent="$3" mid="$4" is_retry="$5" kind="$6" branch="$7" sha="$8"
+    local size="${9:-}" floor="${10:-}"
     local f="$FETCH_WAIT/$tid/$agent" key="$branch $sha"
     local window="${FORK_SANDBOX_POSTMASTER_FETCH_WINDOW:-300}"
     local now since="" attempts=0 not_before=0 retry_flag=0
@@ -3993,7 +3997,8 @@ pm_fetch_wait_gate() {
         present=1
     elif [[ -n "$since" ]] && (( now < not_before )); then
         # Not due yet: keep the clock, take the newest trigger, fetch nothing.
-        pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before"
+        pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before" \
+            "$size" "$floor"
         return 1
     elif pm_target_sha_present "$project" "$branch" "$sha"; then
         present=1
@@ -4025,7 +4030,8 @@ pm_fetch_wait_gate() {
     local delay=$(( 15 << (attempts > 3 ? 2 : attempts - 1) ))
     not_before=$(( now + delay ))
     (( not_before <= since + window )) || not_before=$(( since + window ))
-    pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before"
+    pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before" \
+        "$size" "$floor"
     pm_event "defer thread=${tid:0:8} agent=$agent reason=fetch-miss attempt=$attempts"
     return 1
 }
@@ -4034,12 +4040,14 @@ pm_fetch_wait_gate() {
 # wait the thread's seats have pending, of either kind: each is made due now
 # and loses its key, so the next check starts a fresh window -- on the newest
 # head, or on a review target pm_review_target_orphan has just re-frozen.
+# The size and floor the wait was admitted with are kept.
 pm_fetch_wait_supersede() {
     local tid="$1" f
     for f in "$FETCH_WAIT/$tid"/*; do
         [[ -f "$f" ]] || continue
         pm_fetch_wait_write "$tid" "$(basename -- "$f")" "$(fs_pm_env_get "$f" TRIGGER)" \
-            "$(fs_pm_env_get "$f" RETRY)" "$(fs_pm_env_get "$f" KIND)" "" 0 0 0
+            "$(fs_pm_env_get "$f" RETRY)" "$(fs_pm_env_get "$f" KIND)" "" 0 0 0 \
+            "$(fs_pm_env_get "$f" SIZE)" "$(fs_pm_env_get "$f" FLOOR)"
     done
 }
 
@@ -5037,8 +5045,8 @@ pm_spawn_wake() {
     # run a retry repeats recorded, else what the gate wrote this time; a
     # missing or unusable answer is the `default` row and no floor. Chosen
     # here, before the review-target and grant blocks below, so their
-    # held/fetch-wait records carry it (pm_held_write, pm_fetch_wait_write
-    # read pm_wake_size/pm_wake_floor from this scope).
+    # held/fetch-wait records carry it (passed to pm_held_write and
+    # pm_fetch_wait_gate explicitly).
     local pm_wake_size="" pm_wake_floor="" pipeline_spec="" pipeline_requested="-"
     local pipeline_step1_action="" pipeline_step1_harness="" pipeline_step1_model=""
     if [[ -n "$pipelines" ]]; then
@@ -5099,7 +5107,8 @@ pm_spawn_wake() {
                 fi
             fi
             if [[ -n "$rt_sha" ]] \
-                && ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" review-target "$rt_branch" "$rt_sha"; then
+                && ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" review-target "$rt_branch" "$rt_sha" \
+                    "$pm_wake_size" "$pm_wake_floor"; then
                 return 0
             fi
         fi
@@ -5119,7 +5128,8 @@ pm_spawn_wake() {
                 local uh_branch
                 uh_branch="$(fs_pm_env_get "$uh_file" BRANCH)"
                 uh_sha="$(fs_pm_env_get "$uh_file" SHA)"
-                if ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" upstream-head "$uh_branch" "$uh_sha"; then
+                if ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" upstream-head "$uh_branch" "$uh_sha" \
+                    "$pm_wake_size" "$pm_wake_floor"; then
                     return 0
                 fi
             else

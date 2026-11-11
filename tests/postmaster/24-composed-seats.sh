@@ -2,8 +2,8 @@
 # shellcheck extended-analysis=false  # see shellcheck-memory-budget-test.sh
 # tests/postmaster/24-composed-seats.sh — fork-sandbox-postmaster.sh: seats
 # with a fleet `pipelines:` table. The wake-when gate's size token picks the
-# row (every fallback picks `default`), the choice survives retry and a held
-# release, a composed wake's argv is exactly decision 4's on both backends,
+# row (every fallback picks `default`), the choice survives retry, a held
+# release and a superseded fetch-wait, a composed wake's argv is exactly decision 4's on both backends,
 # a composed `sets` seat always starts from the review target, and seats
 # without the key are untouched.
 #
@@ -453,5 +453,61 @@ check "ran: X-Review-Target-Set names the squashed head" "$fin_branch $fin_sq" \
     "$( [[ -n "$fin_posted" ]] && header_of_file "$fin_posted" X-Review-Target-Set)"
 check "ran: the thread's review target moves to it" "$fin_sq" \
     "$(env_val "$PM_STATE_DIR/review-target/$cs_tid.env" SHA)"
+
+# ============================================================
+printf '\n== composed seats: a fetch-wait record keeps its own size and floor ==\n'
+# ============================================================
+
+# pak (k8s, gated, with a finalize script) takes `sets` again: the
+# upstream-head wait and the re-freeze are k8s `sets` paths.
+sed -i '/^  pat:$/,/^  pam:$/{/review-target: sets/d}' "$FORK_SANDBOX_FLEET_FILE"
+sed -i 's/^  pak:$/  pak:\n    review-target: sets/' "$FORK_SANDBOX_FLEET_FILE"
+k8s_origin_mirror_seed
+export FORK_SANDBOX_POSTMASTER_FETCH_WINDOW=120
+cs_fw_file() { printf '%s/fetch-wait/%s/%s' "$PM_STATE_DIR" "$1" "$2"; }
+cs_fw_set() { sed -i "s/^$3=.*/$3=$4/" "$(cs_fw_file "$1" "$2")"; }
+# A commit in the origin's source repo, not yet pushed; then pushed.
+cs_fw_commit() {
+    git -C "$UH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test \
+        commit -q --allow-empty -m "mirror lag $1"
+    git -C "$UH_ORIGIN_SRC" rev-parse HEAD
+}
+cs_fw_sync() { git -C "$UH_ORIGIN_SRC" push -q -f "$UH_ORIGIN_BARE" "$2:refs/heads/$1"; }
+cs_fw_floor="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+
+# Admitted into fetch-wait with the gate's xs row and a floor; a newer
+# announcement To the operator supersedes the wait outside any wake, and
+# the re-dispatch must still run what was admitted.
+cs_new_store
+printf 'revise\n' > "$work/body.tmp"
+cs_mid="$("$MAIL" send --from '@carol' --to '@pak' --subject 'supersede topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+once
+# The announcement goes To the operator; carol's mail is the gated wake
+# that admits pak (a non-fleet sender's wake skips the gate).
+cs_fw_a="$(cs_fw_commit feature/cs-late)"
+cs_fw_r="$(reply_msg '@ci-demo' "$cs_mid" 'pushed' --to '@operator' --upstream-head "feature/cs-late:$cs_fw_a")"
+once
+printf 'xs' > "$CS_OUT/size"
+printf '%s\n' "$cs_fw_floor" > "$CS_OUT/floor"
+reply_msg '@carol' "$cs_fw_r" 'review the push' --to '@pak' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "supersede setup: pak waits on the announced head" "xs $cs_fw_floor" \
+    "$(env_val "$(cs_fw_file "$cs_tid" pak)" SIZE) $(env_val "$(cs_fw_file "$cs_tid" pak)" FLOOR)"
+rm -f -- "$CS_OUT/size" "$CS_OUT/floor"
+cs_fw_b="$(cs_fw_commit feature/cs-late-2)"
+cs_fw_sync feature/cs-late-2 "$cs_fw_b"
+reply_msg '@ci-demo' "$cs_fw_r" 'pushed again' --to '@operator' \
+    --upstream-head "feature/cs-late-2:$cs_fw_b" >/dev/null
+once
+[[ -s "$STUB_ARGV_LOG" ]] || once
+check "supersede: the re-dispatch runs the admitted xs row" "csonnet1-ropus1" "$(flag_value --pipeline)"
+check "supersede: ... with the admitted floor" "$cs_fw_floor" "$(flag_value --finalize-floor)"
+check "supersede: ... at the newest head" "upstream=$cs_fw_b" "$(flag_value --extra-ref)"
+
+unset FORK_SANDBOX_POSTMASTER_FETCH_WINDOW
 
 finish_suite
