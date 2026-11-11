@@ -690,7 +690,9 @@
 # grants, checkout, services) -- and NO --harness, --model, --effort,
 # --pi-args, --preset or --timeout: the spec names every seat, and
 # fork-sandbox.sh's own default bounds the run (none locally, where every
-# leg is bounded on its own; `fork-sandbox-k8s.sh run`'s 3600 s on k8s).
+# leg is bounded on its own; on k8s, `fork-sandbox-k8s.sh run`'s composed
+# default, 3600 s per leg the pipeline can run, fix and --refresh-at
+# continuation legs included, rather than the 14400 s a plain k8s seat gets).
 # Session args (--session-state/--resume-session/--session-id) and
 # --refresh-at are passed only when the spec's step 1 is a claude code step
 # (fork-sandbox.sh refuses --session-state otherwise); any other row starts

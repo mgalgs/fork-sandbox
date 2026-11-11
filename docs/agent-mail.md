@@ -2424,7 +2424,9 @@ recorded and reused like the size). It passes **no** `--harness`,
 `--model`, `--effort`, `--pi-args`, `--preset` or `--timeout`: the spec
 names every seat, and `fork-sandbox.sh`'s own default bounds the run (a
 local run has no overall limit, every leg is bounded on its own; a `--k8s`
-run takes `fork-sandbox-k8s.sh run`'s 3600 s). Session args and
+run takes `fork-sandbox-k8s.sh run`'s composed default, 3600 s per leg the
+pipeline can run, fix and `--refresh-at` continuation legs included, instead
+of the 14400 s a plain k8s seat is given). Session args and
 `--refresh-at` are passed only when the spec's step 1 is a claude code step;
 any other row starts the wake fresh. Everything else a wake passes is
 unchanged. The run record's `HARNESS`/`MODEL` are step 1's seat.
