@@ -24581,6 +24581,95 @@ else
         "$(find "$lsplit_run_dir/.leg-req" 2>&1)"
 fi
 
+printf '\n== composed pipeline on --k8s: the relayed finalize step runs in the clone ==\n'
+# The same real leg-loop.sh relay as the section above, with
+# --finalize-script on the dispatch. A pod's leg container sets no working
+# directory, so leg-loop.sh runs here from a directory that is not the
+# clone, as it would from / in a pod. The script records where it ran and
+# then commits a tree change through an absolute path, so the runner's
+# restore after "tree differs" runs whatever the script's own cwd was:
+# the branch only comes back if the reset ran in the clone too.
+lfin_pod_work="$(newdir)"; tmpdirs+=("$lfin_pod_work")
+lfin_clone="$lfin_pod_work/clone"
+lfin_branch="fs-k8s-test-leg-split-fin-$$"
+lfin_pwd_mark="$(newdir)/finalize-pwd"; tmpdirs+=("$(dirname "$lfin_pwd_mark")")
+lfin_script="$(newdir)/finalize.sh"; tmpdirs+=("$(dirname "$lfin_script")")
+cat > "$lfin_script" <<EOF
+pwd > "$lfin_pwd_mark"
+printf 'an edit finalize must never make\n' > "$lfin_clone/finalize-edit.txt"
+git -C "$lfin_clone" add finalize-edit.txt
+git -c user.email=t@fork-sandbox.invalid -c user.name=Tester -C "$lfin_clone" commit -q -m edit
+EOF
+if walk_dispatch_flags "$lfin_pod_work" "$lfin_branch" --finalize-script "$lfin_script"; then
+    ok "a composed --k8s dispatch with --finalize-script stages successfully"
+else
+    no "a composed --k8s dispatch with --finalize-script stages successfully" \
+        "$(cat "$WALK_STAGE_OUT")"
+fi
+lfin_run_dir="$WALK_RUN_DIR"
+mkdir -p "$lfin_pod_work/outbox" "$lfin_pod_work/inbox"
+git clone -q "$walk_proj" "$lfin_clone"
+git -C "$lfin_clone" checkout -q -b "$lfin_branch" "$walk_base_sha"
+lfin_count="$(mktemp)"; tmpdirs+=("$lfin_count")
+lfin_argv_log="$(mktemp)"; tmpdirs+=("$lfin_argv_log")
+lfin_script_file="$(mktemp)"; tmpdirs+=("$lfin_script_file")
+printf 'commit\nfindings\ncommit\napproved\napproved\n' > "$lfin_script_file"
+lfin_pod_home="$(newdir)"; tmpdirs+=("$lfin_pod_home")
+lfin_leg_home="$(newdir)"; tmpdirs+=("$lfin_leg_home")
+lfin_handoff_dir="$(newdir)"; tmpdirs+=("$lfin_handoff_dir")
+lfin_leg_tmp="$(newdir)"; tmpdirs+=("$lfin_leg_tmp")
+lfin_leg_cwd="$(newdir)"; tmpdirs+=("$lfin_leg_cwd")
+lfin_loop_log="$(newdir)/leg-loop.log"; tmpdirs+=("$(dirname "$lfin_loop_log")")
+(
+    cd "$lfin_leg_cwd" || exit 1
+    exec env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
+        RUN_DIR="$lfin_run_dir" FORK_SANDBOX_LEG_HANDOFF_DIR="$lfin_handoff_dir" \
+        HOME="$lfin_leg_home" PATH="$walk_stub_bin:$PATH" \
+        TMPDIR="$lfin_leg_tmp" FORK_SANDBOX_LEG_LOOP_YAMA_PATH="$leg_loop_yama_safe_file" \
+        FORK_SANDBOX_CLONE_DIR="$lfin_clone" \
+        CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+        FAKE_COUNT_FILE="$lfin_count" FAKE_ARGV_LOG="$lfin_argv_log" FAKE_SCRIPT="$lfin_script_file" \
+        FORK_SANDBOX_LEG_LOOP_SWEEP_TARGET_FILE="$lsplit_sweep_target_file" \
+        bash "$leg_loop_sh"
+) > "$lfin_loop_log" 2>&1 &
+lfin_loop_pid=$!
+lfin_arm_out="$(PATH="$walk_stub_bin:$PATH" HOME="$lfin_pod_home" \
+    RUN_DIR="$lfin_run_dir" HARNESS=claude MODEL=sonnet MODEL_DISCOVERY="" ALLOW_UNLISTED_MODEL="" \
+    PROXY_BASE_URL="http://fs-k8s-test-walk-proxy.invalid" \
+    CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+    mounts_dir="$walk_mounts" work_dir="$lfin_pod_work" clone_dir="$lfin_clone" \
+    inbox_dir="$lfin_pod_work/inbox" \
+    FORK_SANDBOX_K8S_PI_MODEL_MAP="$lfin_pod_work/pi-model-map.json" \
+    SESSION_HARNESS_STORE=0 RESUME_SESSION="" \
+    FORK_SANDBOX_LEG_HANDOFF_DIR="$lfin_handoff_dir" FS_LEG_RETRY_DELAYS="0 0" \
+    bash "$rd_block_file" 2>&1)"
+touch "$lfin_run_dir/.leg-shutdown"
+lfin_shutdown_deadline=$(( $(date +%s) + 10 ))
+while kill -0 "$lfin_loop_pid" 2>/dev/null; do
+    if (( $(date +%s) >= lfin_shutdown_deadline )); then
+        kill -KILL "$lfin_loop_pid" 2>/dev/null
+        break
+    fi
+    sleep 0.1
+done
+check "relayed finalize: the script runs with cwd the clone" \
+    "$lfin_clone" "$(cat "$lfin_pwd_mark" 2>/dev/null)"
+lfin_outcome="$(jq -r '"\(.finalize.ended)|\(.finalize.detail)|\(.finalize.clone_restored)"' \
+    "$lfin_run_dir/summary.json" 2>/dev/null)"
+if [[ "$lfin_outcome" == "failed|tree differs|true" ]]; then
+    ok "relayed finalize: the tree change is refused and the clone restored"
+else
+    no "relayed finalize: the tree change is refused and the clone restored" \
+        "got '$lfin_outcome'; out=$lfin_arm_out finalize.log=$(cat "$lfin_run_dir/finalize.log" 2>/dev/null)"
+fi
+lfin_reviewed="$(jq -r '.finalize.head_before // empty' "$lfin_run_dir/summary.json" 2>/dev/null)"
+check "relayed finalize: the legs left commits above the base to restore" \
+    "yes" "$([[ -n "$lfin_reviewed" && "$lfin_reviewed" != "$walk_base_sha" ]] && echo yes)"
+check "relayed finalize: the reset ran in the clone, so the branch is the reviewed head" \
+    "$lfin_reviewed" "$(git -C "$lfin_clone" rev-parse "refs/heads/$lfin_branch" 2>/dev/null)"
+check "relayed finalize: the reset left the clone's work tree clean" \
+    "" "$(git -C "$lfin_clone" status --porcelain 2>/dev/null)"
+
 printf '\n== composed pipeline on --k8s: --session-state wires into the pipeline'"'"'s first code step'"'"'s own leg only ==\n'
 # The brief this round adds: --session-state (and --resume-session) used
 # to be refused outright against any composed preset; now they wire into

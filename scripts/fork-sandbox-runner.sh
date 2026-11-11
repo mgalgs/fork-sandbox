@@ -3506,12 +3506,14 @@ finalize_summary_json=null
 # Runs one command against the clone, in the same place the legs ran: the
 # leg container in a composed pod (relayed, as the uncommitted-work check
 # is), else a sealed sandbox. $1 is the wall-clock limit, the rest the
-# command (sh -c ... forms included). stdout goes to the caller, stderr to
-# finalize.log.
+# command (sh -c ... forms included), run with cwd the clone either way:
+# the leg container execs a relayed argv as-is, from wherever it started,
+# so the relay changes into the clone itself. stdout goes to the caller,
+# stderr to finalize.log.
 finalize_exec() {
     local limit="$1" log="$run_dir/finalize.log"; shift
     if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
-        fs_run_leg_split timeout --kill-after 10 "$limit" "$@" < /dev/null 2>> "$log"  # relayed to the leg container, never executed here
+        fs_run_leg_split timeout --kill-after 10 "$limit" sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$clone_dir" "$@" < /dev/null 2>> "$log"  # relayed to the leg container, never executed here
     elif fs_resolve_backend "$script_dir"; then
         local -a fin_bind_flags=()
         local fin_alt
