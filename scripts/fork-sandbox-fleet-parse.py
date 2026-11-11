@@ -59,9 +59,21 @@ regex as fork-sandbox.sh's own `--endpoint` flag, and `grant` is only
 ever the literal string `required`. `check` additionally refuses a
 `backend: k8s` seat whose resolved harness is not `claude`/`pi`, whose
 resolved network is `sealed` (a pod's isolation is the NetworkPolicy's
-job, not a sealed harness's), or that resolves any preset (the cluster
-path is single-leg only in this phase, no maintainer tier, no repeat, no
-composed pipeline).
+job, not a sealed harness's), or that resolves any preset (a k8s seat
+runs a composed pipeline through `pipelines` instead).
+
+`pipelines` is fleet.yaml-only and LLM-only: a mapping from size key
+(^[a-z][a-z0-9-]{0,15}$) to an inline `--pipeline` spec, with `default`
+required. Every spec must hold at least one `c` and one `r` segment (a
+composed seat never runs code unreviewed); whether it compiles is checked
+bash-side with the spec compiler itself. A seat with `pipelines` may not
+resolve `preset`, `harness`, `model` or `thinking` (fleet.yaml or
+frontmatter): the spec names every step's harness, model and effort. Both
+backends accept it. `review-brief` and `finalize` are fleet.yaml-only,
+valid only alongside `pipelines`, and name files directly under the
+personas directory (the persona override's bare-name rule; existence is
+checked bash-side). The postmaster passes them as `--review-brief` and
+`--finalize-script`.
 
 `protocol` (fleet.yaml or frontmatter, fleet.yaml winning) names a shared
 block of protocol text, <prompts-dir>/protocol-<name>.md, that the
@@ -124,6 +136,12 @@ preset line first, then every protocol line:
                                              persona frontmatter)
     agent\t<name>\tprotocol\t<value>       (likewise for protocol)
 
+plus, only for a seat that sets them (fleet.yaml-only):
+
+    agent\t<name>\tpipelines\t<key=spec ...>
+    agent\t<name>\treview-brief\t<value>
+    agent\t<name>\tfinalize\t<value>
+
 This spares fork-sandbox-fleet.sh a second pass over every persona file
 just to learn each agent's resolved preset for the preset-file-exists
 and protocol-file-exists checks below: `check` already parses every
@@ -138,7 +156,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (21 lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (24 lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -159,6 +177,9 @@ routine instead of two.
     agent\t<name>\ton-silence\t<value>
     agent\t<name>\tprotocol\t<value>
     agent\t<name>\ton-failure\t<value>
+    agent\t<name>\tpipelines\t<value>      (`key=spec` pairs, space-joined,
+    agent\t<name>\treview-brief\t<value>    file order)
+    agent\t<name>\tfinalize\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -223,7 +244,7 @@ FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
           "handler", "command", "backend", "endpoint", "grant",
           "review-target", "wake-when", "services", "on-silence",
-          "protocol", "on-failure")
+          "protocol", "on-failure", "pipelines", "review-brief", "finalize")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
@@ -237,7 +258,18 @@ FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
 LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
                     "persona", "refresh-at", "preset", "backend",
                     "endpoint", "grant", "review-target", "services",
-                    "on-silence", "protocol")
+                    "on-silence", "protocol", "pipelines", "review-brief",
+                    "finalize")
+# A `pipelines:` seat runs whatever its chosen spec names, so these may not
+# sit beside it: the spec already names every step's harness, model and
+# effort, and a preset is a second pipeline.
+PIPELINES_EXCLUSIVE = ("preset", "harness", "model", "thinking")
+# Size keys of a `pipelines:` table: the token a wake-when gate writes.
+PIPELINE_KEY_RE = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
+# What fork-sandbox-pipeline-spec.py's segments can spell, joined by `-`.
+# Compiling the spec is fork-sandbox-fleet.sh's job (never a second
+# parser); this only keeps the resolve encoding (`key=spec ...`) safe.
+PIPELINE_SPEC_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -527,6 +559,54 @@ def check_persona(value, path, errors):
     return value
 
 
+def check_pipelines(value, path, errors):
+    """A `pipelines:` table: size token -> inline --pipeline spec. Returns
+    the resolve encoding, `key=spec` pairs space-joined in file order
+    (neither half can hold a space or '='), or "" on any error. Whether
+    each spec compiles is checked bash-side, with the spec compiler
+    itself."""
+    if not isinstance(value, dict) or not value:
+        errors.append(f"{path}: must be a non-empty mapping of size key "
+                       f"to --pipeline spec")
+        return ""
+    pairs = []
+    ok = True
+    for key, spec in value.items():
+        key = str(key)
+        kpath = f"{path}.{key}"
+        if not PIPELINE_KEY_RE.fullmatch(key):
+            errors.append(f"{kpath}: size keys match "
+                           f"^[a-z][a-z0-9-]{{0,15}}$")
+            ok = False
+            continue
+        if not isinstance(spec, str) or not PIPELINE_SPEC_RE.fullmatch(spec):
+            errors.append(f"{kpath}: must be an inline --pipeline spec "
+                           f"like copus1-ropus1, not '{spec}'")
+            ok = False
+            continue
+        segments = spec.split("-")
+        if not any(seg.startswith("c") for seg in segments) or \
+                not any(seg.startswith("r") for seg in segments):
+            errors.append(f"{kpath}: '{spec}' needs at least one c (code) "
+                           f"and one r (review) segment -- a composed seat "
+                           f"never runs code unreviewed")
+            ok = False
+            continue
+        pairs.append(f"{key}={spec}")
+    if "default" not in {str(k) for k in value}:
+        errors.append(f"{path}.default: required -- the row a wake runs "
+                       f"when no size is chosen")
+        ok = False
+    return " ".join(pairs) if ok else ""
+
+
+def check_seat_file(value, path, errors):
+    """review-brief:/finalize: name a file directly under the personas
+    directory, the persona override's shape rule. Existence is checked
+    bash-side (fork-sandbox-fleet.sh's `check`)."""
+    return check_persona(value, path, errors)
+
+
 def check_protocol(value, path, errors):
     """A protocol: names <prompts-dir>/protocol-<value>.md, so it gets
     check_persona's shape rule: a bare name, never a path. Existence of
@@ -790,6 +870,12 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["protocol"] = check_protocol(v, path, errors)
+            elif prop == "pipelines":
+                agent["pipelines"] = check_pipelines(value, path, errors)
+            elif prop in ("review-brief", "finalize"):
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent[prop] = check_seat_file(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],
@@ -797,6 +883,11 @@ def load_and_validate(fleet_file, label, errors):
         check_backend_fields_pair(agent["backend"], agent["endpoint"],
                                    agent["grant"], f"{label}: agents.{name}",
                                    errors)
+        if not agent["pipelines"] and "pipelines" not in (props or {}):
+            for field in ("review-brief", "finalize"):
+                if field in (props or {}):
+                    errors.append(f"{label}: agents.{name}.{field}: only "
+                                   f"valid alongside 'pipelines'")
         if agent["handler"]:
             if not agent["command"]:
                 errors.append(f"{label}: agents.{name}.command: required "
@@ -954,6 +1045,7 @@ def cmd_check(fleet_file, label, personas_dir):
     # agent just to learn `preset`.
     resolved_presets = {}
     resolved_protocols = {}
+    resolved_seat_keys = {}
     if not errors:
         setters = [name for name, agent in agents.items()
                    if agent["review-target"] == "sets"]
@@ -1008,6 +1100,18 @@ def cmd_check(fleet_file, label, personas_dir):
                 agent["harness"] or fm["harness"] or "claude",
                 agent["thinking"] or fm["thinking"],
                 resolved_presets[name], f"agents.{name}", errors)
+            if agent["pipelines"]:
+                # Resolved, not just fleet.yaml: a persona's frontmatter
+                # can set harness/model/thinking/preset on its own.
+                for field in PIPELINES_EXCLUSIVE:
+                    if agent[field] or fm.get(field):
+                        errors.append(
+                            f"agents.{name}.{field}: not allowed alongside "
+                            f"'pipelines' -- the spec names every seat's "
+                            f"harness, model and effort")
+            resolved_seat_keys[name] = (agent["pipelines"],
+                                        agent["review-brief"],
+                                        agent["finalize"])
             if agent["backend"] == "k8s":
                 # Every harness (claude, pi, codex) has a k8s path; whether
                 # a CLUSTER postmaster holds the credential a claude or
@@ -1021,9 +1125,8 @@ def cmd_check(fleet_file, label, personas_dir):
                 if resolved_presets[name]:
                     errors.append(
                         f"agents.{name}: a preset seat cannot run on "
-                        f"backend k8s yet: the cluster path carries no "
-                        f"maintainer tier, no repeat and no composed "
-                        f"pipeline")
+                        f"backend k8s; a k8s seat runs a composed "
+                        f"pipeline through the 'pipelines' key instead")
         # The bash side (fleet_is_agent) treats a bare <name>.md under
         # personas-dir as making `name` an agent even with no fleet.yaml
         # entry at all -- so a list sharing that name is the same
@@ -1066,6 +1169,10 @@ def cmd_check(fleet_file, label, personas_dir):
                               for name, value in resolved_presets.items()))
     sys.stdout.write("".join(f"agent\t{name}\tprotocol\t{value}\n"
                               for name, value in resolved_protocols.items()))
+    for field, i in (("pipelines", 0), ("review-brief", 1), ("finalize", 2)):
+        sys.stdout.write("".join(
+            f"agent\t{name}\t{field}\t{keys[i]}\n"
+            for name, keys in resolved_seat_keys.items() if keys[i]))
     sys.exit(0)
 
 

@@ -87,6 +87,20 @@
 # `check` requires the file to exist. Refused, alongside every other
 # LLM-seat field, on a handler seat.
 #
+# A `pipelines:` table (fleet.yaml only) makes the seat a composed seat:
+# size key -> inline `--pipeline` spec, e.g.
+#   pipelines: {default: copus1-ropus1, xs: csonnet1-ropus1}
+# `default` is required, keys match ^[a-z][a-z0-9-]{0,15}$, and every spec
+# must compile (`check` runs fork-sandbox-pipeline-spec.py on it) and hold
+# at least one `c` and one `r` segment. The seat's wake-when gate picks the
+# row per wake (see fork-sandbox-postmaster.sh's THE WAKE). A `pipelines`
+# seat may not resolve `preset`, `harness`, `model` or `thinking`, from
+# either document. Both backends accept it. `review-brief: <file>` and
+# `finalize: <file>` (fleet.yaml only, each a bare file name under the
+# personas directory that `check` requires to exist) are valid only
+# alongside it; the postmaster passes them as `--review-brief` and
+# `--finalize-script`.
+#
 # This is a registry, not a router or a store: it has no idea what
 # fork-sandbox-mail.sh's message store holds, and never touches it.
 # `expand` turns a `@list` address into its member `@agent` addresses
@@ -139,13 +153,14 @@
 #                  fork-sandbox-preset-parse.py, never a second parser.
 #                  Handler seats stay legal. Without --cluster, `check`
 #                  behaves exactly as it always has.
-#   resolve <name> Print exactly twenty lines for one agent: harness,
+#   resolve <name> Print exactly twenty-three lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
 #                  wake-on-cc, refresh-at, triage, preset, handler,
 #                  command, backend, endpoint, grant, review-target,
-#                  wake-when, services, on-silence, protocol.
+#                  wake-when, services, on-silence, protocol, pipelines,
+#                  review-brief, finalize.
 #                  A field with nothing configured anywhere prints as an
-#                  empty line -- output is always twenty
+#                  empty line -- output is always twenty-three
 #                  lines, never fewer. A new line is only ever appended
 #                  last, so positional readers keep their line numbers. A handler
 #                  seat's harness/model/thinking/network/triage/preset/
@@ -158,15 +173,19 @@
 #                  persona-frontmatter fallback -- printed straight from
 #                  the fleet file, empty when unset. protocol, the
 #                  twentieth, is the bare name (not a path), fleet.yaml
-#                  over frontmatter like the first ten.
+#                  over frontmatter like the first ten. pipelines (21st)
+#                  is the seat's size table as `key=spec` pairs, space-
+#                  joined in file order (`default=copus1-ropus1
+#                  xs=csonnet1-ropus1`); review-brief and finalize (22nd,
+#                  23rd) are full paths under the personas directory. All
+#                  three are fleet.yaml-only, empty when unset.
 #   resolve-on-failure <name>
 #                  Print one line for one agent: its fleet.yaml
 #                  `on-failure` value, `flag` or `note`, `flag` when unset
 #                  (fleet.yaml-only, no persona fallback). Refuses an
 #                  unknown agent exactly as `resolve` does. A verb of its
-#                  own rather than a 21st `resolve` line: `resolve`'s
-#                  twenty-line shape is a contract positional readers
-#                  depend on.
+#                  own rather than a `resolve` line: callers that only
+#                  need this one value need not read `resolve`'s shape.
 #   resolve-triage Print exactly two lines for the wake classifier's own
 #                  sandbox seat: harness, model. Reads only the fleet
 #                  file's top-level `triage` block (no persona fallback --
@@ -374,13 +393,17 @@ cmd_check() {
     # frontmatter parser per agent here. Each agent's resolved `protocol`
     # comes back the same way; lines are keyed by their field column, so
     # their order never matters here.
-    local -A check_preset=() check_protocol=()
+    local -A check_preset=() check_protocol=() check_pipelines=()
+    local -A check_seat_file=()
     local check_kind check_name check_field check_value
     while IFS=$'\t' read -r check_kind check_name check_field check_value; do
         [[ "$check_kind" == agent ]] || continue
         case "$check_field" in
             preset) check_preset["$check_name"]="$check_value" ;;
             protocol) check_protocol["$check_name"]="$check_value" ;;
+            pipelines) check_pipelines["$check_name"]="$check_value" ;;
+            review-brief|finalize)
+                check_seat_file["$check_name.$check_field"]="$check_value" ;;
         esac
     done <<< "$check_out"
 
@@ -425,6 +448,25 @@ cmd_check() {
                 rc=1
             fi
         fi
+        # Every `pipelines` row must compile exactly as `--pipeline` would
+        # compile it at the wake; the parser only checked its shape.
+        local pair row_key row_spec compile_err
+        for pair in ${check_pipelines[$name]:-}; do
+            row_key="${pair%%=*}" row_spec="${pair#*=}"
+            if ! compile_err="$(python3 "$script_dir/fork-sandbox-pipeline-spec.py" "$row_spec" 2>&1 >/dev/null)"; then
+                echo "Error: agents.$name.pipelines.$row_key: '$row_spec' does not compile as a --pipeline spec: ${compile_err#Error: }" >&2
+                rc=1
+            fi
+        done
+        local seat_field seat_path
+        for seat_field in review-brief finalize; do
+            [[ -n "${check_seat_file[$name.$seat_field]:-}" ]] || continue
+            seat_path="$PERSONAS_DIR/${check_seat_file[$name.$seat_field]}"
+            if [[ ! -f "$seat_path" ]]; then
+                echo "Error: agents.$name.$seat_field: file '$seat_path' does not exist." >&2
+                rc=1
+            fi
+        done
     done
     if (( cluster )); then
         check_cluster "$dump" "${agent_names[@]}" || rc=1
@@ -459,21 +501,32 @@ cluster_harness_refusal() {
 # the first.
 check_cluster() {
     local dump="$1"; shift
-    local rc=0 name harness preset handler backend
+    local rc=0 name harness preset handler backend pipelines
     local -a seat
     if grep -q $'^triage\t' <<< "$dump"; then
         echo "Error: triage: the triage classifier runs in a local sandbox, which a cluster postmaster cannot run." >&2
         rc=1
     fi
     for name in "$@"; do
-        # Not $(...): that strips the trailing empty lines of the twenty.
+        # Not $(...): that strips the trailing empty lines of the twenty-three.
         # Indexed by position, so the appended protocol line is never read.
         mapfile -t seat < <(resolve_with_dump "$dump" "$name")
         harness="${seat[0]-}" preset="${seat[9]-}" handler="${seat[10]-}" backend="${seat[12]-}"
+        pipelines="${seat[20]-}"
         [[ "$handler" == exec ]] && continue
         if [[ "$backend" != k8s ]]; then
             echo "Error: agents.$name: a cluster postmaster cannot run local seats (they need bwrap); set backend: k8s." >&2
             rc=1
+        fi
+        if [[ -n "$pipelines" ]]; then
+            # The spec names every seat's harness; the seat's own harness
+            # line is empty and never runs. Each row is checked like a
+            # preset, under the key that names it.
+            local pair
+            for pair in $pipelines; do
+                check_cluster_preset "$name" "pipelines.${pair%%=*}" "${pair#*=}" || rc=1
+            done
+            continue
         fi
         local eff_harness="${harness:-claude}"
         if ! cluster_harness_ok "${eff_harness%%/*}"; then
@@ -481,22 +534,30 @@ check_cluster() {
             rc=1
         fi
         [[ -n "$preset" ]] || continue
-        local preset_out preset_kind preset_agent preset_field preset_value
-        [[ -f "$PRESETS_DIR/$preset.yaml" ]] || fleet_preset_is_spec "$preset" || continue
-        if ! preset_out="$(fleet_parse_preset "$preset")"; then
-            echo "Error: agents.$name.preset: preset '$preset' could not be parsed, so a cluster postmaster cannot tell what harnesses it runs." >&2
-            rc=1
-            continue
-        fi
-        while IFS=$'\t' read -r preset_kind preset_agent preset_field preset_value; do
-            [[ "$preset_kind" == agent && "$preset_field" == harness ]] || continue
-            local preset_leg="${preset_value%%/*}"
-            if ! cluster_harness_ok "$preset_leg"; then
-                echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; $(cluster_harness_refusal "$preset_leg")." >&2
-                rc=1
-            fi
-        done <<< "$preset_out"
+        check_cluster_preset "$name" preset "$preset" || rc=1
     done
+    return "$rc"
+}
+
+# check_cluster's per-preset half: every agent preset $3 seats must run on a
+# cluster postmaster. $2 is the key the error names (`preset` or
+# `pipelines.<size>`).
+check_cluster_preset() {
+    local name="$1" key="$2" preset="$3" rc=0
+    local preset_out preset_kind preset_agent preset_field preset_value
+    [[ -f "$PRESETS_DIR/$preset.yaml" ]] || fleet_preset_is_spec "$preset" || return 0
+    if ! preset_out="$(fleet_parse_preset "$preset")"; then
+        echo "Error: agents.$name.$key: preset '$preset' could not be parsed, so a cluster postmaster cannot tell what harnesses it runs." >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r preset_kind preset_agent preset_field preset_value; do
+        [[ "$preset_kind" == agent && "$preset_field" == harness ]] || continue
+        local preset_leg="${preset_value%%/*}"
+        if ! cluster_harness_ok "$preset_leg"; then
+            echo "Error: agents.$name.$key: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; $(cluster_harness_refusal "$preset_leg")." >&2
+            rc=1
+        fi
+    done <<< "$preset_out"
     return "$rc"
 }
 
@@ -518,6 +579,7 @@ fleet_read_agent() {
     fleet_backend="" fleet_endpoint="" fleet_grant=""
     fleet_review_target="" fleet_wake_when="" fleet_services=""
     fleet_on_silence="" fleet_protocol="" fleet_on_failure=""
+    fleet_pipelines="" fleet_review_brief="" fleet_finalize=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -545,6 +607,9 @@ fleet_read_agent() {
             on-silence) fleet_on_silence="$value" ;;
             protocol) fleet_protocol="$value" ;;
             on-failure) fleet_on_failure="$value" ;;
+            pipelines) fleet_pipelines="$value" ;;
+            review-brief) fleet_review_brief="$value" ;;
+            finalize) fleet_finalize="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -634,6 +699,12 @@ resolve_with_dump() {
     # protocol takes fleet.yaml over frontmatter, like the first ten, but
     # came later, so it is appended here rather than placed beside them.
     printf '%s\n' "${fleet_protocol:-$fm_protocol}"
+    # pipelines, review-brief and finalize are fleet.yaml-only. pipelines
+    # is `key=spec` pairs space-joined in file order; the two files print
+    # as full paths, the way the persona path does.
+    printf '%s\n' "$fleet_pipelines"
+    printf '%s\n' "${fleet_review_brief:+$PERSONAS_DIR/$fleet_review_brief}"
+    printf '%s\n' "${fleet_finalize:+$PERSONAS_DIR/$fleet_finalize}"
 }
 
 cmd_resolve() {

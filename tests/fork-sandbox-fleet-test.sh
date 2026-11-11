@@ -531,8 +531,8 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the twenty-line contract into named globals for assertions.
-    # services and on-silence are read only to reach protocol, the last.
+    # Reads the twenty-three-line contract into named globals for
+    # assertions. services and on-silence are read only to reach protocol.
     # shellcheck disable=SC2034
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
@@ -540,7 +540,8 @@ resolve_lines() {
       read -r r_handler; read -r r_command; read -r r_backend; \
       read -r r_endpoint; read -r r_grant; read -r r_review_target; \
       read -r r_wake_when; read -r r_services; read -r r_on_silence; \
-      read -r r_protocol; \
+      read -r r_protocol; read -r r_pipelines; read -r r_review_brief; \
+      read -r r_finalize; \
     } < <("$fleet" resolve "$1")
 }
 
@@ -572,12 +573,15 @@ check "resolve: all-empty agent, grant empty" "" "$r_grant"
 check "resolve: all-empty agent, review-target empty" "" "$r_review_target"
 check "resolve: all-empty agent, wake-when empty" "" "$r_wake_when"
 check "resolve: all-empty agent, protocol empty" "" "$r_protocol"
+check "resolve: all-empty agent, pipelines empty" "" "$r_pipelines"
+check "resolve: all-empty agent, review-brief empty" "" "$r_review_brief"
+check "resolve: all-empty agent, finalize empty" "" "$r_finalize"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (protocol) is empty, as it is for tuner.
-check "resolve: output is exactly twenty lines" "20" "$("$fleet" resolve tuner | wc -l)"
+# (finalize) is empty, as it is for tuner.
+check "resolve: output is exactly twenty-three lines" "23" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -1352,12 +1356,17 @@ agents:
 EOF
 
 bad "backend k8s seat with a preset resolved is refused" \
-    "carries no maintainer tier" <<'EOF'
+    "a k8s seat runs a composed pipeline through the 'pipelines' key instead" <<'EOF'
 agents:
   riffler:
     backend: k8s
     preset: anything
 EOF
+k8s_preset_err="$(python3 "$parse" check "$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml" bad "$FORK_SANDBOX_PERSONAS_DIR" 2>&1)"
+case "$k8s_preset_err" in
+    *"no composed pipeline"*) no "the k8s preset refusal no longer says 'no composed pipeline'" "$k8s_preset_err" ;;
+    *) ok "the k8s preset refusal no longer says 'no composed pipeline'" ;;
+esac
 
 cat > "$FORK_SANDBOX_PERSONAS_DIR/lkml.md" <<'EOF'
 ---
@@ -1598,7 +1607,7 @@ check "on-failure: unset resolves as flag" flag "$("$fleet" resolve-on-failure t
 printf 'A bare persona, no fleet.yaml entry.\n' > "$FORK_SANDBOX_PERSONAS_DIR/soloist.md"
 check "on-failure: a bare persona seat resolves as flag" flag "$("$fleet" resolve-on-failure soloist 2>/dev/null || echo refused)"
 rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/soloist.md"
-check "on-failure: resolve keeps its twenty lines" 20 "$("$fleet" resolve riffler | wc -l)"
+check "on-failure: resolve keeps its twenty-three lines" 23 "$("$fleet" resolve riffler | wc -l)"
 refuses_rc=0
 "$fleet" resolve-on-failure no-such-seat >/dev/null 2>&1 || refuses_rc=$?
 check "on-failure: an unknown agent is refused" 1 "$refuses_rc"
@@ -2113,8 +2122,8 @@ contains "cluster: the claude-preset error names the seat, preset and agent" "$c
 cl_run --cluster 1
 # backend: k8s is deliberately left off this fleet, same as the has-codex
 # fixture above: a preset seat on backend k8s is refused outright for an
-# unrelated reason (fork-sandbox-fleet-parse.py, no maintainer tier / repeat
-# / composed pipeline support yet), so rc can't be 0 here either way. This
+# unrelated reason (fork-sandbox-fleet-parse.py: a k8s seat runs a composed
+# pipeline through `pipelines` instead), so rc can't be 0 here either way. This
 # isolates the claude-preset-leg check itself: with the var set, its error
 # no longer appears.
 lacks "cluster: a preset naming a claude agent adds no preset error with the credential var" \
@@ -2126,6 +2135,22 @@ agents:
 EOF
 cl_run --cluster
 lacks "cluster: a pi-only preset adds no preset error" "$cl_out" "agents.alpha.preset"
+
+# A pipelines seat is checked row by row, like a preset per row: the spec
+# names its harnesses, and the seat's own (empty) harness line never runs.
+cl_fleet <<'EOF'
+agents:
+  alpha: {backend: k8s, pipelines: {default: copus1-ropus1, xs: csonnet1-rsol1}}
+  beta: {harness: pi, backend: k8s}
+EOF
+cl_run --cluster 1
+check "cluster: a pipelines row seating codex is refused without its credential" "1" "$cl_rc"
+contains "cluster: the pipelines-row error names the row and the agent" "$cl_out" \
+    "agents.alpha.pipelines.xs: preset 'csonnet1-rsol1' agent"
+lacks "cluster: the claude-only default row adds no error with the claude credential" \
+    "$cl_out" "agents.alpha.pipelines.default"
+cl_run --cluster 1 1
+check "cluster: every pipelines row passes once each harness is credentialed" "0" "$cl_rc"
 
 # A preset name with no file that parses as a --pipeline spec must get the
 # same cluster harness-compatibility check a preset file gets -- before
@@ -2170,6 +2195,157 @@ EOF
 cl_run --cluster
 check "cluster: every problem is reported, not just the first" "4" \
     "$(printf '%s\n' "$cl_out" | grep -c '^Error:')"
+
+printf '\n== pipelines ==\n'
+
+# A composed seat's persona carries no frontmatter (the spec names its
+# harness and model); the brief and finalize files are not .md, or each
+# would also make a bare-persona agent of its own.
+pl_personas="$FORK_SANDBOX_PERSONAS_DIR"
+printf 'Strums.\n' > "$pl_personas/strummer.md"
+printf 'Look hard at the bridge.\n' > "$pl_personas/strummer-brief.txt"
+printf '#!/bin/sh\nexit 0\n' > "$pl_personas/strummer-finalize.sh"
+printf -- '---\nharness: claude\n---\nStrums.\n' > "$pl_personas/strum-h.md"
+printf -- '---\nmodel: opus\n---\nStrums.\n' > "$pl_personas/strum-m.md"
+printf -- '---\nthinking: high\n---\nStrums.\n' > "$pl_personas/strum-t.md"
+pl_fleet="$FORK_SANDBOX_FLEET_FILE_DIR/pipelines.yaml"
+pl_saved_fleet="$FORK_SANDBOX_FLEET_FILE"
+export FORK_SANDBOX_FLEET_FILE="$pl_fleet"
+
+cat > "$pl_fleet" <<'EOF'
+agents:
+  strummer:
+    pipelines: {default: copus1-ropus1, xs: csonnet1-ropus1, l: pfable1-copus1-ropus3}
+    review-brief: strummer-brief.txt
+    finalize: strummer-finalize.sh
+EOF
+pl_err="$("$fleet" check 2>&1)"; pl_rc=$?
+check "pipelines: a valid local seat passes check" "0" "$pl_rc"
+[[ "$pl_rc" == 0 ]] || printf '        %s\n' "$pl_err"
+resolve_lines strummer
+check "pipelines: resolve line 21 is the table, key=spec in file order" \
+    "default=copus1-ropus1 xs=csonnet1-ropus1 l=pfable1-copus1-ropus3" "$r_pipelines"
+check "pipelines: resolve line 22 is the review brief's path" \
+    "$pl_personas/strummer-brief.txt" "$r_review_brief"
+check "pipelines: resolve line 23 is the finalize script's path" \
+    "$pl_personas/strummer-finalize.sh" "$r_finalize"
+check "pipelines: resolve still prints twenty-three lines" "23" \
+    "$("$fleet" resolve strummer | wc -l)"
+check "pipelines: dump carries 24 field lines per agent" "24" \
+    "$(python3 "$parse" dump "$pl_fleet" x | grep -c $'^agent\tstrummer\t')"
+
+cat > "$pl_fleet" <<'EOF'
+agents:
+  strummer:
+    backend: k8s
+    pipelines: {default: copus1-ropus1}
+EOF
+check "pipelines: a valid k8s seat passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+export FORK_SANDBOX_FLEET_FILE="$pl_saved_fleet"
+
+bad "pipelines: no default row is refused" "agents.strummer.pipelines.default: required" <<'EOF'
+agents:
+  strummer:
+    pipelines: {xs: csonnet1-ropus1}
+EOF
+for pl_key in Xs 1x abcdefghijklmnopq; do
+    bad "pipelines: size key '$pl_key' is refused" "size keys match" \
+        "agents.strummer.pipelines.$pl_key" <<EOF
+agents:
+  strummer:
+    pipelines: {default: copus1-ropus1, $pl_key: csonnet1-ropus1}
+EOF
+done
+for pl_spec in cwhat-ropus copus1-rnope; do
+    bad "pipelines: spec '$pl_spec' that does not compile is refused" \
+        "does not compile as a --pipeline spec" "agents.strummer.pipelines.default" <<EOF
+agents:
+  strummer:
+    pipelines: {default: $pl_spec}
+EOF
+done
+bad "pipelines: a malformed spec is refused" "must be an inline --pipeline spec" <<'EOF'
+agents:
+  strummer:
+    pipelines: {default: copus-}
+EOF
+for pl_spec in ropus csonnet csonnet-mopus; do
+    bad "pipelines: spec '$pl_spec' without both c and r is refused" \
+        "needs at least one c (code) and one r (review) segment" <<EOF
+agents:
+  strummer:
+    pipelines: {default: $pl_spec}
+EOF
+done
+bad "pipelines: a non-mapping value is refused" "must be a non-empty mapping" <<'EOF'
+agents:
+  strummer:
+    pipelines: copus1-ropus1
+EOF
+for pl_co in "preset: deep" "harness: claude" "model: opus" "thinking: high"; do
+    bad "pipelines: refused beside ${pl_co%%:*}" \
+        "agents.strummer.${pl_co%%:*}: not allowed alongside 'pipelines'" <<EOF
+agents:
+  strummer:
+    pipelines: {default: copus1-ropus1}
+    $pl_co
+EOF
+done
+for pl_fm in h:harness m:model t:thinking; do
+    bad "pipelines: refused beside a frontmatter-only ${pl_fm#*:}" \
+        "agents.strummer.${pl_fm#*:}: not allowed alongside 'pipelines'" <<EOF
+agents:
+  strummer:
+    persona: strum-${pl_fm%%:*}.md
+    pipelines: {default: copus1-ropus1}
+EOF
+done
+for pl_field in review-brief finalize; do
+    bad "pipelines: $pl_field without pipelines is refused" \
+        "agents.strummer.$pl_field: only valid alongside 'pipelines'" <<EOF
+agents:
+  strummer:
+    $pl_field: strummer-brief.txt
+EOF
+    bad "pipelines: $pl_field naming a missing file is refused" \
+        "agents.strummer.$pl_field: file '$pl_personas/nosuch.txt' does not exist" <<EOF
+agents:
+  strummer:
+    pipelines: {default: copus1-ropus1}
+    $pl_field: nosuch.txt
+EOF
+    bad "pipelines: $pl_field as a path is refused" "must be a bare filename" <<EOF
+agents:
+  strummer:
+    pipelines: {default: copus1-ropus1}
+    $pl_field: ../strummer-brief.txt
+EOF
+    bad "pipelines: $pl_field on a handler seat is refused" \
+        "agents.notifier.$pl_field: not allowed alongside 'handler: exec'" <<EOF
+agents:
+  notifier:
+    handler: exec
+    command: real-handler
+    $pl_field: strummer-brief.txt
+EOF
+done
+bad "pipelines: on a handler seat is refused" \
+    "agents.notifier.pipelines: not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  notifier:
+    handler: exec
+    command: real-handler
+    pipelines: {default: copus1-ropus1}
+EOF
+printf -- '---\npipelines: {default: copus1-ropus1}\n---\nStrums.\n' > "$pl_personas/strum-p.md"
+bad "pipelines: persona frontmatter cannot carry pipelines" "frontmatter.pipelines: unknown key" <<'EOF'
+agents:
+  strummer:
+    persona: strum-p.md
+EOF
+rm -f -- "$pl_personas"/strummer.md "$pl_personas"/strummer-brief.txt \
+    "$pl_personas"/strummer-finalize.sh "$pl_personas"/strum-[hmtp].md
 
 printf '\n== dispatcher wiring ==\n'
 

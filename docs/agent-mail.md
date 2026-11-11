@@ -763,6 +763,14 @@ agents:
   critic:
     protocol: reviewer          # appends <prompts-dir>/protocol-reviewer.md
                                  # to the persona body in every wake handoff
+  author:
+    pipelines:                  # a composed seat: size -> --pipeline spec
+      default: copus1-ropus1
+      xs: csonnet1-ropus1
+      l: pfable1-copus1-ropus3
+    wake-when: sized            # the gate may pick the row (rule 5)
+    review-brief: author-review.txt   # appended to every review/maintain leg
+    finalize: author-finalize.sh      # runs after the last leg
 lists:
   crew:
     members: [reviewer, scribe, watcher]
@@ -792,6 +800,24 @@ against) that the postmaster passes as `--preset <name>` at spawn time.
 `check` requires the named file to exist; it does not validate the
 preset's own contents (`fork-sandbox.sh` does that at spawn time). See
 docs/presets.md for the preset file format.
+
+A `pipelines:` table (fleet.yaml only) makes the seat a **composed
+seat**: every wake runs a whole `--pipeline` spec (docs/presets.md) instead
+of one session. Keys are size tokens (`^[a-z][a-z0-9-]{0,15}$`), values
+inline specs; `default` is required. `fleet check` compiles every spec with
+the same compiler `--pipeline` uses, and refuses one that does not hold at
+least one `c` and one `r` segment: a composed seat never runs code
+unreviewed. The seat may not resolve `preset`, `harness`, `model` or
+`thinking` (fleet.yaml or frontmatter): the spec names every step's
+harness, model and effort. Both backends accept it. Which row a wake runs
+is the wake-when gate's choice (rule 5's `FS_HOOK_PIPELINE_SIZE_FILE`),
+`default` otherwise. Two companion keys, fleet.yaml only and valid only
+alongside `pipelines:`, each name a file directly under the personas
+directory (a bare name, required to exist; avoid a `.md` name, which would
+also make a bare-persona agent): `review-brief:` is passed as
+`--review-brief`, appended to every review and maintain leg's prompt, and
+`finalize:` as `--finalize-script`, run after the pipeline's last leg (see
+"The wake").
 
 A `protocol:` override (fleet.yaml or persona frontmatter, same
 precedence as every other LLM-seat field) names a shared block of
@@ -937,13 +963,15 @@ other seat would be refused from a thread's first message.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # twenty lines: harness, model, thinking,
-                                      # network, persona-path, description,
-                                      # wake-on-cc, refresh-at, triage,
-                                      # preset, handler, command, backend,
-                                      # endpoint, grant, review-target,
-                                      # wake-when, services, on-silence,
-                                      # protocol
+fork-sandbox fleet resolve <name>     # twenty-three lines: harness, model,
+                                      # thinking, network, persona-path,
+                                      # description, wake-on-cc, refresh-at,
+                                      # triage, preset, handler, command,
+                                      # backend, endpoint, grant,
+                                      # review-target, wake-when, services,
+                                      # on-silence, protocol, pipelines
+                                      # (`key=spec ...`), review-brief and
+                                      # finalize (full paths)
 fork-sandbox fleet resolve-on-failure <name>
                                       # one line: flag or note (flag when unset)
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
@@ -964,7 +992,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly twenty lines;
+than stopping at the first. `resolve` always prints exactly twenty-three lines;
 an unconfigured field is an empty line, never a missing one. A new field
 is only ever appended as the last line, so a reader that picks a line by
 its position keeps working.
