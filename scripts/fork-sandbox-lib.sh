@@ -4182,6 +4182,43 @@ $history_para
 EOF
 }
 
+# The largest per-run caller input file (--review-brief) fork-sandbox.sh
+# accepts. It is pasted into prompts, so it stays prompt-sized.
+FS_CALLER_INPUT_MAX_BYTES=65536
+
+# Refuses a per-run caller input file that is missing, not a regular file,
+# unreadable, empty, or over FS_CALLER_INPUT_MAX_BYTES. $1 is the flag that
+# named it (for the error), $2 the path.
+fs_check_caller_input_file() {
+    local flag="$1" file="$2" size
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        echo "Error: $flag '$file' is not a readable regular file." >&2
+        return 1
+    fi
+    size="$(wc -c < "$file")"
+    if (( size == 0 )); then
+        echo "Error: $flag '$file' is empty." >&2
+        return 1
+    fi
+    if (( size > FS_CALLER_INPUT_MAX_BYTES )); then
+        echo "Error: $flag '$file' is $size bytes; the limit is $FS_CALLER_INPUT_MAX_BYTES (64 KiB)." >&2
+        return 1
+    fi
+}
+
+# The caller's own review instructions (fork-sandbox.sh --review-brief),
+# appended as the last section of every review and maintain prompt's static
+# base. $1 is the staged copy in the run dir; its bytes print verbatim. Not
+# called at all for a run without --review-brief, so those prompts are
+# byte-identical to before the flag existed.
+fs_emit_review_brief_section() {
+    printf '\n## Additional review instructions from the caller\n\n'
+    cat -- "$1"
+    # A file that does not end in a newline would run into whatever the
+    # runner appends next.
+    [[ -z "$(tail -c 1 -- "$1")" ]] || printf '\n'
+}
+
 fs_emit_headless_turn_section() {
     printf '\n## Before you end your turn\n\n'
     fs_emit_headless_turn_para "${1:-integrator}"

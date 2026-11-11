@@ -153,10 +153,13 @@ omitted, it defaults to the agent's `repeat` property.
 | `repeat` | required — the loop cap: how many verdict-then-fix rounds may run. |
 | `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it defaults to the **last** code step's agent in pipeline order — the seat that owns the final code, so in a draft-then-polish pipeline (`csonnet-copus-ropus`) the polisher applies the review's findings, not the drafter. With one code step that is the implement seat, riding the implement command exactly as fix legs always have; with more, it is that last agent's own seat, on its own harness, model, arguments and `repeat`. Only the fix default moves: the endpoint rule, the refresh keys and `--session-state` stay on the first code step. `--dry-run` prints the resolved seat as `s<K>fix_agent=<name>` on a composed pipeline. A pipeline with no code step has no such default: with no `fix_agent` anywhere it is read-only (below), and otherwise every `review`/`maintain` step needs one. |
 
-Today's local run engine walks arbitrary linear pipelines. Kubernetes still
-accepts only a **legacy-shaped** pipeline — one code step, then at most one
-review step, then at most one maintain step, in that order. Free-order
-pipelines can otherwise use this grammar directly.
+The run engine walks arbitrary linear pipelines, locally and on `--k8s`
+(one walker in one pod; see "Composed pipelines on `--k8s`" in
+`docs/kubernetes-runs.md`). On `--k8s` a **legacy-shaped** pipeline — one
+code step, then at most one review step, then at most one maintain step, in
+that order — with no maintain step, no codex seat and no per-run caller
+input (`--review-brief`) still takes the older single-leg cluster path;
+every other pipeline runs through the walker.
 
 Each round runs the verdict leg; **approval ends the loop** — every
 review and maintain leg ends by writing a verdict whose first line is
@@ -452,6 +455,16 @@ with a note of its own. No flag names a fix
 seat or a repeat, so nothing overrides those two — they are the first
 preset-only knobs.
 
+## Per-run caller inputs
+
+`--review-brief FILE` hands every review and maintain leg of the run the
+caller's own instructions: the file is staged into the run dir as
+`review-brief.md` (so it reaches a `--k8s` run's pod with the rest of the
+run dir) and appended as the last section of each review and maintain
+prompt, under "Additional review instructions from the caller". Code, fix,
+plan and tidy legs never see it. It is refused on a run with no review or
+maintain step, and when the file is missing, empty or over 64 KiB.
+
 ## Because a preset is just flags, the flag rules apply
 
 There is no separate preset semantic to learn, which also means the sharp
@@ -472,7 +485,7 @@ edges are the flags' own — plus the edges of the two preset-only knobs:
   "Composed pipelines on `--k8s`" in `docs/kubernetes-runs.md` for what
   runs, what collect lands, and the handful of seat shapes (codex, a
   sealed/pi-local network, a model-less claude or pi seat) still refused
-  by name.
+  by name. A legacy-shaped preset given `--review-brief` runs there too.
 - **`--session-state` wires into a composed preset's first code step**,
   which must be step 1. That step's first pass, and its `--refresh-at`
   continuations, get the store, exactly as a legacy-shaped preset's code

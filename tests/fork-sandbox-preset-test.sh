@@ -6404,6 +6404,135 @@ else
         "no run dir ever appeared: $(cat "$stop_out")"
 fi
 
+printf '\n== caller inputs: --review-brief ==\n'
+
+rb_dir="$(mktemp -d /var/tmp/claude-scratch/fs-preset-rb.XXXXXX)"; tmpdirs+=("$rb_dir")
+rb_file="$rb_dir/brief.txt"
+printf 'Check every caller of the changed function.\nRB-MARKER-7f3a\n' > "$rb_file"
+rb_heading="## Additional review instructions from the caller"
+
+# A composed run: every review step's prompt ends with the brief; no code,
+# fix or tidy prompt carries it.
+prep_stub $'commit\napproved\napproved'
+if rd_rb="$(run_stubbed --pipeline csonnet-ropus-ropus --review-brief "$rb_file")"; then
+    tmpdirs+=("$rd_rb")
+    check "--review-brief is staged into the run dir byte for byte" \
+        "$(cat "$rb_file")" "$(cat "$rd_rb/review-brief.md" 2>/dev/null)"
+    for rb_k in 2 3; do
+        contains "--review-brief reaches composed review step $rb_k under its heading" \
+            "$(cat "$rd_rb/step-$rb_k-prompt.md")" "$rb_heading"$'\n\n'"Check every caller"
+        check "--review-brief is the last section of review step $rb_k's static prompt" \
+            "RB-MARKER-7f3a" "$(tail -n 1 "$rd_rb/step-$rb_k-prompt.md")"
+        lacks "--review-brief stays out of step $rb_k's fix header" \
+            "$(cat "$rd_rb/$rb_k-fix-prompt-header.md")" "RB-MARKER-7f3a"
+    done
+    lacks "--review-brief stays out of the code leg's handoff" \
+        "$(cat "$rd_rb/handoff.md")" "RB-MARKER-7f3a"
+else
+    no "a composed --review-brief run launches"
+fi
+
+prep_stub $'commit\napproved\napproved'
+if rd_rbm="$(run_stubbed --pipeline csonnet-mopus-ropus --review-brief "$rb_file")"; then
+    tmpdirs+=("$rd_rbm")
+    contains "--review-brief reaches a composed maintain step" \
+        "$(cat "$rd_rbm/step-2-prompt.md")" "RB-MARKER-7f3a"
+    contains "--review-brief reaches the maintain step's inner-review variant" \
+        "$(cat "$rd_rbm/step-2-inner-review-prompt.md")" "RB-MARKER-7f3a"
+    contains "--review-brief reaches the review after it" \
+        "$(cat "$rd_rbm/step-3-prompt.md")" "RB-MARKER-7f3a"
+    lacks "--review-brief stays out of the maintain step's fix header" \
+        "$(cat "$rd_rbm/2-fix-prompt-header.md")" "RB-MARKER-7f3a"
+else
+    no "a composed maintain --review-brief run launches"
+fi
+
+# The legacy-shaped local path renders through the same emitter.
+prep_stub $'commit\napproved'
+if rd_rbl="$(run_stubbed --pipeline csonnet-ropus --review-brief "$rb_file")"; then
+    tmpdirs+=("$rd_rbl")
+    contains "--review-brief reaches a legacy-shaped review prompt" \
+        "$(cat "$rd_rbl/review-prompt.md")" "$rb_heading"
+    lacks "--review-brief stays out of the legacy fix header" \
+        "$(cat "$rd_rbl/fix-prompt-header.md")" "RB-MARKER-7f3a"
+else
+    no "a legacy-shaped --review-brief run launches"
+fi
+prep_stub $'commit\napproved\napproved'
+if rd_rbp="$(run_stubbed --review-loop 1 --maintainer-loop 1 --maintainer-model opus \
+    --review-brief "$rb_file")"; then
+    tmpdirs+=("$rd_rbp")
+    contains "--review-brief reaches a plain run's review prompt" \
+        "$(cat "$rd_rbp/review-prompt.md")" "RB-MARKER-7f3a"
+    contains "--review-brief reaches a plain run's maintainer prompt" \
+        "$(cat "$rd_rbp/maintainer-prompt.md")" "RB-MARKER-7f3a"
+else
+    no "a plain --review-loop --review-brief run launches"
+fi
+# Without the flag, no prompt carries the heading.
+prep_stub $'commit\napproved'
+if rd_rbn="$(run_stubbed --pipeline csonnet-ropus)"; then
+    tmpdirs+=("$rd_rbn")
+    lacks "without --review-brief the review prompt has no caller section" \
+        "$(cat "$rd_rbn/review-prompt.md")" "$rb_heading"
+    check "without --review-brief nothing is staged" "no" \
+        "$([[ -e "$rd_rbn/review-brief.md" ]] && echo yes || echo no)"
+else
+    no "a run without --review-brief launches"
+fi
+
+refuses "--review-brief is refused on a run with no review step (code-only pipeline)" \
+    "--review-brief needs a run with a review or maintain step" \
+    --pipeline csonnet --review-brief "$rb_file"
+refuses "--review-brief is refused on a plain run" \
+    "--review-brief needs a run with a review or maintain step" \
+    --review-brief "$rb_file"
+refuses "--review-brief naming a missing file is refused" \
+    "is not a readable regular file" \
+    --pipeline csonnet-ropus --review-brief "$rb_dir/nosuch.txt"
+: > "$rb_dir/empty.txt"
+refuses "--review-brief naming an empty file is refused" "is empty" \
+    --pipeline csonnet-ropus --review-brief "$rb_dir/empty.txt"
+head -c 65537 /dev/zero | tr '\0' 'x' > "$rb_dir/big.txt"
+refuses "--review-brief over 64 KiB is refused" "the limit is 65536" \
+    --pipeline csonnet-ropus --review-brief "$rb_dir/big.txt"
+head -c 65536 /dev/zero | tr '\0' 'x' > "$rb_dir/max.txt"
+accepts "--review-brief of exactly 64 KiB is accepted" \
+    --pipeline csonnet-ropus --review-brief "$rb_dir/max.txt"
+
+# --k8s: a legacy-shaped spec carrying a brief takes the composed runner
+# (the legacy cluster path renders no host prompts); without one it is
+# unchanged.
+rb_k8s_out="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run --k8s --pipeline csonnet1-ropus1 \
+    --review-brief "$rb_file" "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>"$err")" || true
+contains "--k8s --review-brief runs a legacy-shaped spec in runner mode" "$rb_k8s_out" "k8s=runner"
+rb_k8s_plain="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run --k8s --pipeline csonnet1-ropus1 \
+    "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>&1)" || true
+lacks "--k8s without --review-brief keeps a legacy-shaped spec off runner mode" \
+    "$rb_k8s_plain" "k8s=runner"
+rb_k8s_noplan="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run --k8s --review-loop 1 \
+    --review-harness pi/vendor/model --review-brief "$rb_file" "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>&1)" || true
+contains "--k8s --review-brief without a pipeline is refused" "$rb_k8s_noplan" \
+    "--review-brief on --k8s needs a --pipeline or --preset run"
+if K8S_ARGV_LOG="$k8s_codex_argv_log" HOME="$k8s_dryrun_home" \
+    "$k8s_codex_stub_dir/scripts/fork-sandbox.sh" --k8s --pipeline csonnet1-ropus1 \
+    --review-brief "$rb_file" --branch fs-preset-k8s-rb --no-services \
+    "$k8s_dryrun_proj" "$k8s_dryrun_handoff" >/dev/null 2>"$err"; then
+    rb_k8s_argv="$(cat "$k8s_codex_argv_log" 2>/dev/null)"
+    rb_k8s_rd="$(sed -n 3p <<< "$rb_k8s_argv")"
+    [[ "$rb_k8s_rd" == /var/tmp/claude-scratch/* ]] && tmpdirs+=("$rb_k8s_rd")
+    check "--k8s --review-brief execs fork-sandbox-k8s.sh run --run-dir" \
+        "run --run-dir" "$(head -2 <<< "$rb_k8s_argv" | tr '\n' ' ' | sed 's/ $//')"
+    check "--k8s --review-brief stages the brief in the pushed run dir" \
+        "$(cat "$rb_file")" "$(cat "$rb_k8s_rd/review-brief.md" 2>/dev/null)"
+    contains "--k8s --review-brief renders it into the review step's prompt" \
+        "$(cat "$rb_k8s_rd/step-2-prompt.md" 2>/dev/null)" "RB-MARKER-7f3a"
+    lacks "--k8s never forwards --review-brief to fork-sandbox-k8s.sh" \
+        "$rb_k8s_argv" "--review-brief"
+else
+    no "a --k8s --review-brief launch reaches the stubbed fork-sandbox-k8s.sh" "$(cat "$err")"
+fi
+
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
 # also catch a concurrent real run or another suite's fixtures archiving

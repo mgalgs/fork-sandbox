@@ -172,16 +172,18 @@
 #                        review/maintain seat, or code seat past the first,
 #                        for a flag to override: there,
 #                        --model/--harness/--review-*/--maintainer-*/
-#                        --claude-args/--pi-args/--codex-args/--k8s are
+#                        --claude-args/--pi-args/--codex-args are
 #                        refused outright instead -- give the agent its own
 #                        key in the preset. The run engine walks an
 #                        arbitrary step list, so a composed pipeline runs
-#                        locally exactly as authored -- --k8s is the one
-#                        path that still only accepts a legacy-shaped
+#                        exactly as authored, locally and on --k8s (one
+#                        walker in one pod). On --k8s a legacy-shaped
 #                        pipeline (one code step, then at most one review
 #                        step, then at most one maintain step, in that
-#                        order). Needs PyYAML. See docs/presets.md for the
-#                        file format.
+#                        order) with no maintain step, no codex seat and no
+#                        --review-brief still takes the single-leg cluster
+#                        path. Needs PyYAML.
+#                        See docs/presets.md for the file format.
 # --pipeline <spec>:     a preset written inline, in the composition-name
 #                        grammar: -joined <stage><model>[<harness>][<N>]
 #                        segments, stage c/r/m in any order, e.g.
@@ -522,6 +524,16 @@
 #                        this harmlessly -- which is also what --k8s does
 #                        with it, since the cluster path has no maintainer
 #                        tier (and so no tidy leg) to attach to at all.
+# --review-brief <file>: the caller's own review instructions, appended to
+#                        every review and maintain leg's prompt under
+#                        "Additional review instructions from the caller".
+#                        Staged into the run dir as review-brief.md, so it
+#                        reaches a --k8s run too (there it needs --pipeline
+#                        or --preset, and the run takes the composed
+#                        path). Refused on a run with no review or maintain
+#                        step, and when the file is missing, empty or over
+#                        64 KiB. Never shown to code, fix, plan or tidy
+#                        legs.
 # --kit-skill <name>:    bind one more skill from $HOME/.claude/skills/<name>
 #                        into every seat of this run, read-only, on top of
 #                        the machine's agent kit (AGENT_KIT_SKILLS in
@@ -1911,6 +1923,10 @@ refresh_at_arg=""
 refresh_at_given=false
 refresh_max_arg=""
 tidy_timeout_secs="$FS_TIDY_TIMEOUT_SECS"
+# --review-brief's source file, and its staged copy in the run dir (set once
+# the run dir exists; the prompt renderer appends the copy).
+review_brief_file=""
+review_brief_copy=""
 kit_skill_flags=()
 k8s_mode=false
 # Set true only inside the --k8s dispatch block, for a composed (non-
@@ -2127,6 +2143,10 @@ while [[ "${1:-}" == -* ]]; do
                 echo "seconds, not '$tidy_timeout_secs'." >&2
                 exit 1
             fi
+            ;;
+        --review-brief)
+            review_brief_file="${2:?--review-brief requires a file}"
+            shift 2
             ;;
         --kit-skill)
             kit_skill_flags+=("${2:?--kit-skill requires a skill name}")
@@ -2639,6 +2659,16 @@ if [[ -n "$preset_name" ]]; then
     # "cannot be combined with preset") apply to it too, the same as any
     # other composed preset. Local dispatch is untouched: preset_is_legacy_
     # shaped only changes here when k8s_mode is already true.
+    #
+    # The per-run caller inputs (--review-brief) flip it the same way: the
+    # legacy cluster path renders its own prompts in the pod and has no
+    # runner to carry them, while the composed path renders every prompt
+    # here and pushes the run dir, so a legacy-shaped spec carrying one runs
+    # composed. Without one, a legacy-shaped --k8s run is unchanged.
+    if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true \
+        && -n "$review_brief_file" ]]; then
+        preset_is_legacy_shaped=false
+    fi
     if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true ]]; then
         for ((preset_k8s_shape_k = 1; preset_k8s_shape_k <= preset_step_count; preset_k8s_shape_k++)); do
             preset_k8s_agent="${preset_step_agent[$preset_k8s_shape_k]}"
@@ -3695,6 +3725,36 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
             exit 1
         fi
     fi
+fi
+
+# --review-brief is checked here, after the pipeline is compiled (a legacy-
+# shaped preset's loops are in review_loop_arg/maintainer_loop_arg by now)
+# and before --k8s execs away, so both paths refuse the same launches.
+# run_has_review_step: the run has a review or maintain leg for a caller's
+# per-run review inputs to land on.
+run_has_review_step=false
+if [[ -n "$review_loop_arg" || -n "$maintainer_loop_arg" || "$review_only" == true ]]; then
+    run_has_review_step=true
+elif [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
+    for ((rhr_k = 1; rhr_k <= preset_step_count; rhr_k++)); do
+        case "${preset_step_action[$rhr_k]}" in
+            review|maintain) run_has_review_step=true ;;
+        esac
+    done
+    unset rhr_k
+fi
+if [[ -n "$review_brief_file" ]]; then
+    if [[ "$run_has_review_step" != true ]]; then
+        echo "Error: --review-brief needs a run with a review or maintain step;" >&2
+        echo "this run has none for the brief to reach." >&2
+        exit 1
+    fi
+    if [[ "$k8s_mode" == true && -z "$preset_name" ]]; then
+        echo "Error: --review-brief on --k8s needs a --pipeline or --preset run:" >&2
+        echo "only the composed cluster path renders its prompts on this host." >&2
+        exit 1
+    fi
+    fs_check_caller_input_file --review-brief "$review_brief_file" || exit 1
 fi
 
 # --k8s dispatches the whole run to fork-sandbox-k8s.sh run, which submits it
@@ -6278,6 +6338,12 @@ if [[ -n "$preset_name" ]]; then
          else {name: $name, pipeline: $pipeline, sha256: $sha256} end' \
         > "$run_dir/preset.json"
 fi
+# --review-brief's text, staged into the run dir: the prompt renderer reads
+# this copy, and a --k8s composed run's pushed run dir carries it too.
+if [[ -n "$review_brief_file" ]]; then
+    review_brief_copy="$run_dir/review-brief.md"
+    cp -- "$review_brief_file" "$review_brief_copy"
+fi
 # The prompt overlay's provenance, beside the run for the same reason: what
 # was applied has to be queryable later, not just present in the rendered
 # prompts. dir and rev are facts about the run; fragments and sha256 vary
@@ -7622,6 +7688,7 @@ if (( review_loop_cap > 0 )); then
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
             "$review_verdict_file" "$inbox_dir" "$handoff_file" \
             "$review_leg_flavor"
+        [[ -z "$review_brief_copy" ]] || fs_emit_review_brief_section "$review_brief_copy"
     } > "$review_prompt.part"
     mv -- "$review_prompt.part" "$review_prompt"
 fi
@@ -7696,6 +7763,7 @@ if (( maintainer_loop_cap > 0 )); then
         fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
             "$maintainer_verdict_file" "$inbox_dir" "$mnt_inner_review" \
             "$handoff_file" "$review_prompt_flavor"
+        [[ -z "$review_brief_copy" ]] || fs_emit_review_brief_section "$review_brief_copy"
     } > "$maintainer_prompt.part"
     mv -- "$maintainer_prompt.part" "$maintainer_prompt"
 fi
@@ -7807,6 +7875,7 @@ else
                     fs_emit_review_prompt_body "$branch" "$base_sha" \
                         "$review_skill_dir" "$step_k_verdict_file" "$inbox_dir" \
                         "$handoff_file" "$step_k_review_flavor"
+                    [[ -z "$review_brief_copy" ]] || fs_emit_review_brief_section "$review_brief_copy"
                 } > "$step_k_prompt.part"
                 mv -- "$step_k_prompt.part" "$step_k_prompt"
                 run_step_prompt[preset_k]="$step_k_prompt"
@@ -7851,6 +7920,7 @@ else
                     fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
                         "$step_k_verdict_file" "$inbox_dir" "$step_k_inner_review" \
                         "$handoff_file" "$step_k_maintain_flavor"
+                    [[ -z "$review_brief_copy" ]] || fs_emit_review_brief_section "$review_brief_copy"
                 } > "$step_k_prompt.part"
                 mv -- "$step_k_prompt.part" "$step_k_prompt"
                 # The runner can only know at execution time whether an
@@ -7865,6 +7935,7 @@ else
                     fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
                         "$step_k_verdict_file" "$inbox_dir" yes "$handoff_file" \
                         "$step_k_maintain_flavor"
+                    [[ -z "$review_brief_copy" ]] || fs_emit_review_brief_section "$review_brief_copy"
                 } > "$step_k_inner_prompt.part"
                 mv -- "$step_k_inner_prompt.part" "$step_k_inner_prompt"
                 printf -v "s${preset_k}_prompt_inner_review" '%s' "$step_k_inner_prompt"
