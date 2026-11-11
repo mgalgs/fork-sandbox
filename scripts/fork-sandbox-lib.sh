@@ -115,6 +115,10 @@ FS_OUTBOX_MAX_BYTES=$((64 * 1024 * 1024))   # 64 MiB
 # tidy leg yet.
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_TIDY_TIMEOUT_SECS=1800   # 30 minutes
+# The finalize step's (fork-sandbox.sh --finalize-script) wall-clock limit:
+# it folds commits already written and tested, so five minutes is ample.
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_FINALIZE_TIMEOUT_SECS=300
 
 # Parses a --outbox-max argument into a byte count on stdout: bare digits
 # mean bytes, and a K/M/G suffix means that many KiB/MiB/GiB, consistent
@@ -4153,8 +4157,11 @@ EOF
 #                    whose reply the postmaster harvests from it
 #                    (fork-sandbox.sh --wake-reply); empty otherwise, and
 #                    then nothing below changes.
+# $3  finalize       non-empty when the run has a finalize step
+#                    (--finalize-script); adds the one sentence a caller's
+#                    persona keys its fold-or-fixup behaviour off, verbatim.
 fs_emit_headless_turn_para() {
-    local history_owner="${1:-integrator}" wake_reply_outbox="${2:-}"
+    local history_owner="${1:-integrator}" wake_reply_outbox="${2:-}" finalize="${3:-}"
     local history_para
     if [[ "$history_owner" == maintainer ]]; then
         history_para="After the maintainer step approves the branch, a tidy-history leg on
@@ -4193,6 +4200,12 @@ leg, so it must describe the branch as the run ends it: if you commit, leave
 that file describing the branch as you leave it -- edit it, or write
 \`mail-1.md\` there if there is none yet. Never add a second reply that
 contradicts the first.
+EOF
+    fi
+    if [[ -n "$finalize" ]]; then
+        cat <<'EOF'
+
+A finalize step runs after the last leg. Do not rebase or rewrite any commit that existed when you started; make a fix to an existing commit a `fixup!` commit, and the finalize step folds it.
 EOF
     fi
 }
@@ -4236,7 +4249,7 @@ fs_emit_review_brief_section() {
 
 fs_emit_headless_turn_section() {
     printf '\n## Before you end your turn\n\n'
-    fs_emit_headless_turn_para "${1:-integrator}" "${2:-}"
+    fs_emit_headless_turn_para "${1:-integrator}" "${2:-}" "${3:-}"
 }
 
 # inner_review is "yes" when a --review-loop ran before this one and "no"
@@ -4459,9 +4472,10 @@ EOF
 # $4  history_owner  passed straight through to fs_emit_headless_turn_para;
 #                    see its own doc comment.
 # $5  wake_reply_outbox  likewise.
+# $6  finalize       likewise.
 fs_emit_fix_prompt_body() {
     local branch="$1" base_sha="$2" handoff_file="$3" history_owner="${4:-integrator}"
-    local wake_reply_outbox="${5:-}"
+    local wake_reply_outbox="${5:-}" finalize="${6:-}"
     cat <<EOF
 
 ---
@@ -4475,7 +4489,7 @@ reported the problems repeated below.
 Fix the real ones, and commit. Uncommitted work is lost with the clone, so a
 fix you do not commit is a fix nobody gets.
 
-$(fs_emit_headless_turn_para "$history_owner" "$wake_reply_outbox")
+$(fs_emit_headless_turn_para "$history_owner" "$wake_reply_outbox" "$finalize")
 
 Some of what follows may be wrong: the reviewer read the same code you are
 about to read and could have misread it. **Do not change code to satisfy a

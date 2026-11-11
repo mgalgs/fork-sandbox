@@ -720,6 +720,18 @@ progress_write() {
             2>/dev/null)" || step_json=""
         [[ -n "$step_json" ]] && steps_ndjson+="$step_json"$'\n'
     done
+    # The finalize step, when the run has one, is one more step after the
+    # pipeline's own: pending until its block runs.
+    if [[ -n "${finalize_script:-}" ]]; then
+        step_json="$(jq -cn \
+            --arg state "${finalize_progress_state:-pending}" \
+            --arg ended "${finalize_progress_ended:-}" \
+            --argjson i "$( [[ -n "${finalize_progress_state:-}" && "${finalize_progress_state}" != skipped ]] && echo 1 || echo 0 )" \
+            '{action:"finalize", state:$state, i:$i, cap:1,
+              ended:(if $ended == "" then null else $ended end),
+              continuation:0}' 2>/dev/null)" || step_json=""
+        [[ -n "$step_json" ]] && steps_ndjson+="$step_json"$'\n'
+    fi
     # stderr first, so the redirect below only moves jq's stdout -- the
     # JSON itself -- to the .part file; pg_err keeps whatever jq wrote to
     # its own stderr, read back below only on failure.
@@ -3470,6 +3482,192 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     fi
 done
 
+# The finalize step (fork-sandbox.sh --finalize-script): a caller's script
+# that folds this run's history -- `fixup!` commits, say -- once, after the
+# pipeline's last leg and before the tidy leg would snapshot the head. It
+# runs where the legs ran (the sandbox locally, the leg container in a
+# composed pod), cwd the clone, and may rewrite any history above the floor
+# and edit the reply. Nothing it says is trusted: the runner itself checks
+# that the branch's tree is byte-identical and that the new head descends
+# from the floor (the --finalize-floor sha, else the run's base), and on any
+# failure resets the branch to the head the legs left, so the reviewed
+# commits are what come back. A failure fails the run (rc), and
+# summary.json/progress.json record the outcome either way.
+finalize_ended=""
+finalize_detail=""
+finalize_exit_json=null
+finalize_head_before=""
+finalize_head_after=""
+finalize_clone_restored_json=null
+finalize_progress_state=""
+finalize_progress_ended=""
+finalize_summary_json=null
+
+# Runs one command against the clone, in the same place the legs ran: the
+# leg container in a composed pod (relayed, as the uncommitted-work check
+# is), else a sealed sandbox. $1 is the wall-clock limit, the rest the
+# command (sh -c ... forms included). stdout goes to the caller, stderr to
+# finalize.log.
+finalize_exec() {
+    local limit="$1" log="$run_dir/finalize.log"; shift
+    if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+        fs_run_leg_split timeout --kill-after 10 "$limit" "$@" < /dev/null 2>> "$log"  # relayed to the leg container, never executed here
+    elif fs_resolve_backend "$script_dir"; then
+        local -a fin_bind_flags=()
+        local fin_alt
+        if [[ "${#fs_alternates[@]}" -gt 0 ]]; then
+            for fin_alt in "${fs_alternates[@]}"; do
+                fin_bind_flags+=(--bind-ro "$fin_alt")
+            done
+        fi
+        "$FS_TIMEOUT" --kill-after 10 "$limit" "$FS_BACKEND_BIN" --workdir "$clone_dir" \
+            "${fin_bind_flags[@]}" --bind-ro "$finalize_script" --bind-rw "$outbox_dir" \
+            --net sealed --hostname fork-sandbox-finalize -- "$@" < /dev/null 2>> "$log"
+    else
+        printf 'fork-sandbox: could not resolve the sandbox backend for the finalize step.\n' >> "$log"
+        return 1
+    fi
+}
+
+# Whether $1 is $2 or an ancestor of it, and the tree of a commit -- asked
+# where the objects are: the origin repo locally (the heads were fetched
+# there, the tidy snapshot idiom, so no git runs inside the clone from the
+# host), the clone through finalize_exec in a pod. Replace refs and the
+# clone's own fsmonitor/hooks are switched off either way.
+finalize_git() {
+    if (( fetch_back )); then
+        (cd "$origin_repo" && git --no-replace-objects "$@") 2>> "$run_dir/finalize.log"
+    else
+        # fetch_back is 0 only in a pod, where finalize_exec relays too.
+        fs_run_leg_split timeout 60 git --no-replace-objects -c core.fsmonitor= -c core.hooksPath=/dev/null -C "$clone_dir" "$@" < /dev/null 2>> "$run_dir/finalize.log"  # relayed to the leg container, never executed here
+    fi
+}
+finalize_ancestor() { finalize_git merge-base --is-ancestor "$1" "$2"; }
+finalize_tree() { finalize_git rev-parse --verify -q "$1^{tree}"; }
+
+if [[ -n "${finalize_script:-}" ]]; then
+    : > "$run_dir/finalize.log"
+    finalize_head_before="$(clone_branch_head)"
+    finalize_floor_eff="${finalize_floor:-$base_sha}"
+    finalize_refs="refs/fork-sandbox/finalize/$run_id"
+    if [[ "${stop_requested:-0}" == 1 ]]; then
+        finalize_ended=skipped finalize_detail="stop requested"
+    elif (( rc != 0 )); then
+        # A run that already failed is not published as reviewed work, so
+        # there is nothing to fold for it.
+        finalize_ended=skipped finalize_detail="the run already failed"
+    elif [[ -z "$finalize_head_before" ]]; then
+        finalize_ended=failed finalize_detail="branch $branch could not be read from the clone"
+    elif [[ "$finalize_head_before" == "$base_sha" ]]; then
+        finalize_ended=skipped finalize_detail="no commits above the base"
+    elif (( runner_in_sandbox )) && [[ -z "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+        # fork-sandbox.sh sends every --finalize-script run down the
+        # composed path; the legacy single-container pod never gets one.
+        finalize_ended=failed finalize_detail="the legacy cluster path has no finalize step"
+    elif (( fetch_back )) && ! (cd "$origin_repo" && git fetch --quiet "$clone_dir" \
+            "+refs/heads/$branch:$finalize_refs/before") >> "$run_dir/finalize.log" 2>&1; then
+        finalize_ended=failed finalize_detail="branch $branch could not be read from the clone"
+    elif ! finalize_ancestor "$finalize_floor_eff" "$base_sha"; then
+        finalize_ended=failed finalize_detail="floor-not-ancestor"
+    else
+        finalize_reply=""
+        if (( fetch_back )); then
+            for finalize_mail in "$outbox_dir"/mail-*.md; do
+                [[ -f "$finalize_mail" ]] && { finalize_reply="$finalize_mail"; break; }
+            done
+        else
+            # The pod's outbox lives in the leg container's view; ask there.
+            finalize_reply="$(finalize_exec 30 sh -c \
+                'for f in "$1"/mail-*.md; do [ -f "$f" ] && { printf %s "$f"; break; }; done' \
+                sh "$outbox_dir")" || finalize_reply=""
+        fi
+        finalize_rc=0
+        finalize_exec "$finalize_timeout_secs" \
+            env FS_FINALIZE_BASE="$base_sha" FS_FINALIZE_FLOOR="$finalize_floor_eff" \
+            FS_FINALIZE_REPLY="$finalize_reply" sh "$finalize_script" \
+            >> "$run_dir/finalize.log" || finalize_rc=$?
+        finalize_head_after="$(clone_branch_head)"
+        if (( finalize_rc == 124 || finalize_rc == 137 )); then
+            finalize_ended=failed
+            finalize_detail="the script timed out after ${finalize_timeout_secs}s"
+        elif (( finalize_rc != 0 )); then
+            finalize_ended=failed finalize_exit_json="$finalize_rc"
+            finalize_detail="the script exited $finalize_rc"
+        elif [[ -z "$finalize_head_after" ]]; then
+            finalize_ended=failed finalize_detail="branch $branch could not be read from the clone"
+        else
+            finalize_after_ref="$finalize_head_after"
+            if (( fetch_back )); then
+                finalize_after_ref="$finalize_refs/after"
+                (cd "$origin_repo" && git fetch --quiet "$clone_dir" \
+                    "+refs/heads/$branch:$finalize_after_ref") >> "$run_dir/finalize.log" 2>&1 \
+                    || finalize_after_ref=""
+                finalize_before_ref="$finalize_refs/before"
+            else
+                finalize_before_ref="$finalize_head_before"
+            fi
+            finalize_tree_before="$(finalize_tree "$finalize_before_ref")"
+            finalize_tree_after=""
+            [[ -z "$finalize_after_ref" ]] || finalize_tree_after="$(finalize_tree "$finalize_after_ref")"
+            if [[ -z "$finalize_tree_before" || "$finalize_tree_before" != "$finalize_tree_after" ]]; then
+                finalize_ended=failed finalize_detail="tree differs"
+            elif ! finalize_ancestor "$finalize_floor_eff" "$finalize_after_ref"; then
+                finalize_ended=failed
+                if [[ -n "${finalize_floor:-}" ]]; then
+                    finalize_detail="head does not descend from the floor"
+                else
+                    finalize_detail="head does not descend from the base"
+                fi
+            else
+                finalize_ended=ran finalize_exit_json=0
+            fi
+        fi
+        # Any failure after the script ran puts the branch back where the
+        # legs left it, the tidy restore's own idiom, and reads the result
+        # back rather than assuming it.
+        if [[ "$finalize_ended" == failed ]]; then
+            if [[ "$finalize_head_after" != "$finalize_head_before" ]]; then
+                finalize_exec 60 sh -c 'git rebase --abort >/dev/null 2>&1
+git checkout -q -f "$1" && git reset -q --hard "$2"' sh "$branch" "$finalize_head_before" \
+                    >> "$run_dir/finalize.log" || true
+            fi
+            if [[ "$(clone_branch_head)" == "$finalize_head_before" ]]; then
+                finalize_clone_restored_json=true
+            else
+                finalize_clone_restored_json=false
+            fi
+            finalize_head_after="$(clone_branch_head)"
+        fi
+    fi
+    if (( fetch_back )); then
+        (cd "$origin_repo" && git update-ref -d "$finalize_refs/before" \
+            && git update-ref -d "$finalize_refs/after") >/dev/null 2>&1 || true
+    fi
+    case "$finalize_ended" in
+        ran) finalize_progress_state=done finalize_progress_ended=ran ;;
+        skipped) finalize_progress_state=skipped finalize_progress_ended=skipped ;;
+        *) finalize_progress_state=failed finalize_progress_ended="$finalize_detail" ;;
+    esac
+    if [[ "$finalize_ended" == failed ]]; then
+        printf 'fork-sandbox: finalize failed: %s\n' "$finalize_detail" >> "$sandbox_log"
+        (( rc != 0 )) || rc=1
+    fi
+    finalize_summary_json="$(jq -cn \
+        --arg ended "$finalize_ended" --arg detail "$finalize_detail" \
+        --argjson exit "$finalize_exit_json" \
+        --arg head_before "$finalize_head_before" --arg head_after "$finalize_head_after" \
+        --arg floor "${finalize_floor:-}" \
+        --argjson clone_restored "$finalize_clone_restored_json" \
+        '{ended: $ended,
+          detail: (if $detail == "" then null else $detail end),
+          exit: $exit,
+          head_before: (if $head_before == "" then null else $head_before end),
+          head_after: (if $head_after == "" then null else $head_after end),
+          floor: (if $floor == "" then null else $floor end),
+          clone_restored: $clone_restored}')" || finalize_summary_json=null
+    progress_write running
+fi
+
 # The tidy-history leg: when this run's last pipeline step is a maintain
 # step and it just approved, one more leg rewrites the branch's commits
 # into logical ones -- see "The tidy leg" in this script's own header
@@ -4714,6 +4912,7 @@ jq -n \
     --argjson uncommitted_files_list "$uncommitted_files_list_json" \
     --argjson uncommitted_patch "$uncommitted_patch_json" \
     --argjson tidy "$tidy_summary_json" \
+    --argjson finalize "${finalize_summary_json:-null}" \
     --argjson tidy_has_maintain_step "$( (( tidy_has_maintain_step )) && echo true || echo false )" \
     '{
         version: $version,
@@ -4782,7 +4981,9 @@ jq -n \
     # Absent, not null, on a pipeline with no maintain step anywhere -- the
     # tidy leg never exists to have an outcome there, so there is nothing
     # for this key to report (see the tidy block comment above).
-    + (if $tidy_has_maintain_step then {tidy: $tidy} else {} end)' \
+    + (if $tidy_has_maintain_step then {tidy: $tidy} else {} end)
+    # Absent, not null, on a run without --finalize-script.
+    + (if $finalize == null then {} else {finalize: $finalize} end)' \
     > "$run_dir/summary.json" 2>/dev/null \
     || rm -f "$run_dir/summary.json"
 

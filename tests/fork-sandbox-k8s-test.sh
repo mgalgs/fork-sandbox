@@ -22501,6 +22501,29 @@ else
         "has_session_id=$rdcol5_session_id cost=$rdcol5_cost"
 fi
 
+# A pod run with a finalize step: collect merges the pod summary's
+# `finalize` record into the host's and pulls finalize.log back.
+rdcolf_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcolf.XXXXXX)"; tmpdirs+=("$rdcolf_run_dir")
+printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcolf_run_dir/run.env"
+rdcolf_pod_dir="$(newdir)"; tmpdirs+=("$rdcolf_pod_dir")
+printf '{"total_cost_usd":0.1,"finalize":{"ended":"failed","detail":"the script exited 2","exit":2}}' \
+    > "$rdcolf_pod_dir/summary.json"
+printf 'folded nothing\n' > "$rdcolf_pod_dir/finalize.log"
+rdcolf_log="$(newdir)/kubectl.log"; rdcolf_out="$(newdir)/rdcolf-out.txt"
+tmpdirs+=("$(dirname "$rdcolf_log")" "$(dirname "$rdcolf_out")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_RUN_DIR_PULL_PATH="$rdcolf_run_dir" \
+    K8S_STUB_RUN_DIR_PULL_SRC="$rdcolf_pod_dir" \
+    collectstub_collect "$rdcolf_log" "$rdcolf_out" \
+    --branch fs-k8s-test-rdcolf --run-dir "$rdcolf_run_dir" "$proj_dir"; then
+    ok "collect of a run with a finalize record exits 0"
+else
+    no "collect of a run with a finalize record exits 0" "$(cat "$rdcolf_out")"
+fi
+check "collect merges the pod's finalize record into summary.json" "failed 2" \
+    "$(jq -r '"\(.finalize.ended) \(.finalize.exit)"' "$rdcolf_run_dir/summary.json" 2>/dev/null)"
+check "collect pulls finalize.log back" "folded nothing" \
+    "$(cat "$rdcolf_run_dir/finalize.log" 2>/dev/null)"
+
 # A pod that saved a leftover-work patch (see the runner section below):
 # collect must bring uncommitted.patch back as an allowlisted artifact,
 # and the merged summary.json must keep the pod's own uncommitted_patch:

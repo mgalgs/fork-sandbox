@@ -181,8 +181,8 @@
 #                        pipeline (one code step, then at most one review
 #                        step, then at most one maintain step, in that
 #                        order) with no maintain step, no codex seat and no
-#                        --review-brief or --wake-reply still takes the
-#                        single-leg cluster path. Needs PyYAML.
+#                        --review-brief, --wake-reply or --finalize-script
+#                        still takes the single-leg cluster path. Needs PyYAML.
 #                        See docs/presets.md for the file format.
 # --pipeline <spec>:     a preset written inline, in the composition-name
 #                        grammar: -joined <stage><model>[<harness>][<N>]
@@ -544,6 +544,33 @@
 #                        and tidy legs are not. Refused on a run with no
 #                        review or maintain step; on --k8s it needs
 #                        --pipeline/--preset and takes the composed path.
+# --finalize-script <file>: a history step run once after the pipeline's
+#                        last leg (after every review/fix loop), in the
+#                        sandbox (locally) or the leg container (--k8s),
+#                        cwd the clone, on the run's branch. Skipped when
+#                        the branch has no commits above the run's base.
+#                        Env: FS_FINALIZE_BASE (the run's base sha),
+#                        FS_FINALIZE_FLOOR (--finalize-floor, else the
+#                        base), FS_FINALIZE_REPLY (the first mail-*.md in
+#                        the outbox, empty when none). The script may
+#                        rewrite history above the floor and edit the
+#                        reply; the runner, not the script, then checks the
+#                        branch's tree is byte-identical and its head still
+#                        descends from the floor. A nonzero exit, a timeout
+#                        (FS_FINALIZE_TIMEOUT_SECS, 300 s) or either
+#                        violation fails the run with the branch reset to
+#                        its pre-finalize head; summary.json's `finalize`
+#                        and progress.json's trailing `finalize` step record
+#                        the outcome. Code and fix legs are told a finalize
+#                        step will fold their `fixup!` commits. Refused
+#                        without a --pipeline/--preset code step, on a
+#                        read-only run, and for a missing, empty or over-
+#                        64 KiB file.
+# --finalize-floor <sha>: the commit the finalized head must descend from
+#                        instead of the base (it must be the base or an
+#                        ancestor of it, else finalize fails with
+#                        floor-not-ancestor and the script never runs). A
+#                        full 40- or 64-hex sha; needs --finalize-script.
 # --kit-skill <name>:    bind one more skill from $HOME/.claude/skills/<name>
 #                        into every seat of this run, read-only, on top of
 #                        the machine's agent kit (AGENT_KIT_SKILLS in
@@ -1942,6 +1969,10 @@ review_brief_copy=""
 # path is known).
 wake_reply=false
 wake_reply_outbox=""
+# --finalize-script / --finalize-floor: the history step the runner runs
+# after the last leg (see the runner's finalize block).
+finalize_script_file=""
+finalize_floor=""
 kit_skill_flags=()
 k8s_mode=false
 # Set true only inside the --k8s dispatch block, for a composed (non-
@@ -2166,6 +2197,14 @@ while [[ "${1:-}" == -* ]]; do
         --wake-reply)
             wake_reply=true
             shift
+            ;;
+        --finalize-script)
+            finalize_script_file="${2:?--finalize-script requires a file}"
+            shift 2
+            ;;
+        --finalize-floor)
+            finalize_floor="${2:?--finalize-floor requires a commit sha}"
+            shift 2
             ;;
         --kit-skill)
             kit_skill_flags+=("${2:?--kit-skill requires a skill name}")
@@ -2679,13 +2718,15 @@ if [[ -n "$preset_name" ]]; then
     # other composed preset. Local dispatch is untouched: preset_is_legacy_
     # shaped only changes here when k8s_mode is already true.
     #
-    # The per-run caller inputs (--review-brief, --wake-reply) flip it the same way: the
+    # The per-run caller inputs (--review-brief, --wake-reply,
+    # --finalize-script) flip it the same way: the
     # legacy cluster path renders its own prompts in the pod and has no
     # runner to carry them, while the composed path renders every prompt
     # here and pushes the run dir, so a legacy-shaped spec carrying one runs
     # composed. Without one, a legacy-shaped --k8s run is unchanged.
     if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true ]] \
-        && [[ -n "$review_brief_file" || "$wake_reply" == true ]]; then
+        && [[ -n "$review_brief_file" || "$wake_reply" == true \
+              || -n "$finalize_script_file" ]]; then
         preset_is_legacy_shaped=false
     fi
     if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true ]]; then
@@ -3774,6 +3815,34 @@ if [[ -n "$review_brief_file" ]]; then
         exit 1
     fi
     fs_check_caller_input_file --review-brief "$review_brief_file" || exit 1
+fi
+# --finalize-script rewrites the history a code step made, after the last
+# leg: a run with no code step, or a read-only one, has nothing to fold.
+if [[ -n "$finalize_floor" && -z "$finalize_script_file" ]]; then
+    echo "Error: --finalize-floor only applies with --finalize-script." >&2
+    exit 1
+fi
+if [[ -n "$finalize_script_file" ]]; then
+    run_has_code_step=false
+    if [[ -n "$preset_name" && "$review_only" != true && "$preset_read_only" != true \
+        && "$preset_ro_multi" != true ]]; then
+        for ((rhc_k = 1; rhc_k <= preset_step_count; rhc_k++)); do
+            [[ "${preset_step_action[$rhc_k]}" == code ]] && run_has_code_step=true
+        done
+        unset rhc_k
+    fi
+    if [[ "$run_has_code_step" != true ]]; then
+        echo "Error: --finalize-script needs a --pipeline or --preset run with a" >&2
+        echo "code step, not a read-only one: there is no history of its own" >&2
+        echo "for it to finalize." >&2
+        exit 1
+    fi
+    fs_check_caller_input_file --finalize-script "$finalize_script_file" || exit 1
+    if [[ -n "$finalize_floor" && ! "$finalize_floor" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+        echo "Error: --finalize-floor takes a full lowercase commit sha (40 or 64" >&2
+        echo "hex digits), not '$finalize_floor'." >&2
+        exit 1
+    fi
 fi
 # --wake-reply marks a postmaster wake of a composed seat, whose code leg
 # is never the last word: a run with no later leg has no one to tell.
@@ -6377,6 +6446,11 @@ if [[ -n "$review_brief_file" ]]; then
     review_brief_copy="$run_dir/review-brief.md"
     cp -- "$review_brief_file" "$review_brief_copy"
 fi
+# --finalize-script, staged the same way: the runner runs this copy, in the
+# sandbox locally and in the leg container on --k8s (the run dir is pushed).
+if [[ -n "$finalize_script_file" ]]; then
+    cp -- "$finalize_script_file" "$run_dir/finalize.sh"
+fi
 # The prompt overlay's provenance, beside the run for the same reason: what
 # was applied has to be queryable later, not just present in the rendered
 # prompts. dir and rev are facts about the run; fragments and sha256 vary
@@ -7661,7 +7735,7 @@ EOF
     fi
     fs_emit_browser_section
     fs_emit_prompt_overlay implement
-    fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox"
+    fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
     printf '\n---\n\n'
     cat -- "$handoff_file"
 } > "$handoff_copy.part"
@@ -7748,7 +7822,7 @@ if [[ "$review_only" != true ]] \
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
     } > "$fix_prompt_header.part"
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
 fi
@@ -7760,7 +7834,7 @@ if [[ -n "$fix_harness" ]] && (( review_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$fix_harness" \
             "$fxr_preamble_network" "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
     } > "$fxr_fix_prompt_header.part"
     mv -- "$fxr_fix_prompt_header.part" "$fxr_fix_prompt_header"
 fi
@@ -7772,7 +7846,7 @@ if [[ -n "$mntfix_harness" ]] && (( maintainer_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$mntfix_harness" \
             "$fxm_preamble_network" "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
     } > "$fxm_fix_prompt_header.part"
     mv -- "$fxm_fix_prompt_header.part" "$fxm_fix_prompt_header"
 fi
@@ -7923,7 +7997,7 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
@@ -7984,7 +8058,7 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
@@ -8040,7 +8114,7 @@ if (( refresh_enabled )); then
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
-        fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox"
+        fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
     } > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
@@ -9584,6 +9658,16 @@ fs_emit_run_sh_preamble() {
     # tidy.json/summary.json.
     if [[ "$history_owner" == maintainer ]]; then
         printf 'tidy_timeout_secs=%q\n' "$tidy_timeout_secs"
+    fi
+    # The finalize step (--finalize-script): emitted only when the run has
+    # one, so a run without it leaves no trace in run.sh. The timeout's env
+    # override is a test hook, not a flag (the FS_LEG_RETRY_DELAYS
+    # precedent below).
+    if [[ -n "$finalize_script_file" ]]; then
+        printf 'finalize_script=%q\n' "$run_dir/finalize.sh"
+        printf 'finalize_floor=%q\n' "$finalize_floor"
+        printf 'finalize_timeout_secs=%q\n' \
+            "${FORK_SANDBOX_FINALIZE_TIMEOUT_SECS:-$FS_FINALIZE_TIMEOUT_SECS}"
     fi
     # A claude leg that fails on an auth or transient provider error (a
     # revoked OAuth token, an overloaded model) is retried fresh, at most

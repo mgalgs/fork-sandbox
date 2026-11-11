@@ -1423,6 +1423,17 @@ implementation of the walk here, and no cluster-specific review loop for
 this shape — that is what "The cluster review loop" above is, and it stays
 a separate, `--review-loop`-only path.
 
+**Per-run caller inputs.** `--review-brief`, `--wake-reply` and
+`--finalize-script` each send even a legacy-shaped spec down this path
+(the older single-leg cluster path renders its prompts in the pod and has
+no runner to carry them). Nothing new is forwarded to
+`fork-sandbox-k8s.sh`: the brief is rendered into the review prompts on
+the host, and `review-brief.md` and `finalize.sh` ride in the pushed run
+directory. The finalize step runs in the leg container, relayed like
+every leg, and its own checks (tree identity, descent) are relayed the
+same way. Collect pulls `finalize.log` back and merges the pod summary's
+`finalize` record into the host's `summary.json`.
+
 **What runs.** The launcher (`fork-sandbox.sh`) does everything a local run
 does to turn a preset into a run directory — compile the step spine,
 resolve every seat's harness/model, render every step's and fix seat's

@@ -11423,7 +11423,7 @@ cmd_collect() {
                                author_email, author_email_unexpected, author_email_deliberate,
                                authorship_normalized,
                                agent_kit, harness_error, end_reason,
-                               steps, refresh, report_from}
+                               steps, refresh, report_from, finalize}
                             | with_entries(select(.value != null))
                             | walk(if type == "number" and ((isnan or isinfinite) or . > 1e15 or . < -1e15)
                                    then null else . end)
@@ -11477,7 +11477,7 @@ cmd_collect() {
                 run_dir_pull_name="${run_dir_pull_entry##*/}"
                 case "$run_dir_pull_name" in
                     progress.json|summary.txt|sandbox.log|plan.md| \
-                    events.jsonl|uncommitted.patch) ;;
+                    events.jsonl|uncommitted.patch|finalize.log) ;;
                     step-[0-9]*-loop.json)
                         [[ "$run_dir_pull_name" =~ ^step-[0-9]+-loop\.json$ ]] || continue ;;
                     events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl|events-code-[0-9]*.jsonl|events-continuation-[0-9]*.jsonl|events-tidy-[0-9]*.jsonl)

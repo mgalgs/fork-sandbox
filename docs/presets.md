@@ -158,7 +158,8 @@ The run engine walks arbitrary linear pipelines, locally and on `--k8s`
 `docs/kubernetes-runs.md`). On `--k8s` a **legacy-shaped** pipeline — one
 code step, then at most one review step, then at most one maintain step, in
 that order — with no maintain step, no codex seat and no per-run caller
-input (`--review-brief`) still takes the older single-leg cluster path;
+input (`--review-brief`, `--wake-reply`, `--finalize-script`) still takes
+the older single-leg cluster path;
 every other pipeline runs through the walker.
 
 Each round runs the verdict leg; **approval ends the loop** — every
@@ -465,6 +466,29 @@ prompt, under "Additional review instructions from the caller". Code, fix,
 plan and tidy legs never see it. It is refused on a run with no review or
 maintain step, and when the file is missing, empty or over 64 KiB.
 
+`--wake-reply` marks a postmaster mail wake: every leg that may commit (the
+code leg, its continuations, every fix leg) is told the reply file
+(`mail-*.md` in the outbox) and that a leg that commits must leave it
+describing the branch as that leg ends it. It too needs a review or
+maintain step.
+
+`--finalize-script FILE [--finalize-floor SHA]` runs a history step once,
+after the last leg (after every review/fix loop), in the sandbox or the
+pod's leg container, cwd the clone, on the run's branch; it is skipped when
+the branch has no commits above the base. The script gets
+`FS_FINALIZE_BASE`, `FS_FINALIZE_FLOOR` (the floor, else the base) and
+`FS_FINALIZE_REPLY` (the first `mail-*.md` in the outbox, or empty), and may
+rewrite history above the floor and edit the reply. The runner then checks,
+itself, that the branch's tree is byte-identical and that the new head
+descends from the floor; a floor that is not the base or an ancestor of it
+fails as `floor-not-ancestor` before the script runs. A nonzero exit, a
+timeout (300 s) or either violation fails the run and resets the branch to
+the head the legs left. `summary.json` records `finalize` (`ended`
+ran/skipped/failed, `detail`, `exit`, `head_before`, `head_after`,
+`floor`, `clone_restored`) and `progress.json` a trailing `finalize` step.
+Every code and fix leg is told a finalize step will fold its `fixup!`
+commits. It needs a code step and is refused on a read-only run.
+
 ## Because a preset is just flags, the flag rules apply
 
 There is no separate preset semantic to learn, which also means the sharp
@@ -485,7 +509,8 @@ edges are the flags' own — plus the edges of the two preset-only knobs:
   "Composed pipelines on `--k8s`" in `docs/kubernetes-runs.md` for what
   runs, what collect lands, and the handful of seat shapes (codex, a
   sealed/pi-local network, a model-less claude or pi seat) still refused
-  by name. A legacy-shaped preset given `--review-brief` runs there too.
+  by name. A legacy-shaped preset given a per-run caller input
+  (`--review-brief`, `--wake-reply`, `--finalize-script`) runs there too.
 - **`--session-state` wires into a composed preset's first code step**,
   which must be step 1. That step's first pass, and its `--refresh-at`
   continuations, get the store, exactly as a legacy-shaped preset's code
