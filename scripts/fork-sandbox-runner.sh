@@ -3625,12 +3625,13 @@ if [[ -n "${finalize_script:-}" ]]; then
             fi
         fi
         # Any failure after the script ran puts the branch back where the
-        # legs left it, the tidy restore's own idiom, and reads the result
-        # back rather than assuming it.
+        # legs left it and reads the result back rather than assuming it.
+        # The ref is written straight from the saved head, so a script that
+        # moved or deleted the branch cannot stop the checkout after it.
         if [[ "$finalize_ended" == failed ]]; then
             if [[ "$finalize_head_after" != "$finalize_head_before" ]]; then
                 finalize_exec 60 sh -c 'git rebase --abort >/dev/null 2>&1
-git checkout -q -f "$1" && git reset -q --hard "$2"' sh "$branch" "$finalize_head_before" \
+git update-ref "refs/heads/$1" "$2" && git checkout -q -f "$1" && git reset -q --hard "$2"' sh "$branch" "$finalize_head_before" \
                     >> "$run_dir/finalize.log" || true
             fi
             if [[ "$(clone_branch_head)" == "$finalize_head_before" ]]; then

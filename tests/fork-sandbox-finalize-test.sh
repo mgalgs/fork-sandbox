@@ -193,6 +193,24 @@ EOF
 cat > "$scripts_dir/exit2.sh" <<'EOF'
 exit 2
 EOF
+# Delete the branch ref out from under the restore, with HEAD detached.
+cat > "$scripts_dir/delete-ref.sh" <<'EOF'
+b="$(git symbolic-ref --short HEAD)"
+git checkout -q --detach
+git update-ref -d "refs/heads/$b"
+EOF
+# Detach HEAD and move the branch somewhere else.
+cat > "$scripts_dir/move-ref.sh" <<'EOF'
+b="$(git symbolic-ref --short HEAD)"
+git checkout -q --detach
+git branch -f "$b" HEAD~1
+EOF
+cat > "$scripts_dir/exit124.sh" <<'EOF'
+exit 124
+EOF
+cat > "$scripts_dir/exit137.sh" <<'EOF'
+exit 137
+EOF
 cat > "$scripts_dir/hang.sh" <<'EOF'
 sleep 30
 EOF
@@ -398,6 +416,20 @@ check "exit 2: summary carries the exit and reason" "failed|the script exited 2|
     "$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)|\(.finalize.exit)"')"
 check "exit 2: the branch is the reviewed head" \
     "$(fin_json "$rd" '.finalize.head_before')" "$(git -C "$proj" rev-parse "$br" 2>/dev/null)"
+
+# A script that deletes the branch ref, or detaches and moves it, still
+# ends with the branch at the reviewed head.
+for ref_case in delete-ref move-ref; do
+    next_branch
+    IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
+        --pipeline csonnet-ropus --finalize-script "$scripts_dir/$ref_case.sh" --branch "$br")
+    check "$ref_case: the run fails, the clone restored" "1|failed|true" \
+        "$rc|$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.clone_restored)"')"
+    check "$ref_case: head_after is the reviewed head" \
+        "$(fin_json "$rd" '.finalize.head_before')" "$(fin_json "$rd" '.finalize.head_after')"
+    check "$ref_case: the branch is the reviewed head" \
+        "$(fin_json "$rd" '.finalize.head_before')" "$(git -C "$proj" rev-parse "$br" 2>/dev/null)"
+done
 
 # A hanging script is killed at the timeout.
 start="$(date +%s)"
