@@ -937,6 +937,7 @@ note's `note` event, its "seat notes:" line and its `seat_notes` entry in
 - `snapshot-failed` — the wake's thread snapshot could not be written
 - `handoff-render-failed` — the wake's handoff could not be rendered
 - `route-interrupted` — routing woke no run for the seat after its attempts
+- `finalize-refused` — a composed wake's finalize step failed; its work is held (see "Composed seats")
 - `handler-exit`, `handler-timeout` — a handler seat's command failed or timed out
 - `handler-bad-command`, `handler-missing`, `handler-not-regular`,
   `handler-not-executable`, `render-failed` — a handler seat could not be run
@@ -2438,6 +2439,19 @@ thread's current review target sha when one is recorded, not only its first:
 its in-run review legs read `$base...HEAD`, so the base must be the commit
 the other reviewers already saw. Its own lineage is the fallback only when
 no target is recorded. Non-composed seats keep the rule above.
+
+A composed wake whose finalize step failed (its `summary.json` records
+`finalize.ended: failed`) is **held** at harvest: the reply is not posted,
+the seat's on-failure retry is not applied (a retry would restart from the
+review target and throw away the reviewed commits), no follow-up wake is
+spawned, and the run's branch and outbox are kept. The thread is flagged
+once, keyword `finalize-refused`, reason `finalize refused for <agent> (run
+<rid>): exit=<n> <reason>`, and the pass logs `finalize thread=<t> agent=<a>
+run=<rid> outcome=refused exit=<n> reason=<reason>`. `exit` is the script's
+own status, `-` when the runner refused it (a timeout, a changed tree, a
+descent failure, `floor-not-ancestor`). A finalize that ran or was skipped
+harvests exactly as any other wake; one that ran publishes the folded head,
+which is what a `sets` seat's `Version:` reply then stamps as the target.
 
 The seat comes from `fleet resolve`. Unset harness and network default to
 `claude` and `pinned`. An unset model defaults to `sonnet` **only on the

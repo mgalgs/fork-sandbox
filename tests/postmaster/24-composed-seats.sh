@@ -364,4 +364,94 @@ cs_lineage_branch="$(sed -n 's/^BRANCH=//p' "$PM_STATE_DIR"/runs/cs-lineage-pak-
 once
 check "sets (k8s): with no target recorded, lineage" "$cs_lineage_branch" "$(flag_value --checkout)"
 
+# ============================================================
+printf '\n== composed seats: a refused finalize holds the wake ==\n'
+# ============================================================
+
+# `sets` back on pat (local) for the harvest cases.
+sed -i '/^  pak:$/,/^  pag:$/{/review-target: sets/d}' "$FORK_SANDBOX_FLEET_FILE"
+sed -i 's/^  pat:$/  pat:\n    review-target: sets/' "$FORK_SANDBOX_FLEET_FILE"
+msg_count() { find "$FORK_SANDBOX_MAIL_ROOT/threads/$1" -name '*.msg' | wc -l; }
+# fin_wake <summary-json>: a pat wake that ends with exit-code 1 (0 when
+# the summary's finalize did not fail), a reply in its outbox and the
+# given summary.json, then one harvest pass.
+fin_wake() {
+    cs_new_store
+    cs_mid="$(send_msg '@carol' '@pat' 'finalize topic' 'fold it' 8)"
+    cs_tid="$(thread_of "$cs_mid")"
+    once
+    fin_env="$(live_env_for_agent pat)"
+    fin_rid="$(basename -- "$fin_env" .env)"
+    fin_run_dir="$(env_val "$fin_env" RUN_DIR)"
+    mkdir -p -- "$fin_run_dir/outbox"
+    printf '\nFolded and ready.\n' > "$fin_run_dir/outbox/mail-1.md"
+    printf '%s\n' "$2" > "$fin_run_dir/exit-code"
+    printf '%s\n' "$1" > "$fin_run_dir/summary.json"
+    fin_msgs_before="$(msg_count "$cs_tid")"
+    : > "$work/once.out"
+    : > "$STUB_ARGV_LOG"
+    once
+}
+fin_wake '{"finalize":{"ended":"failed","detail":"the script exited 2","exit":2}}' 1
+check "refused: no reply is posted" "$fin_msgs_before" "$(msg_count "$cs_tid")"
+check "refused: the reply stays in the outbox" "yes" \
+    "$([[ -f "$fin_run_dir/outbox/mail-1.md" ]] && echo yes)"
+check "refused: no retry is scheduled" "no" \
+    "$([[ -e "$PM_STATE_DIR/retries/$cs_tid/pat" ]] && echo yes || echo no)"
+check "refused: the run is harvested" "yes" \
+    "$([[ -e "$PM_STATE_DIR/harvested/$fin_rid" ]] && echo yes)"
+check "refused: the thread is flagged with exit and reason" \
+    "finalize refused for pat (run $fin_rid): exit=2 the script exited 2" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
+contains "refused: the flag journal records the finalize-refused keyword" \
+    "$(cat "$PM_STATE_DIR/needs-operator-journal/$cs_tid" 2>/dev/null)" "finalize-refused"
+contains "refused: the finalize event carries exit and reason" "$(cat "$work/once.out")" \
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=$fin_rid outcome=refused exit=2 reason=the script exited 2"
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+once
+once
+check "refused: no later pass wakes the seat" 0 "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+fin_wake '{"finalize":{"ended":"failed","detail":"tree differs","exit":null}}' 1
+check "refused (runner): exit=- in the flag" \
+    "finalize refused for pat (run $fin_rid): exit=- tree differs" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
+contains "refused (runner): exit=- in the event" "$(cat "$work/once.out")" \
+    "outcome=refused exit=- reason=tree differs"
+
+fin_wake '{"finalize":{"ended":"skipped","detail":"no commits above the base","exit":null}}' 0
+check "skipped: the reply is posted as usual" "$(( fin_msgs_before + 1 ))" "$(msg_count "$cs_tid")"
+not_contains "skipped: no finalize event" "$(cat "$work/once.out")" "pm finalize "
+
+# A finalize that ran: the published head is the squashed one, and a sets
+# seat's Version: reply stamps it as the target.
+cs_new_store
+printf 'revise\n' > "$work/body.tmp"
+cs_mid="$("$MAIL" send --from '@carol' --to '@pat' --subject 'squash topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+fin_env="$(live_env_for_agent pat)"
+fin_run_dir="$(env_val "$fin_env" RUN_DIR)"
+fin_branch="$(env_val "$fin_env" BRANCH)"
+fin_sq="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree "$(git -C "$PROJECT_DIR" rev-parse "$rt1_sha^{tree}")" -p "$rt1_sha" -m 'squashed fix')"
+git -C "$PROJECT_DIR" update-ref "refs/heads/$fin_branch" "$fin_sq"
+mkdir -p -- "$fin_run_dir/outbox"
+printf 'Version: 2\n\nSquashed and ready.\n' > "$fin_run_dir/outbox/mail-1.md"
+printf '0\n' > "$fin_run_dir/exit-code"
+printf '{"finalize":{"ended":"ran","detail":null,"exit":0,"head_after":"%s"}}\n' "$fin_sq" \
+    > "$fin_run_dir/summary.json"
+once
+fin_posted=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$cs_tid"/*.msg; do
+    grep -qF 'Squashed and ready.' "$f" && fin_posted="$f"
+done
+check "ran: the reply is posted" "yes" "$([[ -n "$fin_posted" ]] && echo yes)"
+check "ran: X-Review-Target-Set names the squashed head" "$fin_branch $fin_sq" \
+    "$( [[ -n "$fin_posted" ]] && header_of_file "$fin_posted" X-Review-Target-Set)"
+check "ran: the thread's review target moves to it" "$fin_sq" \
+    "$(env_val "$PM_STATE_DIR/review-target/$cs_tid.env" SHA)"
+
 finish_suite

@@ -706,6 +706,16 @@
 # seat starts EVERY wake from the thread's current review target sha when
 # one is recorded (lineage only when none is): its in-run review legs read
 # $base...HEAD, so the base must be the commit the other reviewers saw.
+# A wake whose summary.json says its finalize step failed (`finalize.ended
+# == failed`) is HELD at harvest: its reply is not posted, the seat's
+# on-failure retry is not applied (a retry would restart from the review
+# target and lose the reviewed commits), no follow-up wake is spawned, its
+# branch and outbox stay as they are, and the thread is flagged once,
+# keyword finalize-refused, "finalize refused for <agent> (run <rid>):
+# exit=<n|-> <reason>", with a `finalize thread=<t> agent=<a> run=<rid>
+# outcome=refused exit=<n|-> reason=<reason>` event (exit is the script's
+# own status, `-` when the runner refused it). What happens next is the
+# operator's call. A finalize that ran or was skipped harvests as before.
 #
 # Which legs a preset's pipeline actually runs is mechanical, not decided
 # here or by the R9c triage classifier: fork-sandbox.sh's review and
@@ -2536,6 +2546,7 @@ pm_flag_keyword() {
         "review target "*|"Version: "*) printf 'review-target' ;;
         "upstream head "*) printf 'upstream-head' ;;
         "routing interrupted:"*) printf 'route-interrupted' ;;
+        "finalize refused for"*) printf 'finalize-refused' ;;
         *) printf 'other' ;;
     esac
 }
@@ -7004,6 +7015,12 @@ pm_harvest_run() {
     # harvest marks it $HARVESTED, a few lines below, regardless of
     # whether the k8s Job itself is done).
     local k8s_still_running=0
+    # Set when the run's finalize step failed (summary.json's finalize
+    # record): the wake's work is HELD -- branch and outbox kept, no reply
+    # posted, no retry (a retry would restart from the review target and
+    # throw the reviewed commits away), no follow-up wake. What happens to
+    # it next is the operator's call.
+    local finalize_refused=0
     if [[ ! -d "$run_dir" ]]; then
         # Vanished (scratch root cleaned up, or never existed) rather than
         # merely still running -- this is the one crash shape distinct
@@ -7076,7 +7093,18 @@ pm_harvest_run() {
         if [[ "$backend" == k8s && -f "$run_dir/k8s-timeout" ]]; then
             k8s_timeout="$(pm_trim "$(cat -- "$run_dir/k8s-timeout" 2>/dev/null)")"
         fi
-        if [[ "$backend" == k8s && "$exit_code" == "1" && "$k8s_timeout" == 1 ]]; then
+        local finalize_ended=""
+        finalize_ended="$(jq -r '.finalize.ended // empty' "$run_dir/summary.json" 2>/dev/null || true)"
+        if [[ "$finalize_ended" == failed ]]; then
+            local finalize_exit finalize_reason
+            finalize_exit="$(jq -r '.finalize.exit // "-"' "$run_dir/summary.json" 2>/dev/null || true)"
+            [[ "$finalize_exit" =~ ^-?[0-9]+$ ]] || finalize_exit=-
+            finalize_reason="$(jq -r '.finalize.detail // "unknown"' "$run_dir/summary.json" 2>/dev/null \
+                | LC_ALL=C tr -d '\000-\037\177' | head -c 200)"
+            pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=refused exit=$finalize_exit reason=${finalize_reason:-unknown}"
+            pm_flag_unless_closed "$tid" "finalize refused for $agent (run $rid): exit=$finalize_exit ${finalize_reason:-unknown}"
+            finalize_refused=1
+        elif [[ "$backend" == k8s && "$exit_code" == "1" && "$k8s_timeout" == 1 ]]; then
             # A wait timeout is not a crash: the pod is still running and
             # holding its work (fork-sandbox-k8s.sh's own message, "the
             # pod is still running, holding its work"). Feeding this into the same
@@ -7199,6 +7227,8 @@ pm_harvest_run() {
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
         reply_files=$(( reply_files + 1 ))
+        # A held (finalize-refused) wake posts nothing; its outbox stays.
+        (( ! finalize_refused )) || continue
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network" \
                 "$project" "$review_target" "$branch" \
                 "$review_target_branch" "$review_target_sha" "$review_target_version"; then
@@ -7272,7 +7302,11 @@ pm_harvest_run() {
         # finish acting on it, so the newest message still needs an
         # actual wake exactly like the non-live case, not a ledger entry
         # standing in for one that never happened.
-        if (( k8s_still_running )); then
+        if (( finalize_refused )); then
+            # A held wake: nothing moves the seat on until the operator
+            # does (see finalize_refused above).
+            :
+        elif (( k8s_still_running )); then
             # Do not wake here: the Job this harvest just flagged may
             # still be running, and fs_pm_find_live_run no longer sees
             # this pair as busy the moment this harvest marks $rid
