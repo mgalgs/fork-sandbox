@@ -4149,8 +4149,12 @@ EOF
 #                    whoever integrates the branch reshapes it by hand. Only
 #                    changes the closing sentence below: coding and fix legs
 #                    never curate their own history either way.
+# $2  wake_reply_outbox  the run's outbox dir when this run is a mail wake
+#                    whose reply the postmaster harvests from it
+#                    (fork-sandbox.sh --wake-reply); empty otherwise, and
+#                    then nothing below changes.
 fs_emit_headless_turn_para() {
-    local history_owner="${1:-integrator}"
+    local history_owner="${1:-integrator}" wake_reply_outbox="${2:-}"
     local history_para
     if [[ "$history_owner" == maintainer ]]; then
         history_para="After the maintainer step approves the branch, a tidy-history leg on
@@ -4180,6 +4184,17 @@ history as you made it: do not re-split, squash, amend or rebase your own
 commits to make it read well. History cleanup is not this leg's job.
 $history_para
 EOF
+    if [[ -n "$wake_reply_outbox" ]]; then
+        cat <<EOF
+
+This run is a mail wake, and its reply is the \`mail-*.md\` file in the
+artifact outbox, \`$wake_reply_outbox\`. The reply is posted after the last
+leg, so it must describe the branch as the run ends it: if you commit, leave
+that file describing the branch as you leave it -- edit it, or write
+\`mail-1.md\` there if there is none yet. Never add a second reply that
+contradicts the first.
+EOF
+    fi
 }
 
 # The largest per-run caller input file (--review-brief) fork-sandbox.sh
@@ -4221,7 +4236,7 @@ fs_emit_review_brief_section() {
 
 fs_emit_headless_turn_section() {
     printf '\n## Before you end your turn\n\n'
-    fs_emit_headless_turn_para "${1:-integrator}"
+    fs_emit_headless_turn_para "${1:-integrator}" "${2:-}"
 }
 
 # inner_review is "yes" when a --review-loop ran before this one and "no"
@@ -4443,8 +4458,10 @@ EOF
 #                   preamble a second time).
 # $4  history_owner  passed straight through to fs_emit_headless_turn_para;
 #                    see its own doc comment.
+# $5  wake_reply_outbox  likewise.
 fs_emit_fix_prompt_body() {
     local branch="$1" base_sha="$2" handoff_file="$3" history_owner="${4:-integrator}"
+    local wake_reply_outbox="${5:-}"
     cat <<EOF
 
 ---
@@ -4458,7 +4475,7 @@ reported the problems repeated below.
 Fix the real ones, and commit. Uncommitted work is lost with the clone, so a
 fix you do not commit is a fix nobody gets.
 
-$(fs_emit_headless_turn_para "$history_owner")
+$(fs_emit_headless_turn_para "$history_owner" "$wake_reply_outbox")
 
 Some of what follows may be wrong: the reviewer read the same code you are
 about to read and could have misread it. **Do not change code to satisfy a

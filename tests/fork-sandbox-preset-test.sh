@@ -6533,6 +6533,51 @@ else
     no "a --k8s --review-brief launch reaches the stubbed fork-sandbox-k8s.sh" "$(cat "$err")"
 fi
 
+printf '\n== caller inputs: --wake-reply ==\n'
+
+wr_marker="This run is a mail wake, and its reply is the"
+# Every rendered static prompt in a run dir that names the marker.
+wr_prompts_with() {
+    grep -l -F -- "$2" "$1"/*.md 2>/dev/null | xargs -r -n1 basename | sort | tr '\n' ' '
+}
+prep_stub $'commit\napproved\napproved'
+if rd_wr="$(run_stubbed --pipeline csonnet-ropus-ropus --wake-reply)"; then
+    tmpdirs+=("$rd_wr")
+    check "--wake-reply reaches exactly the code leg, its continuation and every fix header (composed)" \
+        "2-fix-prompt-header.md 3-fix-prompt-header.md continuation-prompt-header.md handoff.md " \
+        "$(wr_prompts_with "$rd_wr" "$wr_marker")"
+    contains "--wake-reply names the run's own outbox" \
+        "$(cat "$rd_wr/handoff.md")" "\`$rd_wr/outbox\`"
+    contains "--wake-reply tells a committing leg to keep the reply current" \
+        "$(cat "$rd_wr/2-fix-prompt-header.md")" "leave
+that file describing the branch as you leave it"
+else
+    no "a composed --wake-reply run launches"
+fi
+prep_stub $'commit\napproved'
+if rd_wrl="$(run_stubbed --pipeline csonnet-ropus --wake-reply --refresh-at 0.5)"; then
+    tmpdirs+=("$rd_wrl")
+    check "--wake-reply reaches the code leg, its continuation and the fix header (legacy-shaped)" \
+        "continuation-prompt-header.md fix-prompt-header.md handoff.md " \
+        "$(wr_prompts_with "$rd_wrl" "$wr_marker")"
+else
+    no "a legacy-shaped --wake-reply run launches"
+fi
+# Without the flag no prompt changes: the reply paragraph is absent on
+# both shapes (the --review-brief runs above carry no --wake-reply).
+check "without --wake-reply no composed prompt names the reply" "" \
+    "$(wr_prompts_with "$rd_rb" "$wr_marker")"
+check "without --wake-reply no legacy-shaped prompt names the reply" "" \
+    "$(wr_prompts_with "$rd_rbn" "$wr_marker")"
+refuses "--wake-reply is refused on a run with no review step" \
+    "--wake-reply needs a run with a review or maintain step" \
+    --pipeline csonnet --wake-reply
+refuses "--wake-reply is refused on a plain single-leg run" \
+    "--wake-reply needs a run with a review or maintain step" --wake-reply
+wr_k8s_out="$(HOME="$k8s_dryrun_home" "$launcher" --dry-run --k8s --pipeline csonnet1-ropus1 \
+    --wake-reply "$k8s_dryrun_proj" "$k8s_dryrun_handoff" 2>"$err")" || true
+contains "--k8s --wake-reply runs a legacy-shaped spec in runner mode" "$wr_k8s_out" "k8s=runner"
+
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
 # also catch a concurrent real run or another suite's fixtures archiving

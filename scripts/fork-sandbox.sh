@@ -181,8 +181,8 @@
 #                        pipeline (one code step, then at most one review
 #                        step, then at most one maintain step, in that
 #                        order) with no maintain step, no codex seat and no
-#                        --review-brief still takes the single-leg cluster
-#                        path. Needs PyYAML.
+#                        --review-brief or --wake-reply still takes the
+#                        single-leg cluster path. Needs PyYAML.
 #                        See docs/presets.md for the file format.
 # --pipeline <spec>:     a preset written inline, in the composition-name
 #                        grammar: -joined <stage><model>[<harness>][<N>]
@@ -534,6 +534,16 @@
 #                        step, and when the file is missing, empty or over
 #                        64 KiB. Never shown to code, fix, plan or tidy
 #                        legs.
+# --wake-reply:          this run is a postmaster mail wake whose reply the
+#                        postmaster harvests from the outbox (mail-*.md)
+#                        after the last leg. Every leg that may commit (the
+#                        code leg, its --refresh-at continuations and every
+#                        fix leg) is told the reply file's path and that a
+#                        leg that commits must leave it describing the
+#                        branch as that leg ends it. Review, maintain, plan
+#                        and tidy legs are not. Refused on a run with no
+#                        review or maintain step; on --k8s it needs
+#                        --pipeline/--preset and takes the composed path.
 # --kit-skill <name>:    bind one more skill from $HOME/.claude/skills/<name>
 #                        into every seat of this run, read-only, on top of
 #                        the machine's agent kit (AGENT_KIT_SKILLS in
@@ -1927,6 +1937,11 @@ tidy_timeout_secs="$FS_TIDY_TIMEOUT_SECS"
 # the run dir exists; the prompt renderer appends the copy).
 review_brief_file=""
 review_brief_copy=""
+# --wake-reply: this run is a postmaster mail wake; its commit-capable legs
+# are told the reply file's place (wake_reply_outbox, set once the outbox
+# path is known).
+wake_reply=false
+wake_reply_outbox=""
 kit_skill_flags=()
 k8s_mode=false
 # Set true only inside the --k8s dispatch block, for a composed (non-
@@ -2147,6 +2162,10 @@ while [[ "${1:-}" == -* ]]; do
         --review-brief)
             review_brief_file="${2:?--review-brief requires a file}"
             shift 2
+            ;;
+        --wake-reply)
+            wake_reply=true
+            shift
             ;;
         --kit-skill)
             kit_skill_flags+=("${2:?--kit-skill requires a skill name}")
@@ -2660,13 +2679,13 @@ if [[ -n "$preset_name" ]]; then
     # other composed preset. Local dispatch is untouched: preset_is_legacy_
     # shaped only changes here when k8s_mode is already true.
     #
-    # The per-run caller inputs (--review-brief) flip it the same way: the
+    # The per-run caller inputs (--review-brief, --wake-reply) flip it the same way: the
     # legacy cluster path renders its own prompts in the pod and has no
     # runner to carry them, while the composed path renders every prompt
     # here and pushes the run dir, so a legacy-shaped spec carrying one runs
     # composed. Without one, a legacy-shaped --k8s run is unchanged.
-    if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true \
-        && -n "$review_brief_file" ]]; then
+    if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true ]] \
+        && [[ -n "$review_brief_file" || "$wake_reply" == true ]]; then
         preset_is_legacy_shaped=false
     fi
     if [[ "$k8s_mode" == true && "$preset_is_legacy_shaped" == true ]]; then
@@ -3755,6 +3774,20 @@ if [[ -n "$review_brief_file" ]]; then
         exit 1
     fi
     fs_check_caller_input_file --review-brief "$review_brief_file" || exit 1
+fi
+# --wake-reply marks a postmaster wake of a composed seat, whose code leg
+# is never the last word: a run with no later leg has no one to tell.
+if [[ "$wake_reply" == true ]]; then
+    if [[ "$run_has_review_step" != true ]]; then
+        echo "Error: --wake-reply needs a run with a review or maintain step;" >&2
+        echo "a single-leg run's code leg already owns its reply." >&2
+        exit 1
+    fi
+    if [[ "$k8s_mode" == true && -z "$preset_name" ]]; then
+        echo "Error: --wake-reply on --k8s needs a --pipeline or --preset run:" >&2
+        echo "only the composed cluster path renders its prompts on this host." >&2
+        exit 1
+    fi
 fi
 
 # --k8s dispatches the whole run to fork-sandbox-k8s.sh run, which submits it
@@ -7217,6 +7250,8 @@ else
     mkdir -p "$outbox_dir"
     chmod 755 "$outbox_dir"
 fi
+# The reply's place, as the leg sees it (the pod's path on --k8s).
+[[ "$wake_reply" == true ]] && wake_reply_outbox="$outbox_dir"
 fs_reject_unsafe_chars "$outbox_dir"
 
 # Codex writes account quota snapshots only to its private rollout logs; its
@@ -7626,7 +7661,7 @@ EOF
     fi
     fs_emit_browser_section
     fs_emit_prompt_overlay implement
-    fs_emit_headless_turn_section "$history_owner"
+    fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox"
     printf '\n---\n\n'
     cat -- "$handoff_file"
 } > "$handoff_copy.part"
@@ -7713,7 +7748,7 @@ if [[ "$review_only" != true ]] \
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
     } > "$fix_prompt_header.part"
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
 fi
@@ -7725,7 +7760,7 @@ if [[ -n "$fix_harness" ]] && (( review_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$fix_harness" \
             "$fxr_preamble_network" "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
     } > "$fxr_fix_prompt_header.part"
     mv -- "$fxr_fix_prompt_header.part" "$fxr_fix_prompt_header"
 fi
@@ -7737,7 +7772,7 @@ if [[ -n "$mntfix_harness" ]] && (( maintainer_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$mntfix_harness" \
             "$fxm_preamble_network" "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
     } > "$fxm_fix_prompt_header.part"
     mv -- "$fxm_fix_prompt_header.part" "$fxm_fix_prompt_header"
 fi
@@ -7888,7 +7923,7 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
@@ -7949,7 +7984,7 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
@@ -8005,7 +8040,7 @@ if (( refresh_enabled )); then
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
-        fs_emit_headless_turn_section "$history_owner"
+        fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox"
     } > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
