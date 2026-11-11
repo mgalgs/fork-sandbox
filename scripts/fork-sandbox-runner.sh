@@ -3584,12 +3584,18 @@ if [[ -n "${finalize_script:-}" ]]; then
                 sh "$outbox_dir")" || finalize_reply=""
         fi
         finalize_rc=0
+        finalize_started="$(date +%s)"
         finalize_exec "$finalize_timeout_secs" \
             env FS_FINALIZE_BASE="$base_sha" FS_FINALIZE_FLOOR="$finalize_floor_eff" \
             FS_FINALIZE_REPLY="$finalize_reply" sh "$finalize_script" \
             >> "$run_dir/finalize.log" || finalize_rc=$?
+        finalize_elapsed=$(( $(date +%s) - finalize_started ))
         finalize_head_after="$(clone_branch_head)"
-        if (( finalize_rc == 124 || finalize_rc == 137 )); then
+        # timeout passes the script's own status through, so 124 and 137
+        # are a timeout only when the limit has actually gone by; whole
+        # seconds read at both ends never undercount a real one.
+        if (( (finalize_rc == 124 || finalize_rc == 137) \
+                && finalize_elapsed >= finalize_timeout_secs )); then
             finalize_ended=failed
             finalize_detail="the script timed out after ${finalize_timeout_secs}s"
         elif (( finalize_rc != 0 )); then

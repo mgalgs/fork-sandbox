@@ -431,6 +431,16 @@ for ref_case in delete-ref move-ref; do
         "$(fin_json "$rd" '.finalize.head_before')" "$(git -C "$proj" rev-parse "$br" 2>/dev/null)"
 done
 
+# A script's own 124 or 137 is its exit status, not a timeout.
+for own_rc in 124 137; do
+    next_branch
+    IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
+        --pipeline csonnet-ropus --finalize-script "$scripts_dir/exit$own_rc.sh" --branch "$br")
+    check "exit $own_rc: summary carries the script's own exit, not a timeout" \
+        "1|failed|the script exited $own_rc|$own_rc" \
+        "$rc|$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)|\(.finalize.exit)"')"
+done
+
 # A hanging script is killed at the timeout.
 start="$(date +%s)"
 next_branch
