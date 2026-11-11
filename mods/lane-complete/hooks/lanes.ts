@@ -11,6 +11,8 @@ export type Lane = {
   source: 'live' | 'stale' | 'mailbox' | 'remote' | 'peer'
   /** What the lane owns, one line (`lane-mail.sh describe`); local lanes only. */
   description?: string
+  /** When a stale lane's session was last seen (local `YYYY-MM-DD HH:MM`). */
+  lastSeen?: string
 }
 
 /** The part of a prompt.edit input the picker reads. */
@@ -54,8 +56,9 @@ export function parseLanes(stdout: string): Lane[] {
   const remote: string[] = []
   const peers: string[] = []
   const described = new Map<string, string>()
+  const lastSeen = new Map<string, string>()
   for (const line of stdout.split('\n')) {
-    const [source, name, description] = line.split('\t')
+    const [source, name, description, last] = line.split('\t')
     if (name === undefined) continue
     if (source === 'remote') {
       if (REMOTE.test(name)) remote.push(name)
@@ -66,7 +69,10 @@ export function parseLanes(stdout: string): Lane[] {
       described.set(name, description)
     }
     if (source === 'live') live.push(name)
-    else if (source === 'stale') stale.push(name)
+    else if (source === 'stale') {
+      stale.push(name)
+      if (last && !lastSeen.has(name)) lastSeen.set(name, last)
+    }
     else if (source === 'mailbox') mailbox.push(name)
     else if (source === 'peer') peers.push(name)
   }
@@ -76,7 +82,13 @@ export function parseLanes(stdout: string): Lane[] {
     if (seen.has(address)) return
     seen.add(address)
     const description = source === 'live' || source === 'stale' || source === 'mailbox' ? described.get(address.slice(1)) : undefined
-    lanes.push(description === undefined ? { address, source } : { address, source, description })
+    const last = source === 'stale' ? lastSeen.get(address.slice(1)) : undefined
+    lanes.push({
+      address,
+      source,
+      ...(description === undefined ? {} : { description }),
+      ...(last === undefined ? {} : { lastSeen: last }),
+    })
   }
   for (const name of live) add(`@${name}`, 'live')
   for (const name of stale) add(`@${name}`, 'stale')
@@ -268,9 +280,13 @@ export function mentions(text: string, lanes: readonly Lane[]): string[] {
 export function mentionContext(addresses: readonly string[], lanes: readonly Lane[] = []): string {
   const list = addresses.join(', ')
   // A lane's name invites a guess at what it owns; its description says.
+  // A stale lane says so, or work gets routed to a session that is gone.
   const owns = addresses.flatMap(a => {
-    const description = lanes.find(l => l.address === a)?.description
-    return description === undefined ? [] : [`${a} owns: ${description}`]
+    const lane = lanes.find(l => l.address === a)
+    const stale = lane?.source !== 'stale' ? ''
+      : lane.lastSeen === undefined ? 'stale' : `stale, last seen ${lane.lastSeen}`
+    if (lane?.description !== undefined) return [`${a} owns: ${lane.description}${stale && ` (${stale})`}`]
+    return stale ? [`${a} is ${stale}`] : []
   })
   return [
     `The operator's prompt mentions lane-mail ${addresses.length === 1 ? 'lane' : 'lanes'}: ${list}.`,

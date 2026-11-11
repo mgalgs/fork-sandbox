@@ -37,7 +37,10 @@ lanes: `@fs`, `@docs`, `@fs:otherhost`.
   wording. The mod never sends anything itself. A mentioned lane that has a
   description (`lane-mail.sh describe`) also gets a line in that note,
   `@lane owns: <description>`, so the model does not guess its scope from the
-  name; a lane without one adds nothing.
+  name; a lane without one adds nothing. A stale lane (registered, session
+  gone) says so, so work is not routed to a session that has ended:
+  `@lane owns: <description> (stale, last seen <when>)`, or
+  `@lane is stale, last seen <when>` when it has no description.
 
 ## Remote lanes that have written here
 

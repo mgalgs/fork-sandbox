@@ -295,8 +295,19 @@ test('parseLanes orders live, mailbox, then peers, drops bad names', () => {
 test('parseLanes puts stale lanes after live ones and before mailbox lanes, with their descriptions', () => {
   const out = parseLanes('mailbox\tbeta\t\t\nstale\tgamma\tthe gamma repo\t2026-01-02 03:04\nlive\talpha\t\t2026-01-05 06:07\npeer\thostone\t\t\n')
   expect(out.map(l => l.address)).toEqual(['@alpha', '@gamma', '@beta', '@alpha:hostone', '@gamma:hostone', '@beta:hostone'])
-  expect(out[1]).toEqual({ address: '@gamma', source: 'stale', description: 'the gamma repo' })
+  expect(out[1]).toEqual({ address: '@gamma', source: 'stale', description: 'the gamma repo', lastSeen: '2026-01-02 03:04' })
   expect(out[0]?.description).toBeUndefined()
+  expect(out[0]?.lastSeen).toBeUndefined()
+})
+
+test('a mentioned stale lane says when it was last seen; a live one does not', () => {
+  const out = parseLanes('live\talpha\tthe alpha repo\t2026-01-05 06:07\nstale\tgamma\tthe gamma repo\t2026-01-02 03:04\nstale\tdelta\t\t2026-01-03 04:05\nstale\tomega\t\t\n')
+  const ctx = mentionContext(['@alpha', '@gamma', '@delta', '@omega'], out)
+  expect(ctx).toContain('@alpha owns: the alpha repo\n')
+  expect(ctx).toContain('@gamma owns: the gamma repo (stale, last seen 2026-01-02 03:04)')
+  expect(ctx).toContain('@delta is stale, last seen 2026-01-03 04:05')
+  expect(ctx.endsWith('@omega is stale')).toBe(true)
+  expect(ctx).not.toContain('@alpha owns: the alpha repo (')
 })
 
 test('parseLanes lists remote lanes after mailbox lanes, once, and drops malformed ones', () => {
