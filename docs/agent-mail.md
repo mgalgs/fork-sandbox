@@ -2260,7 +2260,14 @@ thread routes it.
      `postmaster status --thread <thread-id> --json` prints), the last two
      in a temp dir under the state dir that is removed when the gate
      returns, on every path. A gate is thereby pinned to the view the
-     postmaster decides on.
+     postmaster decides on. A seat with `pipelines:` also gets
+     `FS_HOOK_PIPELINE_SIZE_FILE`, and one with `finalize:`
+     `FS_HOOK_FINALIZE_FLOOR_FILE`, both paths in that same temp dir: on
+     exit 0 the gate **may** write one token to each — a size key of the
+     seat's table, and a full 40- or 64-hex commit sha the finalized head
+     must descend from. Anything else (no file, empty, malformed, an
+     unknown key) is the `default` row and no floor; see "Composed seats"
+     under "The wake". Seats without the keys get neither variable.
    - **A deferral is remembered.** `wake-deferred/<thread-id>` holds one
      `<agent> <message-id> <due> <attempt>` line per deferred seat (a
      later defer of the same seat replaces its line): `<due>` is when its
@@ -2389,7 +2396,48 @@ wake's `mail-*.md` reply, before any later leg in the preset's pipeline
 runs, so the thread always gets the coding leg's own account, unrevised
 — read it as "what I did," not as "what this pipeline landed," since a
 later leg can still amend or override what was committed without that
-ever reaching the reply.
+ever reaching the reply. A composed seat (below) differs: its reply
+describes what landed.
+
+#### Composed seats
+
+A seat with `pipelines:` runs a whole `--pipeline` spec per wake, the row
+chosen by size. The wake-when gate may write a size token to
+`FS_HOOK_PIPELINE_SIZE_FILE`; a token matching `^[a-z][a-z0-9-]{0,15}$` that
+is a key of the table picks that row, and anything else — no file, empty,
+malformed, unknown, no gate on the seat, or a wake that skips the gate (an
+operator's message) — picks `default`. A retry, a held seat's release and a
+fetch-wait re-dispatch skip the gate, so the size chosen when the wake was
+admitted is recorded (`PIPELINE_SIZE` in the run record, `SIZE` in the
+`held/` and `fetch-wait/` records) and reused; none recorded means
+`default`. Every composed wake logs one event:
+
+```
+pipeline thread=<t> agent=<a> size=<chosen key> requested=<raw token or -> spec=<spec> floor=<sha or ->
+```
+
+The spawn passes `--pipeline <spec>`, `--wake-reply`, and, when the seat
+sets them, `--review-brief <file>` and `--finalize-script <file>` (with
+`--finalize-floor <sha>` when the gate wrote a valid floor at admission,
+recorded and reused like the size). It passes **no** `--harness`,
+`--model`, `--effort`, `--pi-args`, `--preset` or `--timeout`: the spec
+names every seat, and `fork-sandbox.sh`'s own default bounds the run (a
+local run has no overall limit, every leg is bounded on its own; a `--k8s`
+run takes `fork-sandbox-k8s.sh run`'s 3600 s). Session args and
+`--refresh-at` are passed only when the spec's step 1 is a claude code step;
+any other row starts the wake fresh. Everything else a wake passes is
+unchanged. The run record's `HARNESS`/`MODEL` are step 1's seat.
+
+Every leg that may commit (code and fix legs) is told the reply file's path,
+and a leg that commits must leave the reply describing the branch as that
+leg ends it; review and maintain legs are not told to edit it. Whether the
+reply's content matches the tip is the caller's to check.
+
+A composed `review-target: sets` seat starts **every** wake from the
+thread's current review target sha when one is recorded, not only its first:
+its in-run review legs read `$base...HEAD`, so the base must be the commit
+the other reviewers already saw. Its own lineage is the fallback only when
+no target is recorded. Non-composed seats keep the rule above.
 
 The seat comes from `fleet resolve`. Unset harness and network default to
 `claude` and `pinned`. An unset model defaults to `sonnet` **only on the
@@ -2642,6 +2690,8 @@ mktemp+mv rewrite on every write, never a partial one:
 | `SINCE` | epoch seconds the record was first created, kept across a superseding `TRIGGER` |
 | `RETRY` | `1` when this hold was entered from `pm_retry_pass` firing an already-scheduled crash retry into it, `malformed` for a discarded-reply retry (the reasons are in `discards/`), else `0`. `fetch-wait/` records carry the same value |
 | `QUIET` | `1` while the hold waits on a pending grant (`X-Grant: pending` on the root, inside the grant-pending timeout) and has raised no flag, else `0`. Absent in a record written before the field existed, which reads as `0` |
+| `SIZE` | a composed seat's admitted `pipelines:` row, reused on release (absent otherwise; absent reads as `default`). `fetch-wait/` records carry it too |
+| `FLOOR` | a composed seat's admitted finalize floor, reused on release (absent when none). `fetch-wait/` records carry it too |
 
 Created the first time a `backend: k8s`, `grant: required` seat's wake
 would otherwise spawn with no grant file present. A new message addressed

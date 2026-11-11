@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+# shellcheck extended-analysis=false  # see shellcheck-memory-budget-test.sh
+# tests/postmaster/24-composed-seats.sh — fork-sandbox-postmaster.sh: seats
+# with a fleet `pipelines:` table. The wake-when gate's size token picks the
+# row (every fallback picks `default`), the choice survives retry and a held
+# release, a composed wake's argv is exactly decision 4's on both backends,
+# a composed `sets` seat always starts from the review target, and seats
+# without the key are untouched.
+#
+# Usage: tests/postmaster/24-composed-seats.sh  (or all files at once:
+# tests/fork-sandbox-postmaster-test.sh)
+
+set -uo pipefail
+
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
+
+# ============================================================
+printf '\n== composed seats: fixtures ==\n'
+# ============================================================
+
+export FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline
+new_root K8S_TEST_CONFIG_DIR
+export FORK_SANDBOX_CONFIG_DIR="$K8S_TEST_CONFIG_DIR"
+k8s_wake_fixture
+export FORK_SANDBOX_POSTMASTER_K8S="$K8S_WAKE_BIN/fork-sandbox-k8s.sh"
+
+for cs_seat in pat pam pak pag; do
+    printf 'Composed fixture seat.\n' > "$FORK_SANDBOX_PERSONAS_DIR/$cs_seat.md"
+done
+# Not .md: a .md here would also be a bare-persona agent.
+printf 'Read the bridge twice.\n' > "$FORK_SANDBOX_PERSONAS_DIR/pat-brief.txt"
+printf 'exit 0\n' > "$FORK_SANDBOX_PERSONAS_DIR/pat-finalize.sh"
+# One `sets` seat per fleet: pat takes it from ken in this file.
+sed -i '/^  ken:$/,/^  kai:$/{/review-target: sets/d}' "$FORK_SANDBOX_FLEET_FILE"
+sed -i 's/^agents:$/agents:\
+  pat:\
+    pipelines: {default: copus1-ropus1, xs: csonnet1-ropus1, l: pfable1-copus1-ropus3, cx: csol1-ropus1}\
+    wake-when: gate\
+    review-target: sets\
+    refresh-at: 0.5\
+    review-brief: pat-brief.txt\
+    finalize: pat-finalize.sh\
+  pam:\
+    pipelines: {default: copus1-ropus1, plan: pfable1-copus1-ropus1}\
+  pak:\
+    backend: k8s\
+    pipelines: {default: copus1-ropus1, xs: csonnet1-ropus1}\
+    wake-when: gate\
+    finalize: pat-finalize.sh\
+  pag:\
+    backend: k8s\
+    grant: required\
+    pipelines: {default: copus1-ropus1, l: pfable1-copus1-ropus3}\
+    wake-when: gate/' "$FORK_SANDBOX_FLEET_FILE"
+sed -i 's/^  karen:$/  karen:\n    wake-when: gate/; s/^  alice: {}$/  alice:\n    wake-when: gate/' \
+    "$FORK_SANDBOX_FLEET_FILE"
+if "$FLEET" check >/dev/null 2>&1; then
+    ok "composed fixture fleet passes fleet check"
+else
+    no "composed fixture fleet passes fleet check" "$("$FLEET" check 2>&1)"
+fi
+
+new_root CS_HOOKS
+new_root CS_OUT
+# shellcheck disable=SC2031  # the subshell is lib.sh's hk_call, not this scope
+export CS_OUT FORK_SANDBOX_HOOKS_DIR="$CS_HOOKS"
+# The gate wakes everyone; it writes $CS_OUT/size (and floor) into the
+# files the postmaster named, when those exist, and records its env.
+cat > "$CS_HOOKS/wake-when.gate" <<'GATE'
+#!/usr/bin/env bash
+echo "$FS_HOOK_AGENT" >> "$CS_OUT/calls"
+env | grep '^FS_HOOK_' | sort > "$CS_OUT/env-$FS_HOOK_AGENT"
+if [[ -n "${FS_HOOK_PIPELINE_SIZE_FILE:-}" && -f "$CS_OUT/size" ]]; then
+    cat "$CS_OUT/size" > "$FS_HOOK_PIPELINE_SIZE_FILE"
+fi
+if [[ -n "${FS_HOOK_FINALIZE_FLOOR_FILE:-}" && -f "$CS_OUT/floor" ]]; then
+    cat "$CS_OUT/floor" > "$FS_HOOK_FINALIZE_FLOOR_FILE"
+fi
+exit 0
+GATE
+chmod +x "$CS_HOOKS/wake-when.gate"
+
+cs_calls() { [[ -f "$CS_OUT/calls" ]] && wc -l < "$CS_OUT/calls" || echo 0; }
+# The newest stub call's argv, one arg per line.
+last_call() { awk '/^----CALL----$/{buf=""; next} {buf = buf $0 "\n"} END{printf "%s", buf}' "$STUB_ARGV_LOG"; }
+flag_count() { last_call | grep -cxF -- "$1"; }
+flag_value() { last_call | awk -v f="$1" 'found{print; exit} $0==f{found=1}'; }
+cs_new_store() {
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    : > "$STUB_ARGV_LOG"
+    rm -f -- "$CS_OUT/calls" "$CS_OUT/size" "$CS_OUT/floor" "$CS_OUT"/env-*
+}
+# cs_wake <agent> [size-token]: a fresh store, one message to <agent>, one pass.
+cs_wake() {
+    cs_new_store
+    [[ $# -lt 2 ]] || printf '%s' "$2" > "$CS_OUT/size"
+    cs_mid="$(send_msg '@carol' "@$1" 'composed topic' 'please fix' 8)"
+    cs_tid="$(thread_of "$cs_mid")"
+    once
+}
+pipeline_events() { grep -F 'pm pipeline ' "$work/once.out" || true; }
+
+# ============================================================
+printf '\n== composed seats: the gate picks the row ==\n'
+# ============================================================
+
+cs_wake pat xs
+check "size: the gate's xs token runs the xs row" "csonnet1-ropus1" "$(flag_value --pipeline)"
+contains "size: the pipeline event names the choice, the raw token and the spec" \
+    "$(pipeline_events)" "agent=pat size=xs requested=xs spec=csonnet1-ropus1 floor=-"
+check "size: one pipeline event per wake" 1 "$(pipeline_events | wc -l)"
+
+for cs_case in "none:" "empty:" "upper:XS" "spaced:x y" "unknown:nosuch" "two-lines:xs
+l"; do
+    cs_label="${cs_case%%:*}" cs_tok="${cs_case#*:}"
+    if [[ "$cs_label" == none ]]; then cs_wake pat; else cs_wake pat "$cs_tok"; fi
+    check "fallback ($cs_label): the default row runs" "copus1-ropus1" "$(flag_value --pipeline)"
+    contains "fallback ($cs_label): the event says size=default" "$(pipeline_events)" \
+        "agent=pat size=default requested="
+done
+cs_wake pat "XS"
+contains "fallback: the raw token is shown as written" "$(pipeline_events)" "requested=XS spec="
+cs_wake pat
+contains "fallback: no token shows requested=-" "$(pipeline_events)" "requested=- spec=copus1-ropus1"
+
+cs_wake pam
+check "no gate: the default row runs" "copus1-ropus1" "$(flag_value --pipeline)"
+contains "no gate: the event says requested=-" "$(pipeline_events)" \
+    "agent=pam size=default requested=- spec=copus1-ropus1 floor=-"
+
+cs_new_store
+printf 'l' > "$CS_OUT/size"
+printf 'do it\n' > "$work/body.tmp"
+cs_mid="$("$MAIL" send --from '@operator' --to '@pat' --subject 'operator topic' \
+    --body "$work/body.tmp" --hops 8 2>/dev/null)"
+once
+check "operator mail: the gate does not run" 0 "$(cs_calls)"
+check "operator mail: the default row runs" "copus1-ropus1" "$(flag_value --pipeline)"
+
+# ============================================================
+printf '\n== composed seats: spawn args ==\n'
+# ============================================================
+
+cs_wake pat xs
+for cs_flag in --pipeline --branch --network --clone-dir --wake-reply --review-brief \
+    --finalize-script --thread-dir; do
+    check "local args: $cs_flag is passed" 1 "$(flag_count "$cs_flag")"
+done
+check "local args: --review-brief names the seat's brief" \
+    "$FORK_SANDBOX_PERSONAS_DIR/pat-brief.txt" "$(flag_value --review-brief)"
+check "local args: --finalize-script names the seat's script" \
+    "$FORK_SANDBOX_PERSONAS_DIR/pat-finalize.sh" "$(flag_value --finalize-script)"
+for cs_flag in --harness --model --effort --pi-args --preset --timeout; do
+    check "local args: no $cs_flag" 0 "$(flag_count "$cs_flag")"
+done
+cs_env="$(latest_env_for_agent pat)"
+check "record: PIPELINE_SIZE" "xs" "$(env_val "$cs_env" PIPELINE_SIZE)"
+check "record: PIPELINE_SPEC" "csonnet1-ropus1" "$(env_val "$cs_env" PIPELINE_SPEC)"
+check "record: FINALIZE_FLOOR empty without a floor" "" "$(env_val "$cs_env" FINALIZE_FLOOR)"
+check "record: HARNESS/MODEL are step 1's seat" "claude sonnet" \
+    "$(env_val "$cs_env" HARNESS) $(env_val "$cs_env" MODEL)"
+
+cs_wake pak xs
+for cs_flag in --pipeline --k8s --outbox-dir --network --wake-reply --finalize-script; do
+    check "k8s args: $cs_flag is passed" 1 "$(flag_count "$cs_flag")"
+done
+check "k8s args: the xs row" "csonnet1-ropus1" "$(flag_value --pipeline)"
+for cs_flag in --timeout --harness --model --effort --pi-args --preset --review-brief; do
+    check "k8s args: no $cs_flag" 0 "$(flag_count "$cs_flag")"
+done
+
+# Session args follow step 1: kept for a claude code step, dropped for a
+# plan-first or codex-first row; --refresh-at follows the same rule.
+cs_wake pat
+check "session: a claude-code-first row passes --session-state" 1 "$(flag_count --session-state)"
+check "session: ... and --refresh-at" "0.5" "$(flag_value --refresh-at)"
+finish_run pat 0 11111111-2222-3333-4444-555555555555
+once
+printf 'xs' > "$CS_OUT/size"
+: > "$STUB_ARGV_LOG"
+reply_msg '@carol' "$cs_mid" 'more please' >/dev/null
+once
+once
+check "session: a later claude-code-first wake resumes the recorded session" \
+    "11111111-2222-3333-4444-555555555555" "$(flag_value --resume-session)"
+for cs_row in l cx; do
+    cs_wake pat "$cs_row"
+    for cs_flag in --session-state --resume-session --session-id --refresh-at; do
+        check "session: the $cs_row row passes no $cs_flag" 0 "$(flag_count "$cs_flag")"
+    done
+done
+cs_wake pam
+check "session: pam's claude-code-first default keeps --session-state" 1 "$(flag_count --session-state)"
+
+# ============================================================
+printf '\n== composed seats: size survives admission ==\n'
+# ============================================================
+
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+cs_wake pat xs
+cs_calls_before="$(cs_calls)"
+finish_run pat 1
+once
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "retry: the retry wake reuses the admitted xs row" "csonnet1-ropus1" "$(flag_value --pipeline)"
+check "retry: the gate is not asked again" "$cs_calls_before" "$(cs_calls)"
+contains "retry: the event says requested=-" "$(pipeline_events)" "size=xs requested=- spec=csonnet1-ropus1"
+
+cs_wake pat xs
+finish_run pat 1
+sed -i '/^PIPELINE_SIZE=/d' "$(latest_env_for_agent pat)"
+once
+: > "$STUB_ARGV_LOG"
+once
+check "retry: a run record with no size retries on default" "copus1-ropus1" "$(flag_value --pipeline)"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+cs_wake pag l
+check "held: no spawn before the grant" 0 "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+check "held: the held record carries the admitted size" "l" \
+    "$(env_val "$PM_STATE_DIR/held/$cs_tid/pag" SIZE)"
+cs_calls_before="$(cs_calls)"
+"$MAIL" grant "$cs_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "held: the release runs the admitted l row" "pfable1-copus1-ropus3" "$(flag_value --pipeline)"
+check "held: the release does not ask the gate" "$cs_calls_before" "$(cs_calls)"
+
+cs_wake pag l
+sed -i '/^SIZE=/d' "$PM_STATE_DIR/held/$cs_tid/pag"
+"$MAIL" grant "$cs_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "held: a held record with no size releases on default" "copus1-ropus1" "$(flag_value --pipeline)"
+
+# ============================================================
+printf '\n== composed seats: the finalize floor ==\n'
+# ============================================================
+
+cs_floor="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+cs_new_store
+printf 'xs' > "$CS_OUT/size"
+printf '%s\n' "$cs_floor" > "$CS_OUT/floor"
+cs_mid="$(send_msg '@carol' '@pat' 'floor topic' 'fold it' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+check "floor: a valid floor is passed" "$cs_floor" "$(flag_value --finalize-floor)"
+contains "floor: the event names it" "$(pipeline_events)" "spec=csonnet1-ropus1 floor=$cs_floor"
+check "floor: the run record keeps it" "$cs_floor" \
+    "$(env_val "$(latest_env_for_agent pat)" FINALIZE_FLOOR)"
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+finish_run pat 1
+once
+: > "$STUB_ARGV_LOG"
+once
+check "floor: a retry reuses the admitted floor" "$cs_floor" "$(flag_value --finalize-floor)"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+for cs_bad in abc "${cs_floor:0:39}"; do
+    cs_new_store
+    printf '%s' "$cs_bad" > "$CS_OUT/floor"
+    send_msg '@carol' '@pat' 'bad floor' 'x' 8 >/dev/null
+    once
+    check "floor: malformed '$cs_bad' passes no --finalize-floor" 0 "$(flag_count --finalize-floor)"
+    contains "floor: ... and the event says floor=-" "$(pipeline_events)" "floor=-"
+done
+cs_wake pat
+check "floor: no floor file, no --finalize-floor" 0 "$(flag_count --finalize-floor)"
+contains "gate env: a pipelines seat gets the size file" "$(cat "$CS_OUT/env-pat")" \
+    "FS_HOOK_PIPELINE_SIZE_FILE="
+contains "gate env: a finalize seat gets the floor file" "$(cat "$CS_OUT/env-pat")" \
+    "FS_HOOK_FINALIZE_FLOOR_FILE="
+cs_wake pak
+cs_new_store
+send_msg '@carol' '@pag' 'gate env' 'x' 8 >/dev/null
+once
+not_contains "gate env: a seat without finalize gets no floor file" "$(cat "$CS_OUT/env-pag")" \
+    "FS_HOOK_FINALIZE_FLOOR_FILE"
+
+# ============================================================
+printf '\n== composed seats: seats without pipelines are unchanged ==\n'
+# ============================================================
+
+cs_wake alice xs
+not_contains "plain seat: its gate env has no size file" "$(cat "$CS_OUT/env-alice")" \
+    "FS_HOOK_PIPELINE_SIZE_FILE"
+not_contains "plain seat: ... and no floor file" "$(cat "$CS_OUT/env-alice")" \
+    "FS_HOOK_FINALIZE_FLOOR_FILE"
+check "plain seat: no pipeline event" "" "$(pipeline_events)"
+for cs_flag in --harness --model --clone-dir; do
+    check "plain local seat: $cs_flag is still passed" 1 "$(flag_count "$cs_flag")"
+done
+for cs_flag in --pipeline --wake-reply --review-brief --finalize-script; do
+    check "plain local seat: no $cs_flag" 0 "$(flag_count "$cs_flag")"
+done
+check "plain local seat: no PIPELINE_SIZE in its record" "" \
+    "$(env_val "$(latest_env_for_agent alice)" PIPELINE_SIZE)"
+cs_wake karen xs
+not_contains "plain k8s seat: its gate env has no size file" "$(cat "$CS_OUT/env-karen")" \
+    "FS_HOOK_PIPELINE_SIZE_FILE"
+check "plain k8s seat: no pipeline event" "" "$(pipeline_events)"
+check "plain k8s seat: --timeout 14400 as before" "14400" "$(flag_value --timeout)"
+for cs_flag in --harness --k8s; do
+    check "plain k8s seat: $cs_flag is still passed" 1 "$(flag_count "$cs_flag")"
+done
+for cs_flag in --pipeline --wake-reply; do
+    check "plain k8s seat: no $cs_flag" 0 "$(flag_count "$cs_flag")"
+done
+
+# ============================================================
+printf '\n== composed seats: a sets seat starts from the target ==\n'
+# ============================================================
+
+k8s_rt1_seed
+cs_seed_lineage() {
+    # $1=agent: a harvested earlier run of the seat on this thread whose
+    # branch resolves, so a non-composed `sets` seat would take lineage.
+    local rid="cs-lineage-$1-$RANDOM" branch="cs-lineage-$1-$RANDOM"
+    mkdir -p -- "$PM_STATE_DIR/runs" "$PM_STATE_DIR/harvested" "$PM_STATE_DIR/seq"
+    printf 'AGENT=%s\nBRANCH=%s\nREVIEW_TARGET_SHA=%s\n' "$1" "$branch" "$rt1_sha" \
+        > "$PM_STATE_DIR/runs/$rid.env"
+    : > "$PM_STATE_DIR/harvested/$rid"
+    git -C "$PROJECT_DIR" branch "$branch" >/dev/null 2>&1
+    printf '%s\n' "$rid" >> "$PM_STATE_DIR/seq/$cs_tid"
+    mkdir -p -- "$PM_STATE_DIR/workspaces/$cs_tid/$1/.git"
+}
+cs_target_wake() {
+    # $1=agent: a fresh thread with a review target and a lineage, then a wake.
+    cs_new_store
+    printf 'revise\n' > "$work/body.tmp"
+    cs_mid="$("$MAIL" send --from '@carol' --to "@$1" --subject 'target topic' \
+        --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+    cs_tid="$(thread_of "$cs_mid")"
+    cs_seed_lineage "$1"
+    once
+}
+cs_target_wake pat
+check "sets (local): a composed seat with a lineage checks out the target" \
+    "$rt1_sha" "$(flag_value --checkout)"
+# The same seat with no target recorded falls back to lineage (k8s seats
+# check out lineage by branch; a local seat keeps its clone, so no flag).
+cs_new_store
+cs_mid="$(send_msg '@carol' '@pat' 'no target' 'x' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+cs_seed_lineage pat
+once
+check "sets (local): with no target recorded there is no --checkout" 0 "$(flag_count --checkout)"
+
+# k8s: move `sets` from pat to pak for this case.
+sed -i '/^  pat:$/,/^  pam:$/{/review-target: sets/d}' "$FORK_SANDBOX_FLEET_FILE"
+sed -i 's/^  pak:$/  pak:\n    review-target: sets/' "$FORK_SANDBOX_FLEET_FILE"
+cs_target_wake pak
+check "sets (k8s): a composed seat with a lineage checks out the target" \
+    "$rt1_sha" "$(flag_value --checkout)"
+cs_new_store
+cs_mid="$(send_msg '@carol' '@pak' 'no target' 'x' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+cs_seed_lineage pak
+cs_lineage_branch="$(sed -n 's/^BRANCH=//p' "$PM_STATE_DIR"/runs/cs-lineage-pak-*.env)"
+once
+check "sets (k8s): with no target recorded, lineage" "$cs_lineage_branch" "$(flag_value --checkout)"
+
+finish_suite

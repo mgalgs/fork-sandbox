@@ -627,7 +627,12 @@
 #      FS_HOOK_MESSAGE_FILE (the trigger's .msg, absolute),
 #      FS_HOOK_EXPORT_FILE (= `mail export <tid> --json`) and
 #      FS_HOOK_STATUS_FILE (= `status --thread <tid> --json`), the last two
-#      in a temp dir under $STATE removed when the gate returns. Output
+#      in a temp dir under $STATE removed when the gate returns. A seat
+#      with `pipelines:` also gets FS_HOOK_PIPELINE_SIZE_FILE, and one with
+#      `finalize:` FS_HOOK_FINALIZE_FLOOR_FILE, both paths in that same
+#      temp dir: on exit 0 the gate MAY write one token to each (a size
+#      key; a 40- or 64-hex sha), read when it returns (see THE WAKE's
+#      composed seats). Seats without the keys get neither. Output
 #      goes to $STATE/hooks/logs/.
 #
 #   A candidate that clears rules 0-5 is spawned per THE WAKE below -- unless
@@ -657,12 +662,50 @@
 # fork-sandbox.sh invocation, before the postmaster harvests the run's
 # outbox -- this is a division of labor, not a replacement: the in-run
 # pipeline reviews the DIFF, the fleet still reviews the POSITION on the
-# thread, on every seat, preset or not. It is a division in TIME, not
-# content: the coding leg writes its `mail-*.md` reply first, and no
-# later leg is given that file or told to touch it, so the reply the
-# thread receives is the coding leg's own account, unrevised, even when
-# a later leg amends or overrides what it committed -- read the coding
-# leg's reply as "what I did," not as "what this pipeline landed."
+# thread, on every seat, preset or not. On a preset seat it is a division
+# in TIME, not content: the coding leg writes its `mail-*.md` reply first,
+# and no later leg is given that file or told to touch it, so the reply
+# the thread receives is the coding leg's own account, unrevised, even
+# when a later leg amends or overrides what it committed -- read a preset
+# seat's reply as "what I did," not as "what this pipeline landed." A
+# composed seat (below) is different: every leg that may commit is told
+# the reply file, so its reply describes what landed.
+#
+# Composed seats. A seat with `pipelines:` (fleet resolve's 21st line,
+# `key=spec ...`) runs one inline `--pipeline` spec per wake, chosen by
+# size: the wake-when gate may write a size token to
+# FS_HOOK_PIPELINE_SIZE_FILE (rule 5); a token matching
+# ^[a-z][a-z0-9-]{0,15}$ that is a key of the table picks that row, and
+# anything else -- no file, empty, malformed, an unknown key, no gate on the
+# seat, or a wake that skips the gate (an operator's message) -- picks
+# `default`. A retry, a held seat's release and a fetch-wait re-dispatch
+# skip the gate, so the size chosen when the wake was admitted is recorded
+# (the run record's PIPELINE_SIZE, the held/ and fetch-wait/ records' SIZE)
+# and reused; with none recorded, `default`. Every composed wake logs one
+# `pipeline thread=<t> agent=<a> size=<key> requested=<raw token or -> spec=<spec>
+# floor=<sha or ->` event. Its spawn is `fork-sandbox.sh --branch <b>
+# --pipeline <spec> --network <n> --wake-reply [--review-brief <file>]
+# [--finalize-script <file> [--finalize-floor <sha>]]` plus everything any
+# wake passes (clone dir or --k8s and its outbox, attach/thread dirs,
+# grants, checkout, services) -- and NO --harness, --model, --effort,
+# --pi-args, --preset or --timeout: the spec names every seat, and
+# fork-sandbox.sh's own default bounds the run (none locally, where every
+# leg is bounded on its own; `fork-sandbox-k8s.sh run`'s 3600 s on k8s).
+# Session args (--session-state/--resume-session/--session-id) and
+# --refresh-at are passed only when the spec's step 1 is a claude code step
+# (fork-sandbox.sh refuses --session-state otherwise); any other row starts
+# fresh. The run record's HARNESS/MODEL are step 1's seat. --wake-reply
+# tells every leg that may commit (code and fix legs) the reply file's
+# path, and that a leg that commits must leave the reply describing the
+# branch as it ends it; review and maintain legs are not told to edit it.
+# `review-brief:` (fleet resolve's 22nd line) is passed as --review-brief,
+# appended to every review and maintain leg's prompt; `finalize:` (23rd)
+# as --finalize-script, with --finalize-floor when the gate wrote a valid
+# sha to FS_HOOK_FINALIZE_FLOOR_FILE at admission (recorded and reused
+# like the size: FINALIZE_FLOOR, FLOOR). A composed `review-target: sets`
+# seat starts EVERY wake from the thread's current review target sha when
+# one is recorded (lineage only when none is): its in-run review legs read
+# $base...HEAD, so the base must be the commit the other reviewers saw.
 #
 # Which legs a preset's pipeline actually runs is mechanical, not decided
 # here or by the R9c triage classifier: fork-sandbox.sh's review and
@@ -1139,6 +1182,10 @@
 #                                   seat; REVIEW_TARGET_SHA keeps its
 #                                   follow-seat meaning), RETRY_KIND and
 #                                   RETRY_OF (a retry wake only),
+#                                   PIPELINE_SIZE, PIPELINE_SPEC and
+#                                   FINALIZE_FLOOR (a composed seat only;
+#                                   see THE WAKE -- HARNESS/MODEL are then
+#                                   step 1's seat),
 #                                   SPAWNED_AT (UTC ISO-8601, when the
 #                                   record was written: for a k8s seat the
 #                                   submission, not container start), and,
@@ -1193,7 +1240,9 @@
 #                                   for the routing decision, not read back
 #                                   by anything (pm_ledger_delivered_live)
 #   fetch-wait/<thread-id>/<agent> a wake deferred on a fetch miss -- see
-#                                   FETCH MISS.
+#                                   FETCH MISS. A composed seat's record
+#                                   also carries SIZE and FLOOR, reused by
+#                                   the re-dispatch (see THE WAKE).
 #   upstream-state/<thread-id>.env STATE=closed|open, MSGID (the message
 #                                   that set it), AT -- see UPSTREAM STATE.
 #                                   Absent means open
@@ -1266,7 +1315,11 @@
 #                                   fired, `malformed` when it absorbed a
 #                                   discarded-reply retry, else 0), QUIET
 #                                   (1 while it waits on a pending grant
-#                                   unflagged, else 0). Written atomically
+#                                   unflagged, else 0), and on a composed
+#                                   seat SIZE and FLOOR (the row and
+#                                   finalize floor admitted with it,
+#                                   reused on release; each absent when
+#                                   empty). Written atomically
 #                                   (tmp+mv) by pm_spawn_wake, released by
 #                                   pm_held_pass; a full read/write
 #                                   contract for this file lives in
@@ -1999,6 +2052,58 @@ pm_session_spawn_args() {
         fi
     fi
     printf 'RESUMED=%s\n' "$resumed"
+}
+
+# ---- composed seats (fleet `pipelines:`) ----
+#
+# A seat's `pipelines:` table arrives from `fleet resolve` as `key=spec`
+# pairs, space-joined. The size token a wake-when gate may leave
+# (FS_HOOK_PIPELINE_SIZE_FILE) picks the row; anything that is not a key of
+# the table picks `default`.
+PM_PIPELINE_KEY_RE='^[a-z][a-z0-9-]{0,15}$'
+PM_FINALIZE_FLOOR_RE='^[0-9a-f]{40}([0-9a-f]{24})?$'
+
+# pm_pipeline_choose <table> <token>: prints the size key the wake runs.
+pm_pipeline_choose() {
+    local table="$1" token="$2" pair
+    if [[ "$token" =~ $PM_PIPELINE_KEY_RE ]]; then
+        for pair in $table; do
+            [[ "${pair%%=*}" == "$token" ]] && { printf '%s' "$token"; return 0; }
+        done
+    fi
+    printf 'default'
+}
+
+# pm_pipeline_spec <table> <key>: prints that row's spec.
+pm_pipeline_spec() {
+    local table="$1" key="$2" pair
+    for pair in $table; do
+        [[ "${pair%%=*}" == "$key" ]] && { printf '%s' "${pair#*=}"; return 0; }
+    done
+    return 1
+}
+
+# pm_pipeline_step1 <spec>: prints "<action> <harness> <model>" of the spec's
+# step 1, compiled by the same two scripts `--pipeline` itself runs (never a
+# second grammar here). fork-sandbox.sh takes --session-state only when step
+# 1 is a claude code step, so that is what a wake's session args key on.
+pm_pipeline_step1() {
+    python3 "$script_dir/fork-sandbox-pipeline-spec.py" "$1" 2>/dev/null \
+        | python3 "$script_dir/fork-sandbox-preset-parse.py" /dev/stdin "$1" "--pipeline $1" 2>/dev/null \
+        | awk -F'\t' '
+            $1 == "step" && $2 == 1 && $3 == "action" { action = $4 }
+            $1 == "step" && $2 == 1 && $3 == "agent" { agent = $4 }
+            $1 == "agent" && $3 == "harness" { h[$2] = $4 }
+            $1 == "agent" && $3 == "model" { m[$2] = $4 }
+            END { if (action != "") print action, h[agent], m[agent] }'
+}
+
+# A gate-written token as the `pipeline` event prints it: one line, control
+# characters and spaces dropped, at most 64 bytes, `-` when there is none.
+pm_pipeline_token_shown() {
+    local t
+    t="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\040\177' | head -c 64)"
+    printf '%s' "${t:--}"
 }
 
 # Picks a --checkout branch for a k8s seat's wake: this thread's SEQ
@@ -3826,6 +3931,11 @@ pm_fetch_wait_write() {
         printf 'SINCE=%s\n' "$since"
         printf 'ATTEMPTS=%s\n' "$attempts"
         printf 'NOT_BEFORE=%s\n' "$not_before"
+        # A composed seat's admitted row and floor, from pm_spawn_wake's own
+        # scope (this is only ever called beneath it): the re-dispatch
+        # skips the gate, so it reuses these.
+        [[ -z "${pm_wake_size:-}" ]] || printf 'SIZE=%s\n' "$pm_wake_size"
+        [[ -z "${pm_wake_floor:-}" ]] || printf 'FLOOR=%s\n' "$pm_wake_floor"
     } > "$tmp"
     mv -- "$tmp" "$FETCH_WAIT/$tid/$agent"
 }
@@ -4526,6 +4636,7 @@ pm_exec_wake() {
 # hold waits on a pending grant unflagged (pm_grant_pending_quiet), else 0.
 pm_held_write() {
     local tid="$1" agent="$2" trigger="$3" since="$4" retry="$5" quiet="${6:-0}"
+    local size="${7:-}" floor="${8:-}"
     mkdir -p -- "$STATE/held/$tid"
     local tmp
     tmp="$(mktemp "$STATE/held/$tid/.tmp.XXXXXX")"
@@ -4534,6 +4645,10 @@ pm_held_write() {
         printf 'SINCE=%s\n' "$since"
         printf 'RETRY=%s\n' "$retry"
         printf 'QUIET=%s\n' "$quiet"
+        # A composed seat's admitted row and floor (empty otherwise): the
+        # release skips the gate, so it reuses these.
+        [[ -z "$size" ]] || printf 'SIZE=%s\n' "$size"
+        [[ -z "$floor" ]] || printf 'FLOOR=%s\n' "$floor"
     } > "$tmp"
     mv -- "$tmp" "$STATE/held/$tid/$agent"
 }
@@ -4714,7 +4829,7 @@ pm_message_is_operator() {
 # `mail export --json` and `status --thread --json` verbs print) in a temp
 # dir removed on every path. It never inherits the store lock fd.
 pm_wake_gate() {
-    local agent="$1" tid="$2" mid="$3" suffix="$4"
+    local agent="$1" tid="$2" mid="$3" suffix="$4" has_pipelines="${5:-}" has_finalize="${6:-}"
     local gate="$HOOKS_DIR/wake-when.$suffix" msg_file ctx log rc=0
     msg_file="$(pm_find_by_id "$mid" || true)"
     if [[ -n "$msg_file" ]] && pm_message_is_operator "$msg_file"; then
@@ -4733,9 +4848,15 @@ pm_wake_gate() {
         pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=context"
         return 0
     fi
+    # A composed seat's gate may also choose the wake's pipeline row and
+    # its finalize floor, by writing one token to each file below; the
+    # caller reads them after the gate (pm_spawn_wake's PM_GATE_* locals).
+    local -a gate_extra=()
+    [[ -z "$has_pipelines" ]] || gate_extra+=("FS_HOOK_PIPELINE_SIZE_FILE=$ctx/pipeline-size")
+    [[ -z "$has_finalize" ]] || gate_extra+=("FS_HOOK_FINALIZE_FLOOR_FILE=$ctx/finalize-floor")
     pm_hook_env "wake-when" "$tid" "FS_HOOK_AGENT=$agent" "FS_HOOK_MESSAGE=$mid" \
         "FS_HOOK_MESSAGE_FILE=$msg_file" "FS_HOOK_EXPORT_FILE=$ctx/export.json" \
-        "FS_HOOK_STATUS_FILE=$ctx/status.json"
+        "FS_HOOK_STATUS_FILE=$ctx/status.json" "${gate_extra[@]}"
     mkdir -p -- "$STATE/hooks/logs"
     log="$STATE/hooks/logs/$(date +%s)-wake-when-${tid:0:8}-$agent-$RANDOM.log"
     (
@@ -4743,6 +4864,10 @@ pm_wake_gate() {
         exec env "${PM_HOOK_ENV[@]}" "$FS_TIMEOUT" --kill-after 10 \
             "${FORK_SANDBOX_WAKE_GATE_TIMEOUT:-30}" "$gate" < /dev/null > "$log" 2>&1
     ) || rc=$?
+    if (( rc == 0 )); then
+        [[ -z "$has_pipelines" ]] || PM_GATE_SIZE_TOKEN="$(pm_gate_token "$ctx/pipeline-size")"
+        [[ -z "$has_finalize" ]] || PM_GATE_FLOOR_TOKEN="$(pm_gate_token "$ctx/finalize-floor")"
+    fi
     rm -rf -- "$ctx"
     case "$rc" in
         0) return 0 ;;
@@ -4760,6 +4885,46 @@ pm_wake_gate() {
     return 0
 }
 
+# The flags only a composed wake passes, appended to the array named $1;
+# reads pm_spawn_wake's own locals. --wake-reply is always there: the reply
+# is the code leg's, and later legs may change the branch under it.
+pm_composed_args() {
+    local -n ca_args="$1"
+    ca_args+=(--wake-reply)
+    [[ -z "$review_brief" ]] || ca_args+=(--review-brief "$review_brief")
+    if [[ -n "$finalize" ]]; then
+        ca_args+=(--finalize-script "$finalize")
+        [[ -z "$pm_wake_floor" ]] || ca_args+=(--finalize-floor "$pm_wake_floor")
+    fi
+}
+
+# A composed wake's run-record lines (none for any other seat); reads
+# pm_spawn_wake's own locals. A retry reads PIPELINE_SIZE/FINALIZE_FLOOR
+# back (the gate does not run again).
+pm_composed_record() {
+    [[ -n "$pipelines" ]] || return 0
+    printf 'PIPELINE_SIZE=%s\n' "$pm_wake_size"
+    printf 'PIPELINE_SPEC=%s\n' "$pipeline_spec"
+    printf 'FINALIZE_FLOOR=%s\n' "$pm_wake_floor"
+}
+
+# One token a wake gate left in file $1: its first line, trimmed, at most 4
+# KiB read. A second non-empty line makes it malformed, printed as-is so
+# the caller's shape check refuses it.
+pm_gate_token() {
+    [[ -f "$1" && ! -L "$1" ]] || return 0
+    local raw first rest
+    raw="$(head -c 4096 -- "$1" 2>/dev/null)"
+    first="$(pm_trim "${raw%%$'\n'*}")"
+    rest=""
+    [[ "$raw" != *$'\n'* ]] || rest="$(pm_trim "${raw#*$'\n'}")"
+    if [[ -n "$rest" ]]; then
+        printf '%s %s' "$first" "$rest"
+    else
+        printf '%s' "$first"
+    fi
+}
+
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4" is_retry="${5:-}"
     # Every spawn path -- new message, follow-up, retry, held release --
@@ -4771,7 +4936,8 @@ pm_spawn_wake() {
     fi
     local harness model thinking network persona_path description wake_on_cc \
           refresh_at triage preset handler command backend endpoint grant \
-          review_target wake_when seat_services on_silence protocol
+          review_target wake_when seat_services on_silence protocol \
+          pipelines review_brief finalize
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
@@ -4796,13 +4962,16 @@ pm_spawn_wake() {
     # one.
     # protocol (20th line) goes to pm_write_handoff, which prints the named
     # protocol file after the persona body.
+    # pipelines/review-brief/finalize (21st-23rd lines) make a composed
+    # seat: see "Composed seats" under THE WAKE in the header.
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \
            read -r refresh_at; read -r triage; read -r preset; read -r handler; \
            read -r command; read -r backend; read -r endpoint; read -r grant; \
            read -r review_target; read -r wake_when; read -r seat_services; \
-           read -r on_silence; read -r protocol; \
+           read -r on_silence; read -r protocol; read -r pipelines; \
+           read -r review_brief; read -r finalize; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
@@ -4816,8 +4985,10 @@ pm_spawn_wake() {
     # a skip both end the spawn here; the gate itself wrote (or dropped) the
     # seat's wake-deferred line, and no caller acts on anything but the run
     # this leaves behind (none).
+    local PM_GATE_SIZE_TOKEN="" PM_GATE_FLOOR_TOKEN=""
     if [[ -n "$wake_when" && -z "$is_retry" && -z "${PM_WAKE_ADMITTED:-}" ]] \
-        && ! pm_wake_gate "$agent" "$tid" "$mid" "$wake_when"; then
+        && ! pm_wake_gate "$agent" "$tid" "$mid" "$wake_when" \
+            "${pipelines:+1}" "${finalize:+1}"; then
         return 0
     fi
     if [[ -n "$handler" ]]; then
@@ -4848,6 +5019,40 @@ pm_spawn_wake() {
     fi
     network="${network:-pinned}"
 
+    # A composed seat's row and finalize floor: what admission recorded (a
+    # held or fetch-wait release, PM_WAKE_SIZE/PM_WAKE_FLOOR), else what the
+    # run a retry repeats recorded, else what the gate wrote this time; a
+    # missing or unusable answer is the `default` row and no floor. Chosen
+    # here, before the review-target and grant blocks below, so their
+    # held/fetch-wait records carry it (pm_held_write, pm_fetch_wait_write
+    # read pm_wake_size/pm_wake_floor from this scope).
+    local pm_wake_size="" pm_wake_floor="" pipeline_spec="" pipeline_requested="-"
+    local pipeline_step1_action="" pipeline_step1_harness="" pipeline_step1_model=""
+    if [[ -n "$pipelines" ]]; then
+        local size_token="" floor_token=""
+        if [[ -n "${PM_WAKE_ADMITTED:-}" ]]; then
+            size_token="${PM_WAKE_SIZE:-}" floor_token="${PM_WAKE_FLOOR:-}"
+        elif [[ -n "$is_retry" ]]; then
+            local retry_rid
+            retry_rid="$(pm_seat_last_run "$tid" "$agent")"
+            if [[ -n "$retry_rid" ]]; then
+                size_token="$(fs_pm_env_get "$RUNS/$retry_rid.env" PIPELINE_SIZE)"
+                floor_token="$(fs_pm_env_get "$RUNS/$retry_rid.env" FINALIZE_FLOOR)"
+            fi
+        else
+            size_token="$PM_GATE_SIZE_TOKEN" floor_token="$PM_GATE_FLOOR_TOKEN"
+            pipeline_requested="$(pm_pipeline_token_shown "$size_token")"
+        fi
+        pm_wake_size="$(pm_pipeline_choose "$pipelines" "$size_token")"
+        pipeline_spec="$(pm_pipeline_spec "$pipelines" "$pm_wake_size")"
+        if [[ -n "$finalize" && "$floor_token" =~ $PM_FINALIZE_FLOOR_RE ]]; then
+            pm_wake_floor="$floor_token"
+        fi
+        read -r pipeline_step1_action pipeline_step1_harness pipeline_step1_model \
+            < <(pm_pipeline_step1 "$pipeline_spec") || true
+        pm_event "pipeline thread=${tid:0:8} agent=$agent size=$pm_wake_size requested=$pipeline_requested spec=$pipeline_spec floor=${pm_wake_floor:--}"
+    fi
+
     # A `follow` seat on a thread that has a review target spawns checked
     # out at that target's sha instead of its own lineage branch (see the
     # spawn branches below) -- resolved once, here, before the grant hold
@@ -4858,7 +5063,12 @@ pm_spawn_wake() {
     # the commit it is revising, not HEAD. After that its lineage IS the
     # target it last set, so lineage wins.
     local rt_branch="" rt_sha="" rt_version=""
+    # A composed `sets` seat takes the target on EVERY wake that has one:
+    # its in-run review legs read $base...HEAD, and the base must be the
+    # commit the other reviewers already saw. Lineage is its fallback only
+    # when no target is recorded.
     if [[ "$review_target" == follow ]] \
+        || { [[ "$review_target" == sets ]] && [[ -n "$pipelines" ]]; } \
         || { [[ "$review_target" == sets ]] \
              && ! pm_lineage_checkout "$project" "$tid" "$agent" >/dev/null; }; then
         local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env"
@@ -4931,7 +5141,8 @@ pm_spawn_wake() {
             fi
             [[ -n "$is_retry" ]] && retry_flag="$is_retry"
             pm_grant_pending_quiet "$tid" && quiet=1
-            pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag" "$quiet"
+            pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag" "$quiet" \
+                "$pm_wake_size" "$pm_wake_floor"
             if (( quiet )); then
                 pm_event "refuse thread=${tid:0:8} agent=$agent reason=grant-pending"
             else
@@ -5011,6 +5222,12 @@ pm_spawn_wake() {
     fi
     rm -f -- "$DISCARDS/$tid/$agent"
 
+    # The run record's HARNESS/MODEL: a composed seat's step-1 seat (what
+    # live delivery, session harvest and the reply stamp key on).
+    local record_harness="$harness" record_model="$model"
+    if [[ -n "$pipelines" ]]; then
+        record_harness="${pipeline_step1_harness:-claude}" record_model="$pipeline_step1_model"
+    fi
     local attach_dir="$MAIL_ROOT/threads/$tid/attachments"
     local has_attach_dir=0
     if [[ -d "$attach_dir" && -n "$(find "$attach_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -5039,29 +5256,45 @@ pm_spawn_wake() {
         # does below. A codex seat (harness codex, its model as the full
         # slug) runs as a one-step composed run; --effort and --refresh-at
         # stay claude-only.
-        local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
-        [[ -n "$model" ]] && spawn_args+=(--model "$model")
-        if [[ "$harness" == pi && -n "$thinking" ]]; then
-            spawn_args+=(--pi-args "--thinking $thinking")
-        fi
-        [[ "$harness" == claude && -n "$thinking" ]] && spawn_args+=(--effort "$thinking")
-        if [[ "$harness" == claude && -n "$refresh_at" ]]; then
-            spawn_args+=(--refresh-at "$refresh_at")
+        local -a spawn_args=()
+        local session_harness="$harness"
+        if [[ -n "$pipelines" ]]; then
+            # A composed seat: the spec names every seat's harness and model,
+            # and fork-sandbox.sh's own composed default bounds the run, so
+            # none of --harness/--model/--effort/--pi-args/--preset/--timeout.
+            spawn_args=(--branch "$branch" --pipeline "$pipeline_spec" --network "$network")
+            pm_composed_args spawn_args
+            session_harness=""
+            if [[ "$pipeline_step1_action" == code && "$pipeline_step1_harness" == claude ]]; then
+                session_harness=claude
+                [[ -z "$refresh_at" ]] || spawn_args+=(--refresh-at "$refresh_at")
+            fi
+        else
+            spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
+            [[ -n "$model" ]] && spawn_args+=(--model "$model")
+            if [[ "$harness" == pi && -n "$thinking" ]]; then
+                spawn_args+=(--pi-args "--thinking $thinking")
+            fi
+            [[ "$harness" == claude && -n "$thinking" ]] && spawn_args+=(--effort "$thinking")
+            if [[ "$harness" == claude && -n "$refresh_at" ]]; then
+                spawn_args+=(--refresh-at "$refresh_at")
+            fi
         fi
         (( has_attach_dir )) && spawn_args+=(--attach-dir "$attach_dir")
         [[ "$trigger_only" == 1 ]] && spawn_args+=(--thread-dir "$snap_dir")
         spawn_args+=(--k8s)
         [[ -n "$endpoint" ]] && spawn_args+=(--endpoint "$endpoint")
-        spawn_args+=(--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}")
+        [[ -n "$pipelines" ]] || spawn_args+=(--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}")
 
         # A codex seat runs as a one-step composed --k8s run, which has
         # no transcript store for a codex seat (fork-sandbox.sh refuses
         # --session-state there), so it starts each wake fresh rather than
-        # have every wake refused.
+        # have every wake refused. A composed seat whose step 1 is not a
+        # claude code step starts fresh for the same reason.
         local resumed=""
-        if [[ "$harness" != codex ]]; then
+        if [[ -n "$session_harness" && "$session_harness" != codex ]]; then
             local -a session_lines=()
-            mapfile -t session_lines < <(pm_session_spawn_args "$harness" "$tid" "$agent")
+            mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent")
             local session_last=$(( ${#session_lines[@]} - 1 ))
             resumed="${session_lines[session_last]#RESUMED=}"
             spawn_args+=("${session_lines[@]:0:session_last}")
@@ -5213,8 +5446,8 @@ pm_spawn_wake() {
             printf 'TRIGGER=%s\n' "$mid"
             printf 'RUN_DIR=%s\n' "$wake_dir"
             printf 'INBOX=\n'
-            printf 'HARNESS=%s\n' "$harness"
-            printf 'MODEL=%s\n' "$model"
+            printf 'HARNESS=%s\n' "$record_harness"
+            printf 'MODEL=%s\n' "$record_model"
             printf 'NETWORK=%s\n' "$network"
             printf 'BRANCH=%s\n' "$branch"
             printf 'RESUMED=%s\n' "$resumed"
@@ -5222,6 +5455,7 @@ pm_spawn_wake() {
             printf 'VIA=%s\n' "$via"
             printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             printf 'BACKEND=k8s\n'
+            pm_composed_record
             printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
             printf 'ON_SILENCE=%s\n' "$on_silence"
             [[ -z "$woken_sha" ]] || printf 'WOKEN_AT_SHA=%s\nWOKEN_AT_VERSION=%s\n' "$woken_sha" "$woken_version"
@@ -5242,21 +5476,35 @@ pm_spawn_wake() {
         return 0
     fi
 
-    local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
-    # --preset goes first -- documentation only, `fork-sandbox.sh` applies
-    # flags over the preset key-by-key regardless of argv order (see
-    # docs/presets.md) -- so a preset-seat's own harness/model/network/
-    # thinking flags below still win over anything the preset sets.
-    [[ -n "$preset" ]] && spawn_args=(--preset "$preset" "${spawn_args[@]}")
-    [[ -n "$model" ]] && spawn_args+=(--model "$model")
-    if [[ "$harness" == pi && -n "$thinking" ]]; then
-        spawn_args+=(--pi-args "--thinking $thinking")
-    fi
-    [[ "$harness" == claude && -n "$thinking" ]] && spawn_args+=(--effort "$thinking")
-    # --refresh-at only works with --harness claude (fork-sandbox.sh
-    # refuses it outright, by name, on every other harness).
-    if [[ "$harness" == claude && -n "$refresh_at" ]]; then
-        spawn_args+=(--refresh-at "$refresh_at")
+    local -a spawn_args=()
+    local session_harness="$harness"
+    if [[ -n "$pipelines" ]]; then
+        # A composed seat: see the k8s branch above. No --timeout either
+        # way: a local run takes none.
+        spawn_args=(--branch "$branch" --pipeline "$pipeline_spec" --network "$network")
+        pm_composed_args spawn_args
+        session_harness=""
+        if [[ "$pipeline_step1_action" == code && "$pipeline_step1_harness" == claude ]]; then
+            session_harness=claude
+            [[ -z "$refresh_at" ]] || spawn_args+=(--refresh-at "$refresh_at")
+        fi
+    else
+        spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
+        # --preset goes first -- documentation only, `fork-sandbox.sh` applies
+        # flags over the preset key-by-key regardless of argv order (see
+        # docs/presets.md) -- so a preset-seat's own harness/model/network/
+        # thinking flags below still win over anything the preset sets.
+        [[ -n "$preset" ]] && spawn_args=(--preset "$preset" "${spawn_args[@]}")
+        [[ -n "$model" ]] && spawn_args+=(--model "$model")
+        if [[ "$harness" == pi && -n "$thinking" ]]; then
+            spawn_args+=(--pi-args "--thinking $thinking")
+        fi
+        [[ "$harness" == claude && -n "$thinking" ]] && spawn_args+=(--effort "$thinking")
+        # --refresh-at only works with --harness claude (fork-sandbox.sh
+        # refuses it outright, by name, on every other harness).
+        if [[ "$harness" == claude && -n "$refresh_at" ]]; then
+            spawn_args+=(--refresh-at "$refresh_at")
+        fi
     fi
 
     # Every harness gets a persistent per-(thread, agent) clone -- unlike
@@ -5279,8 +5527,11 @@ pm_spawn_wake() {
     # version, a lost workspace) moves the clone there. Otherwise the clone
     # keeps its own lineage, which already holds the target. The trust ref
     # is HEAD, never the target, as in the k8s branch above.
+    # A composed `sets` seat starts every wake from the target (see the
+    # review-target block above), not only a target new to the clone.
     if [[ -n "$rt_sha" ]] \
-        && { [[ ! -d "$PM_WORKSPACES/$tid/$agent/.git" ]] \
+        && { [[ -n "$pipelines" && "$review_target" == sets ]] \
+             || [[ ! -d "$PM_WORKSPACES/$tid/$agent/.git" ]] \
              || [[ "$(pm_seat_last_target_sha "$tid" "$agent")" != "$rt_sha" ]]; }; then
         spawn_args+=(--checkout "$rt_sha")
         local checkout_trust_ref
@@ -5307,11 +5558,13 @@ pm_spawn_wake() {
     # --session-dir/--session-id, which bind the durable store into the
     # sandbox and point pi at it there.
     local resumed=""
-    local -a session_lines=()
-    mapfile -t session_lines < <(pm_session_spawn_args "$harness" "$tid" "$agent")
-    local session_last=$(( ${#session_lines[@]} - 1 ))
-    resumed="${session_lines[session_last]#RESUMED=}"
-    spawn_args+=("${session_lines[@]:0:session_last}")
+    if [[ -n "$session_harness" ]]; then
+        local -a session_lines=()
+        mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent")
+        local session_last=$(( ${#session_lines[@]} - 1 ))
+        resumed="${session_lines[session_last]#RESUMED=}"
+        spawn_args+=("${session_lines[@]:0:session_last}")
+    fi
 
     local launch_out rc run_dir
     set +e
@@ -5337,8 +5590,8 @@ pm_spawn_wake() {
         printf 'TRIGGER=%s\n' "$mid"
         printf 'RUN_DIR=%s\n' "$run_dir"
         printf 'INBOX=%s\n' "$run_dir/inbox"
-        printf 'HARNESS=%s\n' "$harness"
-        printf 'MODEL=%s\n' "$model"
+        printf 'HARNESS=%s\n' "$record_harness"
+        printf 'MODEL=%s\n' "$record_model"
         printf 'NETWORK=%s\n' "$network"
         printf 'BRANCH=%s\n' "$branch"
         printf 'RESUMED=%s\n' "$resumed"
@@ -5346,6 +5599,7 @@ pm_spawn_wake() {
         printf 'VIA=%s\n' "$via"
         printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'BACKEND=local\n'
+        pm_composed_record
         printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
         printf 'ON_SILENCE=%s\n' "$on_silence"
         [[ -z "$woken_sha" ]] || printf 'WOKEN_AT_SHA=%s\nWOKEN_AT_VERSION=%s\n' "$woken_sha" "$woken_version"
@@ -7543,7 +7797,8 @@ pm_held_pass() {
                     local q_trigger
                     q_trigger="$(fs_pm_env_get "$f" TRIGGER)"
                     pm_held_write "$tid" "$agent" "$q_trigger" "$(fs_pm_env_get "$f" SINCE)" \
-                        "$(fs_pm_env_get "$f" RETRY)" 0
+                        "$(fs_pm_env_get "$f" RETRY)" 0 "$(fs_pm_env_get "$f" SIZE)" \
+                        "$(fs_pm_env_get "$f" FLOOR)"
                     pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
                     pm_seat_flag_unless_closed "$tid" "$agent" "no grant for k8s seat $agent: $q_trigger"
                 fi
@@ -7558,6 +7813,9 @@ pm_held_pass() {
             trigger="$(fs_pm_env_get "$f" TRIGGER)"
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
             [[ "$retry_flag" == 1 || "$retry_flag" == malformed ]] && is_retry="$retry_flag"
+            local PM_WAKE_SIZE PM_WAKE_FLOOR
+            PM_WAKE_SIZE="$(fs_pm_env_get "$f" SIZE)"
+            PM_WAKE_FLOOR="$(fs_pm_env_get "$f" FLOOR)"
             rm -f -- "$f"
             local PM_WAKE_ADMITTED=1 by
             pm_event "held-release thread=${tid:0:8} agent=$agent trigger=${trigger:0:8}"
@@ -7610,6 +7868,9 @@ pm_fetch_wait_pass() {
             trigger="$(fs_pm_env_get "$f" TRIGGER)"
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
             [[ "$retry_flag" == 1 || "$retry_flag" == malformed ]] && is_retry="$retry_flag"
+            local PM_WAKE_SIZE PM_WAKE_FLOOR
+            PM_WAKE_SIZE="$(fs_pm_env_get "$f" SIZE)"
+            PM_WAKE_FLOOR="$(fs_pm_env_get "$f" FLOOR)"
             local PM_WAKE_ADMITTED=1
             pm_followup_wake "$project" "$agent" "$tid" "$trigger" "$is_retry" || true
             if [[ -f "$f" && "$(fs_pm_env_get "$f" ATTEMPTS)" == "$attempts" ]]; then
