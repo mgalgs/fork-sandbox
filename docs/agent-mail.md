@@ -2456,7 +2456,12 @@ review target or its lineage, on both backends, and the sha is the run's
 base: review legs read `<sha>...HEAD`, `FS_FINALIZE_BASE` is that sha, and
 a gate floor that is not its ancestor fails finalize as
 `floor-not-ancestor`. Anything else (no file, empty, malformed, a sha the
-repo does not have) keeps the checkout above. It is recorded at admission
+repo does not have) keeps the checkout above. A well-formed sha the repo
+does not have **yet** (a pull mirror that has not synced) on a wake that a
+fetch miss defers rides on the deferred wake's record and is checked again
+when the wake is re-dispatched; only if it is still absent then does the
+wake keep the checkout above (the `pipeline` event's `checkout_requested=`
+shows it). A deferred wake logs its `pipeline` event when it starts. It is recorded at admission
 (`CHECKOUT` in the run record and in the `held/` and `fetch-wait/` records)
 and reused on retry and release, like the size. The thread's review-target
 records (`WOKEN_AT_*`, `REVIEW_TARGET_*`) are written exactly as before, so

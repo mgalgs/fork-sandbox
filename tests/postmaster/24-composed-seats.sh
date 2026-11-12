@@ -1061,6 +1061,67 @@ check "supersede: ... with the admitted floor" "$cs_fw_floor" "$(flag_value --fi
 check "supersede: ... and the admitted start sha" "$cs_start" "$(flag_value --checkout)"
 check "supersede: ... at the newest head" "upstream=$cs_fw_b" "$(flag_value --extra-ref)"
 
+# Mirror lag: the gate's start sha is the announced head, which the pull
+# mirror has not synced yet. The wake defers on the head with the sha on
+# its record, and the re-dispatch starts from it once it has arrived.
+cs_new_store
+printf 'revise\n' > "$work/body.tmp"
+cs_mid="$("$MAIL" send --from '@carol' --to '@pak' --subject 'mirror lag topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+once
+cs_lag_a="$(cs_fw_commit feature/cs-lag)"
+cs_fw_r="$(reply_msg '@ci-demo' "$cs_mid" 'pushed' --to '@operator' --upstream-head "feature/cs-lag:$cs_lag_a")"
+once
+printf '%s\n' "$cs_lag_a" > "$CS_OUT/checkout"
+reply_msg '@carol' "$cs_fw_r" 'review the push' --to '@pak' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+rm -f -- "$CS_OUT/checkout"
+check "mirror lag: the wake defers, the gate's absent sha on its record" "0|$cs_lag_a" \
+    "$(cov_calls)|$(env_val "$(cs_fw_file "$cs_tid" pak)" CHECKOUT)"
+cs_fw_sync feature/cs-lag "$cs_lag_a"
+cs_fw_set "$cs_tid" pak NOT_BEFORE 0
+: > "$work/once.out"
+once
+[[ -s "$STUB_ARGV_LOG" ]] || once
+check "mirror lag: the re-dispatch starts from the gate's sha" "$cs_lag_a" "$(flag_value --checkout)"
+contains "mirror lag: ... and the event names it" "$(pipeline_events)" "checkout=$cs_lag_a"
+not_contains "mirror lag: ... refusing nothing" "$(pipeline_events)" "checkout_requested="
+
+# The gate's sha never arrives (only the head does): the re-dispatch falls
+# back to today's start, with the fallback event.
+cs_new_store
+printf 'revise\n' > "$work/body.tmp"
+cs_mid="$("$MAIL" send --from '@carol' --to '@pak' --subject 'mirror lag fallback' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+once
+cs_lag_a="$(cs_fw_commit feature/cs-lag-2)"
+cs_lag_b="$(git -C "$UH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test \
+    commit-tree -m 'never pushed' "$(git -C "$UH_ORIGIN_SRC" mktree < /dev/null)")"
+cs_fw_r="$(reply_msg '@ci-demo' "$cs_mid" 'pushed' --to '@operator' --upstream-head "feature/cs-lag-2:$cs_lag_a")"
+once
+printf '%s\n' "$cs_lag_b" > "$CS_OUT/checkout"
+reply_msg '@carol' "$cs_fw_r" 'review the push' --to '@pak' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+rm -f -- "$CS_OUT/checkout"
+check "mirror lag (never synced): the absent sha is recorded" "$cs_lag_b" \
+    "$(env_val "$(cs_fw_file "$cs_tid" pak)" CHECKOUT)"
+cs_fw_sync feature/cs-lag-2 "$cs_lag_a"
+cs_fw_set "$cs_tid" pak NOT_BEFORE 0
+: > "$work/once.out"
+once
+[[ -s "$STUB_ARGV_LOG" ]] || once
+check "mirror lag (never synced): the re-dispatch runs" 1 "$(cov_calls)"
+check "mirror lag (never synced): ... not from the absent sha" "no" \
+    "$([[ "$(flag_value --checkout)" == "$cs_lag_b" ]] && echo yes || echo no)"
+contains "mirror lag (never synced): ... with the fallback event" "$(pipeline_events)" \
+    "checkout=- checkout_requested=$cs_lag_b"
+
 # A re-freeze beneath pak's own xs/floor wake queues the panel's follow
 # seats; their records are written in pak's wake but are not pak's. The
 # launcher wrapper snapshots fetch-wait/ at pak's spawn, before the same

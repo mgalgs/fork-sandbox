@@ -718,7 +718,11 @@
 # review legs read <sha>...HEAD, FS_FINALIZE_BASE is that sha, and a gate
 # floor that is not its ancestor fails finalize as floor-not-ancestor.
 # Anything else (no file, empty, malformed, a sha the repo does not have)
-# keeps today's checkout. Recorded and reused like the size (the run
+# keeps today's checkout -- except that a well-formed sha the repo does
+# not have YET (a pull mirror behind) on a wake a fetch miss defers is kept
+# on the deferred record and checked again past the fetch-wait gates of
+# the re-dispatch; the event, logged there, shows checkout_requested= only
+# if it is still absent. Recorded and reused like the size (the run
 # record's CHECKOUT, the held/ and fetch-wait/ records' CHECKOUT). The
 # review-target records (WOKEN_AT_*, REVIEW_TARGET_*) are written as before.
 # A wake whose summary.json says its finalize step failed (`finalize.ended
@@ -5368,6 +5372,10 @@ pm_spawn_wake() {
     # held/fetch-wait records carry it (passed to pm_held_write and
     # pm_fetch_wait_gate explicitly).
     local pm_wake_size="" pm_wake_floor="" pm_wake_checkout="" pipeline_spec="" pipeline_requested="-"
+    # A well-formed gate sha the project repo does not have yet (a pull
+    # mirror that has not synced): kept on a deferred wake's record and
+    # checked again once the fetch-wait gates below have run.
+    local pm_wake_checkout_wait=""
     local pipeline_step1_action="" pipeline_step1_harness="" pipeline_step1_model=""
     if [[ -n "$pipelines" ]]; then
         local size_token="" floor_token="" checkout_token="" checkout_shown=""
@@ -5389,11 +5397,14 @@ pm_spawn_wake() {
         fi
         # The gate's start sha: the wake checks it out instead of the review
         # target, and so it is the run's base. Only a sha the project repo
-        # has counts; anything else is today's checkout, the refused token
-        # shown in the event.
+        # has counts; a malformed token is today's checkout at once, the
+        # refused token shown in the event. A well-formed sha not there yet
+        # waits for the fetch-wait gates below (pm_wake_checkout_wait).
         if [[ "$checkout_token" =~ $PM_FINALIZE_FLOOR_RE ]] \
             && git -C "$project" cat-file -e "$checkout_token^{commit}" 2>/dev/null; then
             pm_wake_checkout="$checkout_token"
+        elif [[ "$checkout_token" =~ $PM_FINALIZE_FLOOR_RE ]]; then
+            pm_wake_checkout_wait="$checkout_token"
         elif [[ -n "$checkout_token" ]]; then
             checkout_shown=" checkout_requested=$(pm_pipeline_token_shown "$checkout_token")"
         fi
@@ -5403,13 +5414,13 @@ pm_spawn_wake() {
             # The held wake's reviewed head, rerun with one code leg.
             # (pm_cover_retry_spawn checked it is a commit in the project).
             pipeline_spec="$PM_COVER_SPEC" pm_wake_checkout="$PM_COVER_HEAD" checkout_shown=""
+            pm_wake_checkout_wait=""
         fi
         if [[ -n "$finalize" && "$floor_token" =~ $PM_FINALIZE_FLOOR_RE ]]; then
             pm_wake_floor="$floor_token"
         fi
         read -r pipeline_step1_action pipeline_step1_harness pipeline_step1_model \
             < <(pm_pipeline_step1 "$pipeline_spec") || true
-        pm_event "pipeline thread=${tid:0:8} agent=$agent size=$pm_wake_size requested=$pipeline_requested spec=$pipeline_spec floor=${pm_wake_floor:--} checkout=${pm_wake_checkout:--}$checkout_shown"
     fi
 
     # A `follow` seat on a thread that has a review target spawns checked
@@ -5455,7 +5466,7 @@ pm_spawn_wake() {
             fi
             if [[ -n "$rt_sha" ]] \
                 && ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" review-target "$rt_branch" "$rt_sha" \
-                    "$pm_wake_size" "$pm_wake_floor" "$pm_wake_checkout"; then
+                    "$pm_wake_size" "$pm_wake_floor" "${pm_wake_checkout:-$pm_wake_checkout_wait}"; then
                 return 0
             fi
         fi
@@ -5476,13 +5487,28 @@ pm_spawn_wake() {
                 uh_branch="$(fs_pm_env_get "$uh_file" BRANCH)"
                 uh_sha="$(fs_pm_env_get "$uh_file" SHA)"
                 if ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" upstream-head "$uh_branch" "$uh_sha" \
-                    "$pm_wake_size" "$pm_wake_floor" "$pm_wake_checkout"; then
+                    "$pm_wake_size" "$pm_wake_floor" "${pm_wake_checkout:-$pm_wake_checkout_wait}"; then
                     return 0
                 fi
             else
                 pm_event "upstream-head-local-seat thread=${tid:0:8} agent=$agent"
             fi
         fi
+    fi
+
+    # Past the fetch-wait gates, a waiting gate sha is checked once more (a
+    # fetch above may have brought it in); still absent, the wake falls back
+    # to today's checkout and the event shows the refused token. Logged
+    # here, so a wake deferred above logs its pipeline once, when it starts.
+    if [[ -n "$pipelines" ]]; then
+        if [[ -n "$pm_wake_checkout_wait" ]]; then
+            if git -C "$project" cat-file -e "$pm_wake_checkout_wait^{commit}" 2>/dev/null; then
+                pm_wake_checkout="$pm_wake_checkout_wait"
+            else
+                checkout_shown=" checkout_requested=$(pm_pipeline_token_shown "$pm_wake_checkout_wait")"
+            fi
+        fi
+        pm_event "pipeline thread=${tid:0:8} agent=$agent size=$pm_wake_size requested=$pipeline_requested spec=$pipeline_spec floor=${pm_wake_floor:--} checkout=${pm_wake_checkout:--}$checkout_shown"
     fi
 
     # A `backend: k8s` seat with `grant: required` and no grant file yet
@@ -5512,7 +5538,7 @@ pm_spawn_wake() {
             [[ -n "$is_retry" ]] && retry_flag="$is_retry"
             pm_grant_pending_quiet "$tid" && quiet=1
             pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag" "$quiet" \
-                "$pm_wake_size" "$pm_wake_floor" "$pm_wake_checkout"
+                "$pm_wake_size" "$pm_wake_floor" "${pm_wake_checkout:-$pm_wake_checkout_wait}"
             if (( quiet )); then
                 pm_event "refuse thread=${tid:0:8} agent=$agent reason=grant-pending"
             else
