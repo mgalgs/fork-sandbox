@@ -744,7 +744,8 @@
 # reply is not posted, the thread is flagged, keyword dead-review, "wake
 # for <agent> review step <n> died (run <rid>): <ended>", and the seat's
 # on-failure retry applies (it restarts from the review target, which is
-# safe because nothing was posted). No hold. Preset and plain seats ignore
+# safe because nothing was posted); a later wake of the seat that exits 0
+# clears that flag the way it clears a wake-exit one. No hold. Preset and plain seats ignore
 # dead_step: their harvest is unchanged.
 # The hold is a record, $STATE/finalize-held/<tid>/<agent> (HELD_RUN,
 # TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING, REASON). While it stands, no wake of
@@ -774,13 +775,22 @@
 # the held reply, the refusal and the range to describe. Its record says
 # RETRY_KIND=cover; mail that comes in meanwhile is pended on it, never
 # delivered live. The runner fails it before finalize if the leg moved HEAD
-# or dirtied the tree. Exit 0 with finalize ran RELEASES the hold: the
+# or dirtied the tree; its leg starts from a clean tree (the runner resets
+# the clone to the held head and removes untracked, non-ignored files).
+# Exit 0 with finalize ran and a reply posted RELEASES the hold: the
 # record goes, the reply posts as for any wake, `finalize thread=<t>
 # agent=<a> run=<retry rid> outcome=released held=<held rid>`, and pending
 # mail is followed up; the finalize-refused flag stays for the operator.
-# Any other outcome keeps the hold, posts nothing and retries nothing. No
+# Exit 0 with finalize ran but every reply file refused (malformed) keeps
+# the hold: `finalize ... run=<retry rid> outcome=held held=<held rid>
+# reason=reply-not-posted`, the record's REASON and the re-raised flag say
+# "cover retry <rid> posted nothing: <why>". Any other outcome keeps the
+# hold, posts nothing and retries nothing. No
 # retry when the default row has no code step or the held run left no usable
 # head/base (`cover-skip thread=<t> agent=<a> held=<rid> reason=<...>`).
+# An exit-2 hold whose RETRY_RUN is still empty (the process died between
+# writing it and spawning the retry) gets that retry from the next pass's
+# pm_finalize_held_pass, still once.
 #
 # Which legs a preset's pipeline actually runs is mechanical, not decided
 # here or by the R9c triage classifier: fork-sandbox.sh's review and
@@ -4944,7 +4954,8 @@ pm_cover_keep_held() {
     pm_finalize_hold_pend "$target" "$(fs_pm_env_get "$f" PENDING_MSGS)"
 }
 
-# Retires each hold `unflag` dropped (a .dropped.<agent> marker), once no
+# Spawns the cover-only retry an exit-2 hold is still owed (see below), and
+# retires each hold `unflag` dropped (a .dropped.<agent> marker), once no
 # run of that seat is live: the marker goes, and nothing else -- a record
 # beside it is a NEWER hold (a later wake of the seat refused again after
 # the drop), which only its own release or drop removes. A `finalize ...
@@ -4953,12 +4964,25 @@ pm_cover_keep_held() {
 # the seat already ran, which carried it forward. The held run dir is
 # never touched. Runs right after pm_held_pass.
 pm_finalize_held_pass() {
-    local project="$1" tid_dir marker
+    local project="$1" tid_dir marker hf
     [[ -d "$FINALIZE_HELD" ]] || return 0
     for tid_dir in "$FINALIZE_HELD"/*/; do
         [[ -d "$tid_dir" ]] || continue
         local tid
         tid="$(basename -- "$tid_dir")"
+        # An exit-2 hold whose harvest never got to its one cover-only
+        # retry (the process died between the two): RETRY_RUN is still
+        # empty, so it is spawned now. pm_cover_retry_spawn sets RETRY_RUN
+        # whatever happens, so this happens once.
+        for hf in "$tid_dir"*; do
+            [[ -f "$hf" ]] || continue
+            local hagent hreason
+            hagent="$(basename -- "$hf")"
+            [[ "$(fs_pm_env_get "$hf" EXIT)" == 2 && -z "$(fs_pm_env_get "$hf" RETRY_RUN)" ]] || continue
+            fs_pm_find_live_run "$hagent" "$tid" >/dev/null && continue
+            hreason="$(fs_pm_env_get "$hf" REASON)"
+            pm_cover_retry_spawn "$project" "$tid" "$hagent" "$(fs_pm_env_get "$hf" HELD_RUN)" 2 "${hreason:-unknown}"
+        done
         for marker in "$tid_dir".dropped.*; do
             [[ -f "$marker" ]] || continue
             local agent held retry pending last
@@ -7437,9 +7461,10 @@ pm_harvest_run() {
     # step: its reply is not posted, and it fails like a crash (retry).
     local dead_review=0
     # A cover-only retry of a held wake (RETRY_KIND=cover): released only
-    # when it exited 0 and its finalize ran; anything else leaves the hold
-    # standing (cover_held), with nothing posted, retried or followed up.
-    local is_cover=0 cover_held=0 cover_held_rid=""
+    # when it exited 0, its finalize ran (cover_release) and it posted a
+    # reply; anything else leaves the hold standing (cover_held), with
+    # nothing posted, retried or followed up.
+    local is_cover=0 cover_held=0 cover_release=0 cover_held_rid=""
     if [[ "$(fs_pm_env_get "$f" RETRY_KIND)" == cover ]]; then
         is_cover=1
         cover_held_rid="$(fs_pm_env_get "$f" RETRY_OF)"
@@ -7650,6 +7675,9 @@ pm_harvest_run() {
             # no-summary flag(s) on the thread -- see pm_wake_exit_clear.
             pm_wake_exit_clear "$tid" "$agent" "$rid" || true
             pm_wake_exit_clear "$tid" "$agent" "$rid" no-summary "$PM_NO_SUMMARY_PREFIX" || true
+            # ... and its dead-review flags: the on-failure retry of a wake
+            # whose review leg died has now finished.
+            pm_wake_exit_clear "$tid" "$agent" "$rid" dead-review "wake for $agent review step " || true
             clean_exit=1
         fi
     fi
@@ -7657,14 +7685,9 @@ pm_harvest_run() {
     if (( is_cover )); then
         if [[ -f "$run_dir/summary.json" && "$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")" == 0 \
               && "$(jq -r '.finalize.ended // empty' "$run_dir/summary.json" 2>/dev/null)" == ran ]]; then
-            # Released: the hold goes before anything below can follow up
-            # what it kept pending, and the reply posts as for any wake.
-            local cover_hf="$FINALIZE_HELD/$tid/$agent"
-            if [[ -f "$cover_hf" && "$(fs_pm_env_get "$cover_hf" HELD_RUN)" == "$cover_held_rid" ]]; then
-                rm -f -- "$cover_hf"
-                rmdir -- "$FINALIZE_HELD/$tid" 2>/dev/null || true
-            fi
-            pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=released held=${cover_held_rid:--}"
+            # Its reply posts as for any wake; whether that releases the
+            # hold is decided once it has (below).
+            cover_release=1
         else
             cover_held=1
         fi
@@ -7708,6 +7731,30 @@ pm_harvest_run() {
     done
     pm_event "harvest thread=${tid:0:8} agent=$agent replies=$replies"
     local -a posted_ids=("${PM_HARVEST_POSTED[@]}")
+    if (( cover_release )); then
+        local cover_hf="$FINALIZE_HELD/$tid/$agent"
+        if (( replies == 0 && reply_files > 0 )); then
+            # Its finalize ran but its reply was refused (malformed): a
+            # release would post nothing at all. The hold stands, flagged
+            # with what was wrong; its one retry is spent.
+            cover_held=1
+            if [[ -f "$cover_hf" && "$(fs_pm_env_get "$cover_hf" HELD_RUN)" == "$cover_held_rid" ]]; then
+                local cover_why="${PM_HARVEST_DISCARDS[0]:-its reply was refused}"
+                pm_finalize_hold_set "$cover_hf" REASON \
+                    "cover retry $rid posted nothing: $(pm_flag_quote_line "$cover_why")"
+                pm_flag_unless_closed "$tid" "$(pm_finalize_hold_reason "$cover_hf" "$agent")" finalize-refused
+            fi
+            pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=held held=${cover_held_rid:--} reason=reply-not-posted"
+        else
+            # Released: the hold goes before anything below can follow up
+            # what it kept pending.
+            if [[ -f "$cover_hf" && "$(fs_pm_env_get "$cover_hf" HELD_RUN)" == "$cover_held_rid" ]]; then
+                rm -f -- "$cover_hf"
+                rmdir -- "$FINALIZE_HELD/$tid" 2>/dev/null || true
+            fi
+            pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=released held=${cover_held_rid:--}"
+        fi
+    fi
     # SILENT WAKE in the header. A malformed reply file has flagged already,
     # so only an outbox with no reply file at all counts as silence.
     if (( clean_exit && replies > 0 )); then

@@ -768,6 +768,57 @@ for cov_case in "refused-again:1:$(cov_sum 2 'still wrong')" \
         "$([[ -e "$PM_STATE_DIR/retries/$cs_tid/pat" ]] && echo yes || echo no)"
 done
 
+# A retry whose finalize ran but whose reply is malformed posts nothing,
+# so it must not release the hold: it stays held, flagged with the reason,
+# and nothing more runs.
+fin_wake "$(cov_sum 2 'reply must say abc')" 1
+cov_rid="$(basename -- "$(live_env_for_agent pat)" .env)"
+cov_rd="$(env_val "$(live_env_for_agent pat)" RUN_DIR)"
+mkdir -p -- "$cov_rd/outbox"
+printf 'Reply-To-Id: new\n\nno address\n' > "$cov_rd/outbox/mail-1.md"
+printf '0\n' > "$cov_rd/exit-code"
+printf '{"base_sha":"%s","finalize":{"ended":"ran","exit":0}}\n' "$cov_base" > "$cov_rd/summary.json"
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+cov_out="$(cat "$work/once.out")"
+once
+check "cover malformed: no further run" 0 "$(cov_calls)"
+check "cover malformed: nothing posted" "no|no" "$(posted_with 'no address')|$(posted_with 'Folded and ready.')"
+check "cover malformed: the hold stands, its retry spent" "$fin_rid|$cov_rid" \
+    "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)|$(env_val "$(cov_hold "$cs_tid" pat)" RETRY_RUN)"
+not_contains "cover malformed: no release event" "$cov_out" "outcome=released"
+contains "cover malformed: a held event instead" "$cov_out" \
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=$cov_rid outcome=held held=$fin_rid reason=reply-not-posted"
+contains "cover malformed: the thread is flagged finalize-refused, naming the malformed reply" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)" \
+    "finalize refused for pat (run $fin_rid): exit=2 cover retry $cov_rid posted nothing: malformed reply file mail-1.md"
+contains "cover malformed: ... and the hold's reason says so" \
+    "$(env_val "$(cov_hold "$cs_tid" pat)" REASON)" "cover retry $cov_rid posted nothing: malformed reply file"
+
+# The postmaster died after writing an exit-2 hold and before spawning its
+# retry (RETRY_RUN still empty): the next pass spawns it, once.
+fin_wake "$(cov_sum 1)" 1
+cov_sum 2 'reply must say abc' > "$fin_run_dir/summary.json"
+sed -i 's/^EXIT=.*/EXIT=2/; s/^RETRY_RUN=.*/RETRY_RUN=/; s/^REASON=.*/REASON=reply must say abc/' \
+    "$(cov_hold "$cs_tid" pat)"
+: > "$STUB_ARGV_LOG"
+once
+cov_rid="$(basename -- "$(live_env_for_agent pat)" .env)"
+check "missed cover: the next pass spawns the owed retry" "1|copus1|$cov_head" \
+    "$(cov_calls)|$(flag_value --pipeline)|$(flag_value --checkout)"
+check "missed cover: ... a cover retry of the held run" "cover $fin_rid" \
+    "$(env_val "$PM_STATE_DIR/runs/$cov_rid.env" RETRY_KIND) $(env_val "$PM_STATE_DIR/runs/$cov_rid.env" RETRY_OF)"
+check "missed cover: the hold names it" "$cov_rid" "$(env_val "$(cov_hold "$cs_tid" pat)" RETRY_RUN)"
+contains "missed cover: its handoff carries the refusal" "$(cat "$(last_call | tail -n 1)" 2>/dev/null)" \
+    "Finalize's refusal: exit=2 reply must say abc"
+cov_finish 1 "$(cov_sum 2 'still wrong')" 'Second try.'
+: > "$STUB_ARGV_LOG"
+once
+once
+check "missed cover: one retry total, no second" "0|$cov_rid" \
+    "$(cov_calls)|$(env_val "$(cov_hold "$cs_tid" pat)" RETRY_RUN)"
+
 # A held seat does not wake on new mail; the operator's `unflag` drops the
 # hold (the held run dir untouched) and the next pass follows the mail up.
 fin_wake "$(cov_sum 1)" 1
@@ -879,6 +930,15 @@ check "dead review: the retry runs the same composed wake again" "1|copus1-ropus
     "$(cov_calls)|$(flag_value --pipeline)|$(flag_count --wake-reply)"
 check "dead review: ... as a failure retry" "failed $fin_rid" \
     "$(env_val "$(live_env_for_agent pat)" RETRY_KIND) $(env_val "$(live_env_for_agent pat)" RETRY_OF)"
+dead_retry_rid="$(basename -- "$(live_env_for_agent pat)" .env)"
+cov_finish 0 '{"exit_code":0,"finalize":{"ended":"skipped","detail":"no commits above the base","exit":null}}' 'Retried and reviewed.'
+: > "$work/once.out"
+once
+check "dead review: the retry's reply is posted" "yes" "$(posted_with 'Retried and reviewed.')"
+check "dead review: ... and its success clears the dead-review flag" "no" \
+    "$([[ -e "$PM_STATE_DIR/needs-operator/$cs_tid" ]] && echo yes || echo no)"
+contains "dead review: ... with a flag-clear event" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=${cs_tid:0:8} agent=pat reason=dead-review run=$fin_rid by=$dead_retry_rid"
 # A dead step on a non-zero exit is the same dead review, not a crash.
 fin_wake "${dead_sum/\"exit_code\":0/\"exit_code\":1}" 1
 check "dead review (exit 1): flagged as a dead review" \

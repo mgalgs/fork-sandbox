@@ -2517,7 +2517,9 @@ At harvest a composed wake with `dead_step` is an ordinary failed wake,
 whatever its exit status: the reply is not posted, the thread is flagged,
 keyword `dead-review`, reason `wake for <agent> review step <n> died (run
 <rid>): <ended>`, and the seat's on-failure retry applies (it restarts from
-the review target, which is safe because nothing went out). Preset and plain
+the review target, which is safe because nothing went out). A later wake of
+the seat that exits 0 clears the `dead-review` flag, as it clears a
+`wake-exit` one. Preset and plain
 seats ignore `dead_step`: their harvest is exactly as before.
 
 **Exit 2 gets one cover-only retry.** A finalize script's exit 2 means "the
@@ -2536,7 +2538,12 @@ non-ignored files removed), and the runner fails it, without running
 finalize, if the leg moved HEAD or left any change in the tree. A retry whose finalize ran is harvested like any wake —
 its reply posted, its branch as finalize left it — and the hold is cleared:
 `finalize thread=<t> agent=<a> run=<retry rid> outcome=released
-held=<held rid>`, then any pending message is followed up. Every other
+held=<held rid>`, then any pending message is followed up. If its finalize
+ran but every reply file was refused (a malformed reply), nothing was
+posted, so the hold stands: `outcome=held ... reason=reply-not-posted`, and
+the hold's reason and the re-raised flag read `cover retry <rid> posted
+nothing: <why>`. Should the postmaster die between writing an exit-2 hold
+and spawning its retry, the next pass spawns it (still once). Every other
 outcome of the retry (a refusal of any kind, a guard failure, a crash)
 leaves the hold standing, posts nothing and retries nothing more; nor is
 there a retry for any other finalize exit, or when the seat's default row
