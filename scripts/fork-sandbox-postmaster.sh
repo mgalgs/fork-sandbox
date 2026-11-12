@@ -4376,7 +4376,8 @@ pm_seat_flag_unless_closed() {
 
 # Moves thread <tid> to upstream state <closed|open> on message <mid>. A
 # redundant transition changes nothing and emits nothing. Closing clears the
-# thread's needs-operator flag (journaled by pm_unflag like any other clear).
+# thread's needs-operator flag (journaled by pm_unflag like any other clear);
+# opening re-raises the finalize-refused flag of each hold standing on it.
 # Atomic tmp+mv, so a reader never sees a partial record.
 pm_set_upstream_state() {
     local tid="$1" ustate="$2" mid="$3"
@@ -4391,7 +4392,13 @@ pm_set_upstream_state() {
     } > "$tmp" || { rm -f -- "$tmp"; return 1; }
     mv -- "$tmp" "$UPSTREAM_STATE/$tid.env" || { rm -f -- "$tmp"; return 1; }
     pm_event "upstream-state thread=${tid:0:8} state=$ustate msg=${mid:0:8}"
-    [[ "$ustate" == open ]] || pm_unflag "$tid"
+    if [[ "$ustate" == open ]]; then
+        # Reopening is the other way a hold's flag goes missing: closing
+        # cleared it and pm_unflag did not re-raise it on the closed thread.
+        pm_finalize_holds_reflag "$tid"
+    else
+        pm_unflag "$tid"
+    fi
     return 0
 }
 

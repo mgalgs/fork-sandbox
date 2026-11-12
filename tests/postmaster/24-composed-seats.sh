@@ -1050,6 +1050,20 @@ contains "flag setup: the upstream head is recorded" "$(cat "$work/once.out")" "
 check "flag: an upstream-head announcement leaves it up too" "$fl_reason" "$(fl_cur)"
 contains "flag: the journal re-raises it under its keyword" \
     "$(tail -n 1 "$PM_STATE_DIR/needs-operator-journal/$cs_tid" 2>/dev/null)" "finalize-refused"
+# Closing the thread clears the flag (a closed thread's hold is not
+# flagged); reopening it, here by an upstream-head announcement, raises it
+# again while the hold stands.
+reply_msg '@ci-demo' "$cs_mid" 'closed' --to '@operator' --upstream-state closed >/dev/null
+once
+check "flag: closing the thread clears it" "no" \
+    "$([[ -e "$PM_STATE_DIR/needs-operator/$cs_tid" ]] && echo yes || echo no)"
+check "flag: ... the hold still stands" "$fin_rid" "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)"
+reply_msg '@ci-demo' "$cs_mid" 'reopened' --to '@operator' --upstream-head "feature/fl-head:$cov_base" >/dev/null
+: > "$work/once.out"
+once
+contains "flag setup: the announcement reopens the thread" "$(cat "$work/once.out")" \
+    "pm upstream-state thread=${cs_tid:0:8} state=open"
+check "flag: reopening by an upstream-head announcement raises it again" "$fl_reason" "$(fl_cur)"
 fl_status="$("$postmaster" status 2>/dev/null)"
 contains "status: lists the finalize hold" "$fl_status" \
     "finalize holds:
