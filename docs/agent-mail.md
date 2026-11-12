@@ -2525,9 +2525,10 @@ held wake's own base (`base_sha`) and floor: `fork-sandbox.sh --pipeline
 on the held wake's trigger, through the same hops and budget gates as any
 retry, with no session args, `--wake-reply` or `--review-brief`. Its
 handoff carries the held reply verbatim, the refusal (`exit=<n>` and the
-reason) and the range `<base>..<head>` the reply must describe. The runner
-fails it, without running finalize, if the leg moved HEAD or left any
-change in the tree. A retry whose finalize ran is harvested like any wake —
+reason) and the range `<base>..<head>` the reply must describe. Its leg
+starts from a clean tree (the clone reset to the held head, untracked
+non-ignored files removed), and the runner fails it, without running
+finalize, if the leg moved HEAD or left any change in the tree. A retry whose finalize ran is harvested like any wake —
 its reply posted, its branch as finalize left it — and the hold is cleared:
 `finalize thread=<t> agent=<a> run=<retry rid> outcome=released
 held=<held rid>`, then any pending message is followed up. Every other

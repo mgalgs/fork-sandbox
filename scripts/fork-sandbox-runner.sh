@@ -1026,6 +1026,50 @@ for ((_fs_cred_k = 1; _fs_cred_k <= run_step_count; _fs_cred_k++)); do
 done
 unset _fs_cred_k _fs_cred_idx _fs_cred_hvar _fs_cred_evar
 
+# Runs one command against the clone, in the same place the legs ran: the
+# leg container in a composed pod (relayed, as the uncommitted-work check
+# is), else a sealed sandbox. $1 is the wall-clock limit, the rest the
+# command (sh -c ... forms included), run with cwd the clone either way:
+# the leg container execs a relayed argv as-is, from wherever it started,
+# so the relay changes into the clone itself. stdout goes to the caller,
+# stderr to finalize.log.
+finalize_exec() {
+    local limit="$1" log="$run_dir/finalize.log"; shift
+    if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+        fs_run_leg_split timeout --kill-after 10 "$limit" sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$clone_dir" "$@" < /dev/null 2>> "$log"  # relayed to the leg container, never executed here
+    elif fs_resolve_backend "$script_dir"; then
+        local -a fin_bind_flags=()
+        local fin_alt
+        if [[ "${#fs_alternates[@]}" -gt 0 ]]; then
+            for fin_alt in "${fs_alternates[@]}"; do
+                fin_bind_flags+=(--bind-ro "$fin_alt")
+            done
+        fi
+        "$FS_TIMEOUT" --kill-after 10 "$limit" "$FS_BACKEND_BIN" --workdir "$clone_dir" \
+            "${fin_bind_flags[@]}" --bind-ro "$finalize_script" --bind-rw "$outbox_dir" \
+            --net sealed --hostname fork-sandbox-finalize -- "$@" < /dev/null 2>> "$log"
+    else
+        printf 'fork-sandbox: could not resolve the sandbox backend for the finalize step.\n' >> "$log"
+        return 1
+    fi
+}
+
+# A cover-only retry (fork-sandbox.sh --cover-only) starts its leg from a
+# clean tree: the clone is reset to the held head and every untracked file
+# that is not ignored is removed, so the guard after the leg (below) sees
+# only what the leg itself did. A persistent --clone-dir keeps what earlier
+# wakes' legs left untracked (reset --hard and checkout -b keep it), or
+# what a finalize script wrote into the clone; a fresh clone has nothing
+# to remove. Never -x: ignored files can be a seat's caches. Before the
+# services come up, so what they write is not removed. A failure is noted
+# and the leg runs anyway; the guard still judges the tree.
+if [[ -n "${cover_only_start:-}" ]]; then
+    if ! cover_only_clean_out="$(finalize_exec 120 sh -c 'git -c core.fsmonitor= -c core.hooksPath=/dev/null reset -q --hard "$1" 2>&1 && git -c core.fsmonitor= clean -fdq 2>&1' sh "$cover_only_start")"; then
+        printf 'fork-sandbox: cover-only: could not clean the clone before the leg: %s\n' \
+            "$cover_only_clean_out" >> "$sandbox_log"
+    fi
+fi
+
 # Per-run services: stand them up before the session and point the project's
 # config at the sockets. The teardown is already armed, so a failure here still
 # cleans up. A services failure is a warning, not fatal — the session runs, it
@@ -3525,34 +3569,6 @@ finalize_summary_json=null
 finalize_stderr_line=""
 # Set by the cover-only guard below: why the run failed before finalize.
 cover_only_failure=""
-
-# Runs one command against the clone, in the same place the legs ran: the
-# leg container in a composed pod (relayed, as the uncommitted-work check
-# is), else a sealed sandbox. $1 is the wall-clock limit, the rest the
-# command (sh -c ... forms included), run with cwd the clone either way:
-# the leg container execs a relayed argv as-is, from wherever it started,
-# so the relay changes into the clone itself. stdout goes to the caller,
-# stderr to finalize.log.
-finalize_exec() {
-    local limit="$1" log="$run_dir/finalize.log"; shift
-    if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
-        fs_run_leg_split timeout --kill-after 10 "$limit" sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$clone_dir" "$@" < /dev/null 2>> "$log"  # relayed to the leg container, never executed here
-    elif fs_resolve_backend "$script_dir"; then
-        local -a fin_bind_flags=()
-        local fin_alt
-        if [[ "${#fs_alternates[@]}" -gt 0 ]]; then
-            for fin_alt in "${fs_alternates[@]}"; do
-                fin_bind_flags+=(--bind-ro "$fin_alt")
-            done
-        fi
-        "$FS_TIMEOUT" --kill-after 10 "$limit" "$FS_BACKEND_BIN" --workdir "$clone_dir" \
-            "${fin_bind_flags[@]}" --bind-ro "$finalize_script" --bind-rw "$outbox_dir" \
-            --net sealed --hostname fork-sandbox-finalize -- "$@" < /dev/null 2>> "$log"
-    else
-        printf 'fork-sandbox: could not resolve the sandbox backend for the finalize step.\n' >> "$log"
-        return 1
-    fi
-}
 
 # Whether $1 is $2 or an ancestor of it, and the tree of a commit -- asked
 # where the objects are: the origin repo locally (the heads were fetched

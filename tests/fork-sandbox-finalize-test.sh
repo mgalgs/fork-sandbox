@@ -685,5 +685,33 @@ check "cover guard: a leg that leaves a file fails the run, finalize skipped" \
 check "cover guard: ... and the finalize script never ran" "no" \
     "$([[ -e "$FIN_MARK" ]] && echo yes || echo no)"
 
+# A persistent seat clone (--clone-dir) keeps what earlier wakes left
+# untracked; a cover-only run starts its leg from a clean tree, so a
+# leftover does not fail its guard, an ignored file survives, and a file
+# the leg itself leaves still fails it.
+seat_root="$(mktemp -d /var/tmp/claude-scratch/fs-finalize-seat.XXXXXX)"; tmpdirs+=("$seat_root")
+seat_clone="$seat_root/clone"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run reply-only "${cover_args[@]}" --clone-dir "$seat_clone" --branch "$br")
+check "cover (seat clone): the first wake makes the clone" "0|ran" "$rc|$(fin_json "$rd" '.finalize.ended')"
+printf 'left by an earlier wake\n' > "$seat_clone/leftover.txt"
+mkdir -p "$seat_clone/leftover-dir" && printf 'x\n' > "$seat_clone/leftover-dir/f.txt"
+printf 'seat-cache.bin\n' >> "$seat_clone/.git/info/exclude"
+printf 'cache\n' > "$seat_clone/seat-cache.bin"
+rm -f "$FIN_MARK"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run reply-only "${cover_args[@]}" --clone-dir "$seat_clone" --branch "$br")
+check "cover (seat clone): untracked leftovers do not fail the guard" "0|ran" \
+    "$rc|$(fin_json "$rd" '.finalize.ended')"
+check "cover (seat clone): ... they are removed before the leg" "no|no" \
+    "$([[ -e "$seat_clone/leftover.txt" ]] && echo yes || echo no)|$([[ -e "$seat_clone/leftover-dir" ]] && echo yes || echo no)"
+check "cover (seat clone): ... an ignored file is kept" "cache" "$(cat "$seat_clone/seat-cache.bin" 2>/dev/null)"
+printf 'left again\n' > "$seat_clone/leftover.txt"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run untracked "${cover_args[@]}" --clone-dir "$seat_clone" --branch "$br")
+check "cover (seat clone): a file the leg leaves still fails the guard" \
+    "1|skipped|cover-only: the leg left changes in the tree" \
+    "$rc|$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)"')"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

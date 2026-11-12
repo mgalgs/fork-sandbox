@@ -512,7 +512,10 @@ quotes it in its flag, and the retry leg is shown it verbatim.
 `--cover-only BASE` is that retry: the run checks out the reviewed head
 (`--checkout`), takes `BASE` (the held wake's base, which the head must
 descend from) as its base, and runs exactly one code step, told to change
-nothing but the reply. After the leg, the runner itself fails the run
+nothing but the reply. Before the leg, the runner resets the clone to the
+reviewed head and removes untracked files that are not ignored (`git clean
+-fd`, never `-x`), so what an earlier wake left in a persistent
+`--clone-dir` is not counted against it. After the leg, the runner itself fails the run
 (exit 1, `finalize.ended` `skipped`, `detail` `cover-only: the leg moved
 HEAD` or `... left changes in the tree`) if HEAD moved or the clone's tree
 has any change, so finalize never runs on a branch the retry changed;

@@ -579,7 +579,11 @@
 #                        ancestor of the checkout) is the run's base, so
 #                        FS_FINALIZE_BASE and the "no commits above the base"
 #                        rule read the held wake's original base, not the
-#                        held head. After the leg, the runner fails the run
+#                        held head. Before the leg, the runner resets the
+#                        clone to the checkout and removes untracked,
+#                        non-ignored files (git clean -fd, never -x), so
+#                        leftovers in a reused --clone-dir do not count
+#                        against it. After the leg, the runner fails the run
 #                        (exit 1, finalize skipped, detail "cover-only: ...")
 #                        if HEAD moved or the clone's tree has any change,
 #                        so the retry cannot change reviewed code; otherwise
