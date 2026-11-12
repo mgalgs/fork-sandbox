@@ -4903,8 +4903,10 @@ pm_cover_keep_held() {
 }
 
 # Retires each hold `unflag` dropped (a .dropped.<agent> marker), once no
-# run of that seat is live: the marker and any record beside it go, a
-# `finalize ... outcome=dropped` event is logged, and the newest message
+# run of that seat is live: the marker goes, and nothing else -- a record
+# beside it is a NEWER hold (a later wake of the seat refused again after
+# the drop), which only its own release or drop removes. A `finalize ...
+# outcome=dropped` event is logged, and the newest message
 # that arrived while it was held is followed up -- unless a newer wake of
 # the seat already ran, which carried it forward. The held run dir is
 # never touched. Runs right after pm_held_pass.
@@ -4923,7 +4925,7 @@ pm_finalize_held_pass() {
             held="$(fs_pm_env_get "$marker" HELD_RUN)"
             retry="$(fs_pm_env_get "$marker" RETRY_RUN)"
             pending="$(fs_pm_env_get "$marker" PENDING)"
-            rm -f -- "$marker" "$tid_dir$agent"
+            rm -f -- "$marker"
             rmdir -- "$tid_dir" 2>/dev/null || true
             pm_event "finalize thread=${tid:0:8} agent=$agent run=- outcome=dropped held=${held:--}"
             [[ -n "$pending" ]] || continue

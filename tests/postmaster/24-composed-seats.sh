@@ -926,6 +926,49 @@ check "preset seat: ... with no flag and no retry" "no|no" \
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
 # ============================================================
+printf '\n== composed seats: a stale dropped marker leaves a newer hold alone ==\n'
+# ============================================================
+
+# R1 is held; `unflag` drops it; the operator's reply wakes the seat as R2
+# before the marker is retired; R2 refuses too and writes its own hold H2
+# at the same path. The pass that retires R1's marker must leave H2.
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+fin_wake "$(cov_sum 1)" 1
+st_r1="$fin_rid"
+"$postmaster" unflag "$cs_tid" >/dev/null 2>&1
+printf 'try again\n' > "$work/body.tmp"
+"$MAIL" reply --from '@operator' --reply-to "$cs_mid" --to '@pat' --body "$work/body.tmp" >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+st_r2="$(basename -- "$(live_env_for_agent pat)" .env)"
+check "stale marker setup: the operator's reply wakes the seat as a new run" "1|yes" \
+    "$(cov_calls)|$([[ -n "$st_r2" && "$st_r2" != "$st_r1" ]] && echo yes)"
+check "stale marker setup: ... while R1's marker still stands" "yes" \
+    "$([[ -f "$PM_STATE_DIR/finalize-held/$cs_tid/.dropped.pat" ]] && echo yes)"
+cov_finish 1 "$(cov_sum 1)" 'R2 reply.'
+once
+check "stale marker setup: R2's refusal writes its own hold" "$st_r2" \
+    "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)"
+: > "$work/once.out"
+once
+contains "stale marker: R1's marker is retired" "$(cat "$work/once.out")" \
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=- outcome=dropped held=$st_r1"
+check "stale marker: ... and H2 survives it" "$st_r2" "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)"
+: > "$STUB_ARGV_LOG"
+st_new="$(reply_msg '@carol' "$cs_mid" 'still there?')"
+once
+check "stale marker: new mail is pended on H2, not woken" "0|$st_new" \
+    "$(cov_calls)|$(env_val "$(cov_hold "$cs_tid" pat)" PENDING)"
+"$postmaster" unflag "$cs_tid" >/dev/null 2>&1
+: > "$work/once.out"
+once
+contains "stale marker: H2's own drop retires it" "$(cat "$work/once.out")" \
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=- outcome=dropped held=$st_r2"
+check "stale marker: ... and its pending mail is followed up, once" "1|$st_new" \
+    "$(cov_calls)|$(env_val "$(live_env_for_agent pat)" TRIGGER)"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# ============================================================
 printf '\n== composed seats: a fetch-wait record keeps its own size and floor ==\n'
 # ============================================================
 
