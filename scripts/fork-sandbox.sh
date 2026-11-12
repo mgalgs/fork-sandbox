@@ -571,6 +571,23 @@
 #                        ancestor of it, else finalize fails with
 #                        floor-not-ancestor and the script never runs). A
 #                        full 40- or 64-hex sha; needs --finalize-script.
+# --cover-only <base>:   a postmaster's cover-only retry of a wake whose
+#                        finalize refused the reply (script exit 2): the
+#                        branch at --checkout is reviewed and final, and the
+#                        one code leg may change nothing but the reply in
+#                        the outbox. <base> (a full 40- or 64-hex sha, an
+#                        ancestor of the checkout) is the run's base, so
+#                        FS_FINALIZE_BASE and the "no commits above the base"
+#                        rule read the held wake's original base, not the
+#                        held head. After the leg, the runner fails the run
+#                        (exit 1, finalize skipped, detail "cover-only: ...")
+#                        if HEAD moved or the clone's tree has any change,
+#                        so the retry cannot change reviewed code; otherwise
+#                        finalize runs as on any run. Needs --checkout,
+#                        --finalize-script and a pipeline of exactly one code
+#                        step; refused with --wake-reply, --review-brief and
+#                        --review-only. The code leg is told the rule in
+#                        place of the usual commit instructions.
 # --kit-skill <name>:    bind one more skill from $HOME/.claude/skills/<name>
 #                        into every seat of this run, read-only, on top of
 #                        the machine's agent kit (AGENT_KIT_SKILLS in
@@ -1973,6 +1990,9 @@ wake_reply_outbox=""
 # after the last leg (see the runner's finalize block).
 finalize_script_file=""
 finalize_floor=""
+# --cover-only: the base a cover-only retry measures against (see the flag's
+# header entry and the runner's cover-only guard).
+cover_only_base=""
 kit_skill_flags=()
 k8s_mode=false
 # Set true only inside the --k8s dispatch block, for a composed (non-
@@ -2204,6 +2224,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --finalize-floor)
             finalize_floor="${2:?--finalize-floor requires a commit sha}"
+            shift 2
+            ;;
+        --cover-only)
+            cover_only_base="${2:?--cover-only requires a commit sha}"
             shift 2
             ;;
         --kit-skill)
@@ -3841,6 +3865,27 @@ if [[ -n "$finalize_script_file" ]]; then
     if [[ -n "$finalize_floor" && ! "$finalize_floor" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
         echo "Error: --finalize-floor takes a full lowercase commit sha (40 or 64" >&2
         echo "hex digits), not '$finalize_floor'." >&2
+        exit 1
+    fi
+fi
+# --cover-only rewrites a held wake's reply on a reviewed branch: one code
+# leg, a finalize step after it, and nothing that would review or reshape.
+if [[ -n "$cover_only_base" ]]; then
+    if [[ ! "$cover_only_base" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+        echo "Error: --cover-only takes a full lowercase commit sha (40 or 64" >&2
+        echo "hex digits), not '$cover_only_base'." >&2
+        exit 1
+    fi
+    if [[ -z "$checkout_ref" || -z "$finalize_script_file" ]]; then
+        echo "Error: --cover-only needs --checkout (the reviewed head) and" >&2
+        echo "--finalize-script: it reruns finalize on a branch it does not change." >&2
+        exit 1
+    fi
+    if [[ "$review_only" == true || "$wake_reply" == true || -n "$review_brief_file" \
+        || "$preset_step_count" != 1 || "${preset_step_action[1]:-}" != code ]]; then
+        echo "Error: --cover-only needs a --pipeline of exactly one code step, and" >&2
+        echo "no --review-only, --wake-reply or --review-brief: its one leg" >&2
+        echo "rewrites the reply and changes nothing else." >&2
         exit 1
     fi
 fi
@@ -6845,6 +6890,26 @@ fi
 if [[ -n "$clone_dir_flag" && -z "$clone_lock_fd" ]]; then
     fs_lock_clone_dir "$clone_dir"
 fi
+# A cover-only retry starts at the reviewed head (--checkout) but measures
+# against the held wake's original base: that is what FS_FINALIZE_BASE and
+# finalize's "no commits above the base" read. The branch accounting
+# (return_base_sha) moves with it, so a branch finalize left at the
+# reviewed head still counts its reviewed commits and comes back, rather
+# than being removed as a branch with nothing above its start; the cluster
+# path fetches the branch back either way. cover_only_start keeps the
+# start point for the runner's guard.
+cover_only_start=""
+if [[ -n "$cover_only_base" ]]; then
+    cover_only_start="$return_base_sha"
+    if ! (cd "$origin_repo" && git cat-file -e "$cover_only_base^{commit}" 2>/dev/null \
+        && git merge-base --is-ancestor "$cover_only_base" "$cover_only_start"); then
+        echo "Error: --cover-only '$cover_only_base' is not a commit in $origin_repo" >&2
+        echo "that the checkout ($cover_only_start) descends from." >&2
+        exit 1
+    fi
+    base_sha="$cover_only_base"
+    return_base_sha="$cover_only_base"
+fi
 if [[ "$k8s_runner_mode" == true ]]; then
     # None of this host-side machinery applies to a pod: there are no
     # alternates to collect (the pod never shares an object store with a
@@ -7735,7 +7800,8 @@ EOF
     fi
     fs_emit_browser_section
     fs_emit_prompt_overlay implement
-    fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
+    fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}" \
+        "${cover_only_base:+$outbox_dir}"
     printf '\n---\n\n'
     cat -- "$handoff_file"
 } > "$handoff_copy.part"
@@ -8114,7 +8180,8 @@ if (( refresh_enabled )); then
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
-        fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
+        fs_emit_headless_turn_section "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}" \
+            "${cover_only_base:+$outbox_dir}"
     } > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
@@ -9336,6 +9403,7 @@ fs_emit_run_sh_preamble() {
     printf 'branch=%q\n' "$branch"
     printf 'base_sha=%q\n' "$base_sha"
     printf 'return_base_sha=%q\n' "$return_base_sha"
+    printf 'cover_only_start=%q\n' "$cover_only_start"
     printf 'upstream=%q\n' "$upstream"
     printf 'upstream_reason=%q\n' "$upstream_reason"
     printf 'agent_kit=%q\n' "${agent_kit_names[*]}"

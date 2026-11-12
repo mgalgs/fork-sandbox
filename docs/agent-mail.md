@@ -937,7 +937,7 @@ note's `note` event, its "seat notes:" line and its `seat_notes` entry in
 - `snapshot-failed` — the wake's thread snapshot could not be written
 - `handoff-render-failed` — the wake's handoff could not be rendered
 - `route-interrupted` — routing woke no run for the seat after its attempts
-- `finalize-refused` — a composed wake's finalize step failed; its work is held (see "Composed seats")
+- `finalize-refused` — a composed wake's finalize step failed; its work is held (see "Composed seats"). A cover-only retry's release leaves it standing
 - `handler-exit`, `handler-timeout` — a handler seat's command failed or timed out
 - `handler-bad-command`, `handler-missing`, `handler-not-regular`,
   `handler-not-executable`, `render-failed` — a handler seat could not be run
@@ -2474,6 +2474,44 @@ own status, `-` when the runner refused it (a timeout, a changed tree, a
 descent failure, `floor-not-ancestor`). A finalize that ran or was skipped
 harvests exactly as any other wake; one that ran publishes the folded head,
 which is what a `sets` seat's `Version:` reply then stamps as the target.
+When the script exited with a status and wrote to stderr, `<reason>` is its
+first stderr line (`finalize.stderr_line`, sanitized, at most 500 bytes);
+otherwise, and always for a runner refusal, the runner's own detail.
+
+The hold is a record, `finalize-held/<thread-id>/<agent>` (`HELD_RUN`,
+`TRIGGER`, `SINCE`, `EXIT`, `RETRY_RUN`, `PENDING`). While it stands the
+seat does not wake on that thread: new mail for it, a follow-up, a retry or
+a release is refused (`refuse thread=<t> agent=<a> reason=finalize-held`)
+and the message id is added to `PENDING`. Operator mail is new mail too; it
+does not clear the hold. The operator's `postmaster unflag <thread-id>`
+does: it drops the thread's holds (the held run dir is left untouched), the
+next pass logs `finalize thread=<t> agent=<a> run=- outcome=dropped
+held=<rid>` and follows up the newest pending message under the normal
+rule (unless a newer wake of the seat already ran).
+
+**Exit 2 gets one cover-only retry.** A finalize script's exit 2 means "the
+reviewed branch is fine; the reply does not describe it". For that one
+status the postmaster starts, once per held wake, a new run from the held
+head (the reviewed, unsquashed commits, `finalize.head_before`) with the
+held wake's own base (`base_sha`) and floor: `fork-sandbox.sh --pipeline
+<the first code step of the seat's default row> --checkout <held head>
+--cover-only <base> --finalize-script <file> [--finalize-floor <floor>]`,
+on the held wake's trigger, through the same hops and budget gates as any
+retry, with no session args, `--wake-reply` or `--review-brief`. Its
+handoff carries the held reply verbatim, the refusal (`exit=<n>` and the
+reason) and the range `<base>..<head>` the reply must describe. The runner
+fails it, without running finalize, if the leg moved HEAD or left any
+change in the tree. A retry whose finalize ran is harvested like any wake —
+its reply posted, its branch as finalize left it — and the hold is cleared:
+`finalize thread=<t> agent=<a> run=<retry rid> outcome=released
+held=<held rid>`, then any pending message is followed up. Every other
+outcome of the retry (a refusal of any kind, a guard failure, a crash)
+leaves the hold standing, posts nothing and retries nothing more; nor is
+there a retry for any other finalize exit, or when the seat's default row
+has no code step or the held run left no usable head and base
+(`cover-skip thread=<t> agent=<a> held=<rid> reason=<...>`). Mail that
+arrives while the retry runs is pending on it but never delivered live.
+Seats without `finalize:` get no hold record and no retry.
 
 The seat comes from `fleet resolve`. Unset harness and network default to
 `claude` and `pinned`. An unset model defaults to `sonnet` **only on the
@@ -2796,6 +2834,7 @@ own thread scans never see it:
 | `discards/<thread-id>/<agent>.prior` | the seat's crash-retry record set aside while a malformed schedule is pending; put back when that schedule ends |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT/REASON fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
+| `finalize-held/<thread-id>/<agent>` | a composed seat's wake held on a refused finalize: `HELD_RUN`, `TRIGGER`, `SINCE`, `EXIT`, `RETRY_RUN` (the cover-only retry's run id, `-` when none will run, empty before the harvest decides), `PENDING` (message ids that arrived while held). `unflag` renames it to `.dropped.<agent>`, which the next pass retires — see "Composed seats" |
 | `fetch-wait/<thread-id>/<agent>` | a wake deferred because its sha (upstream head or review target) is not on `origin` yet: `TRIGGER`, `RETRY`, `KIND`, `KEY` (`<branch> <sha>`), `SINCE`, `ATTEMPTS`, `NOT_BEFORE`, and for a composed seat `SIZE`, `FLOOR`, `CHECKOUT` — see "Upstream moved" step 3 |
 | `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |

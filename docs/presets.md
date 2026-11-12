@@ -485,9 +485,30 @@ fails as `floor-not-ancestor` before the script runs. A nonzero exit, a
 timeout (300 s) or either violation fails the run and resets the branch to
 the head the legs left. `summary.json` records `finalize` (`ended`
 ran/skipped/failed, `detail`, `exit`, `head_before`, `head_after`,
-`floor`, `clone_restored`) and `progress.json` a trailing `finalize` step.
+`floor`, `clone_restored`, and `stderr_line`: the first line the script
+itself wrote to stderr, control characters removed, at most 500 bytes,
+null when it wrote nothing or never ran; `finalize.log` keeps all its
+output) and `progress.json` a trailing `finalize` step.
 Every code and fix leg is told a finalize step will fold its `fixup!`
 commits. It needs a code step and is refused on a read-only run.
+
+The script's exit status is its answer. 0 accepts the branch. **Exit 2
+means "the reviewed branch is fine; the reply does not describe it":** a
+postmaster holding such a composed wake retries it once, with a reply-only
+leg (below), then runs finalize again. Any other failure holds the wake for
+the operator. Put the reason on the first line of stderr: the postmaster
+quotes it in its flag, and the retry leg is shown it verbatim.
+
+`--cover-only BASE` is that retry: the run checks out the reviewed head
+(`--checkout`), takes `BASE` (the held wake's base, which the head must
+descend from) as its base, and runs exactly one code step, told to change
+nothing but the reply. After the leg, the runner itself fails the run
+(exit 1, `finalize.ended` `skipped`, `detail` `cover-only: the leg moved
+HEAD` or `... left changes in the tree`) if HEAD moved or the clone's tree
+has any change, so finalize never runs on a branch the retry changed;
+otherwise finalize runs as on any run, with `FS_FINALIZE_BASE` = `BASE`. It
+needs `--finalize-script` and a `--pipeline` of one code step, and is
+refused with `--wake-reply`, `--review-brief` and `--review-only`.
 
 ## Because a preset is just flags, the flag rules apply
 

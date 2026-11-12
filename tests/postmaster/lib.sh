@@ -313,7 +313,11 @@ if (( is_k8s )); then
     done
     if [[ -z "${STUB_K8S_NO_RUNDIR:-}" ]]; then
         printf '  run dir:  %s\n' "$run_dir" >&2
-        if [[ -z "${STUB_K8S_NO_SUMMARY:-}" ]]; then
+        if [[ -n "${STUB_K8S_SUMMARY_JSON:-}" ]]; then
+            # STUB_K8S_SUMMARY_JSON: a file whose content is the run's
+            # summary.json, as collect would leave it.
+            cp -- "$STUB_K8S_SUMMARY_JSON" "$run_dir/summary.json"
+        elif [[ -z "${STUB_K8S_NO_SUMMARY:-}" ]]; then
             printf '{"exit_code": %s}' "${STUB_K8S_SUMMARY_EXIT:-$rc}" > "$run_dir/summary.json"
         fi
     fi

@@ -1432,7 +1432,11 @@ the host, and `review-brief.md` and `finalize.sh` ride in the pushed run
 directory. The finalize step runs in the leg container, relayed like
 every leg, and its own checks (tree identity, descent) are relayed the
 same way. Collect pulls `finalize.log` back and merges the pod summary's
-`finalize` record into the host's `summary.json`.
+`finalize` record (its `stderr_line` included: the script's stderr comes
+back through the relay like any leg's) into the host's `summary.json`.
+`--cover-only` rides in `run.sh` too (`base_sha` is the held wake's base,
+`cover_only_start` the checked-out head), and its guard runs in the pod
+before finalize, the tree check relayed to the leg container.
 
 **What runs.** The launcher (`fork-sandbox.sh`) does everything a local run
 does to turn a preset into a run directory — compile the step spine,

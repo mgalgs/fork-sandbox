@@ -3502,6 +3502,9 @@ finalize_clone_restored_json=null
 finalize_progress_state=""
 finalize_progress_ended=""
 finalize_summary_json=null
+finalize_stderr_line=""
+# Set by the cover-only guard below: why the run failed before finalize.
+cover_only_failure=""
 
 # Runs one command against the clone, in the same place the legs ran: the
 # leg container in a composed pod (relayed, as the uncommitted-work check
@@ -3509,9 +3512,9 @@ finalize_summary_json=null
 # command (sh -c ... forms included), run with cwd the clone either way:
 # the leg container execs a relayed argv as-is, from wherever it started,
 # so the relay changes into the clone itself. stdout goes to the caller,
-# stderr to finalize.log.
+# stderr to finalize.log, or to $finalize_exec_stderr when the caller sets it.
 finalize_exec() {
-    local limit="$1" log="$run_dir/finalize.log"; shift
+    local limit="$1" log="${finalize_exec_stderr:-$run_dir/finalize.log}"; shift
     if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
         fs_run_leg_split timeout --kill-after 10 "$limit" sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$clone_dir" "$@" < /dev/null 2>> "$log"  # relayed to the leg container, never executed here
     elif fs_resolve_backend "$script_dir"; then
@@ -3547,6 +3550,27 @@ finalize_git() {
 finalize_ancestor() { finalize_git merge-base --is-ancestor "$1" "$2"; }
 finalize_tree() { finalize_git rev-parse --verify -q "$1^{tree}"; }
 
+# A cover-only retry (fork-sandbox.sh --cover-only) may change nothing but
+# the reply: the branch is reviewed and final, and this run has no review
+# leg to catch a change. So a leg that moved HEAD off the start point, or
+# left anything in the clone's tree, fails the run here and finalize is not
+# run on it (the skip below). Nothing is reset: the held branch is another
+# ref, and this run's own is not published as reviewed work.
+if [[ -n "${cover_only_start:-}" && "${stop_requested:-0}" != 1 ]] && (( rc == 0 )); then
+    cover_only_status=""
+    if [[ "$(clone_branch_head)" != "$cover_only_start" ]]; then
+        cover_only_failure="the leg moved HEAD"
+    elif ! cover_only_status="$(finalize_exec 60 git -c core.fsmonitor= status --porcelain)"; then
+        cover_only_failure="the clone's status could not be read"
+    elif [[ -n "$cover_only_status" ]]; then
+        cover_only_failure="the leg left changes in the tree"
+    fi
+    if [[ -n "$cover_only_failure" ]]; then
+        printf 'fork-sandbox: cover-only: %s\n' "$cover_only_failure" >> "$sandbox_log"
+        rc=1
+    fi
+fi
+
 if [[ -n "${finalize_script:-}" ]]; then
     : > "$run_dir/finalize.log"
     finalize_head_before="$(clone_branch_head)"
@@ -3554,6 +3578,8 @@ if [[ -n "${finalize_script:-}" ]]; then
     finalize_refs="refs/fork-sandbox/finalize/$run_id"
     if [[ "${stop_requested:-0}" == 1 ]]; then
         finalize_ended=skipped finalize_detail="stop requested"
+    elif [[ -n "$cover_only_failure" ]]; then
+        finalize_ended=skipped finalize_detail="cover-only: $cover_only_failure"
     elif (( rc != 0 )); then
         # A run that already failed is not published as reviewed work, so
         # there is nothing to fold for it.
@@ -3585,11 +3611,21 @@ if [[ -n "${finalize_script:-}" ]]; then
         fi
         finalize_rc=0
         finalize_started="$(date +%s)"
-        finalize_exec "$finalize_timeout_secs" \
+        # The script's stderr goes to a file of its own first: its first
+        # line is the script's own reason (a refusal names what the reply
+        # must say), recorded as stderr_line. finalize.log still gets all
+        # of it, after.
+        finalize_stderr_file="$run_dir/finalize-stderr.log"
+        : > "$finalize_stderr_file"
+        finalize_exec_stderr="$finalize_stderr_file" finalize_exec "$finalize_timeout_secs" \
             env FS_FINALIZE_BASE="$base_sha" FS_FINALIZE_FLOOR="$finalize_floor_eff" \
             FS_FINALIZE_REPLY="$finalize_reply" sh "$finalize_script" \
             >> "$run_dir/finalize.log" || finalize_rc=$?
         finalize_elapsed=$(( $(date +%s) - finalize_started ))
+        finalize_stderr_line="$(head -n 1 -- "$finalize_stderr_file" 2>/dev/null \
+            | LC_ALL=C tr -d '\000-\037\177' | head -c 500)" || finalize_stderr_line=""
+        cat -- "$finalize_stderr_file" >> "$run_dir/finalize.log" 2>/dev/null || true
+        rm -f -- "$finalize_stderr_file"
         finalize_head_after="$(clone_branch_head)"
         # timeout passes the script's own status through, so 124 and 137
         # are a timeout only when the limit has actually gone by; whole
@@ -3667,9 +3703,11 @@ git update-ref "refs/heads/$1" "$2" && git checkout -q -f "$1" && git reset -q -
         --arg head_before "$finalize_head_before" --arg head_after "$finalize_head_after" \
         --arg floor "${finalize_floor:-}" \
         --argjson clone_restored "$finalize_clone_restored_json" \
+        --arg stderr_line "$finalize_stderr_line" \
         '{ended: $ended,
           detail: (if $detail == "" then null else $detail end),
           exit: $exit,
+          stderr_line: (if $stderr_line == "" then null else $stderr_line end),
           head_before: (if $head_before == "" then null else $head_before end),
           head_after: (if $head_after == "" then null else $head_after end),
           floor: (if $floor == "" then null else $floor end),

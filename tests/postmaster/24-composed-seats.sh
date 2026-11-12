@@ -5,7 +5,9 @@
 # row (every fallback picks `default`), the choice survives retry, a held
 # release and a superseded fetch-wait, a composed wake's argv is exactly
 # decision 4's on both backends, a composed `sets` seat always starts from
-# the review target, and seats without the key are untouched -- including
+# the review target, the gate may pick the start sha, a finalize script's
+# exit 2 gets one cover-only retry and a hold keeps new mail pending until
+# it clears, and seats without the key are untouched -- including
 # the fetch-wait record a re-freeze queues for one beneath a composed wake.
 #
 # Usage: tests/postmaster/24-composed-seats.sh  (or all files at once:
@@ -555,6 +557,7 @@ msg_count() { find "$FORK_SANDBOX_MAIL_ROOT/threads/$1" -name '*.msg' | wc -l; }
 # given summary.json, then one harvest pass.
 fin_wake() {
     cs_new_store
+    [[ -z "${FIN_FLOOR:-}" ]] || printf '%s\n' "$FIN_FLOOR" > "$CS_OUT/floor"
     cs_mid="$(send_msg '@carol' '@pat' 'finalize topic' 'fold it' 8)"
     cs_tid="$(thread_of "$cs_mid")"
     once
@@ -570,7 +573,7 @@ fin_wake() {
     : > "$STUB_ARGV_LOG"
     once
 }
-fin_wake '{"finalize":{"ended":"failed","detail":"the script exited 2","exit":2}}' 1
+fin_wake '{"finalize":{"ended":"failed","detail":"the script exited 1","exit":1}}' 1
 check "refused: no reply is posted" "$fin_msgs_before" "$(msg_count "$cs_tid")"
 check "refused: the reply stays in the outbox" "yes" \
     "$([[ -f "$fin_run_dir/outbox/mail-1.md" ]] && echo yes)"
@@ -579,16 +582,18 @@ check "refused: no retry is scheduled" "no" \
 check "refused: the run is harvested" "yes" \
     "$([[ -e "$PM_STATE_DIR/harvested/$fin_rid" ]] && echo yes)"
 check "refused: the thread is flagged with exit and reason" \
-    "finalize refused for pat (run $fin_rid): exit=2 the script exited 2" \
+    "finalize refused for pat (run $fin_rid): exit=1 the script exited 1" \
     "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
 contains "refused: the flag journal records the finalize-refused keyword" \
     "$(cat "$PM_STATE_DIR/needs-operator-journal/$cs_tid" 2>/dev/null)" "finalize-refused"
 contains "refused: the finalize event carries exit and reason" "$(cat "$work/once.out")" \
-    "pm finalize thread=${cs_tid:0:8} agent=pat run=$fin_rid outcome=refused exit=2 reason=the script exited 2"
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=$fin_rid outcome=refused exit=1 reason=the script exited 1"
+check "refused (exit 1): the hold is recorded, with no retry run" "$fin_rid|$cs_mid|1|-||" \
+    "$(for k in HELD_RUN TRIGGER EXIT RETRY_RUN PENDING; do printf '%s|' "$(env_val "$PM_STATE_DIR/finalize-held/$cs_tid/pat" "$k")"; done)"
 export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
 once
 once
-check "refused: no later pass wakes the seat" 0 "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+check "refused (exit 1): no later pass wakes the seat" 0 "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
 fin_wake '{"finalize":{"ended":"failed","detail":"tree differs","exit":null}}' 1
@@ -597,6 +602,25 @@ check "refused (runner): exit=- in the flag" \
     "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
 contains "refused (runner): exit=- in the event" "$(cat "$work/once.out")" \
     "outcome=refused exit=- reason=tree differs"
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+once
+once
+check "refused (runner): held with no retry, and no pass wakes the seat" "-|0" \
+    "$(env_val "$PM_STATE_DIR/finalize-held/$cs_tid/pat" RETRY_RUN)|$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# The script's own first stderr line is the reason when it exited with a
+# status; a runner refusal keeps its detail even beside one.
+fin_wake '{"finalize":{"ended":"failed","detail":"the script exited 1","exit":1,"stderr_line":"reply must name abc123"}}' 1
+check "reason: a script's stderr line is the flag's reason" \
+    "finalize refused for pat (run $fin_rid): exit=1 reply must name abc123" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
+contains "reason: ... and the event's" "$(cat "$work/once.out")" \
+    "outcome=refused exit=1 reason=reply must name abc123"
+fin_wake '{"finalize":{"ended":"failed","detail":"tree differs","exit":null,"stderr_line":"not this"}}' 1
+check "reason: a runner refusal keeps its own detail" \
+    "finalize refused for pat (run $fin_rid): exit=- tree differs" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
 
 fin_wake '{"finalize":{"ended":"skipped","detail":"no commits above the base","exit":null}}' 0
 check "skipped: the reply is posted as usual" "$(( fin_msgs_before + 1 ))" "$(msg_count "$cs_tid")"
@@ -631,6 +655,205 @@ check "ran: X-Review-Target-Set names the squashed head" "$fin_branch $fin_sq" \
     "$( [[ -n "$fin_posted" ]] && header_of_file "$fin_posted" X-Review-Target-Set)"
 check "ran: the thread's review target moves to it" "$fin_sq" \
     "$(env_val "$PM_STATE_DIR/review-target/$cs_tid.env" SHA)"
+
+# ============================================================
+printf '\n== composed seats: exit 2 gets one cover-only retry ==\n'
+# ============================================================
+
+# The held wake's base and reviewed head, real commits in the project repo.
+cov_base="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+cov_head="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree -p "$cov_base" -m 'reviewed work' "$(git -C "$PROJECT_DIR" rev-parse "$cov_base^{tree}")")"
+# cov_sum <exit|null> [stderr-line]: a summary whose finalize failed so.
+cov_sum() {
+    jq -cn --arg base "$cov_base" --arg head "$cov_head" --argjson exit "$1" --arg line "${2:-}" \
+        '{base_sha: $base, finalize: {ended: "failed", exit: $exit, head_before: $head,
+          detail: (if $exit == null then "tree differs" else "the script exited \($exit)" end),
+          stderr_line: (if $line == "" then null else $line end)}}'
+}
+# cov_finish <exit-code> <summary-json> [reply]: ends the live cover run.
+cov_finish() {
+    local env_f rd
+    env_f="$(live_env_for_agent pat)"
+    rd="$(env_val "$env_f" RUN_DIR)"
+    mkdir -p -- "$rd/outbox"
+    [[ -z "${3:-}" ]] || printf '\n%s\n' "$3" > "$rd/outbox/mail-1.md"
+    printf '%s\n' "$1" > "$rd/exit-code"
+    printf '%s\n' "$2" > "$rd/summary.json"
+}
+cov_hold() { printf '%s/finalize-held/%s/%s' "$PM_STATE_DIR" "$1" "$2"; }
+cov_calls() { grep -c -- '----CALL----' "$STUB_ARGV_LOG"; }
+posted_with() {
+    local f
+    for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$cs_tid"/*.msg; do
+        grep -qF -- "$1" "$f" && { printf yes; return 0; }
+    done
+    printf no
+}
+
+FIN_FLOOR="$cov_base" fin_wake "$(cov_sum 2 'reply must say abc')" 1
+check "cover: exactly one retry is spawned at the refusal's harvest" 1 "$(cov_calls)"
+check "cover: one code step, the first of the default row" "copus1" "$(flag_value --pipeline)"
+check "cover: it starts from the held head" "1 $cov_head" "$(flag_count --checkout) $(flag_value --checkout)"
+check "cover: the held wake's base is the run's base" "$cov_base" "$(flag_value --cover-only)"
+check "cover: the held wake's floor" "$cov_base" "$(flag_value --finalize-floor)"
+check "cover: the seat's finalize script" "$FORK_SANDBOX_PERSONAS_DIR/pat-finalize.sh" \
+    "$(flag_value --finalize-script)"
+for cs_flag in --wake-reply --review-brief --session-state --resume-session --session-id --refresh-at; do
+    check "cover: no $cs_flag" 0 "$(flag_count "$cs_flag")"
+done
+cov_env="$(live_env_for_agent pat)"
+cov_rid="$(basename -- "$cov_env" .env)"
+check "cover: its record is a cover retry of the held run, on the held trigger" \
+    "cover $fin_rid $cs_mid" \
+    "$(env_val "$cov_env" RETRY_KIND) $(env_val "$cov_env" RETRY_OF) $(env_val "$cov_env" TRIGGER)"
+check "cover: the hold names the retry" "$fin_rid|2|$cov_rid" \
+    "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)|$(env_val "$(cov_hold "$cs_tid" pat)" EXIT)|$(env_val "$(cov_hold "$cs_tid" pat)" RETRY_RUN)"
+check "cover: the held reply is not posted" "no" "$(posted_with 'Folded and ready.')"
+check "cover: it lists no snapshot ids" "no" \
+    "$([[ -e "$PM_STATE_DIR/wake-threads/$cov_rid.message-ids" ]] && echo yes || echo no)"
+cov_handoff="$(cat "$(last_call | tail -n 1)" 2>/dev/null)"
+contains "cover handoff: the held reply, verbatim" "$cov_handoff" "Folded and ready."
+contains "cover handoff: the refusal's exit and stderr line" "$cov_handoff" \
+    "Finalize's refusal: exit=2 reply must say abc"
+contains "cover handoff: the range the reply must describe" "$cov_handoff" "$cov_base..$cov_head"
+contains "cover handoff: change nothing" "$cov_handoff" "Change nothing in the"
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+: > "$STUB_ARGV_LOG"
+once
+check "cover: no second retry while the first runs" 0 "$(cov_calls)"
+
+# Mail while the retry runs is pended on it, not delivered live.
+cov_new="$(reply_msg '@carol' "$cs_mid" 'one more thing')"
+once
+contains "cover: new mail is pending on the retry" "$(env_val "$cov_env" PENDING_MSGS)" "$cov_new"
+check "cover: ... and not delivered into it" "" \
+    "$(find "$(env_val "$cov_env" RUN_DIR)/inbox" -type f 2>/dev/null)"
+check "cover: ... and wakes nothing" 0 "$(cov_calls)"
+
+# A retry whose finalize ran releases the hold and posts its reply; the
+# pending message is followed up under the normal rule.
+cov_finish 0 "{\"base_sha\":\"$cov_base\",\"finalize\":{\"ended\":\"ran\",\"exit\":0}}" 'Rewritten cover.'
+: > "$work/once.out"
+once
+check "released: the retry's reply is posted" "yes" "$(posted_with 'Rewritten cover.')"
+check "released: the held reply never is" "no" "$(posted_with 'Folded and ready.')"
+check "released: the hold is gone" "no" "$([[ -e "$(cov_hold "$cs_tid" pat)" ]] && echo yes || echo no)"
+contains "released: the event names the retry and the held run" "$(cat "$work/once.out")" \
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=$cov_rid outcome=released held=$fin_rid"
+contains "released: the finalize-refused flag stays for the operator" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)" "finalize refused for pat (run $fin_rid)"
+check "released: the pending mail is followed up, once" 1 "$(cov_calls)"
+check "released: ... as an ordinary wake on that message" "$cov_new|" \
+    "$(env_val "$(live_env_for_agent pat)" TRIGGER)|$(env_val "$(live_env_for_agent pat)" RETRY_KIND)"
+
+# A retry whose own finalize fails again, or whose leg changed the branch,
+# stays held: nothing posted, no further retry, no wake.
+for cov_case in "refused-again:1:$(cov_sum 2 'still wrong')" \
+    "guard:1:{\"base_sha\":\"$cov_base\",\"finalize\":{\"ended\":\"skipped\",\"detail\":\"cover-only: the leg moved HEAD\",\"exit\":null}}"; do
+    cov_label="${cov_case%%:*}" cov_rest="${cov_case#*:}"
+    fin_wake "$(cov_sum 2)" 1
+    cov_rid="$(basename -- "$(live_env_for_agent pat)" .env)"
+    cov_finish "${cov_rest%%:*}" "${cov_rest#*:}" 'Second try.'
+    : > "$STUB_ARGV_LOG"
+    once
+    once
+    check "cover $cov_label: no further run" 0 "$(cov_calls)"
+    check "cover $cov_label: nothing posted" "no|no" "$(posted_with 'Second try.')|$(posted_with 'Folded and ready.')"
+    check "cover $cov_label: the hold stands, its retry spent" "$fin_rid|$cov_rid" \
+        "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)|$(env_val "$(cov_hold "$cs_tid" pat)" RETRY_RUN)"
+    check "cover $cov_label: no on-failure retry" "no" \
+        "$([[ -e "$PM_STATE_DIR/retries/$cs_tid/pat" ]] && echo yes || echo no)"
+done
+
+# A held seat does not wake on new mail; the operator's `unflag` drops the
+# hold (the held run dir untouched) and the next pass follows the mail up.
+fin_wake "$(cov_sum 1)" 1
+cov_held_dir="$fin_run_dir"
+cov_sum_before="$(find "$cov_held_dir" -type f -exec sha256sum {} + | sort)"
+cov_new="$(reply_msg '@carol' "$cs_mid" 'are you there')"
+: > "$work/once.out"
+once
+check "held: new mail does not wake the seat" 0 "$(cov_calls)"
+contains "held: ... the spawn is refused as finalize-held" "$(cat "$work/once.out")" \
+    "pm refuse thread=${cs_tid:0:8} agent=pat reason=finalize-held"
+check "held: ... and the message waits on the hold" "$cov_new" \
+    "$(env_val "$(cov_hold "$cs_tid" pat)" PENDING)"
+printf 'carry on\n' > "$work/body.tmp"
+"$MAIL" reply --from '@operator' --reply-to "$cs_mid" --to '@pat' --body "$work/body.tmp" >/dev/null 2>&1
+once
+check "held: operator mail does not drop the hold or wake the seat" "yes|0" \
+    "$([[ -e "$(cov_hold "$cs_tid" pat)" ]] && echo yes)|$(cov_calls)"
+"$postmaster" unflag "$cs_tid" >/dev/null 2>&1
+: > "$work/once.out"
+once
+contains "unflag: the hold is dropped" "$(cat "$work/once.out")" \
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=- outcome=dropped held=$fin_rid"
+check "unflag: no record is left" "" "$(ls -A "$PM_STATE_DIR/finalize-held/$cs_tid" 2>/dev/null)"
+check "unflag: the held run dir is untouched" "$cov_sum_before" \
+    "$(find "$cov_held_dir" -type f -exec sha256sum {} + | sort)"
+check "unflag: the newest pending message is followed up, once" 1 "$(cov_calls)"
+contains "unflag: ... as an ordinary wake" "$(env_val "$(live_env_for_agent pat)" TRIGGER)" "$(env_val "$(cov_hold "$cs_tid" pat)" PENDING)"
+check "unflag: ... not a cover retry" "" "$(env_val "$(live_env_for_agent pat)" RETRY_KIND)"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# A seat without finalize: a refusal recorded for it writes no hold and no
+# cover-only retry, exactly as before.
+cs_new_store
+cs_mid="$(send_msg '@carol' '@pam' 'no finalize' 'x' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+cov_pam_dir="$(env_val "$(live_env_for_agent pam)" RUN_DIR)"
+printf '1\n' > "$cov_pam_dir/exit-code"
+cov_sum 2 > "$cov_pam_dir/summary.json"
+: > "$STUB_ARGV_LOG"
+once
+once
+check "no finalize: no hold record" "no" "$([[ -e "$PM_STATE_DIR/finalize-held" ]] && echo yes || echo no)"
+check "no finalize: no cover-only retry" 0 "$(cov_calls)"
+
+# k8s: the same on pak, whose wakes harvest in the pass after they start.
+cov_k8s_sum="$CS_OUT/k8s-summary.json"
+cov_sum 2 'k8s reply is stale' > "$cov_k8s_sum"
+cs_new_store
+cs_mid="$(send_msg '@carol' '@pak' 'k8s cover' 'fold it' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+STUB_K8S_EXIT=1 STUB_K8S_SUMMARY_JSON="$cov_k8s_sum" once
+cov_k8s_held="$(env_val "$(cov_hold "$cs_tid" pak)" HELD_RUN)"
+check "k8s cover: the original wake and one retry" 2 "$(cov_calls)"
+check "k8s cover: the retry is a cover-only run from the held head" "copus1 $cov_head $cov_base" \
+    "$(flag_value --pipeline) $(flag_value --checkout) $(flag_value --cover-only)"
+check "k8s cover: ... with no --wake-reply" 0 "$(flag_count --wake-reply)"
+cov_rid="$(env_val "$(cov_hold "$cs_tid" pak)" RETRY_RUN)"
+check "k8s cover: the hold names it" "cover $cov_k8s_held" \
+    "$(env_val "$PM_STATE_DIR/runs/$cov_rid.env" RETRY_KIND) $(env_val "$PM_STATE_DIR/runs/$cov_rid.env" RETRY_OF)"
+# The retry ran with the same stub, so its own finalize refused too: held.
+: > "$STUB_ARGV_LOG"
+once
+once
+check "k8s cover: a second refusal stays held, no further run" "0|$cov_rid" \
+    "$(cov_calls)|$(env_val "$(cov_hold "$cs_tid" pak)" RETRY_RUN)"
+check "k8s cover: nothing posted" "no" "$(posted_with 'hello from k8s stub')"
+cov_new="$(reply_msg '@carol' "$cs_mid" 'k8s ping')"
+once
+check "k8s held: new mail does not wake the seat" "0|$cov_new" \
+    "$(cov_calls)|$(env_val "$(cov_hold "$cs_tid" pak)" PENDING)"
+# A released k8s retry: the retry's wake dir is rewritten before its harvest.
+cs_new_store
+cs_mid="$(send_msg '@carol' '@pak' 'k8s release' 'fold it' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+STUB_K8S_EXIT=1 STUB_K8S_SUMMARY_JSON="$cov_k8s_sum" STUB_K8S_NO_REPLY=1 once
+cov_rid="$(env_val "$(cov_hold "$cs_tid" pak)" RETRY_RUN)"
+cov_k8s_rd="$(env_val "$PM_STATE_DIR/runs/$cov_rid.env" RUN_DIR)"
+mkdir -p -- "$cov_k8s_rd/outbox"
+printf '\nk8s rewritten cover.\n' > "$cov_k8s_rd/outbox/mail-1.md"
+printf '0\n' > "$cov_k8s_rd/exit-code"
+printf '{"base_sha":"%s","finalize":{"ended":"ran","exit":0}}\n' "$cov_base" > "$cov_k8s_rd/summary.json"
+: > "$work/once.out"
+once
+check "k8s released: the retry's reply is posted" "yes" "$(posted_with 'k8s rewritten cover.')"
+contains "k8s released: the event" "$(cat "$work/once.out")" "agent=pak run=$cov_rid outcome=released"
+check "k8s released: the hold is gone" "no" "$([[ -e "$(cov_hold "$cs_tid" pak)" ]] && echo yes || echo no)"
 
 # ============================================================
 printf '\n== composed seats: a fetch-wait record keeps its own size and floor ==\n'

@@ -728,8 +728,38 @@
 # keyword finalize-refused, "finalize refused for <agent> (run <rid>):
 # exit=<n|-> <reason>", with a `finalize thread=<t> agent=<a> run=<rid>
 # outcome=refused exit=<n|-> reason=<reason>` event (exit is the script's
-# own status, `-` when the runner refused it). What happens next is the
-# operator's call. A finalize that ran or was skipped harvests as before.
+# own status, `-` when the runner refused it; reason is the script's first
+# stderr line, summary.json's finalize.stderr_line, when it exited with a
+# status and wrote one, else the runner's detail). A finalize that ran or
+# was skipped harvests as before.
+# The hold is a record, $STATE/finalize-held/<tid>/<agent> (HELD_RUN,
+# TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING). While it stands, no wake of
+# that seat on that thread starts -- new mail, a follow-up, a retry, a
+# release: pm_spawn_wake refuses it (`refuse ... reason=finalize-held`) and
+# adds the message to PENDING -- with one exception, below. Operator mail
+# does not clear it; the operator's `unflag <tid>` does (the held run dir
+# is untouched), and the next pass logs `finalize thread=<t> agent=<a>
+# run=- outcome=dropped held=<rid>` and follows up the newest pending
+# message. A seat without `finalize:` gets no record.
+# EXIT 2 is the finalize script's way to say "the reviewed branch is fine,
+# the reply does not describe it; rewrite the reply and finalize again".
+# For that status alone the harvest starts ONE cover-only retry per held
+# wake (pm_cover_retry_spawn): a new run on the held trigger, through
+# pm_followup_wake's hops and budget gates, from the held head
+# (finalize.head_before) with the held wake's base (base_sha) and floor,
+# `--pipeline <first code step of the default row> --checkout <head>
+# --cover-only <base> --finalize-script <f> [--finalize-floor <floor>]`,
+# no session args, --wake-reply or --review-brief, and a handoff carrying
+# the held reply, the refusal and the range to describe. Its record says
+# RETRY_KIND=cover; mail that comes in meanwhile is pended on it, never
+# delivered live. The runner fails it before finalize if the leg moved HEAD
+# or dirtied the tree. Exit 0 with finalize ran RELEASES the hold: the
+# record goes, the reply posts as for any wake, `finalize thread=<t>
+# agent=<a> run=<retry rid> outcome=released held=<held rid>`, and pending
+# mail is followed up; the finalize-refused flag stays for the operator.
+# Any other outcome keeps the hold, posts nothing and retries nothing. No
+# retry when the default row has no code step or the held run left no usable
+# head/base (`cover-skip thread=<t> agent=<a> held=<rid> reason=<...>`).
 #
 # Which legs a preset's pipeline actually runs is mechanical, not decided
 # here or by the R9c triage classifier: fork-sandbox.sh's review and
@@ -1266,8 +1296,13 @@
 #                                   by anything (pm_ledger_delivered_live)
 #   fetch-wait/<thread-id>/<agent> a wake deferred on a fetch miss -- see
 #                                   FETCH MISS. A composed seat's record
-#                                   also carries SIZE and FLOOR, reused by
-#                                   the re-dispatch (see THE WAKE).
+#                                   also carries SIZE, FLOOR and CHECKOUT,
+#                                   reused by the re-dispatch (see THE WAKE).
+#   finalize-held/<thread-id>/<agent> a composed wake held on a refused
+#                                   finalize (HELD_RUN, TRIGGER, SINCE, EXIT,
+#                                   RETRY_RUN, PENDING); `unflag` renames it
+#                                   .dropped.<agent> -- see THE WAKE's
+#                                   composed seats.
 #   upstream-state/<thread-id>.env STATE=closed|open, MSGID (the message
 #                                   that set it), AT -- see UPSTREAM STATE.
 #                                   Absent means open
@@ -1607,6 +1642,10 @@ PM_SEAT_RECORD_DIRS=("$WAKE_DEFERRED" "$BUDGET_RESERVED")
 # One pending fetch-miss re-check per seat, $FETCH_WAIT/<thread-id>/<agent>
 # -- see FETCH MISS in the header. Under $STATE, so it survives a restart.
 FETCH_WAIT="$STATE/fetch-wait"
+# One held composed wake per seat, $FINALIZE_HELD/<thread-id>/<agent> (a
+# refused finalize; see "Composed seats" under THE WAKE). `unflag` renames a
+# record to .dropped.<agent>, which pm_finalize_held_pass then retires.
+FINALIZE_HELD="$STATE/finalize-held"
 # One route plan per message whose seats are not all handled yet,
 # $ROUTE_PENDING/<message-id>/ (thread, band, seats, inflight) -- see
 # ROUTE PLAN in the header. Written before the message's routed marker, so a
@@ -3644,6 +3683,32 @@ pm_is_operator() {
     return 1
 }
 
+# A cover-only retry's instructions (pm_cover_retry_spawn's PM_COVER_*): the
+# branch is final, the reply is to be rewritten, and here are the held reply
+# and finalize's refusal, verbatim (the refusal already sanitized).
+pm_cover_handoff_section() {
+    local mf
+    printf '## Cover-only retry: rewrite the reply, change nothing else\n\n'
+    printf 'Your previous wake for this message finished its pipeline, and the\n'
+    printf 'branch it left is reviewed and final. Its finalize step refused the\n'
+    printf 'reply instead: the reply does not describe the branch as it stands.\n'
+    printf 'This run starts from that reviewed branch. Change nothing in the\n'
+    printf 'clone -- no commits, no edits -- or the run fails and nothing is\n'
+    printf 'posted. Rewrite the reply so it describes the branch as it stands,\n'
+    printf '%s..%s (base..HEAD), as a new mail-*.md file in your outbox; then\n' \
+        "$PM_COVER_BASE" "$PM_COVER_HEAD"
+    printf 'finalize runs again.\n\n'
+    printf "Finalize's refusal: exit=%s %s\n\n" "$PM_COVER_EXIT" "$PM_COVER_REASON"
+    printf 'The held reply:\n\n'
+    for mf in "$PM_COVER_HELD_RUN_DIR/outbox"/mail-*.md; do
+        [[ -f "$mf" ]] || continue
+        printf '%s:\n\n~~~~~~~~\n' "$(basename -- "$mf")"
+        cat -- "$mf"
+        [[ -z "$(tail -c 1 -- "$mf")" ]] || printf '\n'
+        printf '~~~~~~~~\n\n'
+    done
+}
+
 # $9, when set, is the seat's protocol name: <prompts-dir>/protocol-<name>.md
 # (the directory pm_kit_path resolves) is printed byte for byte straight
 # after the persona body, before the blank line that follows it, so a
@@ -3756,6 +3821,8 @@ pm_write_handoff() {
                 printf 'mail-*.md file in your outbox (see "Replying" below for the format).\n'
                 printf 'This is the only retry: a second discarded reply is not retried.\n\n'
             fi
+        elif [[ "$is_retry" == cover ]]; then
+            pm_cover_handoff_section
         elif [[ "$is_retry" == 1 ]]; then
             printf '## This is a retry\n\n'
             printf 'Your previous wake for this same message did not finish cleanly (it\n'
@@ -4693,6 +4760,170 @@ pm_held_write() {
     mv -- "$tmp" "$STATE/held/$tid/$agent"
 }
 
+# ---- finalize holds (composed seats) ----
+#
+# A composed wake whose finalize refused is held: $FINALIZE_HELD/<tid>/<agent>
+# records it (HELD_RUN, TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING), full-file
+# mktemp+mv like pm_held_write. While it stands no wake of that seat on that
+# thread starts (pm_spawn_wake's hold check) but the one cover-only retry; a
+# message that would have woken it is added to PENDING instead, for the
+# follow-up once the hold clears. It is NOT a grant hold (held/): nothing in
+# pm_held_pass or `status`'s held: list reads it.
+
+# pm_finalize_hold_write <file> <held-run> <trigger> <since> <exit> <retry-run> <pending>
+pm_finalize_hold_write() {
+    local file="$1" tmp
+    mkdir -p -- "$(dirname -- "$file")"
+    tmp="$(mktemp "$(dirname -- "$file")/.tmp.XXXXXX")"
+    printf 'HELD_RUN=%s\nTRIGGER=%s\nSINCE=%s\nEXIT=%s\nRETRY_RUN=%s\nPENDING=%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" > "$tmp"
+    mv -- "$tmp" "$file"
+}
+
+# pm_finalize_hold_set <file> <key> <value>: one field rewritten, the rest kept.
+pm_finalize_hold_set() {
+    local file="$1" key="$2" value="$3" k
+    [[ -f "$file" ]] || return 0
+    local -A v=()
+    for k in HELD_RUN TRIGGER SINCE EXIT RETRY_RUN PENDING; do
+        v[$k]="$(fs_pm_env_get "$file" "$k")"
+    done
+    v[$key]="$value"
+    pm_finalize_hold_write "$file" "${v[HELD_RUN]}" "${v[TRIGGER]}" "${v[SINCE]}" \
+        "${v[EXIT]}" "${v[RETRY_RUN]}" "${v[PENDING]}"
+}
+
+# pm_finalize_hold_pend <file> <mid,...>: adds each id to the record's
+# PENDING once, never its TRIGGER (the held wake answered that one).
+pm_finalize_hold_pend() {
+    local file="$1" ids="$2" pending trigger m
+    [[ -f "$file" ]] || return 0
+    pending="$(fs_pm_env_get "$file" PENDING)"
+    trigger="$(fs_pm_env_get "$file" TRIGGER)"
+    local -a add
+    IFS=, read -ra add <<< "$ids"
+    for m in "${add[@]}"; do
+        [[ -n "$m" && "$m" != "$trigger" ]] || continue
+        case ",$pending," in *",$m,"*) continue ;; esac
+        pending+="${pending:+,}$m"
+    done
+    pm_finalize_hold_set "$file" PENDING "$pending"
+}
+
+# The cover-only retry's spec: the first code step of the seat's `default`
+# row (a `-`-separated segment starting with `c`), run once. Prints nothing
+# when that row has no code step.
+pm_cover_spec() {
+    local table="$1" spec seg
+    spec="$(pm_pipeline_spec "$table" default)" || return 0
+    local -a segs
+    IFS=- read -ra segs <<< "$spec"
+    for seg in "${segs[@]}"; do
+        if [[ "$seg" =~ ^c[a-z]+[0-9]*$ ]]; then
+            seg="${seg%"${seg##*[!0-9]}"}"
+            printf '%s1' "$seg"
+            return 0
+        fi
+    done
+}
+
+# The globals pm_spawn_wake and pm_write_handoff read for a cover-only retry
+# (is_retry=cover); set only by pm_cover_retry_spawn, around its one spawn.
+PM_COVER_SPEC="" PM_COVER_HEAD="" PM_COVER_BASE="" PM_COVER_HELD_RUN_DIR=""
+PM_COVER_EXIT="" PM_COVER_REASON="" PM_COVER_PENDING=""
+
+# A held wake whose finalize script exited 2 ("the reviewed branch is fine,
+# the reply does not describe it") gets ONE cover-only retry: a new run from
+# the held head (the reviewed, unsquashed commits) with the held wake's own
+# base and floor, one code leg that may change only the reply, then finalize
+# again. Spawned through pm_followup_wake, so hops and the thread budget gate
+# it as they gate any retry. Whatever happens, the record's RETRY_RUN is set
+# (the run, or `-`), so no later harvest spawns a second one; a wake that
+# cannot be retried stays held, with a `cover-skip` event saying why.
+pm_cover_retry_spawn() {
+    local project="$1" tid="$2" agent="$3" held_rid="$4" fexit="$5" freason="$6"
+    local hf="$FINALIZE_HELD/$tid/$agent" run_dir summary spec="" head base reason=""
+    run_dir="$(fs_pm_env_get "$RUNS/$held_rid.env" RUN_DIR)"
+    summary="$run_dir/summary.json"
+    spec="$(pm_cover_spec "$("$FLEET" resolve "$agent" 2>/dev/null | sed -n '21p')")"
+    head="$(jq -r '.finalize.head_before // empty' "$summary" 2>/dev/null || true)"
+    base="$(jq -r '.base_sha // empty' "$summary" 2>/dev/null || true)"
+    if [[ -z "$spec" ]]; then
+        reason=no-code-step
+    elif [[ ! "$head" =~ $PM_FINALIZE_FLOOR_RE ]] \
+        || ! git -C "$project" cat-file -e "$head^{commit}" 2>/dev/null; then
+        reason=no-head
+    elif [[ ! "$base" =~ $PM_FINALIZE_FLOOR_RE || "$base" == "$head" ]] \
+        || ! git -C "$project" cat-file -e "$base^{commit}" 2>/dev/null \
+        || ! git -C "$project" merge-base --is-ancestor "$base" "$head" 2>/dev/null; then
+        reason=no-base
+    fi
+    if [[ -n "$reason" ]]; then
+        pm_finalize_hold_set "$hf" RETRY_RUN -
+        pm_event "cover-skip thread=${tid:0:8} agent=$agent held=$held_rid reason=$reason"
+        return 0
+    fi
+    PM_COVER_SPEC="$spec" PM_COVER_HEAD="$head" PM_COVER_BASE="$base"
+    PM_COVER_HELD_RUN_DIR="$run_dir" PM_COVER_EXIT="$fexit" PM_COVER_REASON="$freason"
+    PM_COVER_PENDING="$(fs_pm_env_get "$hf" PENDING)"
+    pm_followup_wake "$project" "$agent" "$tid" "$(fs_pm_env_get "$hf" TRIGGER)" cover || true
+    PM_COVER_SPEC="" PM_COVER_HEAD="" PM_COVER_BASE="" PM_COVER_HELD_RUN_DIR=""
+    PM_COVER_EXIT="" PM_COVER_REASON="" PM_COVER_PENDING=""
+    local new_rid
+    new_rid="$(pm_seat_last_run "$tid" "$agent")"
+    if [[ -n "$new_rid" && "$new_rid" != "$held_rid" \
+          && "$(fs_pm_env_get "$RUNS/$new_rid.env" RETRY_KIND)" == cover ]]; then
+        pm_finalize_hold_set "$hf" RETRY_RUN "$new_rid"
+    else
+        pm_finalize_hold_set "$hf" RETRY_RUN -
+        pm_event "cover-skip thread=${tid:0:8} agent=$agent held=$held_rid reason=refused"
+    fi
+}
+
+# A cover-only retry that did not release its hold: the hold stays as it is
+# (its RETRY_RUN already set, so there is no second retry), and whatever
+# mail the run kept pending joins the hold's -- or the dropped marker's, when
+# `unflag` dropped the hold while the retry ran; no new hold is written then.
+pm_cover_keep_held() {
+    local tid="$1" agent="$2" f="$3" target
+    target="$FINALIZE_HELD/$tid/$agent"
+    [[ -f "$target" ]] || target="$FINALIZE_HELD/$tid/.dropped.$agent"
+    pm_finalize_hold_pend "$target" "$(fs_pm_env_get "$f" PENDING_MSGS)"
+}
+
+# Retires each hold `unflag` dropped (a .dropped.<agent> marker), once no
+# run of that seat is live: the marker and any record beside it go, a
+# `finalize ... outcome=dropped` event is logged, and the newest message
+# that arrived while it was held is followed up -- unless a newer wake of
+# the seat already ran, which carried it forward. The held run dir is
+# never touched. Runs right after pm_held_pass.
+pm_finalize_held_pass() {
+    local project="$1" tid_dir marker
+    [[ -d "$FINALIZE_HELD" ]] || return 0
+    for tid_dir in "$FINALIZE_HELD"/*/; do
+        [[ -d "$tid_dir" ]] || continue
+        local tid
+        tid="$(basename -- "$tid_dir")"
+        for marker in "$tid_dir".dropped.*; do
+            [[ -f "$marker" ]] || continue
+            local agent held retry pending last
+            agent="${marker##*/.dropped.}"
+            fs_pm_find_live_run "$agent" "$tid" >/dev/null && continue
+            held="$(fs_pm_env_get "$marker" HELD_RUN)"
+            retry="$(fs_pm_env_get "$marker" RETRY_RUN)"
+            pending="$(fs_pm_env_get "$marker" PENDING)"
+            rm -f -- "$marker" "$tid_dir$agent"
+            rmdir -- "$tid_dir" 2>/dev/null || true
+            pm_event "finalize thread=${tid:0:8} agent=$agent run=- outcome=dropped held=${held:--}"
+            [[ -n "$pending" ]] || continue
+            last="$(pm_seat_last_run "$tid" "$agent")"
+            if [[ "$last" == "$held" || ( -n "$retry" && "$retry" != - && "$last" == "$retry" ) ]]; then
+                pm_followup_wake "$project" "$agent" "$tid" "${pending##*,}" || true
+            fi
+        done
+    done
+}
+
 # Replaces seat $3's line in per-thread record $1/$2 with `<agent> <mid>`,
 # followed by any further arguments as more fields (full-file tmp+mv: a
 # reader never sees a partial write).
@@ -4932,6 +5163,13 @@ pm_wake_gate() {
 # is the code leg's, and later legs may change the branch under it.
 pm_composed_args() {
     local -n ca_args="$1"
+    if [[ -n "$PM_COVER_SPEC" ]]; then
+        # A cover-only retry: no review leg to tell anything, no reply
+        # instructions beyond the cover rule (fork-sandbox.sh --cover-only).
+        ca_args+=(--cover-only "$PM_COVER_BASE" --finalize-script "$finalize")
+        [[ -z "$pm_wake_floor" ]] || ca_args+=(--finalize-floor "$pm_wake_floor")
+        return 0
+    fi
     ca_args+=(--wake-reply)
     [[ -z "$review_brief" ]] || ca_args+=(--review-brief "$review_brief")
     if [[ -n "$finalize" ]]; then
@@ -4975,6 +5213,15 @@ pm_spawn_wake() {
     # resolved, gated or written (see UPSTREAM STATE in the header).
     if pm_upstream_closed "$tid"; then
         pm_upstream_refuse "$tid" "$agent"
+        return 0
+    fi
+    # A seat whose composed wake is held on a refused finalize does not wake
+    # on this thread (new mail, a follow-up, a retry, a release) until the
+    # hold clears; the message waits in the hold's PENDING. Only the hold's
+    # own cover-only retry passes.
+    if [[ "$is_retry" != cover && -f "$FINALIZE_HELD/$tid/$agent" ]]; then
+        pm_finalize_hold_pend "$FINALIZE_HELD/$tid/$agent" "$mid"
+        pm_event "refuse thread=${tid:0:8} agent=$agent reason=finalize-held"
         return 0
     fi
     local harness model thinking network persona_path description wake_on_cc \
@@ -5101,6 +5348,11 @@ pm_spawn_wake() {
         fi
         pm_wake_size="$(pm_pipeline_choose "$pipelines" "$size_token")"
         pipeline_spec="$(pm_pipeline_spec "$pipelines" "$pm_wake_size")"
+        if [[ "$is_retry" == cover ]]; then
+            # The held wake's reviewed head, rerun with one code leg.
+            # (pm_cover_retry_spawn checked it is a commit in the project).
+            pipeline_spec="$PM_COVER_SPEC" pm_wake_checkout="$PM_COVER_HEAD" checkout_shown=""
+        fi
         if [[ -n "$finalize" && "$floor_token" =~ $PM_FINALIZE_FLOOR_RE ]]; then
             pm_wake_floor="$floor_token"
         fi
@@ -5123,7 +5375,16 @@ pm_spawn_wake() {
     # its in-run review legs read $base...HEAD, and the base must be the
     # commit the other reviewers already saw. Lineage is its fallback only
     # when no target is recorded.
-    if [[ "$review_target" == follow ]] \
+    if [[ "$is_retry" == cover ]]; then
+        # A cover-only retry starts from the held head, which nothing below
+        # gates: the target is only read, for the run record.
+        local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env"
+        if [[ "$review_target" == follow || "$review_target" == sets ]] && [[ -f "$rt_file" ]]; then
+            rt_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
+            rt_sha="$(fs_pm_env_get "$rt_file" SHA)"
+            rt_version="$(fs_pm_env_get "$rt_file" VERSION)"
+        fi
+    elif [[ "$review_target" == follow ]] \
         || { [[ "$review_target" == sets ]] && [[ -n "$pipelines" ]]; } \
         || { [[ "$review_target" == sets ]] \
              && ! pm_lineage_checkout "$project" "$tid" "$agent" >/dev/null; }; then
@@ -5156,7 +5417,7 @@ pm_spawn_wake() {
     # passed on as --extra-ref in the k8s branch below, on EVERY wake of
     # this seat while the file exists -- there is no "answered" state.
     local uh_sha=""
-    if [[ "$review_target" == sets ]]; then
+    if [[ "$review_target" == sets && "$is_retry" != cover ]]; then
         local uh_file="$MAIL_ROOT/.postmaster/upstream-head/$tid.env"
         if [[ -f "$uh_file" ]]; then
             if [[ "$backend" == k8s ]]; then
@@ -5186,7 +5447,7 @@ pm_spawn_wake() {
     # holds the same, but quietly (QUIET=1, no flag) until the grant-pending
     # timeout runs out; pm_held_pass raises the flag then. A hold that was
     # quiet flags on its first non-quiet check whatever its trigger.
-    if [[ "$backend" == k8s && "$grant" == required ]]; then
+    if [[ "$backend" == k8s && "$grant" == required && "$is_retry" != cover ]]; then
         local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env"
         if [[ ! -e "$grant_file" ]] && ! pm_thread_no_grant "$tid"; then
             local held_file="$STATE/held/$tid/$agent" old_trigger="" old_quiet since retry_flag=0 quiet=0
@@ -5229,8 +5490,14 @@ pm_spawn_wake() {
     if [[ -n "$is_retry" ]]; then
         retry_kind=failed
         [[ "$is_retry" == malformed ]] && retry_kind=malformed
+        [[ "$is_retry" == cover ]] && retry_kind=cover
         retry_of="$(pm_seat_last_run "$tid" "$agent")"
     fi
+    # A cover-only retry answers nothing new: its PENDING_MSGS start as the
+    # hold's, and it lists no snapshot ids, so none of them is dropped as
+    # "shown" at its harvest (see pm_pending_unshown).
+    local pending_init=""
+    [[ "$is_retry" != cover ]] || pending_init="$PM_COVER_PENDING"
     local trigger_only=""
     local snap_dir="$MAIL_ROOT/.postmaster/wake-threads/$run_id"
     # The snapshot's message ids are listed BEFORE it is rendered: messages
@@ -5248,8 +5515,12 @@ pm_spawn_wake() {
         chmod 644 -- "$snap_dir/thread.txt.part" 2>/dev/null
         if mv -- "$snap_dir/thread.txt.part" "$snap_dir/thread.txt" 2>/dev/null; then
             trigger_only=1
-            mv -- "$snap_dir.message-ids.part" "$snap_dir.message-ids" 2>/dev/null \
-                || rm -f -- "$snap_dir.message-ids.part"
+            if [[ "$is_retry" == cover ]]; then
+                rm -f -- "$snap_dir.message-ids.part"
+            else
+                mv -- "$snap_dir.message-ids.part" "$snap_dir.message-ids" 2>/dev/null \
+                    || rm -f -- "$snap_dir.message-ids.part"
+            fi
         else
             rm -f -- "$snap_dir/thread.txt.part" "$snap_dir.message-ids.part"
             pm_seat_flag "$tid" "$agent" "wake thread snapshot failed for $agent: $mid (move)"
@@ -5323,7 +5594,8 @@ pm_spawn_wake() {
             spawn_args=(--branch "$branch" --pipeline "$pipeline_spec" --network "$network")
             pm_composed_args spawn_args
             session_harness=""
-            if [[ "$pipeline_step1_action" == code && "$pipeline_step1_harness" == claude ]]; then
+            if [[ "$pipeline_step1_action" == code && "$pipeline_step1_harness" == claude \
+                  && "$is_retry" != cover ]]; then
                 session_harness=claude
                 [[ -z "$refresh_at" ]] || spawn_args+=(--refresh-at "$refresh_at")
             fi
@@ -5511,7 +5783,7 @@ pm_spawn_wake() {
             printf 'NETWORK=%s\n' "$network"
             printf 'BRANCH=%s\n' "$branch"
             printf 'RESUMED=%s\n' "$resumed"
-            printf 'PENDING_MSGS=\n'
+            printf 'PENDING_MSGS=%s\n' "$pending_init"
             printf 'VIA=%s\n' "$via"
             printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             printf 'BACKEND=k8s\n'
@@ -5544,7 +5816,8 @@ pm_spawn_wake() {
         spawn_args=(--branch "$branch" --pipeline "$pipeline_spec" --network "$network")
         pm_composed_args spawn_args
         session_harness=""
-        if [[ "$pipeline_step1_action" == code && "$pipeline_step1_harness" == claude ]]; then
+        if [[ "$pipeline_step1_action" == code && "$pipeline_step1_harness" == claude \
+              && "$is_retry" != cover ]]; then
             session_harness=claude
             [[ -z "$refresh_at" ]] || spawn_args+=(--refresh-at "$refresh_at")
         fi
@@ -5663,7 +5936,7 @@ pm_spawn_wake() {
         printf 'NETWORK=%s\n' "$network"
         printf 'BRANCH=%s\n' "$branch"
         printf 'RESUMED=%s\n' "$resumed"
-        printf 'PENDING_MSGS=\n'
+        printf 'PENDING_MSGS=%s\n' "$pending_init"
         printf 'VIA=%s\n' "$via"
         printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'BACKEND=local\n'
@@ -5711,7 +5984,12 @@ pm_wake_or_pend() {
         # this process can write a banner file for) -- skip live delivery
         # for it exactly as for any other non-claude harness above.
         backend="$(fs_pm_env_get "$RUNS/$run_id.env" BACKEND)"
-        if [[ "$backend" != k8s && ( -z "$harness" || "$harness" == claude ) ]]; then
+        # A cover-only retry only rewrites its held reply: mail that comes
+        # in meanwhile is for the follow-up once the hold clears, so it is
+        # never delivered live (a live-delivered message would be ledgered
+        # as answered at harvest instead of followed up).
+        if [[ "$backend" != k8s && ( -z "$harness" || "$harness" == claude ) \
+              && "$(fs_pm_env_get "$RUNS/$run_id.env" RETRY_KIND)" != cover ]]; then
             pm_deliver_live "$run_id" "$tid" "$mid"
         fi
     else
@@ -7077,7 +7355,15 @@ pm_harvest_run() {
     # posted, no retry (a retry would restart from the review target and
     # throw the reviewed commits away), no follow-up wake. What happens to
     # it next is the operator's call.
-    local finalize_refused=0
+    local finalize_refused=0 finalize_exit="" finalize_reason=""
+    # A cover-only retry of a held wake (RETRY_KIND=cover): released only
+    # when it exited 0 and its finalize ran; anything else leaves the hold
+    # standing (cover_held), with nothing posted, retried or followed up.
+    local is_cover=0 cover_held=0 cover_held_rid=""
+    if [[ "$(fs_pm_env_get "$f" RETRY_KIND)" == cover ]]; then
+        is_cover=1
+        cover_held_rid="$(fs_pm_env_get "$f" RETRY_OF)"
+    fi
     if [[ ! -d "$run_dir" ]]; then
         # Vanished (scratch root cleaned up, or never existed) rather than
         # merely still running -- this is the one crash shape distinct
@@ -7092,6 +7378,7 @@ pm_harvest_run() {
         # standing rather than cleared on evidence this branch never had.
         pm_harvest_record "$f" 0 0 0
         pm_mark_harvested "$rid"
+        (( ! is_cover )) || pm_cover_keep_held "$tid" "$agent" "$f"
         pm_regate_deferred "$project" "$tid" "$rid"
         return 0
     fi
@@ -7153,10 +7440,16 @@ pm_harvest_run() {
         local finalize_ended=""
         finalize_ended="$(jq -r '.finalize.ended // empty' "$run_dir/summary.json" 2>/dev/null || true)"
         if [[ "$finalize_ended" == failed ]]; then
-            local finalize_exit finalize_reason
             finalize_exit="$(jq -r '.finalize.exit // "-"' "$run_dir/summary.json" 2>/dev/null || true)"
             [[ "$finalize_exit" =~ ^-?[0-9]+$ ]] || finalize_exit=-
-            finalize_reason="$(jq -r '.finalize.detail // "unknown"' "$run_dir/summary.json" 2>/dev/null \
+            # The script's own first stderr line is its reason when it exited
+            # with a status and said something; a runner refusal (exit -)
+            # keeps the runner's detail.
+            if [[ "$finalize_exit" != - ]]; then
+                finalize_reason="$(jq -r '.finalize.stderr_line // empty' "$run_dir/summary.json" 2>/dev/null \
+                    | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | head -c 500)"
+            fi
+            [[ -n "$finalize_reason" ]] || finalize_reason="$(jq -r '.finalize.detail // "unknown"' "$run_dir/summary.json" 2>/dev/null \
                 | LC_ALL=C tr -d '\000-\037\177' | head -c 200)"
             pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=refused exit=$finalize_exit reason=${finalize_reason:-unknown}"
             pm_flag_unless_closed "$tid" "finalize refused for $agent (run $rid): exit=$finalize_exit ${finalize_reason:-unknown}"
@@ -7257,6 +7550,22 @@ pm_harvest_run() {
         fi
     fi
 
+    if (( is_cover )); then
+        if [[ -f "$run_dir/summary.json" && "$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")" == 0 \
+              && "$(jq -r '.finalize.ended // empty' "$run_dir/summary.json" 2>/dev/null)" == ran ]]; then
+            # Released: the hold goes before anything below can follow up
+            # what it kept pending, and the reply posts as for any wake.
+            local cover_hf="$FINALIZE_HELD/$tid/$agent"
+            if [[ -f "$cover_hf" && "$(fs_pm_env_get "$cover_hf" HELD_RUN)" == "$cover_held_rid" ]]; then
+                rm -f -- "$cover_hf"
+                rmdir -- "$FINALIZE_HELD/$tid" 2>/dev/null || true
+            fi
+            pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=released held=${cover_held_rid:--}"
+        else
+            cover_held=1
+        fi
+    fi
+
     # $model above is the model the postmaster ASKED fork-sandbox.sh for
     # (from fleet resolve), which is empty exactly for a sealed pi seat
     # with no model: in fleet.yaml -- the one case where the model is
@@ -7285,7 +7594,8 @@ pm_harvest_run() {
         [[ -e "$mf" ]] || continue
         reply_files=$(( reply_files + 1 ))
         # A held (finalize-refused) wake posts nothing; its outbox stays.
-        (( ! finalize_refused )) || continue
+        # Neither does a cover-only retry that did not release its hold.
+        (( ! finalize_refused && ! cover_held )) || continue
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network" \
                 "$project" "$review_target" "$branch" \
                 "$review_target_branch" "$review_target_sha" "$review_target_version"; then
@@ -7342,7 +7652,28 @@ pm_harvest_run() {
     local pending
     pm_pending_unshown "$rid" "$agent" "$(fs_pm_env_get "$f" PENDING_MSGS)" "$tid"
     pending="$PM_PENDING_UNSHOWN"
-    if [[ -n "$pending" ]]; then
+    if (( cover_held )); then
+        # The hold stands; what came in meanwhile waits on it.
+        pm_cover_keep_held "$tid" "$agent" "$f"
+    elif (( finalize_refused )) && [[ -z "$(fs_pm_env_get "$f" PIPELINE_SPEC)" \
+            || -z "$("$FLEET" resolve "$agent" 2>/dev/null | sed -n '23p')" ]]; then
+        # A refusal recorded for a run of a seat without `finalize:` holds
+        # as it always did: nothing posted, nothing woken, no hold record.
+        :
+    elif (( finalize_refused )); then
+        # A held wake: nothing moves the seat on until the hold clears --
+        # the operator's `unflag`, or the one cover-only retry a script's
+        # exit 2 asks for (see "Composed seats" in the header).
+        local hold_file="$FINALIZE_HELD/$tid/$agent"
+        pm_finalize_hold_write "$hold_file" "$rid" "$trigger" "$(date +%s)" "$finalize_exit" "" ""
+        pm_finalize_hold_pend "$hold_file" "$pending"
+        pm_retry_clear_schedule "$tid" "$agent"
+        if [[ "$finalize_exit" == 2 ]]; then
+            pm_cover_retry_spawn "$project" "$tid" "$agent" "$rid" "$finalize_exit" "${finalize_reason:-unknown}"
+        else
+            pm_finalize_hold_set "$hold_file" RETRY_RUN -
+        fi
+    elif [[ -n "$pending" ]]; then
         # This follow-up wake already re-wakes the seat on the newest
         # pending message, so it supersedes any deferred retry of the
         # (older) trigger this run itself answered (whether or not that
@@ -7359,11 +7690,7 @@ pm_harvest_run() {
         # finish acting on it, so the newest message still needs an
         # actual wake exactly like the non-live case, not a ledger entry
         # standing in for one that never happened.
-        if (( finalize_refused )); then
-            # A held wake: nothing moves the seat on until the operator
-            # does (see finalize_refused above).
-            :
-        elif (( k8s_still_running )); then
+        if (( k8s_still_running )); then
             # Do not wake here: the Job this harvest just flagged may
             # still be running, and fs_pm_find_live_run no longer sees
             # this pair as busy the moment this harvest marks $rid
@@ -7386,7 +7713,7 @@ pm_harvest_run() {
         if [[ "$backend" == k8s && "$(fs_pm_env_get "$RETRIES/$tid/$agent" STATE)" != exhausted ]]; then
             pm_k8s_streak_exhausted "$tid" "$agent" "$trigger" || true
         fi
-    elif (( clean_exit && replies == 0 )) \
+    elif (( clean_exit && replies == 0 && ! is_cover )) \
         && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == retry \
               && "$(cat -- "$DISCARDS/$tid/$agent.spent" 2>/dev/null || true)" != "$trigger" ]] \
         && { (( reply_files > 0 )) \
@@ -8324,6 +8651,7 @@ cmd_deliver() {
         pm_hook_reap
         pm_route_pass "$project"
         pm_held_pass "$project"
+        pm_finalize_held_pass "$project"
         pm_fetch_wait_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
@@ -8351,6 +8679,7 @@ cmd_deliver() {
         pm_hook_reap
         pm_route_pass "$project"
         (( stop )) || pm_held_pass "$project"
+        (( stop )) || pm_finalize_held_pass "$project"
         (( stop )) || pm_fetch_wait_pass "$project"
         (( stop )) || pm_retry_pass "$project"
         (( stop )) || pm_harvest_pass "$project"
@@ -8841,6 +9170,15 @@ cmd_unflag() {
     mkdir -p -- "$STATE"
     pm_unflag "$tid"
     pm_seat_notes_clear "$tid"
+    # The operator's unflag also drops the thread's finalize holds. This
+    # verb runs without the store lock, so it only renames each record; the
+    # next deliver pass retires it (pm_finalize_held_pass). Operator MAIL
+    # does not: it is new mail, which a held seat does not wake on.
+    local hf
+    for hf in "$FINALIZE_HELD/$tid"/*; do
+        [[ -f "$hf" ]] || continue
+        mv -f -- "$hf" "$FINALIZE_HELD/$tid/.dropped.$(basename -- "$hf")"
+    done
 }
 
 # Sourced (the test suite calls pm_hook_fire/pm_hook_reap directly): define

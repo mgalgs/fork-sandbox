@@ -8,7 +8,8 @@
 # with an exec-ing fake sandbox backend so the finalize script really runs
 # against the clone: a successful autosquash, a tree change, a re-rooted
 # head, a failing and a hanging script, the skip on no commits, the
-# script's environment, and the floor rules.
+# script's environment, and the floor rules. Section C: --cover-only's
+# refusals, its base and the guard that fails a leg that changes the branch.
 #
 # Usage: tests/fork-sandbox-finalize-test.sh
 
@@ -97,6 +98,8 @@ STUB
 #   fixup-of      a content change committed as "fixup! $FAKE_FIXUP_OF".
 #   reply         commit-file, plus mail-1.md in the run's outbox.
 #   approved      writes the verdict the prompt named.
+#   reply-only    mail-1.md in the run's outbox, nothing in the clone.
+#   untracked     a new file in the clone, not committed.
 #   anything else a plain success.
 cat > "$real_stub/claude-sandboxed" <<'STUB'
 #!/usr/bin/env bash
@@ -136,6 +139,13 @@ fixup-of)
     ;;
 approved)
     printf 'APPROVED\n\nChecked: everything.\n' > "$clone_dir/.git/$verdict_name"
+    ;;
+reply-only)
+    out="$(dirname "$(dirname "$clone_dir")")/outbox"
+    mkdir -p "$out" && printf 'Subject: re\n\nrewritten cover\n' > "$out/mail-1.md"
+    ;;
+untracked)
+    printf 'stray\n' > "$clone_dir/stray.txt"
     ;;
 esac
 printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
@@ -216,6 +226,16 @@ sleep 30
 EOF
 cat > "$scripts_dir/mark.sh" <<'EOF'
 : > "$FIN_MARK"
+EOF
+# The script's own refusal: its first stderr line is the reason.
+cat > "$scripts_dir/stderr-refuse.sh" <<'EOF'
+printf 'first\a line\nsecond line\n' >&2
+exit 1
+EOF
+cat > "$scripts_dir/stderr-long.sh" <<'EOF'
+head -c 600 /dev/zero | tr '\0' x >&2
+printf '\n' >&2
+exit 2
 EOF
 # Rewrites the floor commit itself (amends its message), then replays
 # everything after it: same tree, but history below the floor changed.
@@ -540,6 +560,102 @@ check "checkout floor: a floor off the checkout's line is floor-not-ancestor" \
     "1|failed|floor-not-ancestor|null" \
     "$rc|$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)|\(.finalize.exit)"')"
 check "checkout floor: the script never ran" "no" "$([[ -e "$FIN_MARK" ]] && echo yes || echo no)"
+
+# The script's first stderr line is recorded, sanitized, as stderr_line;
+# finalize.log keeps everything.
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
+    --pipeline csonnet-ropus --finalize-script "$scripts_dir/stderr-refuse.sh" --branch "$br")
+check "stderr: the first line, control characters removed" "1|the script exited 1|1|first line" \
+    "$rc|$(fin_json "$rd" '"\(.finalize.detail)|\(.finalize.exit)|\(.finalize.stderr_line)"')"
+contains "stderr: finalize.log still holds every line" "$(cat "$rd/finalize.log" 2>/dev/null)" "second line"
+check "stderr: the capture file is not left behind" "no" \
+    "$([[ -e "$rd/finalize-stderr.log" ]] && echo yes || echo no)"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
+    --pipeline csonnet-ropus --finalize-script "$scripts_dir/stderr-long.sh" --branch "$br")
+check "stderr: a long line is capped at 500 bytes" "500" \
+    "$(fin_json "$rd" '.finalize.stderr_line | length')"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
+    --pipeline csonnet-ropus --finalize-script "$scripts_dir/exit2.sh" --branch "$br")
+check "stderr: a script that wrote nothing records null" "null" "$(fin_json "$rd" '.finalize.stderr_line')"
+check "stderr: a run with no finalize script run records null" "null" \
+    "$(fin_json "$rd_np" '.finalize.stderr_line')"
+
+#############################################################################
+printf '\n== C: --cover-only ==\n'
+
+# A held wake: its base, a reviewed commit above it on a branch, the floor.
+cover_base="$(git -C "$proj" rev-parse HEAD)"
+cover_floor="$(git -C "$proj" rev-parse HEAD~1)"
+printf 'held\n' > "$proj/held.txt"
+git -C "$proj" checkout -q -b fs-fin-held
+git -C "$proj" add held.txt && git -C "$proj" commit -q -m "held work"
+cover_head="$(git -C "$proj" rev-parse HEAD)"
+git -C "$proj" checkout -q -
+cover_args=(--pipeline csonnet --checkout "$cover_head" --cover-only "$cover_base"
+    --finalize-script "$scripts_dir/autosquash.sh" --finalize-floor "$cover_floor")
+
+refuses "--cover-only takes a full sha" "--cover-only takes a full lowercase commit sha" \
+    --pipeline csonnet --checkout "$cover_head" --cover-only abc --finalize-script "$s"
+refuses "--cover-only needs --checkout" "--cover-only needs --checkout" \
+    --pipeline csonnet --cover-only "$cover_base" --finalize-script "$s"
+refuses "--cover-only needs --finalize-script" "--cover-only needs --checkout" \
+    --pipeline csonnet --checkout "$cover_head" --cover-only "$cover_base"
+refuses "--cover-only refuses a pipeline with a review step" "exactly one code step" \
+    --pipeline csonnet-ropus --checkout "$cover_head" --cover-only "$cover_base" --finalize-script "$s"
+refuses "--cover-only refuses --wake-reply" "exactly one code step" \
+    "${cover_args[@]}" --wake-reply
+next_branch
+cover_refusal="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-exec timeout 120 "$launcher" --foreground --pipeline csonnet \
+    --checkout "$cover_head" --cover-only "$orphan" --finalize-script "$s" --branch "$br" \
+    "$proj" "$handoff" 2>&1)" && cover_refusal_rc=0 || cover_refusal_rc=$?
+check "--cover-only refuses a base the checkout does not descend from" "1" "$cover_refusal_rc"
+contains "... and says why" "$cover_refusal" "that the checkout ($cover_head) descends from"
+
+# A leg that only rewrites the reply: finalize runs with the held wake's
+# base and floor, on the reviewed head.
+rm -f "$FIN_MARK"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run reply-only "${cover_args[@]}" --branch "$br")
+check "cover: a reply-only leg passes and finalize runs" "0|ran" "$rc|$(fin_json "$rd" '.finalize.ended')"
+check "cover: FS_FINALIZE_BASE is the held wake's base" "$cover_base" "$(sed -n 1p "$FIN_MARK" 2>/dev/null)"
+check "cover: FS_FINALIZE_FLOOR is the held wake's floor" "$cover_floor" "$(sed -n 2p "$FIN_MARK" 2>/dev/null)"
+check "cover: FS_FINALIZE_REPLY is the rewritten reply" "$rd/outbox/mail-1.md" "$(sed -n 3p "$FIN_MARK" 2>/dev/null)"
+check "cover: the branch is the reviewed head" "$cover_head" "$(git -C "$proj" rev-parse "$br" 2>/dev/null)"
+check "cover: summary's base_sha is the held wake's base" "$cover_base" "$(fin_json "$rd" '.base_sha')"
+check "cover: run.sh records the start point" "cover_only_start=$cover_head" \
+    "$(grep -E '^cover_only_start=' "$rd/run.sh" 2>/dev/null)"
+contains "cover: the leg is told to change nothing but the reply" "$(cat "$rd/handoff.md" 2>/dev/null)" \
+    "This run is a cover-only retry: the branch is reviewed and final."
+lacks "cover: ... and is not told to commit" "$(cat "$rd/handoff.md" 2>/dev/null)" \
+    "commit before you end your turn"
+lacks "cover: ... nor the fixup sentence" "$(cat "$rd/handoff.md" 2>/dev/null)" \
+    "A finalize step runs after the last leg."
+check "a run without --cover-only records an empty start" "cover_only_start=''" \
+    "$(grep -E '^cover_only_start=' "$rd_np/run.sh" 2>/dev/null)"
+
+# The guard: a leg that commits, or leaves anything in the tree, fails the
+# run and finalize never runs.
+rm -f "$FIN_MARK"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run commit-file "${cover_args[@]}" --branch "$br")
+check "cover guard: a leg that commits fails the run, finalize skipped" \
+    "1|skipped|cover-only: the leg moved HEAD" \
+    "$rc|$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)"')"
+check "cover guard: ... and the finalize script never ran" "no" \
+    "$([[ -e "$FIN_MARK" ]] && echo yes || echo no)"
+check "cover guard: ... exit-code is 1" "1" "$(cat "$rd/exit-code" 2>/dev/null)"
+rm -f "$FIN_MARK"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run untracked "${cover_args[@]}" --branch "$br")
+check "cover guard: a leg that leaves a file fails the run, finalize skipped" \
+    "1|skipped|cover-only: the leg left changes in the tree" \
+    "$rc|$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)"')"
+check "cover guard: ... and the finalize script never ran" "no" \
+    "$([[ -e "$FIN_MARK" ]] && echo yes || echo no)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -23539,6 +23539,10 @@ oversized-verdict)
 approved)
     printf 'APPROVED\n\nChecked: everything.\n' > "$clone_dir/.git/$verdict_name"
     ;;
+reply-only)
+    # A reply in $FAKE_OUTBOX, nothing in the clone.
+    mkdir -p "$FAKE_OUTBOX" && printf 'Subject: re\n\nrewritten cover\n' > "$FAKE_OUTBOX/mail-1.md"
+    ;;
 fail)
     printf 'stub: scripted failure on call %s\n' "$n" >&2
     exit 1
@@ -24669,6 +24673,96 @@ check "relayed finalize: the reset ran in the clone, so the branch is the review
     "$lfin_reviewed" "$(git -C "$lfin_clone" rev-parse "refs/heads/$lfin_branch" 2>/dev/null)"
 check "relayed finalize: the reset left the clone's work tree clean" \
     "" "$(git -C "$lfin_clone" status --porcelain 2>/dev/null)"
+
+printf '\n== composed pipeline on --k8s: a cover-only retry, relayed ==\n'
+# The relayed finalize harness above, on a --cover-only dispatch: one code
+# leg from a reviewed head, the held wake's base. A leg that commits fails
+# the run before finalize; one that only rewrites the reply runs finalize
+# with the original base, and the script's first stderr line is recorded.
+kcov_head="$(git -C "$walk_proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit-tree -p "$walk_base_sha" -m 'reviewed work' "$(git -C "$walk_proj" rev-parse "$walk_base_sha^{tree}")")"
+git -C "$walk_proj" update-ref refs/heads/fs-k8s-test-kcov-held "$kcov_head"
+kcov_mark="$(newdir)/kcov-mark"; tmpdirs+=("$(dirname "$kcov_mark")")
+kcov_script="$(newdir)/finalize.sh"; tmpdirs+=("$(dirname "$kcov_script")")
+cat > "$kcov_script" <<EOF
+printf '%s\n' "\$FS_FINALIZE_BASE" > "$kcov_mark"
+printf 'reply\a must name %s\nmore\n' "\$FS_FINALIZE_BASE" >&2
+exit 2
+EOF
+# kcov_run <label> <actions>: dispatches and drives one cover-only run;
+# leaves its run dir in KCOV_RUN_DIR.
+kcov_run() {
+    local label="$1" actions="$2" pod_work branch clone count argv script_file
+    pod_work="$(newdir)"; tmpdirs+=("$pod_work")
+    branch="fs-k8s-test-kcov-$label-$$"
+    clone="$pod_work/clone"
+    WALK_STAGE_OUT="$(newdir)/stage-out-kcov.txt"; tmpdirs+=("$(dirname "$WALK_STAGE_OUT")")
+    HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+        FORK_SANDBOX_K8S_WORK_DIR="$pod_work" \
+        "$walk_scripts/fork-sandbox.sh" --pipeline csonnet --k8s --branch "$branch" \
+        --checkout "$kcov_head" --cover-only "$walk_base_sha" --finalize-script "$kcov_script" \
+        "$walk_proj" "$walk_handoff" > "$WALK_STAGE_OUT" 2>&1
+    KCOV_RUN_DIR="$(grep -o -- '--run-dir [^ ]*' "$WALK_STAGE_OUT" | head -1 | awk '{print $2}')"
+    [[ -n "$KCOV_RUN_DIR" ]] || { no "kcov $label: the dispatch stages" "$(cat "$WALK_STAGE_OUT")"; return 0; }
+    tmpdirs+=("$KCOV_RUN_DIR")
+    mkdir -p "$pod_work/outbox" "$pod_work/inbox"
+    git clone -q "$walk_proj" "$clone"
+    git -C "$clone" checkout -q -b "$branch" "$kcov_head"
+    count="$(mktemp)"; tmpdirs+=("$count")
+    argv="$(mktemp)"; tmpdirs+=("$argv")
+    script_file="$(mktemp)"; tmpdirs+=("$script_file")
+    printf '%s\n' "$actions" > "$script_file"
+    local pod_home leg_home handoff_dir leg_tmp leg_cwd loop_pid deadline
+    pod_home="$(newdir)"; leg_home="$(newdir)"; handoff_dir="$(newdir)"
+    leg_tmp="$(newdir)"; leg_cwd="$(newdir)"
+    tmpdirs+=("$pod_home" "$leg_home" "$handoff_dir" "$leg_tmp" "$leg_cwd")
+    rm -f "$kcov_mark"
+    (
+        cd "$leg_cwd" || exit 1
+        exec env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
+            RUN_DIR="$KCOV_RUN_DIR" FORK_SANDBOX_LEG_HANDOFF_DIR="$handoff_dir" \
+            HOME="$leg_home" PATH="$walk_stub_bin:$PATH" \
+            TMPDIR="$leg_tmp" FORK_SANDBOX_LEG_LOOP_YAMA_PATH="$leg_loop_yama_safe_file" \
+            FORK_SANDBOX_CLONE_DIR="$clone" FAKE_OUTBOX="$pod_work/outbox" \
+            CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+            FAKE_COUNT_FILE="$count" FAKE_ARGV_LOG="$argv" FAKE_SCRIPT="$script_file" \
+            FORK_SANDBOX_LEG_LOOP_SWEEP_TARGET_FILE="$lsplit_sweep_target_file" \
+            bash "$leg_loop_sh"
+    ) > "$pod_work/leg-loop.log" 2>&1 &
+    loop_pid=$!
+    KCOV_ARM_OUT="$(PATH="$walk_stub_bin:$PATH" HOME="$pod_home" \
+        RUN_DIR="$KCOV_RUN_DIR" HARNESS=claude MODEL=sonnet MODEL_DISCOVERY="" ALLOW_UNLISTED_MODEL="" \
+        PROXY_BASE_URL="http://fs-k8s-test-walk-proxy.invalid" \
+        CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-walk-claude-proxy.invalid" \
+        mounts_dir="$walk_mounts" work_dir="$pod_work" clone_dir="$clone" \
+        inbox_dir="$pod_work/inbox" \
+        FORK_SANDBOX_K8S_PI_MODEL_MAP="$pod_work/pi-model-map.json" \
+        SESSION_HARNESS_STORE=0 RESUME_SESSION="" \
+        FORK_SANDBOX_LEG_HANDOFF_DIR="$handoff_dir" FS_LEG_RETRY_DELAYS="0 0" \
+        bash "$rd_block_file" 2>&1)"
+    touch "$KCOV_RUN_DIR/.leg-shutdown"
+    deadline=$(( $(date +%s) + 10 ))
+    while kill -0 "$loop_pid" 2>/dev/null; do
+        if (( $(date +%s) >= deadline )); then kill -KILL "$loop_pid" 2>/dev/null; break; fi
+        sleep 0.1
+    done
+}
+kcov_run commit commit
+check "relayed cover: a leg that commits skips finalize as a guard failure" \
+    "skipped|cover-only: the leg moved HEAD" \
+    "$(jq -r '"\(.finalize.ended)|\(.finalize.detail)"' "$KCOV_RUN_DIR/summary.json" 2>/dev/null)"
+check "relayed cover: ... the script never ran" "no" "$([[ -e "$kcov_mark" ]] && echo yes || echo no)"
+check "relayed cover: ... and the run failed" "1" \
+    "$(jq -r '.exit_code' "$KCOV_RUN_DIR/summary.json" 2>/dev/null)"
+kcov_run reply reply-only
+check "relayed cover: a reply-only leg runs finalize, which refuses with exit 2" "failed|2" \
+    "$(jq -r '"\(.finalize.ended)|\(.finalize.exit)"' "$KCOV_RUN_DIR/summary.json" 2>/dev/null)" 
+check "relayed cover: FS_FINALIZE_BASE is the held wake's base" "$walk_base_sha" \
+    "$(cat "$kcov_mark" 2>/dev/null)"
+check "relayed cover: the script's first stderr line is recorded, sanitized" \
+    "reply must name $walk_base_sha" \
+    "$(jq -r '.finalize.stderr_line' "$KCOV_RUN_DIR/summary.json" 2>/dev/null)"
+contains "relayed cover: finalize.log keeps every line" "$(cat "$KCOV_RUN_DIR/finalize.log" 2>/dev/null)" "more"
 
 printf '\n== composed pipeline on --k8s: --checkout is the run'"'"'s base ==\n'
 # A composed seat's gate may pick the wake's start sha; the postmaster

@@ -4160,8 +4160,26 @@ EOF
 # $3  finalize       non-empty when the run has a finalize step
 #                    (--finalize-script); adds the one sentence a caller's
 #                    persona keys its fold-or-fixup behaviour off, verbatim.
+# $4  cover_outbox   the run's outbox dir on a cover-only retry
+#                    (fork-sandbox.sh --cover-only); empty otherwise. The
+#                    leg may change nothing but the reply, so it gets that
+#                    rule in place of everything above about committing.
 fs_emit_headless_turn_para() {
     local history_owner="${1:-integrator}" wake_reply_outbox="${2:-}" finalize="${3:-}"
+    local cover_outbox="${4:-}"
+    if [[ -n "$cover_outbox" ]]; then
+        cat <<EOF
+This session is headless: when your turn ends, the run ends.
+
+This run is a cover-only retry: the branch is reviewed and final. Do not
+commit, and leave every file in the clone exactly as you found it -- the run
+fails, and nothing is posted, if HEAD moves or the clone's tree has any
+change when your turn ends. The one thing to change is the reply, the
+\`mail-*.md\` file in the artifact outbox, \`$cover_outbox\`. After your
+turn, the finalize step runs on the branch with the reply you leave.
+EOF
+        return 0
+    fi
     local history_para
     if [[ "$history_owner" == maintainer ]]; then
         history_para="After the maintainer step approves the branch, a tidy-history leg on
@@ -4249,7 +4267,7 @@ fs_emit_review_brief_section() {
 
 fs_emit_headless_turn_section() {
     printf '\n## Before you end your turn\n\n'
-    fs_emit_headless_turn_para "${1:-integrator}" "${2:-}" "${3:-}"
+    fs_emit_headless_turn_para "${1:-integrator}" "${2:-}" "${3:-}" "${4:-}"
 }
 
 # inner_review is "yes" when a --review-loop ran before this one and "no"
