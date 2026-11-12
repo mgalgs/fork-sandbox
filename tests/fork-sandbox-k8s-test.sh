@@ -22506,7 +22506,7 @@ fi
 rdcolf_run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-rdcolf.XXXXXX)"; tmpdirs+=("$rdcolf_run_dir")
 printf 'RUNNER=1\nharness=claude\nmodel=sonnet\n' > "$rdcolf_run_dir/run.env"
 rdcolf_pod_dir="$(newdir)"; tmpdirs+=("$rdcolf_pod_dir")
-printf '{"total_cost_usd":0.1,"finalize":{"ended":"failed","detail":"the script exited 2","exit":2}}' \
+printf '{"total_cost_usd":0.1,"finalize":{"ended":"failed","detail":"the script exited 2","exit":2,"stderr_line":"reply is stale"},"dead_step":{"step":2,"action":"review","ended":"harness-error","detail":"x"}}' \
     > "$rdcolf_pod_dir/summary.json"
 printf 'folded nothing\n' > "$rdcolf_pod_dir/finalize.log"
 rdcolf_log="$(newdir)/kubectl.log"; rdcolf_out="$(newdir)/rdcolf-out.txt"
@@ -22521,6 +22521,10 @@ else
 fi
 check "collect merges the pod's finalize record into summary.json" "failed 2" \
     "$(jq -r '"\(.finalize.ended) \(.finalize.exit)"' "$rdcolf_run_dir/summary.json" 2>/dev/null)"
+check "collect keeps the finalize record's stderr_line" "reply is stale" \
+    "$(jq -r '.finalize.stderr_line' "$rdcolf_run_dir/summary.json" 2>/dev/null)"
+check "collect merges the pod's dead_step record into summary.json" "2 review harness-error" \
+    "$(jq -r '"\(.dead_step.step) \(.dead_step.action) \(.dead_step.ended)"' "$rdcolf_run_dir/summary.json" 2>/dev/null)"
 check "collect pulls finalize.log back" "folded nothing" \
     "$(cat "$rdcolf_run_dir/finalize.log" 2>/dev/null)"
 
@@ -24746,6 +24750,7 @@ kcov_run() {
         if (( $(date +%s) >= deadline )); then kill -KILL "$loop_pid" 2>/dev/null; break; fi
         sleep 0.1
     done
+    [[ -f "$KCOV_RUN_DIR/summary.json" ]] || no "kcov $label: the run writes summary.json" "$KCOV_ARM_OUT"
 }
 kcov_run commit commit
 check "relayed cover: a leg that commits skips finalize as a guard failure" \

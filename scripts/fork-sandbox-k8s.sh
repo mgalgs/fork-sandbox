@@ -11423,7 +11423,7 @@ cmd_collect() {
                                author_email, author_email_unexpected, author_email_deliberate,
                                authorship_normalized,
                                agent_kit, harness_error, end_reason,
-                               steps, refresh, report_from, finalize}
+                               steps, refresh, report_from, finalize, dead_step}
                             | with_entries(select(.value != null))
                             | walk(if type == "number" and ((isnan or isinfinite) or . > 1e15 or . < -1e15)
                                    then null else . end)

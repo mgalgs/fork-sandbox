@@ -426,6 +426,8 @@ check "no commits: skipped" "skipped" "$(fin_json "$rd" '.finalize.ended')"
 check "no commits: the script never ran" "no" "$([[ -e "$FIN_MARK" ]] && echo yes || echo no)"
 check "no commits: progress.json's finalize step is skipped" "finalize skipped skipped" \
     "$(fin_progress_last "$rd")"
+check "no commits: a review skipped on an empty range is not a dead step" "false" \
+    "$(fin_json "$rd" 'has("dead_step")')"
 
 # A nonzero exit fails with the script's own status.
 next_branch
@@ -582,6 +584,30 @@ IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
 check "stderr: a script that wrote nothing records null" "null" "$(fin_json "$rd" '.finalize.stderr_line')"
 check "stderr: a run with no finalize script run records null" "null" \
     "$(fin_json "$rd_np" '.finalize.stderr_line')"
+
+# A review leg that leaves no verdict ends its step harness-error: finalize
+# does not run, as a skip (not a failure), summary.json names the dead step,
+# and the run's exit status is what it was.
+rm -f "$FIN_MARK"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\nnoop' \
+    --pipeline csonnet-ropus --finalize-script "$scripts_dir/mark.sh" --branch "$br")
+check "dead review: finalize is skipped, naming the dead step" \
+    "skipped|step 2 (review) died: harness-error" \
+    "$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)"')"
+check "dead review: the script never ran" "no" "$([[ -e "$FIN_MARK" ]] && echo yes || echo no)"
+check "dead review: summary.json records the dead step" "2|review|harness-error" \
+    "$(fin_json "$rd" '"\(.dead_step.step)|\(.dead_step.action)|\(.dead_step.ended)"')"
+check "dead review: ... with its detail" "true" "$(fin_json "$rd" '.dead_step.detail | type == "string"')"
+check "dead review: the run's exit status is unchanged" "0|0" "$rc|$(fin_json "$rd" '.exit_code')"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\nnoop' --pipeline csonnet-mopus --branch "$br")
+check "dead maintain: recorded as a maintain step, no finalize key without a script" "2|maintain|false" \
+    "$(fin_json "$rd" '"\(.dead_step.step)|\(.dead_step.action)|\(has("finalize"))"')"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
+    --pipeline csonnet-ropus --finalize-script "$scripts_dir/mark.sh" --branch "$br")
+check "an approved review records no dead step" "false" "$(fin_json "$rd" 'has("dead_step")')"
 
 #############################################################################
 printf '\n== C: --cover-only ==\n'

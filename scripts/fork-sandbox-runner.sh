@@ -2602,6 +2602,13 @@ fs_refresh_chain() {
 # both review and maintain steps, per the pipeline schema; legacy
 # records use maintainer-flavored names only for a legacy maintainer
 # step (see the loop-json writer's own flavor branch, further down).
+# The first review or maintain step that ended other than on one of its
+# normal outcomes (approved, findings, no-progress, cap, or skipped for an
+# empty range): a harness error, say, or a stop. Recorded as summary.json's
+# dead_step, and finalize does not run after it -- the postmaster does not
+# post a composed wake's reply on a review that never finished. It changes
+# no exit status.
+dead_step_json=null
 cur_first_code=0
 cur_first_code_ran=0
 for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
@@ -3432,6 +3439,19 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     esac
     progress_ended[cur_step_no]="$cur_ended"
     progress_write running
+    case "$cur_ended" in
+        approved|findings|no-progress|cap|skipped) ;;
+        *)
+            if [[ "$dead_step_json" == null ]]; then
+                dead_step_json="$(jq -cn --argjson step "$cur_step_no" \
+                    --arg action "${cur_kind/maintainer/maintain}" \
+                    --arg ended "$cur_ended" --arg detail "${cur_detail:-}" \
+                    '{step: $step, action: $action, ended: $ended,
+                      detail: (if $detail == "" then null else $detail end)}')" \
+                    || dead_step_json=null
+            fi
+            ;;
+    esac
     if [[ "$cur_legacy" == 1 ]]; then
         if [[ "$cur_kind" == maintainer ]]; then
             maintainer_loop_ended="$cur_ended"
@@ -3578,6 +3598,12 @@ if [[ -n "${finalize_script:-}" ]]; then
     finalize_refs="refs/fork-sandbox/finalize/$run_id"
     if [[ "${stop_requested:-0}" == 1 ]]; then
         finalize_ended=skipped finalize_detail="stop requested"
+    elif [[ "$dead_step_json" != null ]]; then
+        # Not a finalize failure (that would hold the wake): finalize never
+        # got to run, because a review that should have checked the branch
+        # did not finish.
+        finalize_ended=skipped
+        finalize_detail="$(jq -r '"step \(.step) (\(.action)) died: \(.ended)"' <<< "$dead_step_json")"
     elif [[ -n "$cover_only_failure" ]]; then
         finalize_ended=skipped finalize_detail="cover-only: $cover_only_failure"
     elif (( rc != 0 )); then
@@ -4960,6 +4986,7 @@ jq -n \
     --argjson uncommitted_patch "$uncommitted_patch_json" \
     --argjson tidy "$tidy_summary_json" \
     --argjson finalize "${finalize_summary_json:-null}" \
+    --argjson dead_step "${dead_step_json:-null}" \
     --argjson tidy_has_maintain_step "$( (( tidy_has_maintain_step )) && echo true || echo false )" \
     '{
         version: $version,
@@ -5030,7 +5057,10 @@ jq -n \
     # for this key to report (see the tidy block comment above).
     + (if $tidy_has_maintain_step then {tidy: $tidy} else {} end)
     # Absent, not null, on a run without --finalize-script.
-    + (if $finalize == null then {} else {finalize: $finalize} end)' \
+    + (if $finalize == null then {} else {finalize: $finalize} end)
+    # Absent, not null, unless a review or maintain step died (see
+    # dead_step_json).
+    + (if $dead_step == null then {} else {dead_step: $dead_step} end)' \
     > "$run_dir/summary.json" 2>/dev/null \
     || rm -f "$run_dir/summary.json"
 

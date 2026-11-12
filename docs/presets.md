@@ -495,6 +495,13 @@ output) and `progress.json` a trailing `finalize` step.
 Every code and fix leg is told a finalize step will fold its `fixup!`
 commits. It needs a code step and is refused on a read-only run.
 
+A review or maintain step that ends on anything but its normal outcomes
+(approved, findings, no-progress, cap, or skipped on an empty range) — a
+harness error, say — is recorded in `summary.json` as `dead_step`
+(`step`, `action` `review` or `maintain`, `ended`, `detail`), and finalize
+does not run after it: `finalize.ended` is `skipped`, detail `step <n>
+(<action>) died: <ended>`. The run's exit status is not changed by it.
+
 The script's exit status is its answer. 0 accepts the branch. **Exit 2
 means "the reviewed branch is fine; the reply does not describe it":** a
 postmaster holding such a composed wake retries it once, with a reply-only

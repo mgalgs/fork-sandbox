@@ -6472,10 +6472,8 @@ if rd_rbp="$(run_stubbed --review-loop 1 --maintainer-loop 1 --maintainer-model 
         "$(cat "$rd_rbp/review-prompt.md")" "RB-MARKER-7f3a"
     contains "--review-brief reaches a plain run's maintainer prompt" \
         "$(cat "$rd_rbp/maintainer-prompt.md")" "RB-MARKER-7f3a"
-    for rb_f in fix-prompt-header.md; do
-        contains "--review-brief reaches a plain run's $rb_f" \
-            "$(cat "$rd_rbp/$rb_f" 2>/dev/null)" "RB-MARKER-7f3a"
-    done
+    contains "--review-brief reaches a plain run's fix header" \
+        "$(cat "$rd_rbp/fix-prompt-header.md" 2>/dev/null)" "RB-MARKER-7f3a"
 else
     no "a plain --review-loop --review-brief run launches"
 fi

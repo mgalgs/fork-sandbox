@@ -7,7 +7,9 @@
 # decision 4's on both backends, a composed `sets` seat always starts from
 # the review target, the gate may pick the start sha, a finalize script's
 # exit 2 gets one cover-only retry and a hold keeps new mail pending until
-# it clears, and seats without the key are untouched -- including
+# it clears, a dead review leg keeps a composed wake from posting (a
+# preset seat's harvest is unchanged), and seats without the key are
+# untouched -- including
 # the fetch-wait record a re-freeze queues for one beneath a composed wake.
 #
 # Usage: tests/postmaster/24-composed-seats.sh  (or all files at once:
@@ -854,6 +856,74 @@ once
 check "k8s released: the retry's reply is posted" "yes" "$(posted_with 'k8s rewritten cover.')"
 contains "k8s released: the event" "$(cat "$work/once.out")" "agent=pak run=$cov_rid outcome=released"
 check "k8s released: the hold is gone" "no" "$([[ -e "$(cov_hold "$cs_tid" pak)" ]] && echo yes || echo no)"
+
+# ============================================================
+printf '\n== composed seats: a dead review leg keeps the wake from posting ==\n'
+# ============================================================
+
+dead_sum='{"exit_code":0,"base_sha":null,"finalize":{"ended":"skipped","detail":"step 2 (review) died: harness-error","exit":null},"dead_step":{"step":2,"action":"review","ended":"harness-error","detail":"the review leg of iteration 1 exited 1"}}'
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+fin_wake "$dead_sum" 0
+check "dead review: the reply is not posted" "$fin_msgs_before|no" \
+    "$(msg_count "$cs_tid")|$(posted_with 'Folded and ready.')"
+check "dead review: the thread is flagged with the step" \
+    "wake for pat review step 2 died (run $fin_rid): harness-error" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
+contains "dead review: the journal keyword is dead-review" \
+    "$(cat "$PM_STATE_DIR/needs-operator-journal/$cs_tid" 2>/dev/null)" "dead-review"
+check "dead review: the on-failure retry is scheduled, no hold" "pending|no" \
+    "$(env_val "$PM_STATE_DIR/retries/$cs_tid/pat" STATE)|$([[ -e "$PM_STATE_DIR/finalize-held/$cs_tid" ]] && echo yes || echo no)"
+: > "$STUB_ARGV_LOG"
+once
+check "dead review: the retry runs the same composed wake again" "1|copus1-ropus1|1" \
+    "$(cov_calls)|$(flag_value --pipeline)|$(flag_count --wake-reply)"
+check "dead review: ... as a failure retry" "failed $fin_rid" \
+    "$(env_val "$(live_env_for_agent pat)" RETRY_KIND) $(env_val "$(live_env_for_agent pat)" RETRY_OF)"
+# A dead step on a non-zero exit is the same dead review, not a crash.
+fin_wake "${dead_sum/\"exit_code\":0/\"exit_code\":1}" 1
+check "dead review (exit 1): flagged as a dead review" \
+    "wake for pat review step 2 died (run $fin_rid): harness-error" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)"
+
+# pam: composed, no finalize.
+cs_new_store
+cs_mid="$(send_msg '@carol' '@pam' 'dead pam' 'x' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+dead_rd="$(env_val "$(live_env_for_agent pam)" RUN_DIR)"
+printf '\nPam reply.\n' > "$dead_rd/outbox/mail-1.md"
+printf '0\n' > "$dead_rd/exit-code"
+printf '{"exit_code":0,"dead_step":{"step":2,"action":"review","ended":"harness-error"}}\n' > "$dead_rd/summary.json"
+once
+check "dead review (no finalize): not posted, retry scheduled" "no|pending" \
+    "$(posted_with 'Pam reply.')|$(env_val "$PM_STATE_DIR/retries/$cs_tid/pam" STATE)"
+
+# k8s: pak, its summary through the stub.
+cov_k8s_dead="$CS_OUT/k8s-dead.json"
+printf '%s\n' "$dead_sum" > "$cov_k8s_dead"
+cs_new_store
+cs_mid="$(send_msg '@carol' '@pak' 'dead k8s' 'x' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+STUB_K8S_SUMMARY_JSON="$cov_k8s_dead" once
+[[ -e "$PM_STATE_DIR/retries/$cs_tid/pak" ]] || STUB_K8S_SUMMARY_JSON="$cov_k8s_dead" once
+check "dead review (k8s): not posted" "no" "$(posted_with 'hello from k8s stub')"
+check "dead review (k8s): flagged and retried" "dead-review|pending" \
+    "$(awk -F'\t' 'END{print $3}' "$PM_STATE_DIR/needs-operator-journal/$cs_tid" 2>/dev/null)|$(env_val "$PM_STATE_DIR/retries/$cs_tid/pak" STATE)"
+
+# A preset seat's wake with the same record harvests exactly as before.
+cs_new_store
+cs_mid="$(send_msg '@carol' '@gina' 'dead preset' 'x' 8)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+dead_rd="$(env_val "$(live_env_for_agent gina)" RUN_DIR)"
+printf '\nGina reply.\n' > "$dead_rd/outbox/mail-1.md"
+printf '0\n' > "$dead_rd/exit-code"
+printf '{"session_id":null,"dead_step":{"step":2,"action":"review","ended":"harness-error"}}\n' > "$dead_rd/summary.json"
+once
+check "preset seat: a dead review leg still posts as before" "yes" "$(posted_with 'Gina reply.')"
+check "preset seat: ... with no flag and no retry" "no|no" \
+    "$([[ -e "$PM_STATE_DIR/needs-operator/$cs_tid" ]] && echo yes || echo no)|$([[ -e "$PM_STATE_DIR/retries/$cs_tid/gina" ]] && echo yes || echo no)"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
 # ============================================================
 printf '\n== composed seats: a fetch-wait record keeps its own size and floor ==\n'

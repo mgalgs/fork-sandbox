@@ -732,7 +732,16 @@
 # own status, `-` when the runner refused it; reason is the script's first
 # stderr line, summary.json's finalize.stderr_line, when it exited with a
 # status and wrote one, else the runner's detail). A finalize that ran or
-# was skipped harvests as before.
+# was skipped harvests as before -- unless the summary records a DEAD
+# review or maintain step (summary.json's dead_step: a step that ended on
+# anything but approved, findings, no-progress, cap or skipped, such as a
+# harness error; the runner then skips finalize without failing it). Such
+# a composed wake is an ordinary failed wake, whatever its exit status: its
+# reply is not posted, the thread is flagged, keyword dead-review, "wake
+# for <agent> review step <n> died (run <rid>): <ended>", and the seat's
+# on-failure retry applies (it restarts from the review target, which is
+# safe because nothing was posted). No hold. Preset and plain seats ignore
+# dead_step: their harvest is unchanged.
 # The hold is a record, $STATE/finalize-held/<tid>/<agent> (HELD_RUN,
 # TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING). While it stands, no wake of
 # that seat on that thread starts -- new mail, a follow-up, a retry, a
@@ -2594,6 +2603,7 @@ pm_flag_keyword() {
         "pending message"*"vanished"*) printf 'pending-vanished' ;;
         "run dir for"*"vanished"*) printf 'run-vanished' ;;
         "wake never produced summary.json"*) printf 'no-summary' ;;
+        "wake for"*" review step "*" died (run "*) printf 'dead-review' ;;
         "wake for"*"exited"*) printf 'wake-exit' ;;
         "wake for"*"posted no reply"*) printf 'silent-wake' ;;
         "wake for"*"failed after"*"retries"*) printf 'retry-exhausted' ;;
@@ -7357,6 +7367,9 @@ pm_harvest_run() {
     # throw the reviewed commits away), no follow-up wake. What happens to
     # it next is the operator's call.
     local finalize_refused=0 finalize_exit="" finalize_reason=""
+    # Set when a composed wake's summary records a dead review or maintain
+    # step: its reply is not posted, and it fails like a crash (retry).
+    local dead_review=0
     # A cover-only retry of a held wake (RETRY_KIND=cover): released only
     # when it exited 0 and its finalize ran; anything else leaves the hold
     # standing (cover_held), with nothing posted, retried or followed up.
@@ -7469,6 +7482,30 @@ pm_harvest_run() {
             # hand.
             pm_seat_flag_unless_closed "$tid" "$agent" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job was still running, and the cluster stops it about 600s past the run's TIMEOUT -- until then fetch it with fork-sandbox-k8s.sh fetch --branch $branch; remove it with fork-sandbox-k8s.sh rm --branch $branch" "" "" "$rid"
             k8s_still_running=1
+        elif [[ -n "$(fs_pm_env_get "$f" PIPELINE_SPEC)" ]] \
+            && [[ "$(jq -r 'if (.dead_step | type) == "object" then "dead" else empty end' \
+                    "$run_dir/summary.json" 2>/dev/null)" == dead ]]; then
+            # A composed wake whose review or maintain step died (a harness
+            # error, say): the reply was never checked, so it is not
+            # posted, and the wake fails like a crash -- the seat's
+            # on-failure retry restarts it, which is safe because nothing
+            # went out. Whatever its exit status: a dead review leaves the
+            # run's own status as it was.
+            local dead_no dead_ended
+            dead_no="$(jq -r '.dead_step.step // "?"' "$run_dir/summary.json" 2>/dev/null \
+                | LC_ALL=C tr -cd '0-9?' | head -c 8)"
+            dead_ended="$(jq -r '.dead_step.ended // "unknown"' "$run_dir/summary.json" 2>/dev/null \
+                | LC_ALL=C tr -d '\000-\037\177' | head -c 200)"
+            pm_seat_flag_unless_closed "$tid" "$agent" \
+                "wake for $agent review step ${dead_no:-?} died (run $rid): ${dead_ended:-unknown}" "" "" "$rid"
+            if [[ "$sessions_tracked" == true ]]; then
+                local sid
+                sid="$(pm_trim "$(jq -r '.session_id // empty' \
+                    "$run_dir/summary.json" 2>/dev/null || true)")"
+                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid"
+            fi
+            was_failure=1
+            dead_review=1
         elif [[ "$exit_code" != "0" ]]; then
             # Harvest whatever outbox there is (a crash mid-reply may still
             # have written a file), but flag regardless: an empty outbox from
@@ -7596,7 +7633,7 @@ pm_harvest_run() {
         reply_files=$(( reply_files + 1 ))
         # A held (finalize-refused) wake posts nothing; its outbox stays.
         # Neither does a cover-only retry that did not release its hold.
-        (( ! finalize_refused && ! cover_held )) || continue
+        (( ! finalize_refused && ! cover_held && ! dead_review )) || continue
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network" \
                 "$project" "$review_target" "$branch" \
                 "$review_target_branch" "$review_target_sha" "$review_target_version"; then

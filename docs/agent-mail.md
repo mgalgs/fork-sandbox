@@ -938,6 +938,7 @@ note's `note` event, its "seat notes:" line and its `seat_notes` entry in
 - `snapshot-failed` — the wake's thread snapshot could not be written
 - `handoff-render-failed` — the wake's handoff could not be rendered
 - `route-interrupted` — routing woke no run for the seat after its attempts
+- `dead-review` — a composed wake's review or maintain step died (its `summary.json` records `dead_step`); its reply was not posted and the on-failure retry applies (see "Composed seats")
 - `finalize-refused` — a composed wake's finalize step failed; its work is held (see "Composed seats"). A cover-only retry's release leaves it standing
 - `handler-exit`, `handler-timeout` — a handler seat's command failed or timed out
 - `handler-bad-command`, `handler-missing`, `handler-not-regular`,
@@ -2489,6 +2490,20 @@ does: it drops the thread's holds (the held run dir is left untouched), the
 next pass logs `finalize thread=<t> agent=<a> run=- outcome=dropped
 held=<rid>` and follows up the newest pending message under the normal
 rule (unless a newer wake of the seat already ran).
+
+**A dead review leg keeps a composed wake from posting.** When a review or
+maintain step ends on anything but its normal outcomes (approved, findings,
+no-progress, cap, or skipped on an empty range) — a harness error, a
+provider's session limit, a stop — the runner records it as `summary.json`'s
+`dead_step` (`step`, `action`, `ended`, `detail`) and does not run finalize
+(`finalize.ended: skipped`, detail `step <n> (<action>) died: <ended>`; not
+a failure, so no hold). The run's exit status is what it would have been.
+At harvest a composed wake with `dead_step` is an ordinary failed wake,
+whatever its exit status: the reply is not posted, the thread is flagged,
+keyword `dead-review`, reason `wake for <agent> review step <n> died (run
+<rid>): <ended>`, and the seat's on-failure retry applies (it restarts from
+the review target, which is safe because nothing went out). Preset and plain
+seats ignore `dead_step`: their harvest is exactly as before.
 
 **Exit 2 gets one cover-only retry.** A finalize script's exit 2 means "the
 reviewed branch is fine; the reply does not describe it". For that one
