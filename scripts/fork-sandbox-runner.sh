@@ -3532,9 +3532,9 @@ cover_only_failure=""
 # command (sh -c ... forms included), run with cwd the clone either way:
 # the leg container execs a relayed argv as-is, from wherever it started,
 # so the relay changes into the clone itself. stdout goes to the caller,
-# stderr to finalize.log, or to $finalize_exec_stderr when the caller sets it.
+# stderr to finalize.log.
 finalize_exec() {
-    local limit="$1" log="${finalize_exec_stderr:-$run_dir/finalize.log}"; shift
+    local limit="$1" log="$run_dir/finalize.log"; shift
     if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
         fs_run_leg_split timeout --kill-after 10 "$limit" sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$clone_dir" "$@" < /dev/null 2>> "$log"  # relayed to the leg container, never executed here
     elif fs_resolve_backend "$script_dir"; then
@@ -3640,13 +3640,16 @@ if [[ -n "${finalize_script:-}" ]]; then
         # The script's stderr goes to a file of its own first: its first
         # line is the script's own reason (a refusal names what the reply
         # must say), recorded as stderr_line. finalize.log still gets all
-        # of it, after.
+        # of it, after. The script's stdout and stderr are swapped inside
+        # the sandbox, because the sandbox backend writes its own banner
+        # lines to stderr ahead of anything the script says.
         finalize_stderr_file="$run_dir/finalize-stderr.log"
         : > "$finalize_stderr_file"
-        finalize_exec_stderr="$finalize_stderr_file" finalize_exec "$finalize_timeout_secs" \
+        finalize_exec "$finalize_timeout_secs" \
             env FS_FINALIZE_BASE="$base_sha" FS_FINALIZE_FLOOR="$finalize_floor_eff" \
-            FS_FINALIZE_REPLY="$finalize_reply" sh "$finalize_script" \
-            >> "$run_dir/finalize.log" || finalize_rc=$?
+            FS_FINALIZE_REPLY="$finalize_reply" \
+            sh -c 'sh "$1" 3>&1 1>&2 2>&3 3>&-' sh "$finalize_script" \
+            > "$finalize_stderr_file" || finalize_rc=$?
         finalize_elapsed=$(( $(date +%s) - finalize_started ))
         finalize_stderr_line="$(head -n 1 -- "$finalize_stderr_file" 2>/dev/null \
             | LC_ALL=C tr -d '\000-\037\177' | head -c 500)" || finalize_stderr_line=""

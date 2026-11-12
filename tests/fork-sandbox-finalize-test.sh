@@ -89,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 cd "$workdir" || exit 1
+# Like the real backends, a banner on stderr before the command runs.
+printf 'sandbox-backend-fake-exec: work dir %s\n' "$workdir" >&2
 exec "$@"
 STUB
 # A call-scripted claude-sandboxed stub. Actions:
