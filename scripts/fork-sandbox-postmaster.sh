@@ -781,8 +781,8 @@
 # record goes, the reply posts as for any wake, `finalize thread=<t>
 # agent=<a> run=<retry rid> outcome=released held=<held rid>`, and pending
 # mail is followed up; the finalize-refused flag stays for the operator.
-# Exit 0 with finalize ran but every reply file refused (malformed) keeps
-# the hold: `finalize ... run=<retry rid> outcome=held held=<held rid>
+# Exit 0 with finalize ran but no reply posted (every reply file refused
+# as malformed, or none written) keeps the hold: `finalize ... run=<retry rid> outcome=held held=<held rid>
 # reason=reply-not-posted`, the record's REASON and the re-raised flag say
 # "cover retry <rid> posted nothing: <why>". Any other outcome keeps the
 # hold, posts nothing and retries nothing. No
@@ -7740,13 +7740,15 @@ pm_harvest_run() {
     local -a posted_ids=("${PM_HARVEST_POSTED[@]}")
     if (( cover_release )); then
         local cover_hf="$FINALIZE_HELD/$tid/$agent"
-        if (( replies == 0 && reply_files > 0 )); then
-            # Its finalize ran but its reply was refused (malformed): a
-            # release would post nothing at all. The hold stands, flagged
-            # with what was wrong; its one retry is spent.
+        if (( replies == 0 )); then
+            # Its finalize ran but no reply posted -- its reply was refused
+            # (malformed) or it wrote none: a release would post nothing at
+            # all. The hold stands, flagged with what was wrong; its one
+            # retry is spent.
             cover_held=1
             if [[ -f "$cover_hf" && "$(fs_pm_env_get "$cover_hf" HELD_RUN)" == "$cover_held_rid" ]]; then
-                local cover_why="${PM_HARVEST_DISCARDS[0]:-its reply was refused}"
+                local cover_why="it wrote no reply"
+                (( reply_files == 0 )) || cover_why="${PM_HARVEST_DISCARDS[0]:-its reply was refused}"
                 pm_finalize_hold_set "$cover_hf" REASON \
                     "cover retry $rid posted nothing: $(pm_flag_quote_line "$cover_why")"
                 pm_flag_unless_closed "$tid" "$(pm_finalize_hold_reason "$cover_hf" "$agent")" finalize-refused
@@ -7763,10 +7765,11 @@ pm_harvest_run() {
         fi
     fi
     # SILENT WAKE in the header. A malformed reply file has flagged already,
-    # so only an outbox with no reply file at all counts as silence.
+    # so only an outbox with no reply file at all counts as silence (and
+    # not a cover retry's: its hold's flag says it posted nothing).
     if (( clean_exit && replies > 0 )); then
         pm_wake_exit_clear "$tid" "$agent" "$rid" silent-wake "wake for $agent posted no reply " || true
-    elif (( clean_exit && reply_files == 0 )) && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == flag || "$(fs_pm_env_get "$f" ON_SILENCE)" == retry ]]; then
+    elif (( clean_exit && reply_files == 0 && ! cover_held )) && [[ "$(fs_pm_env_get "$f" ON_SILENCE)" == flag || "$(fs_pm_env_get "$f" ON_SILENCE)" == retry ]]; then
         # A seat that already replied on the run's review target owes
         # nothing on it (a courtesy Cc, a follow-up for someone else); this
         # run's own REPLIES is not written yet, so it never counts itself.

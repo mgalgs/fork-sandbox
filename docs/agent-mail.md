@@ -2539,8 +2539,8 @@ finalize, if the leg moved HEAD or left any change in the tree. A retry whose fi
 its reply posted, its branch as finalize left it — and the hold is cleared:
 `finalize thread=<t> agent=<a> run=<retry rid> outcome=released
 held=<held rid>`, then any pending message is followed up. If its finalize
-ran but every reply file was refused (a malformed reply), nothing was
-posted, so the hold stands: `outcome=held ... reason=reply-not-posted`, and
+ran but no reply posted (every reply file refused as malformed, or none
+written), the hold stands: `outcome=held ... reason=reply-not-posted`, and
 the hold's reason and the re-raised flag read `cover retry <rid> posted
 nothing: <why>`. Should the postmaster die between writing an exit-2 hold
 and spawning its retry, the next pass spawns it (still once). Every other

@@ -796,6 +796,26 @@ contains "cover malformed: the thread is flagged finalize-refused, naming the ma
 contains "cover malformed: ... and the hold's reason says so" \
     "$(env_val "$(cov_hold "$cs_tid" pat)" REASON)" "cover retry $cov_rid posted nothing: malformed reply file"
 
+# A retry whose finalize ran (exit 0) but whose leg wrote no reply at all
+# posts nothing either: the hold stands, its reason says so.
+fin_wake "$(cov_sum 2 'reply must say abc')" 1
+cov_rid="$(basename -- "$(live_env_for_agent pat)" .env)"
+cov_finish 0 "{\"base_sha\":\"$cov_base\",\"finalize\":{\"ended\":\"ran\",\"exit\":0}}"
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+cov_out="$(cat "$work/once.out")"
+once
+check "cover no reply: no further run" 0 "$(cov_calls)"
+check "cover no reply: the hold stands, its retry spent" "$fin_rid|$cov_rid" \
+    "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)|$(env_val "$(cov_hold "$cs_tid" pat)" RETRY_RUN)"
+not_contains "cover no reply: no release event" "$cov_out" "outcome=released"
+contains "cover no reply: a held event instead" "$cov_out" \
+    "pm finalize thread=${cs_tid:0:8} agent=pat run=$cov_rid outcome=held held=$fin_rid reason=reply-not-posted"
+contains "cover no reply: the flag names it" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null)" \
+    "finalize refused for pat (run $fin_rid): exit=2 cover retry $cov_rid posted nothing: it wrote no reply"
+
 # The postmaster died after writing an exit-2 hold and before spawning its
 # retry (RETRY_RUN still empty): the next pass spawns it, once.
 fin_wake "$(cov_sum 1)" 1
