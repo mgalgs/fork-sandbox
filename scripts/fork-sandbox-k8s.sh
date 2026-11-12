@@ -4011,6 +4011,39 @@ pm_plan_team_token() {
         "$PM_TEAM_SECRET" "$K8S_NAMESPACE" "$token")"
 }
 
+# Write one postmaster ConfigMap: `pm_write_configmap <name> <manifest>`.
+# Create-or-replace, never `kubectl apply`: a client-side apply copies the
+# whole object into the kubectl.kubernetes.io/last-applied-configuration
+# annotation, and annotations are capped at 256 KiB in total, so a hooks or
+# personas directory that grows past that is rejected outright. `replace`
+# sets the object to exactly the manifest -- no last-applied annotation (an
+# old one from an earlier apply is dropped) and a key removed from the
+# source directory is removed from the ConfigMap, so a deleted hook stops
+# being mounted. Server-side apply is not used: on an object an earlier
+# client-side apply created, whether the annotation lingers and whether
+# removed keys are pruned depend on the API server's field-manager
+# migration. Whether to create or replace is decided by asking the API, not
+# by falling back to create after a failed replace: a replace refused for
+# any other reason (RBAC, validation) must fail the install.
+pm_write_configmap() {
+    local name="$1" manifest="$2" existing
+    if ! existing="$(kubectl get configmap "$name" --ignore-not-found -o name)"; then
+        echo "Error: could not read ConfigMap $name to see whether it exists." >&2
+        exit 1
+    fi
+    if [[ -n "$existing" ]]; then
+        printf '%s\n' "$manifest" | kubectl replace -f - || {
+            echo "Error: could not replace ConfigMap $name." >&2
+            exit 1
+        }
+    else
+        printf '%s\n' "$manifest" | kubectl create -f - || {
+            echo "Error: could not create ConfigMap $name." >&2
+            exit 1
+        }
+    fi
+}
+
 cmd_install() {
     local dry_run=false postmaster=false rotate_team=false image_override=""
     while (( $# )); do
@@ -5309,13 +5342,14 @@ cmd_install() {
     # the SA/Role/RoleBinding/PVC in $pm_file_rendered) -- so the Deployment
     # never comes up racing a config or credential that is not there yet.
     if $postmaster; then
-        printf '%s\n' "$pm_config_yaml" | kubectl apply -f -
-        $pm_have_personas && printf '%s\n' "$pm_personas_yaml" | kubectl apply -f -
-        $pm_have_prompts  && printf '%s\n' "$pm_prompts_yaml" | kubectl apply -f -
-        $pm_have_handlers && printf '%s\n' "$pm_handlers_yaml" | kubectl apply -f -
-        $pm_have_hooks    && printf '%s\n' "$pm_hooks_yaml" | kubectl apply -f -
-        $pm_have_headroom && printf '%s\n' "$pm_headroom_yaml" | kubectl apply -f -
-        $pm_have_presets  && printf '%s\n' "$pm_presets_yaml" | kubectl apply -f -
+        # ConfigMaps by create-or-replace, never apply (pm_write_configmap).
+        pm_write_configmap fork-sandbox-postmaster-config "$pm_config_yaml"
+        if $pm_have_personas; then pm_write_configmap fork-sandbox-postmaster-personas "$pm_personas_yaml"; fi
+        if $pm_have_prompts;  then pm_write_configmap fork-sandbox-postmaster-prompts "$pm_prompts_yaml"; fi
+        if $pm_have_handlers; then pm_write_configmap fork-sandbox-postmaster-handlers "$pm_handlers_yaml"; fi
+        if $pm_have_hooks;    then pm_write_configmap fork-sandbox-postmaster-hooks "$pm_hooks_yaml"; fi
+        if $pm_have_headroom; then pm_write_configmap fork-sandbox-postmaster-headroom "$pm_headroom_yaml"; fi
+        if $pm_have_presets;  then pm_write_configmap fork-sandbox-postmaster-presets "$pm_presets_yaml"; fi
         [[ -z "$pm_git_secret_yaml" ]] || \
             printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f - \
                 --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts

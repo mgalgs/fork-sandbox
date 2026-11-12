@@ -19800,17 +19800,68 @@ done
 # team token Secret: `create -f -` stores the token it is handed (and fails
 # like a real create when one is already there), `get secret` answers
 # "<name> <base64 token>" or nothing, `delete secret` removes it.
+# K8S_STUB_CM_STATE, when set, is a directory standing in for the
+# cluster's ConfigMaps, one file per name holding the stored manifest:
+# `get configmap <name>` answers "configmap/<name>" or nothing, `create -f -`
+# of a ConfigMap fails like a real create when it exists, and `replace -f -`
+# fails like a real replace when it does not (or always, with
+# K8S_STUB_REPLACE_RC set). Every `create -f -` / `replace -f -` logs a
+# `created:` / `replaced:` line naming the object, as apply does.
+# A client-side `apply -f -` of a ConfigMap whose manifest exceeds 262144
+# bytes is rejected, as the real API server rejects it: the whole object
+# is copied into the last-applied-configuration annotation, and
+# annotations are capped at 256 KiB in total.
 case "${args[0]:-} ${args[1]:-}" in
     "apply -f")
         body="$(cat)"
         printf 'applied: %s\n' "$(grep -m1 '^  name:' <<< "$body")" >> "$K8S_STUB_LOG"
+        if grep -qx 'kind: ConfigMap' <<< "$body" && (( $(printf '%s\n' "$body" | wc -c) > 262144 )); then
+            printf 'The ConfigMap "%s" is invalid: metadata.annotations: Too long: may not be more than 262144 bytes\n' \
+                "$(sed -n 's/^  name: //p' <<< "$body" | head -1)" >&2
+            exit 1
+        fi
         if [[ -n "${K8S_STUB_APPLY_CAPTURE:-}" ]]; then
             printf '%s\n---\n' "$body" >> "$K8S_STUB_APPLY_CAPTURE"
         fi
         exit 0
         ;;
+    "get configmap")
+        if [[ -n "${K8S_STUB_CM_STATE:-}" && -e "$K8S_STUB_CM_STATE/${args[2]:-}" ]]; then
+            printf 'configmap/%s\n' "${args[2]}"
+        fi
+        exit 0
+        ;;
+    "replace -f")
+        body="$(cat)"
+        printf 'replaced: %s\n' "$(grep -m1 '^  name:' <<< "$body")" >> "$K8S_STUB_LOG"
+        name="$(sed -n 's/^  name: //p' <<< "$body" | head -1)"
+        if [[ -n "${K8S_STUB_REPLACE_RC:-}" ]]; then
+            printf 'Error from server (Forbidden): configmaps "%s" is forbidden\n' "$name" >&2
+            exit "$K8S_STUB_REPLACE_RC"
+        fi
+        if [[ -n "${K8S_STUB_CM_STATE:-}" ]]; then
+            if [[ ! -e "$K8S_STUB_CM_STATE/$name" ]]; then
+                printf 'Error from server (NotFound): configmaps "%s" not found\n' "$name" >&2
+                exit 1
+            fi
+            printf '%s\n' "$body" > "$K8S_STUB_CM_STATE/$name"
+        fi
+        exit 0
+        ;;
     "create -f")
         body="$(cat)"
+        printf 'created: %s\n' "$(grep -m1 '^  name:' <<< "$body")" >> "$K8S_STUB_LOG"
+        if grep -qx 'kind: ConfigMap' <<< "$body"; then
+            name="$(sed -n 's/^  name: //p' <<< "$body" | head -1)"
+            if [[ -n "${K8S_STUB_CM_STATE:-}" ]]; then
+                if [[ -e "$K8S_STUB_CM_STATE/$name" ]]; then
+                    printf 'Error from server (AlreadyExists): configmaps "%s" already exists\n' "$name" >&2
+                    exit 1
+                fi
+                printf '%s\n' "$body" > "$K8S_STUB_CM_STATE/$name"
+            fi
+            exit 0
+        fi
         if [[ -n "${K8S_STUB_STATE:-}" ]]; then
             if [[ -e "$K8S_STUB_STATE/team-token" ]]; then
                 echo 'Error from server (AlreadyExists): secrets already exists' >&2
@@ -20909,10 +20960,67 @@ pm_secret_flags_check fork-sandbox-mail-api-tokens head \
     "the mail-api-tokens Secret apply carries --server-side, the install field manager and --force-conflicts"
 pm_secret_flags_check fork-sandbox-postmaster-claude head \
     "the postmaster-claude Secret apply carries --server-side, the install field manager and --force-conflicts"
-pm_nonsecret_flags_check fork-sandbox-postmaster-config head \
-    "the postmaster-config ConfigMap apply carries neither --server-side nor a field manager"
+check "the postmaster-config ConfigMap is never applied (create-or-replace instead)" "0" \
+    "$(grep -c '^applied:   name: fork-sandbox-postmaster-config$' "$pm_secret_flags_wd/log")"
 pm_nonsecret_flags_check fork-sandbox-postmaster tail \
     "the postmaster Deployment-bundle apply carries neither --server-side nor a field manager"
+
+# 14k. Postmaster ConfigMaps are written by create-or-replace, never by a
+# client-side apply: apply copies the whole object into the last-applied
+# annotation, capped at 256 KiB, so a site's hooks directory that grows
+# past that would be refused (the stub refuses it as the API server does).
+# K8S_STUB_CM_STATE holds the "cluster's" ConfigMaps across installs.
+pm_big_cfg="$(pm_hooks_cfg)"
+{
+    printf '#!/bin/sh\nexit 0\n'
+    head -c 300000 /dev/zero | tr '\0' 'x' | fold -w 76 | sed 's/^/# /'
+    echo
+} > "$pm_big_cfg/hooks/big-helper"
+chmod 755 "$pm_big_cfg/hooks/big-helper"
+pm_big_st="$(newdir)"; tmpdirs+=("$pm_big_st")
+mkdir -p "$pm_big_st/cm"
+pm_big_install() {   # <log> [VAR=value ...]; rc in $pm_big_rc
+    local log="$1"; shift
+    pm_big_rc=0
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_big_st/$log" K8S_STUB_CM_STATE="$pm_big_st/cm" \
+        FORK_SANDBOX_CONFIG_DIR="$pm_big_cfg" "$@" \
+        "$k8s_sh" install --postmaster >/dev/null 2>"$pm_big_st/$log.err" || pm_big_rc=$?
+}
+pm_big_install first
+check "a hooks ConfigMap over 256 KiB installs" "0" "$pm_big_rc"
+check "... its manifest really is over 262144 bytes" "1" \
+    "$(( $(cat "$pm_big_st/cm/fork-sandbox-postmaster-hooks" 2>/dev/null | wc -c) > 262144 ))"
+check "... it holds both hooks" "big-helper on-target" \
+    "$(yq -r '.data | keys | .[]' "$pm_big_st/cm/fork-sandbox-postmaster-hooks" | sort | paste -sd' ')"
+check "first install: the config, hooks and personas ConfigMaps are created" "fork-sandbox-postmaster-config fork-sandbox-postmaster-hooks fork-sandbox-postmaster-personas" \
+    "$(sed -n 's/^created:   name: \(fork-sandbox-postmaster-.*\)$/\1/p' "$pm_big_st/first" | sort | paste -sd' ')"
+check "first install: nothing is replaced" "0" "$(grep -c '^replaced:' "$pm_big_st/first" || true)"
+check "first install: no postmaster ConfigMap is applied" "0" \
+    "$(grep -cE '^applied:   name: fork-sandbox-postmaster-(config|hooks|personas)$' "$pm_big_st/first" || true)"
+check "first install: each ConfigMap is looked up before it is written" "3" \
+    "$(grep -cE ' get configmap fork-sandbox-postmaster-(config|hooks|personas) --ignore-not-found ' "$pm_big_st/first" || true)"
+
+# A re-install over the existing ConfigMaps replaces them; a hook file
+# removed from the source directory disappears from the ConfigMap.
+rm "$pm_big_cfg/hooks/on-target"
+pm_big_install second
+check "re-install: exits 0" "0" "$pm_big_rc"
+check "re-install: the config, hooks and personas ConfigMaps are replaced" "fork-sandbox-postmaster-config fork-sandbox-postmaster-hooks fork-sandbox-postmaster-personas" \
+    "$(sed -n 's/^replaced:   name: \(fork-sandbox-postmaster-.*\)$/\1/p' "$pm_big_st/second" | sort | paste -sd' ')"
+check "re-install: no ConfigMap is created" "0" \
+    "$(grep -c '^created:   name: fork-sandbox-postmaster-' "$pm_big_st/second" || true)"
+check "re-install: the removed hook is gone from the ConfigMap" "big-helper" \
+    "$(yq -r '.data | keys | .[]' "$pm_big_st/cm/fork-sandbox-postmaster-hooks" | paste -sd' ')"
+
+# A replace that fails (RBAC, validation) fails the install: no fallback
+# to create, and the Deployment bundle is never applied.
+pm_big_install third K8S_STUB_REPLACE_RC=1
+check "a failed replace fails the install" "1" "$(( pm_big_rc != 0 ))"
+check "... naming the ConfigMap" "1" \
+    "$(grep -c 'could not replace ConfigMap fork-sandbox-postmaster-config' "$pm_big_st/third.err" || true)"
+check "... without falling back to create" "0" "$(grep -c '^created:   name: fork-sandbox-postmaster-' "$pm_big_st/third" || true)"
+check "... and before the Deployment bundle" "0" \
+    "$(grep -c '^applied:   name: fork-sandbox-postmaster$' "$pm_big_st/third" || true)"
 
 # Refusals, before any kubectl call, none printing the token.
 pm_cfg_claude_missing="$(pm_api_cfg)"
@@ -21183,7 +21291,7 @@ pm_cfg_team="$(pm_api_cfg)"
 pm_team_a="$(newdir)"; tmpdirs+=("$pm_team_a")
 pm_team_real "$pm_cfg_team" "$pm_team_a"
 check "team: a fresh install exits 0" "0" "$pm_team_rc"
-check "team: it created the team Secret exactly once" "1" "$(pm_team_calls "$pm_team_a" ' create -f -$')"
+check "team: it created the team Secret exactly once" "1" "$(pm_team_calls "$pm_team_a" '^created:   name: fork-sandbox-mail-api-team-token$')"
 check "team: ... after looking for it" "1" "$(pm_team_calls "$pm_team_a" ' get secret fork-sandbox-mail-api-team-token ')"
 check "team: ... never with apply (so it can never overwrite)" "0" \
     "$(grep -c 'applied:   name: fork-sandbox-mail-api-team-token' "$pm_team_a/log" || true)"
@@ -21197,7 +21305,7 @@ check "team: the raw token appears in no output stream" "0" \
 check "team: ... nor in anything applied" "0" "$(grep -cF -- "$pm_team_tok_a" "$pm_team_a/applied")"
 check "team: ... nor in any kubectl argument" "0" "$(grep -cF -- "$pm_team_tok_a" "$pm_team_a/log")"
 check "team: the order is Secret, then the tokens Secret, then the Deployment bundle" "ok" \
-    "$(awk '/ create -f -$/ && !c {c=NR} /^applied:   name: fork-sandbox-mail-api-tokens$/ && !t {t=NR} /^applied:   name: fork-sandbox-postmaster$/ {d=NR} END {print (c && t && d && c < t && t < d) ? "ok" : "bad"}' "$pm_team_a/log")"
+    "$(awk '/^created:   name: fork-sandbox-mail-api-team-token$/ && !c {c=NR} /^applied:   name: fork-sandbox-mail-api-tokens$/ && !t {t=NR} /^applied:   name: fork-sandbox-postmaster$/ {d=NR} END {print (c && t && d && c < t && t < d) ? "ok" : "bad"}' "$pm_team_a/log")"
 # The team hash is what the server reads, as a sibling of the tokens file.
 check "team: the real hash passes the server's own check as a team entry" "ok: 3 entries (2 operator, 1 client)" \
     "$("$pm_api_mint" check --tokens "$pm_cfg_team/mail-api-tokens" --team-hash "$(pm_team_tokens_hash "$pm_team_a")")"
@@ -21210,7 +21318,7 @@ pm_team_hash_a="$(pm_team_tokens_hash "$pm_team_a")"
 : > "$pm_team_a/log"; : > "$pm_team_a/applied"
 pm_team_real "$pm_cfg_team" "$pm_team_a"
 check "team: a second install exits 0" "0" "$pm_team_rc"
-check "team: ... creates nothing" "0" "$(pm_team_calls "$pm_team_a" ' create -f -$')"
+check "team: ... creates nothing" "0" "$(pm_team_calls "$pm_team_a" '^created:   name: fork-sandbox-mail-api-team-token$')"
 check "team: ... deletes nothing" "0" "$(pm_team_calls "$pm_team_a" ' delete ')"
 check "team: ... leaves the token byte for byte" "" "$(cmp "$pm_team_a/team-token" "$pm_team_a/team-token.first" 2>&1)"
 check "team: ... serves the same hash" "$pm_team_hash_a" "$(pm_team_tokens_hash "$pm_team_a")"
@@ -21222,7 +21330,7 @@ check "team: ... and says nothing about creating" "0" "$(grep -c 'team token' "$
 pm_team_real "$pm_cfg_team" "$pm_team_a" --rotate-team-token
 check "team: --rotate-team-token exits 0" "0" "$pm_team_rc"
 check "team: ... deletes the old Secret" "1" "$(pm_team_calls "$pm_team_a" ' delete secret fork-sandbox-mail-api-team-token')"
-check "team: ... creates the new one" "1" "$(pm_team_calls "$pm_team_a" ' create -f -$')"
+check "team: ... creates the new one" "1" "$(pm_team_calls "$pm_team_a" '^created:   name: fork-sandbox-mail-api-team-token$')"
 pm_team_tok_b="$(cat "$pm_team_a/team-token")"
 check "team: ... the token changed" "1" "$([[ -n "$pm_team_tok_b" && "$pm_team_tok_b" != "$pm_team_tok_a" ]] && echo 1 || echo 0)"
 check "team: ... the served hash changed to the new token's" \
@@ -21254,14 +21362,14 @@ printf 'a-token-made-by-hand' > "$pm_team_c/team-token"
 pm_team_real "$pm_cfg_team" "$pm_team_c"
 check "team: a pre-existing Secret is adopted, not replaced" "a-token-made-by-hand" "$(cat "$pm_team_c/team-token")"
 check "team: ... and its hash is served" "$(printf '%s' 'a-token-made-by-hand' | sha256sum | cut -d' ' -f1)" "$(pm_team_tokens_hash "$pm_team_c")"
-check "team: ... without a create" "0" "$(pm_team_calls "$pm_team_c" ' create -f -$')"
+check "team: ... without a create" "0" "$(pm_team_calls "$pm_team_c" '^created:   name: fork-sandbox-mail-api-team-token$')"
 
 # No mail API (the base fixture): no team token, no Role, no cluster read for it.
 pm_team_d="$(newdir)"; tmpdirs+=("$pm_team_d")
 pm_team_real "$pm_cfg1" "$pm_team_d"
 check "team: without the mail API a real install exits 0" "0" "$pm_team_rc"
 check "team: ... and never touches the team Secret" "0" "$(grep -c 'team-token' "$pm_team_d/log" || true)"
-check "team: ... and creates nothing" "0" "$(pm_team_calls "$pm_team_d" ' create -f -$')"
+check "team: ... and creates nothing" "0" "$(pm_team_calls "$pm_team_d" '^created:   name: fork-sandbox-mail-api-team-token$')"
 check "team: ... and renders no team Role" "0" "$(grep -c 'fork-sandbox-mail-team' "$pm_team_d/applied" || true)"
 
 # A dry-run reads no cluster and writes none.
