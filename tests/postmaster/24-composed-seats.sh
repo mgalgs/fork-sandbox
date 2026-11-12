@@ -969,6 +969,43 @@ check "stale marker: ... and its pending mail is followed up, once" "1|$st_new" 
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
 
 # ============================================================
+printf '\n== composed seats: a standing hold keeps its flag ==\n'
+# ============================================================
+
+fin_wake "$(cov_sum 1 'reply must name the fold')" 1
+fl_reason="finalize refused for pat (run $fin_rid): exit=1 reply must name the fold"
+fl_cur() { cat "$PM_STATE_DIR/needs-operator/$cs_tid" 2>/dev/null; }
+check "flag: the refusal flags the thread" "$fl_reason" "$(fl_cur)"
+check "flag: the hold records the reason" "reply must name the fold" \
+    "$(env_val "$(cov_hold "$cs_tid" pat)" REASON)"
+printf 'any news?\n' > "$work/body.tmp"
+"$MAIL" reply --from '@operator' --reply-to "$cs_mid" --to '@pat' --body "$work/body.tmp" >/dev/null 2>&1
+once
+check "flag: operator mail (rule 1's reset) leaves the finalize-refused flag up" "$fl_reason" "$(fl_cur)"
+check "flag: ... and the hold stands" "$fin_rid" "$(env_val "$(cov_hold "$cs_tid" pat)" HELD_RUN)"
+reply_msg '@ci-demo' "$cs_mid" 'pushed' --to '@operator' --upstream-head "feature/fl-head:$cov_head" >/dev/null
+: > "$work/once.out"
+once
+contains "flag setup: the upstream head is recorded" "$(cat "$work/once.out")" "pm upstream-head thread=${cs_tid:0:8}"
+check "flag: an upstream-head announcement leaves it up too" "$fl_reason" "$(fl_cur)"
+contains "flag: the journal re-raises it under its keyword" \
+    "$(tail -n 1 "$PM_STATE_DIR/needs-operator-journal/$cs_tid" 2>/dev/null)" "finalize-refused"
+fl_status="$("$postmaster" status 2>/dev/null)"
+contains "status: lists the finalize hold" "$fl_status" \
+    "finalize holds:
+  $cs_tid: agent=pat held=$fin_rid retry=- exit=1 reason=reply must name the fold"
+check "status --json: lists the finalize hold" \
+    '[{"agent":"pat","held_run":"'"$fin_rid"'","retry_run":null,"exit":1,"reason":"reply must name the fold"}]' \
+    "$("$postmaster" status --thread "$cs_tid" --json 2>/dev/null | jq -c '.finalize_holds')"
+"$postmaster" unflag "$cs_tid" >/dev/null 2>&1
+check "flag: unflag clears the flag and the hold both" "no|no" \
+    "$([[ -e "$PM_STATE_DIR/needs-operator/$cs_tid" ]] && echo yes || echo no)|$([[ -e "$(cov_hold "$cs_tid" pat)" ]] && echo yes || echo no)"
+check "status --json: no finalize_holds key once none stands" "false" \
+    "$("$postmaster" status --thread "$cs_tid" --json 2>/dev/null | jq -c 'has("finalize_holds")')"
+lacks_status="$("$postmaster" status 2>/dev/null)"
+not_contains "status: no finalize holds section once none stands" "$lacks_status" "finalize holds:"
+
+# ============================================================
 printf '\n== composed seats: a fetch-wait record keeps its own size and floor ==\n'
 # ============================================================
 

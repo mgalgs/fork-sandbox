@@ -2481,15 +2481,25 @@ first stderr line (`finalize.stderr_line`, sanitized, at most 500 bytes);
 otherwise, and always for a runner refusal, the runner's own detail.
 
 The hold is a record, `finalize-held/<thread-id>/<agent>` (`HELD_RUN`,
-`TRIGGER`, `SINCE`, `EXIT`, `RETRY_RUN`, `PENDING`). While it stands the
+`TRIGGER`, `SINCE`, `EXIT`, `RETRY_RUN`, `PENDING`, `REASON`). While it stands the
 seat does not wake on that thread: new mail for it, a follow-up, a retry or
 a release is refused (`refuse thread=<t> agent=<a> reason=finalize-held`)
 and the message id is added to `PENDING`. Operator mail is new mail too; it
-does not clear the hold. The operator's `postmaster unflag <thread-id>`
-does: it drops the thread's holds (the held run dir is left untouched), the
+does not clear the hold. While a hold stands on an open thread, the thread
+keeps its `finalize-refused` flag: anything else that clears the thread's
+flag (operator or external mail, an upstream-head announcement, a cleared
+wake-exit) raises it again for each standing hold, so a held seat never
+goes silent unflagged. A hold on a closed thread is not flagged; its wakes
+are refused anyway. `postmaster status` lists standing holds under
+`finalize holds:` (thread, agent, held run, retry run, exit, reason), and
+`status --thread --json` as `finalize_holds` (present only when one
+stands): `{"agent", "held_run", "retry_run" (null when none), "exit" (null
+for `-`), "reason"}`. The operator's `postmaster unflag <thread-id>`
+clears both: it drops the thread's holds (the held run dir is left untouched), the
 next pass logs `finalize thread=<t> agent=<a> run=- outcome=dropped
 held=<rid>` and follows up the newest pending message under the normal
-rule (unless a newer wake of the seat already ran).
+rule (unless a newer wake of the seat already ran). Retiring a dropped
+hold never removes a newer hold the seat wrote since.
 
 **A dead review leg keeps a composed wake from posting.** When a review or
 maintain step ends on anything but its normal outcomes (approved, findings,
@@ -2850,7 +2860,7 @@ own thread scans never see it:
 | `discards/<thread-id>/<agent>.prior` | the seat's crash-retry record set aside while a malformed schedule is pending; put back when that schedule ends |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT/REASON fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
-| `finalize-held/<thread-id>/<agent>` | a composed seat's wake held on a refused finalize: `HELD_RUN`, `TRIGGER`, `SINCE`, `EXIT`, `RETRY_RUN` (the cover-only retry's run id, `-` when none will run, empty before the harvest decides), `PENDING` (message ids that arrived while held). `unflag` renames it to `.dropped.<agent>`, which the next pass retires — see "Composed seats" |
+| `finalize-held/<thread-id>/<agent>` | a composed seat's wake held on a refused finalize: `HELD_RUN`, `TRIGGER`, `SINCE`, `EXIT`, `RETRY_RUN` (the cover-only retry's run id, `-` when none will run, empty before the harvest decides), `PENDING` (message ids that arrived while held), `REASON` (the refusal's reason, as in the flag). `unflag` renames it to `.dropped.<agent>`, which the next pass retires — see "Composed seats" |
 | `fetch-wait/<thread-id>/<agent>` | a wake deferred because its sha (upstream head or review target) is not on `origin` yet: `TRIGGER`, `RETRY`, `KIND`, `KEY` (`<branch> <sha>`), `SINCE`, `ATTEMPTS`, `NOT_BEFORE`, and for a composed seat `SIZE`, `FLOOR`, `CHECKOUT` — see "Upstream moved" step 3 |
 | `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |

@@ -743,14 +743,21 @@
 # safe because nothing was posted). No hold. Preset and plain seats ignore
 # dead_step: their harvest is unchanged.
 # The hold is a record, $STATE/finalize-held/<tid>/<agent> (HELD_RUN,
-# TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING). While it stands, no wake of
+# TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING, REASON). While it stands, no wake of
 # that seat on that thread starts -- new mail, a follow-up, a retry, a
 # release: pm_spawn_wake refuses it (`refuse ... reason=finalize-held`) and
-# adds the message to PENDING -- with one exception, below. Operator mail
-# does not clear it; the operator's `unflag <tid>` does (the held run dir
-# is untouched), and the next pass logs `finalize thread=<t> agent=<a>
-# run=- outcome=dropped held=<rid>` and follows up the newest pending
-# message. A seat without `finalize:` gets no record.
+# adds the message to PENDING -- with one exception, below. While it stands
+# on an open thread, the thread keeps its finalize-refused flag: whatever
+# else clears the thread's flag (rule 1's operator/external reset, an
+# upstream-head announcement, a cleared wake-exit) re-raises it for each
+# standing hold (a hold on a closed thread is not flagged). `status` lists
+# the standing holds (`finalize holds:`; `status --thread --json`'s
+# `finalize_holds`). Operator mail does not clear it; the operator's
+# `unflag <tid>` does, flag and hold both (the held run dir is untouched),
+# and the next pass logs `finalize thread=<t> agent=<a> run=- outcome=dropped
+# held=<rid>` and follows up the newest pending message. Retiring that
+# dropped record never touches a newer hold of the seat. A seat without
+# `finalize:` gets no record.
 # EXIT 2 is the finalize script's way to say "the reviewed branch is fine,
 # the reply does not describe it; rewrite the reply and finalize again".
 # For that status alone the harvest starts ONE cover-only retry per held
@@ -1310,7 +1317,7 @@
 #                                   reused by the re-dispatch (see THE WAKE).
 #   finalize-held/<thread-id>/<agent> a composed wake held on a refused
 #                                   finalize (HELD_RUN, TRIGGER, SINCE, EXIT,
-#                                   RETRY_RUN, PENDING); `unflag` renames it
+#                                   RETRY_RUN, PENDING, REASON); `unflag` renames it
 #                                   .dropped.<agent> -- see THE WAKE's
 #                                   composed seats.
 #   upstream-state/<thread-id>.env STATE=closed|open, MSGID (the message
@@ -2744,6 +2751,10 @@ pm_unflag() {
         [[ -f "$wf" ]] || continue
         pm_wake_exit_mark_cleared "$tid" "$(basename -- "$(dirname -- "$wf")")" "$(basename -- "$wf" .json)" operator
     done
+    # A finalize hold still standing keeps its flag up: rule 1's reset, an
+    # upstream-head announcement and a cleared wake-exit all come through
+    # here, and none of them clears the hold.
+    pm_finalize_holds_reflag "$tid"
 }
 
 # Keeps the evidence for one wake that exited non-zero: a single-line JSON
@@ -4774,20 +4785,22 @@ pm_held_write() {
 # ---- finalize holds (composed seats) ----
 #
 # A composed wake whose finalize refused is held: $FINALIZE_HELD/<tid>/<agent>
-# records it (HELD_RUN, TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING), full-file
-# mktemp+mv like pm_held_write. While it stands no wake of that seat on that
-# thread starts (pm_spawn_wake's hold check) but the one cover-only retry; a
-# message that would have woken it is added to PENDING instead, for the
-# follow-up once the hold clears. It is NOT a grant hold (held/): nothing in
-# pm_held_pass or `status`'s held: list reads it.
+# records it (HELD_RUN, TRIGGER, SINCE, EXIT, RETRY_RUN, PENDING, REASON),
+# full-file mktemp+mv like pm_held_write. While it stands no wake of that
+# seat on that thread starts (pm_spawn_wake's hold check) but the one
+# cover-only retry; a message that would have woken it is added to PENDING
+# instead, for the follow-up once the hold clears. It is NOT a grant hold
+# (held/): nothing in pm_held_pass or `status`'s held: list reads it (it has
+# its own `finalize holds:` list). While it stands on an open thread the
+# thread carries its finalize-refused flag (pm_finalize_holds_reflag).
 
-# pm_finalize_hold_write <file> <held-run> <trigger> <since> <exit> <retry-run> <pending>
+# pm_finalize_hold_write <file> <held-run> <trigger> <since> <exit> <retry-run> <pending> <reason>
 pm_finalize_hold_write() {
     local file="$1" tmp
     mkdir -p -- "$(dirname -- "$file")"
     tmp="$(mktemp "$(dirname -- "$file")/.tmp.XXXXXX")"
-    printf 'HELD_RUN=%s\nTRIGGER=%s\nSINCE=%s\nEXIT=%s\nRETRY_RUN=%s\nPENDING=%s\n' \
-        "$2" "$3" "$4" "$5" "$6" "$7" > "$tmp"
+    printf 'HELD_RUN=%s\nTRIGGER=%s\nSINCE=%s\nEXIT=%s\nRETRY_RUN=%s\nPENDING=%s\nREASON=%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "${8:-}" > "$tmp"
     mv -- "$tmp" "$file"
 }
 
@@ -4796,12 +4809,37 @@ pm_finalize_hold_set() {
     local file="$1" key="$2" value="$3" k
     [[ -f "$file" ]] || return 0
     local -A v=()
-    for k in HELD_RUN TRIGGER SINCE EXIT RETRY_RUN PENDING; do
+    for k in HELD_RUN TRIGGER SINCE EXIT RETRY_RUN PENDING REASON; do
         v[$k]="$(fs_pm_env_get "$file" "$k")"
     done
     v[$key]="$value"
     pm_finalize_hold_write "$file" "${v[HELD_RUN]}" "${v[TRIGGER]}" "${v[SINCE]}" \
-        "${v[EXIT]}" "${v[RETRY_RUN]}" "${v[PENDING]}"
+        "${v[EXIT]}" "${v[RETRY_RUN]}" "${v[PENDING]}" "${v[REASON]}"
+}
+
+# The flag reason for hold record $1 of seat $2: the one the refusal's
+# harvest raised.
+pm_finalize_hold_reason() {
+    local reason
+    reason="$(fs_pm_env_get "$1" REASON)"
+    printf 'finalize refused for %s (run %s): exit=%s %s' "$2" \
+        "$(fs_pm_env_get "$1" HELD_RUN)" "$(fs_pm_env_get "$1" EXIT)" "${reason:-unknown}"
+}
+
+# Re-raises thread $1's finalize-refused flag for each hold standing on it,
+# after something cleared the thread's flag (pm_unflag): a hold must not
+# outlive the flag that tells the operator why the seat is silent. A closed
+# thread's hold is not flagged (its wakes are refused anyway), and a dropped
+# one (.dropped.<agent>) is not a standing hold. Only `unflag` clears both:
+# it drops the holds before it clears the flag.
+pm_finalize_holds_reflag() {
+    local tid="$1" hf
+    [[ -d "$FINALIZE_HELD/$tid" ]] || return 0
+    pm_upstream_closed "$tid" && return 0
+    for hf in "$FINALIZE_HELD/$tid"/*; do
+        [[ -f "$hf" ]] || continue
+        pm_flag "$tid" "$(pm_finalize_hold_reason "$hf" "$(basename -- "$hf")")" finalize-refused
+    done
 }
 
 # pm_finalize_hold_pend <file> <mid,...>: adds each id to the record's
@@ -7705,7 +7743,8 @@ pm_harvest_run() {
         # the operator's `unflag`, or the one cover-only retry a script's
         # exit 2 asks for (see "Composed seats" in the header).
         local hold_file="$FINALIZE_HELD/$tid/$agent"
-        pm_finalize_hold_write "$hold_file" "$rid" "$trigger" "$(date +%s)" "$finalize_exit" "" ""
+        pm_finalize_hold_write "$hold_file" "$rid" "$trigger" "$(date +%s)" "$finalize_exit" "" "" \
+            "${finalize_reason:-unknown}"
         pm_finalize_hold_pend "$hold_file" "$pending"
         pm_retry_clear_schedule "$tid" "$agent"
         if [[ "$finalize_exit" == 2 ]]; then
@@ -8880,6 +8919,15 @@ cmd_status_json() {
             printf '%s\0' held "$(basename -- "$hf")" "$(fs_pm_env_get "$hf" TRIGGER)" "$(( now - hsince ))"
         done
 
+        # Standing finalize holds (a dropped .dropped.<agent> is not one).
+        local fhf
+        for fhf in "$FINALIZE_HELD/$tid"/*; do
+            [[ -f "$fhf" ]] || continue
+            printf '%s\0' finalize_hold "$(basename -- "$fhf")" "$(fs_pm_env_get "$fhf" HELD_RUN)" \
+                "$(fs_pm_env_get "$fhf" RETRY_RUN)" "$(fs_pm_env_get "$fhf" EXIT)" \
+                "$(fs_pm_env_get "$fhf" REASON)"
+        done
+
         # A two-column line (written before notes carried a run id) reads
         # with an empty run id.
         local nf nagent ntime nkey nrid
@@ -8904,8 +8952,9 @@ out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
 arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "upstream_state": 3,
          "review_target": 5, "spawns": 1, "budget": 2, "spawns_total": 1, "grant_mode": 1,
          "run": 14, "retry": 5, "held": 3, "wake_exit": 3, "wake_deferred": 2,
-         "seat_note": 4}
+         "seat_note": 4, "finalize_hold": 5}
 wake_exits = []
+finalize_holds = []
 i = 0
 while i < len(tok):
     tag = tok[i]
@@ -8956,6 +9005,11 @@ while i < len(tok):
                                "reason": a[4] or "failed"})
     elif tag == "held":
         out["held"].append({"agent": a[0], "trigger": a[1], "age_s": int(a[2])})
+    elif tag == "finalize_hold":
+        finalize_holds.append({"agent": a[0], "held_run": a[1],
+                               "retry_run": a[2] if a[2] not in ("", "-") else None,
+                               "exit": int(a[3]) if a[3].lstrip("-").isdigit() else None,
+                               "reason": a[4] or "unknown"})
     elif tag == "seat_note":
         out["seat_notes"].append({"agent": a[0], "reason": a[1], "at": a[2],
                                   "run_id": a[3] or None})
@@ -9000,6 +9054,8 @@ out["seat_notes"].sort(key=lambda n: n["at"])
 if wake_exits:
     wake_exits.sort(key=lambda r: (r["at"], r["run_id"]))
     out["wake_failures"] = wake_exits
+if finalize_holds:
+    out["finalize_holds"] = finalize_holds
 print(json.dumps(out))
 '
 }
@@ -9177,6 +9233,21 @@ cmd_status() {
     done
     (( any_held )) || printf '  (none)\n'
 
+    # Only when there is one, so a store with no finalize hold prints
+    # exactly what it always did.
+    local any_fhold=0 fhf fhtid fhretry fhreason
+    for fhf in "$FINALIZE_HELD"/*/*; do
+        [[ -f "$fhf" ]] || continue
+        (( any_fhold )) || printf '\nfinalize holds:\n'
+        fhtid="$(basename -- "$(dirname -- "$fhf")")"
+        fhretry="$(fs_pm_env_get "$fhf" RETRY_RUN)"
+        fhreason="$(fs_pm_env_get "$fhf" REASON)"
+        printf '  %s: agent=%s held=%s retry=%s exit=%s reason=%s\n' "$fhtid" "$(basename -- "$fhf")" \
+            "$(fs_pm_env_get "$fhf" HELD_RUN)" "${fhretry:--}" "$(fs_pm_env_get "$fhf" EXIT)" \
+            "${fhreason:-unknown}"
+        any_fhold=1
+    done
+
     local triaged_count=0
     for f in "$TRIAGED"/*; do
         [[ -e "$f" ]] || continue
@@ -9208,17 +9279,18 @@ cmd_flag() {
 cmd_unflag() {
     local tid="${1:?Usage: fork-sandbox-postmaster.sh unflag <thread-id>}"
     mkdir -p -- "$STATE"
-    pm_unflag "$tid"
-    pm_seat_notes_clear "$tid"
-    # The operator's unflag also drops the thread's finalize holds. This
-    # verb runs without the store lock, so it only renames each record; the
-    # next deliver pass retires it (pm_finalize_held_pass). Operator MAIL
-    # does not: it is new mail, which a held seat does not wake on.
+    # The operator's unflag also drops the thread's finalize holds -- first,
+    # so pm_unflag finds none standing to re-raise the flag for. This verb
+    # runs without the store lock, so it only renames each record; the next
+    # deliver pass retires it (pm_finalize_held_pass). Operator MAIL does
+    # not: it is new mail, which a held seat does not wake on.
     local hf
     for hf in "$FINALIZE_HELD/$tid"/*; do
         [[ -f "$hf" ]] || continue
         mv -f -- "$hf" "$FINALIZE_HELD/$tid/.dropped.$(basename -- "$hf")"
     done
+    pm_unflag "$tid"
+    pm_seat_notes_clear "$tid"
 }
 
 # Sourced (the test suite calls pm_hook_fire/pm_hook_reap directly): define
