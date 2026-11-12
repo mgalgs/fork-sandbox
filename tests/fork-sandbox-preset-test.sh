@@ -6409,10 +6409,10 @@ printf '\n== caller inputs: --review-brief ==\n'
 rb_dir="$(mktemp -d /var/tmp/claude-scratch/fs-preset-rb.XXXXXX)"; tmpdirs+=("$rb_dir")
 rb_file="$rb_dir/brief.txt"
 printf 'Check every caller of the changed function.\nRB-MARKER-7f3a\n' > "$rb_file"
-rb_heading="## Additional review instructions from the caller"
+rb_heading="## Caller's instructions for every leg after the code leg"
 
-# A composed run: every review step's prompt ends with the brief; no code,
-# fix or tidy prompt carries it.
+# A composed run: every review step's prompt ends with the brief, and every
+# fix header carries it before the findings; the code leg's prompts do not.
 prep_stub $'commit\napproved\napproved'
 if rd_rb="$(run_stubbed --pipeline csonnet-ropus-ropus --review-brief "$rb_file")"; then
     tmpdirs+=("$rd_rb")
@@ -6420,14 +6420,20 @@ if rd_rb="$(run_stubbed --pipeline csonnet-ropus-ropus --review-brief "$rb_file"
         "$(cat "$rb_file")" "$(cat "$rd_rb/review-brief.md" 2>/dev/null)"
     for rb_k in 2 3; do
         contains "--review-brief reaches composed review step $rb_k under its heading" \
-            "$(cat "$rd_rb/step-$rb_k-prompt.md")" "$rb_heading"$'\n\n'"Check every caller"
+            "$(cat "$rd_rb/step-$rb_k-prompt.md")" "$rb_heading"$'\n\n'"These apply to every leg"
         check "--review-brief is the last section of review step $rb_k's static prompt" \
             "RB-MARKER-7f3a" "$(tail -n 1 "$rd_rb/step-$rb_k-prompt.md")"
-        lacks "--review-brief stays out of step $rb_k's fix header" \
+        contains "--review-brief reaches step $rb_k's fix header under the same heading" \
+            "$(cat "$rd_rb/$rb_k-fix-prompt-header.md")" "$rb_heading"$'\n\n'"These apply to every leg"
+        contains "... with the caller's text" \
             "$(cat "$rd_rb/$rb_k-fix-prompt-header.md")" "RB-MARKER-7f3a"
+        contains "... and the findings' closing paragraph still comes last" \
+            "$(cat "$rd_rb/$rb_k-fix-prompt-header.md")" $'RB-MARKER-7f3a\n\nThe findings follow.'
     done
     lacks "--review-brief stays out of the code leg's handoff" \
         "$(cat "$rd_rb/handoff.md")" "RB-MARKER-7f3a"
+    lacks "--review-brief stays out of the code leg's continuation header" \
+        "$(cat "$rd_rb/continuation-prompt-header.md" 2>/dev/null)" "RB-MARKER-7f3a"
 else
     no "a composed --review-brief run launches"
 fi
@@ -6441,7 +6447,7 @@ if rd_rbm="$(run_stubbed --pipeline csonnet-mopus-ropus --review-brief "$rb_file
         "$(cat "$rd_rbm/step-2-inner-review-prompt.md")" "RB-MARKER-7f3a"
     contains "--review-brief reaches the review after it" \
         "$(cat "$rd_rbm/step-3-prompt.md")" "RB-MARKER-7f3a"
-    lacks "--review-brief stays out of the maintain step's fix header" \
+    contains "--review-brief reaches the maintain step's fix header" \
         "$(cat "$rd_rbm/2-fix-prompt-header.md")" "RB-MARKER-7f3a"
 else
     no "a composed maintain --review-brief run launches"
@@ -6453,7 +6459,7 @@ if rd_rbl="$(run_stubbed --pipeline csonnet-ropus --review-brief "$rb_file")"; t
     tmpdirs+=("$rd_rbl")
     contains "--review-brief reaches a legacy-shaped review prompt" \
         "$(cat "$rd_rbl/review-prompt.md")" "$rb_heading"
-    lacks "--review-brief stays out of the legacy fix header" \
+    contains "--review-brief reaches the legacy fix header" \
         "$(cat "$rd_rbl/fix-prompt-header.md")" "RB-MARKER-7f3a"
 else
     no "a legacy-shaped --review-brief run launches"
@@ -6466,6 +6472,10 @@ if rd_rbp="$(run_stubbed --review-loop 1 --maintainer-loop 1 --maintainer-model 
         "$(cat "$rd_rbp/review-prompt.md")" "RB-MARKER-7f3a"
     contains "--review-brief reaches a plain run's maintainer prompt" \
         "$(cat "$rd_rbp/maintainer-prompt.md")" "RB-MARKER-7f3a"
+    for rb_f in fix-prompt-header.md; do
+        contains "--review-brief reaches a plain run's $rb_f" \
+            "$(cat "$rd_rbp/$rb_f" 2>/dev/null)" "RB-MARKER-7f3a"
+    done
 else
     no "a plain --review-loop --review-brief run launches"
 fi
@@ -6475,8 +6485,24 @@ if rd_rbn="$(run_stubbed --pipeline csonnet-ropus)"; then
     tmpdirs+=("$rd_rbn")
     lacks "without --review-brief the review prompt has no caller section" \
         "$(cat "$rd_rbn/review-prompt.md")" "$rb_heading"
+    check "without --review-brief no prompt carries the heading" "" \
+        "$(grep -lF -- "$rb_heading" "$rd_rbn"/*.md 2>/dev/null)"
     check "without --review-brief nothing is staged" "no" \
         "$([[ -e "$rd_rbn/review-brief.md" ]] && echo yes || echo no)"
+    # The code leg's prompt is the same with and without the brief, but for
+    # the run dir's own path; the fix header differs by the section alone.
+    check "the code leg's prompt is byte-identical with --review-brief" \
+        "$(sed -E "s#$rd_rbn#RD#g; s#sandbox-[0-9]{8}-[0-9]{6}#BR#g" "$rd_rbn/handoff.md")" \
+        "$(sed -E "s#$rd_rbl#RD#g; s#sandbox-[0-9]{8}-[0-9]{6}#BR#g" "$rd_rbl/handoff.md")"
+    check "the fix header differs by the brief's section alone" \
+"> $rb_heading
+> These apply to every leg that reads or changes the branch after the
+> code leg (review, fix and maintain legs).
+> Check every caller of the changed function.
+> RB-MARKER-7f3a" \
+        "$(diff <(sed -E "s#$rd_rbn#RD#g; s#sandbox-[0-9]{8}-[0-9]{6}#BR#g" "$rd_rbn/fix-prompt-header.md") \
+            <(sed -E "s#$rd_rbl#RD#g; s#sandbox-[0-9]{8}-[0-9]{6}#BR#g" "$rd_rbl/fix-prompt-header.md") \
+            | grep '^[<>]' | grep -v '^> $')"
 else
     no "a run without --review-brief launches"
 fi
@@ -6527,6 +6553,10 @@ if K8S_ARGV_LOG="$k8s_codex_argv_log" HOME="$k8s_dryrun_home" \
         "$(cat "$rb_file")" "$(cat "$rb_k8s_rd/review-brief.md" 2>/dev/null)"
     contains "--k8s --review-brief renders it into the review step's prompt" \
         "$(cat "$rb_k8s_rd/step-2-prompt.md" 2>/dev/null)" "RB-MARKER-7f3a"
+    contains "--k8s --review-brief renders it into the review step's fix header" \
+        "$(cat "$rb_k8s_rd/2-fix-prompt-header.md" 2>/dev/null)" "RB-MARKER-7f3a"
+    lacks "--k8s --review-brief keeps it out of the code leg's prompt" \
+        "$(cat "$rb_k8s_rd/handoff.md" 2>/dev/null)" "RB-MARKER-7f3a"
     lacks "--k8s never forwards --review-brief to fork-sandbox-k8s.sh" \
         "$rb_k8s_argv" "--review-brief"
 else

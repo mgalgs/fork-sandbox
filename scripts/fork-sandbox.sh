@@ -524,16 +524,16 @@
 #                        this harmlessly -- which is also what --k8s does
 #                        with it, since the cluster path has no maintainer
 #                        tier (and so no tidy leg) to attach to at all.
-# --review-brief <file>: the caller's own review instructions, appended to
-#                        every review and maintain leg's prompt under
-#                        "Additional review instructions from the caller".
+# --review-brief <file>: the caller's own instructions for every leg after
+#                        the code leg, appended to every review, maintain
+#                        and fix leg's prompt under "Caller's instructions
+#                        for every leg after the code leg".
 #                        Staged into the run dir as review-brief.md, so it
 #                        reaches a --k8s run too (there it needs --pipeline
 #                        or --preset, and the run takes the composed
 #                        path). Refused on a run with no review or maintain
 #                        step, and when the file is missing, empty or over
-#                        64 KiB. Never shown to code, fix, plan or tidy
-#                        legs.
+#                        64 KiB. Never shown to code, plan or tidy legs.
 # --wake-reply:          this run is a postmaster mail wake whose reply the
 #                        postmaster harvests from the outbox (mail-*.md)
 #                        after the last leg. Every leg that may commit (the
@@ -7888,7 +7888,8 @@ if [[ "$review_only" != true ]] \
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}" \
+            "$review_brief_copy"
     } > "$fix_prompt_header.part"
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
 fi
@@ -7900,7 +7901,8 @@ if [[ -n "$fix_harness" ]] && (( review_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$fix_harness" \
             "$fxr_preamble_network" "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}" \
+            "$review_brief_copy"
     } > "$fxr_fix_prompt_header.part"
     mv -- "$fxr_fix_prompt_header.part" "$fxr_fix_prompt_header"
 fi
@@ -7912,7 +7914,8 @@ if [[ -n "$mntfix_harness" ]] && (( maintainer_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$mntfix_harness" \
             "$fxm_preamble_network" "$outbox_dir" "$prompt_inbox_write" "$outbox_max_bytes" "${plan_file:-}"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}" \
+            "$review_brief_copy"
     } > "$fxm_fix_prompt_header.part"
     mv -- "$fxm_fix_prompt_header.part" "$fxm_fix_prompt_header"
 fi
@@ -8063,7 +8066,8 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}" \
+                            "$review_brief_copy"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
@@ -8124,7 +8128,8 @@ else
                         preset_k_fix_harness_var="s${preset_k}fix_harness"
                         preset_k_fix_model_var="s${preset_k}fix_model"
                         fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file" "$history_owner" "$wake_reply_outbox" "${finalize_script_file:+1}" \
+                            "$review_brief_copy"
                     } > "$step_k_fix_header.part"
                     mv -- "$step_k_fix_header.part" "$step_k_fix_header"
                     printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"

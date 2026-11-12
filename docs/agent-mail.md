@@ -769,7 +769,7 @@ agents:
       xs: csonnet1-ropus1
       l: pfable1-copus1-ropus3
     wake-when: sized            # the gate may pick the row (rule 5)
-    review-brief: author-review.txt   # appended to every review/maintain leg
+    review-brief: author-review.txt   # appended to every review/fix/maintain leg
     finalize: author-finalize.sh      # runs after the last leg
 lists:
   crew:
@@ -815,7 +815,8 @@ is the wake-when gate's choice (rule 5's `FS_HOOK_PIPELINE_SIZE_FILE`),
 alongside `pipelines:`, each name a file directly under the personas
 directory (a bare name, required to exist; avoid a `.md` name, which would
 also make a bare-persona agent): `review-brief:` is passed as
-`--review-brief`, appended to every review and maintain leg's prompt, and
+`--review-brief`, appended to every review, fix and maintain leg's prompt
+(the caller's instructions for every leg after the code leg), and
 `finalize:` as `--finalize-script`, run after the pipeline's last leg (see
 "The wake").
 

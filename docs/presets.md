@@ -458,12 +458,15 @@ preset-only knobs.
 
 ## Per-run caller inputs
 
-`--review-brief FILE` hands every review and maintain leg of the run the
-caller's own instructions: the file is staged into the run dir as
-`review-brief.md` (so it reaches a `--k8s` run's pod with the rest of the
-run dir) and appended as the last section of each review and maintain
-prompt, under "Additional review instructions from the caller". Code, fix,
-plan and tidy legs never see it. It is refused on a run with no review or
+`--review-brief FILE` hands every leg that reads or changes the branch
+after the code leg — every review, fix and maintain leg — the caller's own
+instructions: the file is staged into the run dir as `review-brief.md` (so
+it reaches a `--k8s` run's pod with the rest of the run dir) and appended,
+under one heading for all of them ("Caller's instructions for every leg
+after the code leg"), as the last section of each review and maintain
+prompt and of each fix prompt (there before the findings, which stay
+last). Code, plan and tidy legs never see it; fork-sandbox itself reads
+nothing in it, so trailer or cover rules a caller needs go there. It is refused on a run with no review or
 maintain step, and when the file is missing, empty or over 64 KiB.
 
 `--wake-reply` marks a postmaster mail wake: every leg that may commit (the

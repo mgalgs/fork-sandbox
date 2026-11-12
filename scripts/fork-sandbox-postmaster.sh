@@ -703,7 +703,8 @@
 # path, and that a leg that commits must leave the reply describing the
 # branch as it ends it; review and maintain legs are not told to edit it.
 # `review-brief:` (fleet resolve's 22nd line) is passed as --review-brief,
-# appended to every review and maintain leg's prompt; `finalize:` (23rd)
+# appended to every review, fix and maintain leg's prompt (never the code
+# leg's); `finalize:` (23rd)
 # as --finalize-script, with --finalize-floor when the gate wrote a valid
 # sha to FS_HOOK_FINALIZE_FLOOR_FILE at admission (recorded and reused
 # like the size: FINALIZE_FLOOR, FLOOR). A composed `review-target: sets`
