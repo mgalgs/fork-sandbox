@@ -4126,6 +4126,8 @@ pm_refreeze_queue_followers() {
         # The 16th line of `fleet resolve` is review-target (see pm_spawn_wake).
         rt="$("$FLEET" resolve "$seat" 2>/dev/null | sed -n 16p)" || continue
         [[ "$rt" == follow ]] || continue
+        # No size or floor: <agent>'s own are not this seat's, so a composed
+        # follower re-dispatches on `default` and no floor.
         pm_fetch_wait_write "$tid" "$seat" "$vmid" 0 review-target "" 0 0 0
         queued+=("$seat")
     done < <(pm_expand_to "$vto")

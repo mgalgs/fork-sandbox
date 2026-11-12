@@ -3,9 +3,10 @@
 # tests/postmaster/24-composed-seats.sh — fork-sandbox-postmaster.sh: seats
 # with a fleet `pipelines:` table. The wake-when gate's size token picks the
 # row (every fallback picks `default`), the choice survives retry, a held
-# release and a superseded fetch-wait, a composed wake's argv is exactly decision 4's on both backends,
-# a composed `sets` seat always starts from the review target, and seats
-# without the key are untouched.
+# release and a superseded fetch-wait, a composed wake's argv is exactly
+# decision 4's on both backends, a composed `sets` seat always starts from
+# the review target, and seats without the key are untouched -- including
+# the fetch-wait record a re-freeze queues for one beneath a composed wake.
 #
 # Usage: tests/postmaster/24-composed-seats.sh  (or all files at once:
 # tests/fork-sandbox-postmaster-test.sh)
@@ -508,6 +509,56 @@ check "supersede: the re-dispatch runs the admitted xs row" "csonnet1-ropus1" "$
 check "supersede: ... with the admitted floor" "$cs_fw_floor" "$(flag_value --finalize-floor)"
 check "supersede: ... at the newest head" "upstream=$cs_fw_b" "$(flag_value --extra-ref)"
 
+# A re-freeze beneath pak's own xs/floor wake queues the panel's follow
+# seats; their records are written in pak's wake but are not pak's. The
+# launcher wrapper snapshots fetch-wait/ at pak's spawn, before the same
+# pass re-dispatches (and so removes) the followers' records.
+cs_real_launcher="$FORK_SANDBOX_POSTMASTER_LAUNCHER"
+cs_snap_launcher="$CS_OUT/launcher-snap.sh"
+cat > "$cs_snap_launcher" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${CS_FW_SNAP:-}" && ! -e "$CS_FW_SNAP" ]]; then
+    mkdir -p -- "$CS_FW_SNAP"
+    cp -R -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/fetch-wait/." "$CS_FW_SNAP/" 2>/dev/null
+fi
+exec "$CS_REAL_LAUNCHER" "$@"
+EOF
+chmod +x "$cs_snap_launcher"
+cs_new_store
+cs_fw_old="$(cs_fw_commit feature/cs-replay)"
+printf 'v1\n' > "$work/body.tmp"
+cs_mid="$("$MAIL" send --from '@carol' --to '@panel' --subject 'panel v1 replay' \
+    --body "$work/body.tmp" --hops 8 --review-target "feature/cs-replay:$cs_fw_old" 2>/dev/null)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+for cs_s in kai kye; do
+    cs_fw_set "$cs_tid" "$cs_s" SINCE "$(( $(date +%s) - 130 ))"
+    cs_fw_set "$cs_tid" "$cs_s" NOT_BEFORE 0
+done
+once
+cs_fw_new="$(git -C "$UH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test \
+    commit-tree -m "unrelated replay" "$(git -C "$UH_ORIGIN_SRC" mktree < /dev/null)")"
+cs_fw_sync feature/cs-replay "$cs_fw_new"
+cs_fw_r="$(reply_msg '@ci-demo' "$cs_mid" 'force-pushed' --to '@operator' \
+    --upstream-head "feature/cs-replay:$cs_fw_new")"
+once
+printf 'xs' > "$CS_OUT/size"
+printf '%s\n' "$cs_fw_floor" > "$CS_OUT/floor"
+cs_snap="$CS_OUT/fw-snap"
+rm -rf -- "$cs_snap"
+: > "$STUB_ARGV_LOG"
+reply_msg '@carol' "$cs_fw_r" 'review the new head' --to '@pak' >/dev/null
+FORK_SANDBOX_POSTMASTER_LAUNCHER="$cs_snap_launcher" CS_FW_SNAP="$cs_snap" \
+    CS_REAL_LAUNCHER="$cs_real_launcher" once
+contains "followers setup: the re-freeze queued the panel" "$(cat "$work/once.out")" \
+    "pm review-target-refrozen-wake thread=${cs_tid:0:8} agents=kai,kye"
+contains "followers setup: beneath pak's own xs wake" "$(pipeline_events)" \
+    "agent=pak size=xs requested=xs spec=csonnet1-ropus1 floor=$cs_fw_floor"
+for cs_s in kai kye; do
+    check "followers: $cs_s's record is byte-identical to a plain seat's" \
+        "$(printf 'TRIGGER=%s\nRETRY=0\nKIND=review-target\nKEY=\nSINCE=0\nATTEMPTS=0\nNOT_BEFORE=0\n' "$cs_mid")" \
+        "$(cat "$cs_snap/$cs_tid/$cs_s" 2>/dev/null)"
+done
 unset FORK_SANDBOX_POSTMASTER_FETCH_WINDOW
 
 finish_suite
