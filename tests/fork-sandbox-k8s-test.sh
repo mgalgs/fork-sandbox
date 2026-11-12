@@ -24670,6 +24670,24 @@ check "relayed finalize: the reset ran in the clone, so the branch is the review
 check "relayed finalize: the reset left the clone's work tree clean" \
     "" "$(git -C "$lfin_clone" status --porcelain 2>/dev/null)"
 
+printf '\n== composed pipeline on --k8s: --checkout is the run'"'"'s base ==\n'
+# A composed seat's gate may pick the wake's start sha; the postmaster
+# passes it as --checkout, and the staged run.sh's base is that sha (the
+# review range and FS_FINALIZE_BASE both read base_sha).
+kco_sha="$(git -C "$walk_proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit-tree -p "$walk_base_sha" -m 'pushed head' "$(git -C "$walk_proj" rev-parse "$walk_base_sha^{tree}")")"
+kco_pod_work="$(newdir)"; tmpdirs+=("$kco_pod_work")
+if walk_dispatch_flags "$kco_pod_work" "fs-k8s-test-walk-checkout-$$" --checkout "$kco_sha" \
+    --finalize-script "$lfin_script"; then
+    ok "a composed --k8s dispatch with --checkout <sha> stages successfully"
+else
+    no "a composed --k8s dispatch with --checkout <sha> stages successfully" "$(cat "$WALK_STAGE_OUT")"
+fi
+check "--checkout on --k8s: run.sh's base is the checked-out sha" \
+    "base_sha=$kco_sha" "$(grep -E '^base_sha=' "$WALK_RUN_DIR/run.sh" 2>/dev/null)"
+check "--checkout on --k8s: the branch is measured from that sha too" \
+    "return_base_sha=$kco_sha" "$(grep -E '^return_base_sha=' "$WALK_RUN_DIR/run.sh" 2>/dev/null)"
+
 printf '\n== composed pipeline on --k8s: --session-state wires into the pipeline'"'"'s first code step'"'"'s own leg only ==\n'
 # The brief this round adds: --session-state (and --resume-session) used
 # to be refused outright against any composed preset; now they wire into

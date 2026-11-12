@@ -628,11 +628,12 @@
 #      FS_HOOK_EXPORT_FILE (= `mail export <tid> --json`) and
 #      FS_HOOK_STATUS_FILE (= `status --thread <tid> --json`), the last two
 #      in a temp dir under $STATE removed when the gate returns. A seat
-#      with `pipelines:` also gets FS_HOOK_PIPELINE_SIZE_FILE, and one with
-#      `finalize:` FS_HOOK_FINALIZE_FLOOR_FILE, both paths in that same
-#      temp dir: on exit 0 the gate MAY write one token to each (a size
-#      key; a 40- or 64-hex sha), read when it returns (see THE WAKE's
-#      composed seats). Seats without the keys get neither. Output
+#      with `pipelines:` also gets FS_HOOK_PIPELINE_SIZE_FILE and
+#      FS_HOOK_CHECKOUT_FILE, and one with `finalize:`
+#      FS_HOOK_FINALIZE_FLOOR_FILE, all paths in that same temp dir: on
+#      exit 0 the gate MAY write one token to each (a size key; a 40- or
+#      64-hex sha to the other two), read when it returns (see THE WAKE's
+#      composed seats). Seats without the keys get none. Output
 #      goes to $STATE/hooks/logs/.
 #
 #   A candidate that clears rules 0-5 is spawned per THE WAKE below -- unless
@@ -683,7 +684,8 @@
 # (the run record's PIPELINE_SIZE, the held/ and fetch-wait/ records' SIZE)
 # and reused; with none recorded, `default`. Every composed wake logs one
 # `pipeline thread=<t> agent=<a> size=<key> requested=<raw token or -> spec=<spec>
-# floor=<sha or ->` event. Its spawn is `fork-sandbox.sh --branch <b>
+# floor=<sha or -> checkout=<sha or ->[ checkout_requested=<raw token>]` event
+# (the last only when a non-empty checkout token was refused). Its spawn is `fork-sandbox.sh --branch <b>
 # --pipeline <spec> --network <n> --wake-reply [--review-brief <file>]
 # [--finalize-script <file> [--finalize-floor <sha>]]` plus everything any
 # wake passes (clone dir or --k8s and its outbox, attach/thread dirs,
@@ -708,6 +710,16 @@
 # seat starts EVERY wake from the thread's current review target sha when
 # one is recorded (lineage only when none is): its in-run review legs read
 # $base...HEAD, so the base must be the commit the other reviewers saw.
+# The gate may instead pick where the wake starts: a 40- or 64-hex sha
+# written to FS_HOOK_CHECKOUT_FILE that names a commit in the project repo
+# is passed as --checkout (on both backends, on every wake that has one,
+# in place of the review target or lineage), so it is the run's base too:
+# review legs read <sha>...HEAD, FS_FINALIZE_BASE is that sha, and a gate
+# floor that is not its ancestor fails finalize as floor-not-ancestor.
+# Anything else (no file, empty, malformed, a sha the repo does not have)
+# keeps today's checkout. Recorded and reused like the size (the run
+# record's CHECKOUT, the held/ and fetch-wait/ records' CHECKOUT). The
+# review-target records (WOKEN_AT_*, REVIEW_TARGET_*) are written as before.
 # A wake whose summary.json says its finalize step failed (`finalize.ended
 # == failed`) is HELD at harvest: its reply is not posted, the seat's
 # on-failure retry is not applied (a retry would restart from the review
@@ -1194,8 +1206,9 @@
 #                                   seat; REVIEW_TARGET_SHA keeps its
 #                                   follow-seat meaning), RETRY_KIND and
 #                                   RETRY_OF (a retry wake only),
-#                                   PIPELINE_SIZE, PIPELINE_SPEC and
-#                                   FINALIZE_FLOOR (a composed seat only;
+#                                   PIPELINE_SIZE, PIPELINE_SPEC,
+#                                   FINALIZE_FLOOR and CHECKOUT (a
+#                                   composed seat only;
 #                                   see THE WAKE -- HARNESS/MODEL are then
 #                                   step 1's seat),
 #                                   SPAWNED_AT (UTC ISO-8601, when the
@@ -3931,13 +3944,13 @@ pm_review_history_pin() {
 
 # Atomic tmp+mv write of one pending fetch-miss record (see FETCH MISS in the
 # header), $FETCH_WAIT/<tid>/<agent>. <size> and <floor> (optional) are a
-# composed seat's admitted row and finalize floor: the re-dispatch skips the
-# gate, so it reuses them. Only the record's own seat's values belong here,
+# composed seat's admitted row and finalize floor (and <checkout>, the
+# gate's start sha): the re-dispatch skips the gate, so it reuses them. Only the record's own seat's values belong here,
 # passed explicitly; a record with none re-dispatches on `default` and no
 # floor.
 pm_fetch_wait_write() {
     local tid="$1" agent="$2" trigger="$3" retry="$4" kind="$5" key="$6" since="$7" attempts="$8" not_before="$9"
-    local size="${10:-}" floor="${11:-}"
+    local size="${10:-}" floor="${11:-}" checkout="${12:-}"
     mkdir -p -- "$FETCH_WAIT/$tid"
     local tmp
     tmp="$(mktemp "$FETCH_WAIT/$tid/.tmp.XXXXXX")"
@@ -3951,6 +3964,7 @@ pm_fetch_wait_write() {
         printf 'NOT_BEFORE=%s\n' "$not_before"
         [[ -z "$size" ]] || printf 'SIZE=%s\n' "$size"
         [[ -z "$floor" ]] || printf 'FLOOR=%s\n' "$floor"
+        [[ -z "$checkout" ]] || printf 'CHECKOUT=%s\n' "$checkout"
     } > "$tmp"
     mv -- "$tmp" "$FETCH_WAIT/$tid/$agent"
 }
@@ -3965,11 +3979,12 @@ pm_fetch_wait_drop() {
 # when the wake may go ahead; 1 when it may not -- either deferred (a pending
 # record is written or kept; pm_fetch_wait_pass re-dispatches it) or, once the
 # window has passed, flagged exactly as a miss always was. Never sleeps. See
-# FETCH MISS in the header. <size> and <floor> are the waking seat's own
-# admitted row and floor, kept on the record (see pm_fetch_wait_write).
+# FETCH MISS in the header. <size>, <floor> and <checkout> are the waking
+# seat's own admitted row, floor and start sha, kept on the record (see
+# pm_fetch_wait_write).
 pm_fetch_wait_gate() {
     local project="$1" tid="$2" agent="$3" mid="$4" is_retry="$5" kind="$6" branch="$7" sha="$8"
-    local size="${9:-}" floor="${10:-}"
+    local size="${9:-}" floor="${10:-}" checkout="${11:-}"
     local f="$FETCH_WAIT/$tid/$agent" key="$branch $sha"
     local window="${FORK_SANDBOX_POSTMASTER_FETCH_WINDOW:-300}"
     local now since="" attempts=0 not_before=0 retry_flag=0
@@ -3998,7 +4013,7 @@ pm_fetch_wait_gate() {
     elif [[ -n "$since" ]] && (( now < not_before )); then
         # Not due yet: keep the clock, take the newest trigger, fetch nothing.
         pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before" \
-            "$size" "$floor"
+            "$size" "$floor" "$checkout"
         return 1
     elif pm_target_sha_present "$project" "$branch" "$sha"; then
         present=1
@@ -4031,7 +4046,7 @@ pm_fetch_wait_gate() {
     not_before=$(( now + delay ))
     (( not_before <= since + window )) || not_before=$(( since + window ))
     pm_fetch_wait_write "$tid" "$agent" "$mid" "$retry_flag" "$kind" "$key" "$since" "$attempts" "$not_before" \
-        "$size" "$floor"
+        "$size" "$floor" "$checkout"
     pm_event "defer thread=${tid:0:8} agent=$agent reason=fetch-miss attempt=$attempts"
     return 1
 }
@@ -4040,14 +4055,15 @@ pm_fetch_wait_gate() {
 # wait the thread's seats have pending, of either kind: each is made due now
 # and loses its key, so the next check starts a fresh window -- on the newest
 # head, or on a review target pm_review_target_orphan has just re-frozen.
-# The size and floor the wait was admitted with are kept.
+# The size, floor and checkout the wait was admitted with are kept.
 pm_fetch_wait_supersede() {
     local tid="$1" f
     for f in "$FETCH_WAIT/$tid"/*; do
         [[ -f "$f" ]] || continue
         pm_fetch_wait_write "$tid" "$(basename -- "$f")" "$(fs_pm_env_get "$f" TRIGGER)" \
             "$(fs_pm_env_get "$f" RETRY)" "$(fs_pm_env_get "$f" KIND)" "" 0 0 0 \
-            "$(fs_pm_env_get "$f" SIZE)" "$(fs_pm_env_get "$f" FLOOR)"
+            "$(fs_pm_env_get "$f" SIZE)" "$(fs_pm_env_get "$f" FLOOR)" \
+            "$(fs_pm_env_get "$f" CHECKOUT)"
     done
 }
 
@@ -4659,7 +4675,7 @@ pm_exec_wake() {
 # hold waits on a pending grant unflagged (pm_grant_pending_quiet), else 0.
 pm_held_write() {
     local tid="$1" agent="$2" trigger="$3" since="$4" retry="$5" quiet="${6:-0}"
-    local size="${7:-}" floor="${8:-}"
+    local size="${7:-}" floor="${8:-}" checkout="${9:-}"
     mkdir -p -- "$STATE/held/$tid"
     local tmp
     tmp="$(mktemp "$STATE/held/$tid/.tmp.XXXXXX")"
@@ -4668,10 +4684,11 @@ pm_held_write() {
         printf 'SINCE=%s\n' "$since"
         printf 'RETRY=%s\n' "$retry"
         printf 'QUIET=%s\n' "$quiet"
-        # A composed seat's admitted row and floor (empty otherwise): the
-        # release skips the gate, so it reuses these.
+        # A composed seat's admitted row, floor and start sha (empty
+        # otherwise): the release skips the gate, so it reuses these.
         [[ -z "$size" ]] || printf 'SIZE=%s\n' "$size"
         [[ -z "$floor" ]] || printf 'FLOOR=%s\n' "$floor"
+        [[ -z "$checkout" ]] || printf 'CHECKOUT=%s\n' "$checkout"
     } > "$tmp"
     mv -- "$tmp" "$STATE/held/$tid/$agent"
 }
@@ -4871,12 +4888,13 @@ pm_wake_gate() {
         pm_event "wake-gate-error thread=${tid:0:8} agent=$agent reason=context"
         return 0
     fi
-    # A composed seat's gate may also choose the wake's pipeline row and
-    # its finalize floor, by writing one token to each file below; the
+    # A composed seat's gate may also choose the wake's pipeline row, its
+    # finalize floor and its start sha, by writing one token to each file below; the
     # caller reads them after the gate (pm_spawn_wake's PM_GATE_* locals).
     local -a gate_extra=()
     [[ -z "$has_pipelines" ]] || gate_extra+=("FS_HOOK_PIPELINE_SIZE_FILE=$ctx/pipeline-size")
     [[ -z "$has_finalize" ]] || gate_extra+=("FS_HOOK_FINALIZE_FLOOR_FILE=$ctx/finalize-floor")
+    [[ -z "$has_pipelines" ]] || gate_extra+=("FS_HOOK_CHECKOUT_FILE=$ctx/checkout")
     pm_hook_env "wake-when" "$tid" "FS_HOOK_AGENT=$agent" "FS_HOOK_MESSAGE=$mid" \
         "FS_HOOK_MESSAGE_FILE=$msg_file" "FS_HOOK_EXPORT_FILE=$ctx/export.json" \
         "FS_HOOK_STATUS_FILE=$ctx/status.json" "${gate_extra[@]}"
@@ -4889,6 +4907,7 @@ pm_wake_gate() {
     ) || rc=$?
     if (( rc == 0 )); then
         [[ -z "$has_pipelines" ]] || PM_GATE_SIZE_TOKEN="$(pm_gate_token "$ctx/pipeline-size")"
+        [[ -z "$has_pipelines" ]] || PM_GATE_CHECKOUT_TOKEN="$(pm_gate_token "$ctx/checkout")"
         [[ -z "$has_finalize" ]] || PM_GATE_FLOOR_TOKEN="$(pm_gate_token "$ctx/finalize-floor")"
     fi
     rm -rf -- "$ctx"
@@ -4922,13 +4941,14 @@ pm_composed_args() {
 }
 
 # A composed wake's run-record lines (none for any other seat); reads
-# pm_spawn_wake's own locals. A retry reads PIPELINE_SIZE/FINALIZE_FLOOR
-# back (the gate does not run again).
+# pm_spawn_wake's own locals. A retry reads PIPELINE_SIZE/FINALIZE_FLOOR/
+# CHECKOUT back (the gate does not run again).
 pm_composed_record() {
     [[ -n "$pipelines" ]] || return 0
     printf 'PIPELINE_SIZE=%s\n' "$pm_wake_size"
     printf 'PIPELINE_SPEC=%s\n' "$pipeline_spec"
     printf 'FINALIZE_FLOOR=%s\n' "$pm_wake_floor"
+    printf 'CHECKOUT=%s\n' "$pm_wake_checkout"
 }
 
 # One token a wake gate left in file $1: its first line, trimmed, at most 4
@@ -5008,7 +5028,7 @@ pm_spawn_wake() {
     # a skip both end the spawn here; the gate itself wrote (or dropped) the
     # seat's wake-deferred line, and no caller acts on anything but the run
     # this leaves behind (none).
-    local PM_GATE_SIZE_TOKEN="" PM_GATE_FLOOR_TOKEN=""
+    local PM_GATE_SIZE_TOKEN="" PM_GATE_FLOOR_TOKEN="" PM_GATE_CHECKOUT_TOKEN=""
     if [[ -n "$wake_when" && -z "$is_retry" && -z "${PM_WAKE_ADMITTED:-}" ]] \
         && ! pm_wake_gate "$agent" "$tid" "$mid" "$wake_when" \
             "${pipelines:+1}" "${finalize:+1}"; then
@@ -5049,22 +5069,35 @@ pm_spawn_wake() {
     # here, before the review-target and grant blocks below, so their
     # held/fetch-wait records carry it (passed to pm_held_write and
     # pm_fetch_wait_gate explicitly).
-    local pm_wake_size="" pm_wake_floor="" pipeline_spec="" pipeline_requested="-"
+    local pm_wake_size="" pm_wake_floor="" pm_wake_checkout="" pipeline_spec="" pipeline_requested="-"
     local pipeline_step1_action="" pipeline_step1_harness="" pipeline_step1_model=""
     if [[ -n "$pipelines" ]]; then
-        local size_token="" floor_token=""
+        local size_token="" floor_token="" checkout_token="" checkout_shown=""
         if [[ -n "${PM_WAKE_ADMITTED:-}" ]]; then
             size_token="${PM_WAKE_SIZE:-}" floor_token="${PM_WAKE_FLOOR:-}"
+            checkout_token="${PM_WAKE_CHECKOUT:-}"
         elif [[ -n "$is_retry" ]]; then
             local retry_rid
             retry_rid="$(pm_seat_last_run "$tid" "$agent")"
             if [[ -n "$retry_rid" ]]; then
                 size_token="$(fs_pm_env_get "$RUNS/$retry_rid.env" PIPELINE_SIZE)"
                 floor_token="$(fs_pm_env_get "$RUNS/$retry_rid.env" FINALIZE_FLOOR)"
+                checkout_token="$(fs_pm_env_get "$RUNS/$retry_rid.env" CHECKOUT)"
             fi
         else
             size_token="$PM_GATE_SIZE_TOKEN" floor_token="$PM_GATE_FLOOR_TOKEN"
+            checkout_token="$PM_GATE_CHECKOUT_TOKEN"
             pipeline_requested="$(pm_pipeline_token_shown "$size_token")"
+        fi
+        # The gate's start sha: the wake checks it out instead of the review
+        # target, and so it is the run's base. Only a sha the project repo
+        # has counts; anything else is today's checkout, the refused token
+        # shown in the event.
+        if [[ "$checkout_token" =~ $PM_FINALIZE_FLOOR_RE ]] \
+            && git -C "$project" cat-file -e "$checkout_token^{commit}" 2>/dev/null; then
+            pm_wake_checkout="$checkout_token"
+        elif [[ -n "$checkout_token" ]]; then
+            checkout_shown=" checkout_requested=$(pm_pipeline_token_shown "$checkout_token")"
         fi
         pm_wake_size="$(pm_pipeline_choose "$pipelines" "$size_token")"
         pipeline_spec="$(pm_pipeline_spec "$pipelines" "$pm_wake_size")"
@@ -5073,7 +5106,7 @@ pm_spawn_wake() {
         fi
         read -r pipeline_step1_action pipeline_step1_harness pipeline_step1_model \
             < <(pm_pipeline_step1 "$pipeline_spec") || true
-        pm_event "pipeline thread=${tid:0:8} agent=$agent size=$pm_wake_size requested=$pipeline_requested spec=$pipeline_spec floor=${pm_wake_floor:--}"
+        pm_event "pipeline thread=${tid:0:8} agent=$agent size=$pm_wake_size requested=$pipeline_requested spec=$pipeline_spec floor=${pm_wake_floor:--} checkout=${pm_wake_checkout:--}$checkout_shown"
     fi
 
     # A `follow` seat on a thread that has a review target spawns checked
@@ -5110,7 +5143,7 @@ pm_spawn_wake() {
             fi
             if [[ -n "$rt_sha" ]] \
                 && ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" review-target "$rt_branch" "$rt_sha" \
-                    "$pm_wake_size" "$pm_wake_floor"; then
+                    "$pm_wake_size" "$pm_wake_floor" "$pm_wake_checkout"; then
                 return 0
             fi
         fi
@@ -5131,7 +5164,7 @@ pm_spawn_wake() {
                 uh_branch="$(fs_pm_env_get "$uh_file" BRANCH)"
                 uh_sha="$(fs_pm_env_get "$uh_file" SHA)"
                 if ! pm_fetch_wait_gate "$project" "$tid" "$agent" "$mid" "$is_retry" upstream-head "$uh_branch" "$uh_sha" \
-                    "$pm_wake_size" "$pm_wake_floor"; then
+                    "$pm_wake_size" "$pm_wake_floor" "$pm_wake_checkout"; then
                     return 0
                 fi
             else
@@ -5167,7 +5200,7 @@ pm_spawn_wake() {
             [[ -n "$is_retry" ]] && retry_flag="$is_retry"
             pm_grant_pending_quiet "$tid" && quiet=1
             pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag" "$quiet" \
-                "$pm_wake_size" "$pm_wake_floor"
+                "$pm_wake_size" "$pm_wake_floor" "$pm_wake_checkout"
             if (( quiet )); then
                 pm_event "refuse thread=${tid:0:8} agent=$agent reason=grant-pending"
             else
@@ -5344,7 +5377,9 @@ pm_spawn_wake() {
             *) pm_flag "$tid" "invalid K8S_POSTMASTER_SEAT_SERVICES: expected true or false"; return 0 ;;
         esac
         local checkout_branch=""
-        if [[ -n "$rt_sha" ]]; then
+        if [[ -n "$pm_wake_checkout" ]]; then
+            checkout_branch="$pm_wake_checkout"
+        elif [[ -n "$rt_sha" ]]; then
             checkout_branch="$rt_sha"
         else
             checkout_branch="$(pm_lineage_checkout "$project" "$tid" "$agent" || true)"
@@ -5554,11 +5589,19 @@ pm_spawn_wake() {
     # is HEAD, never the target, as in the k8s branch above.
     # A composed `sets` seat starts every wake from the target (see the
     # review-target block above), not only a target new to the clone.
-    if [[ -n "$rt_sha" ]] \
+    # A composed seat's gate-chosen start sha (pm_wake_checkout) wins over
+    # all of that, on every wake that has one.
+    local local_checkout=""
+    if [[ -n "$pm_wake_checkout" ]]; then
+        local_checkout="$pm_wake_checkout"
+    elif [[ -n "$rt_sha" ]] \
         && { [[ -n "$pipelines" && "$review_target" == sets ]] \
              || [[ ! -d "$PM_WORKSPACES/$tid/$agent/.git" ]] \
              || [[ "$(pm_seat_last_target_sha "$tid" "$agent")" != "$rt_sha" ]]; }; then
-        spawn_args+=(--checkout "$rt_sha")
+        local_checkout="$rt_sha"
+    fi
+    if [[ -n "$local_checkout" ]]; then
+        spawn_args+=(--checkout "$local_checkout")
         local checkout_trust_ref
         checkout_trust_ref="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
         [[ -n "$checkout_trust_ref" && "$seat_services" != false ]] \
@@ -7846,7 +7889,7 @@ pm_held_pass() {
                     q_trigger="$(fs_pm_env_get "$f" TRIGGER)"
                     pm_held_write "$tid" "$agent" "$q_trigger" "$(fs_pm_env_get "$f" SINCE)" \
                         "$(fs_pm_env_get "$f" RETRY)" 0 "$(fs_pm_env_get "$f" SIZE)" \
-                        "$(fs_pm_env_get "$f" FLOOR)"
+                        "$(fs_pm_env_get "$f" FLOOR)" "$(fs_pm_env_get "$f" CHECKOUT)"
                     pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
                     pm_seat_flag_unless_closed "$tid" "$agent" "no grant for k8s seat $agent: $q_trigger"
                 fi
@@ -7861,9 +7904,10 @@ pm_held_pass() {
             trigger="$(fs_pm_env_get "$f" TRIGGER)"
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
             [[ "$retry_flag" == 1 || "$retry_flag" == malformed ]] && is_retry="$retry_flag"
-            local PM_WAKE_SIZE PM_WAKE_FLOOR
+            local PM_WAKE_SIZE PM_WAKE_FLOOR PM_WAKE_CHECKOUT
             PM_WAKE_SIZE="$(fs_pm_env_get "$f" SIZE)"
             PM_WAKE_FLOOR="$(fs_pm_env_get "$f" FLOOR)"
+            PM_WAKE_CHECKOUT="$(fs_pm_env_get "$f" CHECKOUT)"
             rm -f -- "$f"
             local PM_WAKE_ADMITTED=1 by
             pm_event "held-release thread=${tid:0:8} agent=$agent trigger=${trigger:0:8}"
@@ -7916,9 +7960,10 @@ pm_fetch_wait_pass() {
             trigger="$(fs_pm_env_get "$f" TRIGGER)"
             retry_flag="$(fs_pm_env_get "$f" RETRY)"
             [[ "$retry_flag" == 1 || "$retry_flag" == malformed ]] && is_retry="$retry_flag"
-            local PM_WAKE_SIZE PM_WAKE_FLOOR
+            local PM_WAKE_SIZE PM_WAKE_FLOOR PM_WAKE_CHECKOUT
             PM_WAKE_SIZE="$(fs_pm_env_get "$f" SIZE)"
             PM_WAKE_FLOOR="$(fs_pm_env_get "$f" FLOOR)"
+            PM_WAKE_CHECKOUT="$(fs_pm_env_get "$f" CHECKOUT)"
             local PM_WAKE_ADMITTED=1
             pm_followup_wake "$project" "$agent" "$tid" "$trigger" "$is_retry" || true
             if [[ -f "$f" && "$(fs_pm_env_get "$f" ATTEMPTS)" == "$attempts" ]]; then

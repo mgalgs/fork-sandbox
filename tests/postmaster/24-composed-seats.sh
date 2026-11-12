@@ -78,6 +78,9 @@ fi
 if [[ -n "${FS_HOOK_FINALIZE_FLOOR_FILE:-}" && -f "$CS_OUT/floor" ]]; then
     cat "$CS_OUT/floor" > "$FS_HOOK_FINALIZE_FLOOR_FILE"
 fi
+if [[ -n "${FS_HOOK_CHECKOUT_FILE:-}" && -f "$CS_OUT/checkout" ]]; then
+    cat "$CS_OUT/checkout" > "$FS_HOOK_CHECKOUT_FILE"
+fi
 exit 0
 GATE
 chmod +x "$CS_HOOKS/wake-when.gate"
@@ -92,7 +95,7 @@ cs_new_store() {
     export FORK_SANDBOX_MAIL_ROOT
     PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
     : > "$STUB_ARGV_LOG"
-    rm -f -- "$CS_OUT/calls" "$CS_OUT/size" "$CS_OUT/floor" "$CS_OUT"/env-*
+    rm -f -- "$CS_OUT/calls" "$CS_OUT/size" "$CS_OUT/floor" "$CS_OUT/checkout" "$CS_OUT"/env-*
 }
 # cs_wake <agent> [size-token]: a fresh store, one message to <agent>, one pass.
 cs_wake() {
@@ -283,10 +286,160 @@ not_contains "gate env: a seat without finalize gets no floor file" "$(cat "$CS_
     "FS_HOOK_FINALIZE_FLOOR_FILE"
 
 # ============================================================
+printf '\n== composed seats: the gate picks the start sha ==\n'
+# ============================================================
+
+# A commit in the project repo that is not HEAD (nor on any branch), the
+# shape of a pushed integration head the seat has not seen yet.
+cs_start="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree -p "$(git -C "$PROJECT_DIR" rev-parse HEAD)" -m 'pushed head' \
+    "$(git -C "$PROJECT_DIR" rev-parse 'HEAD^{tree}')")"
+# cs_start_wake <agent> <checkout-token> [floor]: one gated wake.
+cs_start_wake() {
+    cs_new_store
+    printf '%s' "$2" > "$CS_OUT/checkout"
+    [[ $# -lt 3 ]] || printf '%s\n' "$3" > "$CS_OUT/floor"
+    cs_mid="$(send_msg '@carol' "@$1" 'start topic' 'carry it' 8)"
+    cs_tid="$(thread_of "$cs_mid")"
+    once
+}
+cs_start_wake pat "$cs_start"
+check "start (local): the gate's sha is the one --checkout" "1 $cs_start" \
+    "$(flag_count --checkout) $(flag_value --checkout)"
+check "start (local): the run record keeps it" "$cs_start" \
+    "$(env_val "$(latest_env_for_agent pat)" CHECKOUT)"
+contains "start (local): the pipeline event names it" "$(pipeline_events)" \
+    "spec=copus1-ropus1 floor=- checkout=$cs_start"
+not_contains "start (local): ... and refuses nothing" "$(pipeline_events)" "checkout_requested="
+contains "gate env: a pipelines seat gets the checkout file" "$(cat "$CS_OUT/env-pat")" \
+    "FS_HOOK_CHECKOUT_FILE=$PM_STATE_DIR/wake-gate."
+cs_start_wake pak "$cs_start"
+check "start (k8s): the gate's sha is the one --checkout" "1 $cs_start" \
+    "$(flag_count --checkout) $(flag_value --checkout)"
+check "start (k8s): the run record keeps it" "$cs_start" \
+    "$(env_val "$(latest_env_for_agent pak)" CHECKOUT)"
+cs_start_wake pam "$cs_start"
+check "start (no gate): pam takes no --checkout" 0 "$(flag_count --checkout)"
+contains "start (no gate): the event says checkout=-" "$(pipeline_events)" "floor=- checkout=-"
+
+# Every fallback keeps today's checkout (pat, `sets` with no target and
+# no lineage: none), and the event shows what was refused.
+cs_absent="$(printf 'deadbeef%.0s' 1 2 3 4 5)"
+for cs_case in "none:" "empty:" "short:abc" "39-hex:${cs_start:0:39}" "two-lines:$cs_start
+$cs_start" "absent:$cs_absent" "upper:${cs_start^^}"; do
+    cs_label="${cs_case%%:*}" cs_tok="${cs_case#*:}"
+    if [[ "$cs_label" == none ]]; then
+        cs_wake pat
+    else
+        cs_start_wake pat "$cs_tok"
+    fi
+    check "start fallback ($cs_label): no --checkout, as without a gate sha" 0 "$(flag_count --checkout)"
+    contains "start fallback ($cs_label): the event says checkout=-" "$(pipeline_events)" "checkout=-"
+    check "start fallback ($cs_label): the record's CHECKOUT is empty" "" \
+        "$(env_val "$(latest_env_for_agent pat)" CHECKOUT)"
+    case "$cs_label" in
+        none|empty) not_contains "start fallback ($cs_label): nothing shown as refused" \
+            "$(pipeline_events)" "checkout_requested=" ;;
+        *) contains "start fallback ($cs_label): the raw token is shown as refused" \
+            "$(pipeline_events)" "checkout=- checkout_requested=$(printf '%s' "$cs_tok" | tr -d ' \n' | head -c 64)" ;;
+    esac
+done
+# A sets seat with a review target: a refused sha keeps the target.
+k8s_rt1_seed
+cs_new_store
+printf 'abc' > "$CS_OUT/checkout"
+printf 'revise\n' > "$work/body.tmp"
+cs_mid="$("$MAIL" send --from '@carol' --to '@pat' --subject 'target start' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+once
+check "start fallback (target): a refused sha keeps the review target" "$rt1_sha" "$(flag_value --checkout)"
+cs_new_store
+printf '%s' "$cs_start" > "$CS_OUT/checkout"
+cs_mid="$("$MAIL" send --from '@carol' --to '@pat' --subject 'target start' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+cs_tid="$(thread_of "$cs_mid")"
+once
+check "start (target): a valid sha wins over the review target" "1 $cs_start" \
+    "$(flag_count --checkout) $(flag_value --checkout)"
+check "start (target): the review-target records are still written" "$rt1_sha $rt1_sha" \
+    "$(env_val "$(latest_env_for_agent pat)" WOKEN_AT_SHA) $(env_val "$(latest_env_for_agent pat)" REVIEW_TARGET_SHA)"
+
+# Admission: a retry, a held release and a fetch-wait re-dispatch reuse it.
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+cs_start_wake pat "$cs_start"
+cs_calls_before="$(cs_calls)"
+rm -f -- "$CS_OUT/checkout"
+finish_run pat 1
+once
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "start retry: the retry reuses the admitted sha" "1 $cs_start" \
+    "$(flag_count --checkout) $(flag_value --checkout)"
+check "start retry: the gate is not asked again" "$cs_calls_before" "$(cs_calls)"
+contains "start retry: the event names it" "$(pipeline_events)" "checkout=$cs_start"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+cs_start_wake pag "$cs_start"
+check "start held: the held record carries the admitted sha" "$cs_start" \
+    "$(env_val "$PM_STATE_DIR/held/$cs_tid/pag" CHECKOUT)"
+rm -f -- "$CS_OUT/checkout"
+cs_calls_before="$(cs_calls)"
+"$MAIL" grant "$cs_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "start held: the release checks out the admitted sha" "1 $cs_start" \
+    "$(flag_count --checkout) $(flag_value --checkout)"
+check "start held: the release does not ask the gate" "$cs_calls_before" "$(cs_calls)"
+
+# A gate floor reaches the runner unchanged beside the gate's sha; whether
+# it is an ancestor is the runner's existing floor-not-ancestor check (the
+# finalize suite proves that against the checkout).
+cs_floor_side="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree -p "$(git -C "$PROJECT_DIR" rev-parse HEAD)" -m 'side floor' \
+    "$(git -C "$PROJECT_DIR" rev-parse 'HEAD^{tree}')")"
+cs_start_wake pat "$cs_start" "$cs_floor_side"
+check "start floor: both flags reach the runner as written" "$cs_start $cs_floor_side" \
+    "$(flag_value --checkout) $(flag_value --finalize-floor)"
+
+# ============================================================
 printf '\n== composed seats: seats without pipelines are unchanged ==\n'
 # ============================================================
 
+# The whole argv, the gate env's FS_HOOK_ keys and the run record's keys of
+# a plain local and a plain k8s seat, exactly (the variable values masked).
+cs_argv_shape() {
+    last_call | sed -E "s#^$CS_SHAPE_STATE.*#<state>#; s#^/.*/pm-k8s-wake\.[^/]*/#<wake>/#; s#^sbx-mail-[0-9a-f]{8}-#sbx-mail-<t>-#; s#^$PROJECT_DIR\$#<project>#; s#^$FORK_SANDBOX_MAIL_ROOT/#<root>/#"
+}
+cs_env_keys() { sed 's/=.*//' "$1" | tr '\n' ' '; }
+
 cs_wake alice xs
+printf '%s' "$cs_start" > "$CS_OUT/checkout"
+CS_SHAPE_STATE="$PM_STATE_DIR"
+check "plain local seat: the argv is exactly as before" \
+"--branch
+sbx-mail-<t>-alice-1
+--harness
+claude
+--network
+pinned
+--model
+opus
+--effort
+high
+--clone-dir
+<state>
+--thread-dir
+<state>
+--session-state
+<state>
+<project>
+<state>" "$(cs_argv_shape)"
+check "plain local seat: the gate env's keys are exactly as before" \
+    "FS_HOOK_AGENT FS_HOOK_EVENT FS_HOOK_EXPORT_FILE FS_HOOK_MAIL_ROOT FS_HOOK_MESSAGE FS_HOOK_MESSAGE_FILE FS_HOOK_REPO FS_HOOK_STATUS_FILE FS_HOOK_THREAD FS_HOOK_UPSTREAM_STATE " \
+    "$(cs_env_keys "$CS_OUT/env-alice")"
+check "plain local seat: the run record's keys are exactly as before" \
+    "AGENT THREAD TRIGGER RUN_DIR INBOX HARNESS MODEL NETWORK BRANCH RESUMED PENDING_MSGS VIA SPAWNED_AT BACKEND REVIEW_TARGET ON_SILENCE " \
+    "$(cs_env_keys "$(latest_env_for_agent alice)")"
 not_contains "plain seat: its gate env has no size file" "$(cat "$CS_OUT/env-alice")" \
     "FS_HOOK_PIPELINE_SIZE_FILE"
 not_contains "plain seat: ... and no floor file" "$(cat "$CS_OUT/env-alice")" \
@@ -301,6 +454,30 @@ done
 check "plain local seat: no PIPELINE_SIZE in its record" "" \
     "$(env_val "$(latest_env_for_agent alice)" PIPELINE_SIZE)"
 cs_wake karen xs
+CS_SHAPE_STATE="$PM_STATE_DIR"
+check "plain k8s seat: the argv is exactly as before" \
+"--branch
+sbx-mail-<t>-karen-1
+--harness
+claude
+--network
+pinned
+--model
+sonnet
+--thread-dir
+<state>
+--k8s
+--timeout
+14400
+--session-state
+<state>
+--outbox-dir
+<wake>/outbox
+<project>
+<state>" "$(cs_argv_shape)"
+check "plain k8s seat: the gate env's keys are exactly as before" \
+    "FS_HOOK_AGENT FS_HOOK_EVENT FS_HOOK_EXPORT_FILE FS_HOOK_MAIL_ROOT FS_HOOK_MESSAGE FS_HOOK_MESSAGE_FILE FS_HOOK_REPO FS_HOOK_STATUS_FILE FS_HOOK_THREAD FS_HOOK_UPSTREAM_STATE " \
+    "$(cs_env_keys "$CS_OUT/env-karen")"
 not_contains "plain k8s seat: its gate env has no size file" "$(cat "$CS_OUT/env-karen")" \
     "FS_HOOK_PIPELINE_SIZE_FILE"
 check "plain k8s seat: no pipeline event" "" "$(pipeline_events)"
@@ -493,12 +670,13 @@ cs_fw_r="$(reply_msg '@ci-demo' "$cs_mid" 'pushed' --to '@operator' --upstream-h
 once
 printf 'xs' > "$CS_OUT/size"
 printf '%s\n' "$cs_fw_floor" > "$CS_OUT/floor"
+printf '%s\n' "$cs_start" > "$CS_OUT/checkout"
 reply_msg '@carol' "$cs_fw_r" 'review the push' --to '@pak' >/dev/null
 : > "$STUB_ARGV_LOG"
 once
-check "supersede setup: pak waits on the announced head" "xs $cs_fw_floor" \
-    "$(env_val "$(cs_fw_file "$cs_tid" pak)" SIZE) $(env_val "$(cs_fw_file "$cs_tid" pak)" FLOOR)"
-rm -f -- "$CS_OUT/size" "$CS_OUT/floor"
+check "supersede setup: pak waits on the announced head" "xs $cs_fw_floor $cs_start" \
+    "$(env_val "$(cs_fw_file "$cs_tid" pak)" SIZE) $(env_val "$(cs_fw_file "$cs_tid" pak)" FLOOR) $(env_val "$(cs_fw_file "$cs_tid" pak)" CHECKOUT)"
+rm -f -- "$CS_OUT/size" "$CS_OUT/floor" "$CS_OUT/checkout"
 cs_fw_b="$(cs_fw_commit feature/cs-late-2)"
 cs_fw_sync feature/cs-late-2 "$cs_fw_b"
 reply_msg '@ci-demo' "$cs_fw_r" 'pushed again' --to '@operator' \
@@ -507,6 +685,7 @@ once
 [[ -s "$STUB_ARGV_LOG" ]] || once
 check "supersede: the re-dispatch runs the admitted xs row" "csonnet1-ropus1" "$(flag_value --pipeline)"
 check "supersede: ... with the admitted floor" "$cs_fw_floor" "$(flag_value --finalize-floor)"
+check "supersede: ... and the admitted start sha" "$cs_start" "$(flag_value --checkout)"
 check "supersede: ... at the newest head" "upstream=$cs_fw_b" "$(flag_value --extra-ref)"
 
 # A re-freeze beneath pak's own xs/floor wake queues the panel's follow

@@ -2262,13 +2262,15 @@ thread routes it.
      in a temp dir under the state dir that is removed when the gate
      returns, on every path. A gate is thereby pinned to the view the
      postmaster decides on. A seat with `pipelines:` also gets
-     `FS_HOOK_PIPELINE_SIZE_FILE`, and one with `finalize:`
-     `FS_HOOK_FINALIZE_FLOOR_FILE`, both paths in that same temp dir: on
-     exit 0 the gate **may** write one token to each — a size key of the
-     seat's table, and a full 40- or 64-hex commit sha the finalized head
-     must descend from. Anything else (no file, empty, malformed, an
-     unknown key) is the `default` row and no floor; see "Composed seats"
-     under "The wake". Seats without the keys get neither variable.
+     `FS_HOOK_PIPELINE_SIZE_FILE` and `FS_HOOK_CHECKOUT_FILE`, and one with
+     `finalize:` `FS_HOOK_FINALIZE_FLOOR_FILE`, all paths in that same temp
+     dir: on exit 0 the gate **may** write one token to each — a size key
+     of the seat's table, a full 40- or 64-hex commit sha the wake starts
+     from, and one the finalized head must descend from. Anything else (no
+     file, empty, malformed, an unknown key, a sha the project repo does not
+     have) is the `default` row, today's checkout and no floor; see
+     "Composed seats" under "The wake". Seats without the keys get none of
+     these variables.
    - **A deferral is remembered.** `wake-deferred/<thread-id>` holds one
      `<agent> <message-id> <due> <attempt>` line per deferred seat (a
      later defer of the same seat replaces its line): `<due>` is when its
@@ -2414,8 +2416,11 @@ admitted is recorded (`PIPELINE_SIZE` in the run record, `SIZE` in the
 `default`. Every composed wake logs one event:
 
 ```
-pipeline thread=<t> agent=<a> size=<chosen key> requested=<raw token or -> spec=<spec> floor=<sha or ->
+pipeline thread=<t> agent=<a> size=<chosen key> requested=<raw token or -> spec=<spec> floor=<sha or -> checkout=<sha or ->[ checkout_requested=<raw token>]
 ```
+
+`checkout_requested` appears only when the gate wrote a non-empty checkout
+token that was refused (see the start sha below).
 
 The spawn passes `--pipeline <spec>`, `--wake-reply`, and, when the seat
 sets them, `--review-brief <file>` and `--finalize-script <file>` (with
@@ -2441,6 +2446,21 @@ thread's current review target sha when one is recorded, not only its first:
 its in-run review legs read `$base...HEAD`, so the base must be the commit
 the other reviewers already saw. Its own lineage is the fallback only when
 no target is recorded. Non-composed seats keep the rule above.
+
+**The gate may pick where the wake starts.** A composed seat's gate may
+write one sha (40 or 64 hex) to `FS_HOOK_CHECKOUT_FILE`. When it names a
+commit in the project repo, the wake checks that sha out instead of the
+review target or its lineage, on both backends, and the sha is the run's
+base: review legs read `<sha>...HEAD`, `FS_FINALIZE_BASE` is that sha, and
+a gate floor that is not its ancestor fails finalize as
+`floor-not-ancestor`. Anything else (no file, empty, malformed, a sha the
+repo does not have) keeps the checkout above. It is recorded at admission
+(`CHECKOUT` in the run record and in the `held/` and `fetch-wait/` records)
+and reused on retry and release, like the size. The thread's review-target
+records (`WOKEN_AT_*`, `REVIEW_TARGET_*`) are written exactly as before, so
+a `Version:` reply still stamps what it should. An integration wake, for
+example, may start at the pushed head: with nothing above it, review and
+finalize skip by their own rules.
 
 A composed wake whose finalize step failed (its `summary.json` records
 `finalize.ended: failed`) is **held** at harvest: the reply is not posted,
@@ -2708,6 +2728,7 @@ mktemp+mv rewrite on every write, never a partial one:
 | `QUIET` | `1` while the hold waits on a pending grant (`X-Grant: pending` on the root, inside the grant-pending timeout) and has raised no flag, else `0`. Absent in a record written before the field existed, which reads as `0` |
 | `SIZE` | a composed seat's admitted `pipelines:` row, reused on release (absent otherwise; absent reads as `default`). `fetch-wait/` records carry it too |
 | `FLOOR` | a composed seat's admitted finalize floor, reused on release (absent when none). `fetch-wait/` records carry it too |
+| `CHECKOUT` | a composed seat's admitted start sha (`FS_HOOK_CHECKOUT_FILE`), reused on release (absent when none). `fetch-wait/` records carry it too |
 
 Created the first time a `backend: k8s`, `grant: required` seat's wake
 would otherwise spawn with no grant file present. A new message addressed
@@ -2775,7 +2796,7 @@ own thread scans never see it:
 | `discards/<thread-id>/<agent>.prior` | the seat's crash-retry record set aside while a malformed schedule is pending; put back when that schedule ends |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT/REASON fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
-| `fetch-wait/<thread-id>/<agent>` | a wake deferred because its sha (upstream head or review target) is not on `origin` yet: `TRIGGER`, `RETRY`, `KIND`, `KEY` (`<branch> <sha>`), `SINCE`, `ATTEMPTS`, `NOT_BEFORE` — see "Upstream moved" step 3 |
+| `fetch-wait/<thread-id>/<agent>` | a wake deferred because its sha (upstream head or review target) is not on `origin` yet: `TRIGGER`, `RETRY`, `KIND`, `KEY` (`<branch> <sha>`), `SINCE`, `ATTEMPTS`, `NOT_BEFORE`, and for a composed seat `SIZE`, `FLOOR`, `CHECKOUT` — see "Upstream moved" step 3 |
 | `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |
 | `hook-marks/quiescent/<thread-id>` | `<count> <1|0>`: the message count and flag state the last `on-quiescent` pass saw, written before the hook fires (a count alone is an older marker; see "Hooks") |

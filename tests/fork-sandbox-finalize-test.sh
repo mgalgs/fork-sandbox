@@ -511,5 +511,35 @@ check "tidy: finalize ran on a maintainer-last run" "0|ran" "$rc|$(fin_json "$rd
 check "tidy: the tidy leg's approved head is finalize's head" \
     "$(fin_json "$rd" '.finalize.head_after')" "$(fin_json "$rd" '.tidy.head_approved')"
 
+# --checkout makes the base: a composed wake whose gate picked a start sha
+# checks it out, and the review range and FS_FINALIZE_BASE start there.
+start_sha="$(git -C "$proj" rev-parse HEAD~1)"
+rm -f "$FIN_MARK"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-fixup\napproved' \
+    --pipeline csonnet-ropus --checkout "$start_sha" \
+    --finalize-script "$scripts_dir/autosquash.sh" --branch "$br")
+check "checkout: the run's base is the checked-out sha" "0|$start_sha" "$rc|$(fin_json "$rd" '.base_sha')"
+check "checkout: FS_FINALIZE_BASE is the checked-out sha" "$start_sha" "$(sed -n 1p "$FIN_MARK")"
+contains "checkout: the review leg reads <sha>...HEAD" \
+    "$(cat "$rd"/step-2-prompt-1.md "$rd"/review-prompt-1.md 2>/dev/null)" "    $start_sha...HEAD"
+check "checkout: the folded head sits one commit above the sha" "1" \
+    "$(git -C "$proj" rev-list --count "$start_sha..$br" 2>/dev/null)"
+
+# A floor that is an ancestor of origin's HEAD but not of the checked-out
+# sha is refused by the existing check, against the checkout.
+side="$(git -C "$proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit-tree "$(git -C "$proj" rev-parse "HEAD~1^{tree}")" -p "$(git -C "$proj" rev-parse HEAD~1)" -m side)"
+git -C "$proj" update-ref refs/heads/fs-fin-side "$side"
+rm -f "$FIN_MARK"
+next_branch
+IFS=$'\t' read -r rd rc < <(fin_run $'commit-file\napproved' \
+    --pipeline csonnet-ropus --checkout "$side" --finalize-script "$scripts_dir/mark.sh" \
+    --finalize-floor "$base2" --branch "$br")
+check "checkout floor: a floor off the checkout's line is floor-not-ancestor" \
+    "1|failed|floor-not-ancestor|null" \
+    "$rc|$(fin_json "$rd" '"\(.finalize.ended)|\(.finalize.detail)|\(.finalize.exit)"')"
+check "checkout floor: the script never ran" "no" "$([[ -e "$FIN_MARK" ]] && echo yes || echo no)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
