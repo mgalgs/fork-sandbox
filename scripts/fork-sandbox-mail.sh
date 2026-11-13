@@ -2270,51 +2270,19 @@ cmd_inbox() {
     local addr="@$name"
     mail_validate_inbox_name "$name" inbox || return 1
 
-    local seen_file="$MAIL_ROOT/agents/$name/seen"
-    local -a seen_ids=()
-    if [[ -f "$seen_file" ]]; then
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && seen_ids+=("$line")
-        done < "$seen_file"
-    fi
-
-    local threads_dir; threads_dir="$(mail_threads_dir)"
+    local threads_dir="$MAIL_ROOT/threads"
     [[ -d "$threads_dir" ]] || return 0
+    local lane_root=0
+    if mail_is_lane_root; then lane_root=1; fi
+
+    # Bash expands the same glob as before; NUL framing keeps paths out of
+    # argv and lets one scanner process read every message in that order.
     local f
     for f in "$threads_dir"/*/*.msg; do
-        [[ -e "$f" ]] || continue
-        local to cc position=""
-        to="$(mail_header "$f" To)"
-        cc="$(mail_header "$f" Cc)"
-        case ",$to," in
-            *", $addr,"* | ",$addr,"*) position="To" ;;
-        esac
-        if [[ -z "$position" ]]; then
-            case ",$cc," in
-                *", $addr,"* | ",$addr,"*) position="Cc" ;;
-            esac
-        fi
-        if [[ -z "$position" && "$to,$cc" == *"$MAIL_BROADCAST"* ]] && mail_is_lane_root; then
-            position="$(mail_broadcast_position "$f" "$addr" "$to" "$cc")"
-        fi
-        [[ -n "$position" ]] || continue
+        if [[ -e "$f" ]]; then printf '%s\0' "$f"; fi
+    done | python3 "$script_dir/fork-sandbox-mail-inbox.py" \
+        "$addr" "$MAIL_ROOT/agents/$name/seen" "$all" "$lane_root" "$MAIL_BROADCAST"
 
-        local mid
-        mid="$(mail_header "$f" Message-ID)"
-        if (( ! all )); then
-            local s already=0
-            for s in "${seen_ids[@]:-}"; do
-                [[ "$s" == "$mid" ]] && { already=1; break; }
-            done
-            (( already )) && continue
-        fi
-
-        local tid from subject
-        tid="$(mail_header "$f" Thread-ID)"
-        from="$(mail_header "$f" From)"
-        subject="$(mail_header "$f" Subject)"
-        printf '%s\t%s\t%s\t%s\t%s\n' "$mid" "$tid" "$position" "$from" "$subject"
-    done
 }
 
 cmd_grant() {

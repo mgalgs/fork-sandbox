@@ -349,6 +349,7 @@ PLUMBING=(
     fork-sandbox-k8s-wake.sh
     fork-sandbox-lib.sh
     fork-sandbox-mail-remote.py
+    fork-sandbox-mail-inbox.py # invoked by fork-sandbox-mail.sh via script_dir
     fork-sandbox-pipeline-spec.py
     fork-sandbox-postmaster-pod-init.sh
     fork-sandbox-preset-parse.py
