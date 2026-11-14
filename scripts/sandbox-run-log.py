@@ -1132,7 +1132,8 @@ def main():
                        help="append a run_end record from a run directory")
     p.add_argument("--run-dir", required=True,
                    help=f"a {RUN_DIR_PREFIX}* directory under {FORKS_ROOT}")
-    p.add_argument("--end-reason", choices=["stopped", "stop-timeout", "salvaged"],
+    p.add_argument("--end-reason", choices=["stopped", "stop-timeout", "salvaged",
+                                            "services-unavailable", "services-failed"],
                    help="end_reason to record when the run left no "
                         "summary.json to read one from")
     p.set_defaults(func=cmd_record)

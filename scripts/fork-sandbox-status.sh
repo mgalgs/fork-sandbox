@@ -1269,6 +1269,8 @@ print_status_block() {
                 stopped)      printf ', stopped by operator' ;;
                 stop-timeout) printf ', stop timeout kill' ;;
                 salvaged)     printf ', salvaged after external kill' ;;
+                services-unavailable) printf ', required services were not available' ;;
+                services-failed)      printf ', required services failed to start' ;;
             esac
             printf ')'
             ;;

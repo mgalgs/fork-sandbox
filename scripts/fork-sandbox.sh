@@ -470,6 +470,9 @@
 # --no-services:         skip the per-run services a repo opts into with
 #                        .agents/sandbox-services/ (see below), even when it
 #                        has them.
+# --require-services:    abort a local run before its first agent leg if
+#                        per-run services are unavailable or fail to start.
+#                        Refused with --no-services and --k8s.
 # --services-trust-ref <ref>:
 #                        honor the services hook only if the checked-out ref
 #                        did not change the sandbox-services contract relative to
@@ -1974,6 +1977,7 @@ review_base_ref=""
 foreground=false
 keep_session=false
 no_services=false
+require_services=false
 services_trust_ref=""
 services_env=()
 prompts_dir_arg=""
@@ -2184,6 +2188,10 @@ while [[ "${1:-}" == -* ]]; do
             no_services=true
             shift
             ;;
+        --require-services)
+            require_services=true
+            shift
+            ;;
         --services-trust-ref)
             services_trust_ref="${2:?--services-trust-ref requires a ref}"
             shift 2
@@ -2343,6 +2351,17 @@ while [[ "${1:-}" == -* ]]; do
             ;;
     esac
 done
+
+if $require_services; then
+    if $no_services; then
+        echo "Error: --require-services conflicts with --no-services." >&2
+        exit 1
+    fi
+    if $k8s_mode; then
+        echo "Error: --require-services is local only and cannot be used with --k8s." >&2
+        exit 1
+    fi
+fi
 
 if (( ${#services_env[@]} )); then
     fs_services_env_check "$config_dir" "${services_env[@]}" || exit 1
@@ -9710,6 +9729,7 @@ fs_emit_run_sh_preamble() {
     printf 'user_shell=%q\n' "$user_shell"
     printf 'keep_open=%q\n' "$keep_open"
     printf 'services_enabled=%q\n' "$services_enabled"
+    $require_services && printf 'require_services=true\n'
     printf 'services_script=%q\n' "$services_script"
     printf 'sockets_dir=%q\n' "$sockets_dir"
     printf 'services_project=%q\n' "$services_project"
@@ -10047,6 +10067,26 @@ if ! $foreground; then
         echo "--foreground, or start the generated runner yourself:" >&2
         echo "$run_dir/run.sh" >&2
         exit 1
+    fi
+    if $require_services; then
+        # The detached launcher must report a startup refusal as its own
+        # non-zero exit, while a successful startup remains detached.
+        while [[ ! -s "$run_dir/services-startup" ]]; do
+            if ! tmux has-session -t "$session_name" 2>/dev/null; then
+                # The runner may have completed between the file check and
+                # this query. Its startup result wins over tmux liveness.
+                if [[ ! -s "$run_dir/services-startup" ]]; then
+                    echo "fork-sandbox: required services did not start; see $run_dir/sandbox.log." >&2
+                    exit 1
+                fi
+                break
+            fi
+            sleep 0.1
+        done
+        if [[ "$(cat "$run_dir/services-startup")" != ok ]]; then
+            cat "$run_dir/services-startup" >&2
+            exit 1
+        fi
     fi
     where="detached tmux session $session_name"
 fi

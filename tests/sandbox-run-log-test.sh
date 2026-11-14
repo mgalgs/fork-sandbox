@@ -530,6 +530,21 @@ record "$rd_stopped" >/dev/null 2>"$tmp/err"
 out="$(query show "$(basename "$rd_stopped")")"
 contains "a stopped run's end_reason is recorded" '"end_reason": "stopped"' "$out"
 
+printf '\n== record: required-services end reasons use the no-summary fallback ==\n'
+for reason in services-unavailable services-failed; do
+    rd_services="$(mk_run_dir "$reason")"
+    tmpdirs+=("$rd_services")
+    printf 'harness=claude\nmodel=sonnet\n' > "$rd_services/run.env"
+    printf '1\n' > "$rd_services/exit-code"
+    query record --run-dir "$rd_services" --end-reason "$reason" >/dev/null 2>"$tmp/err"
+    out="$(query show "$(basename "$rd_services")")"
+    contains "$reason is recorded" "\"end_reason\": \"$reason\"" "$out"
+    contains "$reason uses run.env harness" '"harness": "claude"' "$out"
+    contains "$reason uses run.env model" '"model": "sonnet"' "$out"
+    contains "$reason uses exit-code" '"exit_code": 1' "$out"
+    contains "$reason marks summary missing" '"summary_missing": true' "$out"
+done
+
 printf '\n== record: end_reason is absent from the run_end record on a normal run ==\n'
 rd_normal="$(mk_run_dir end-reason-absent)"
 tmpdirs+=("$rd_normal")

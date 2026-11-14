@@ -1070,15 +1070,41 @@ if [[ -n "${cover_only_start:-}" ]]; then
     fi
 fi
 
-# Per-run services: stand them up before the session and point the project's
-# config at the sockets. The teardown is already armed, so a failure here still
-# cleans up. A services failure is a warning, not fatal — the session runs, it
-# just cannot reach the services.
+# End a required-services run before any agent leg. The exit-code and run-log
+# end_reason are the run's failure record; cleanup tears down a partly started
+# compose project.
+required_services_abort() {
+    local cause="$1" reason="$2" line
+    line="fork-sandbox: required services $cause; see $sandbox_log."
+    printf '%s\n' "$line" >&2
+    printf '%s\n' "$line" >> "$sandbox_log"
+    progress_state[1]=failed
+    progress_any_step_failed=1
+    progress_write failed
+    run_cleanup
+    printf '%s\n' "$line" > "$run_dir/summary.txt"
+    printf '1\n' > "$run_dir/exit-code"
+    if [[ -n "$run_log_bin" && -x "$run_log_bin" ]]; then
+        "$run_log_bin" record --run-dir "$run_dir" --end-reason "$reason" \
+            >> "$sandbox_log" 2>&1 || true
+    fi
+    printf '%s\n' "$line" > "$run_dir/services-startup"
+    exit 1
+}
+
+# Per-run services come up once, before the first agent leg. Later review,
+# fix, maintainer and refresh legs use this same stack.
+if [[ "${require_services:-false}" == true && "$services_enabled" != 1 ]]; then
+    required_services_abort "were not available" services-unavailable
+fi
 if [[ "$services_enabled" == "1" && -n "$services_script" ]]; then
     printf 'fork-sandbox: starting per-run services (%s)...\n' "$services_project" >&2
     if ! env ${services_env[@]+"${services_env[@]}"} \
         "$services_script" up "$sockets_dir" "$clone_dir" "$services_project" \
         >> "$sandbox_log" 2>&1; then
+        if [[ "${require_services:-false}" == true ]]; then
+            required_services_abort "failed to start" services-failed
+        fi
         printf 'fork-sandbox: WARNING: services failed to start; see %s.\n' \
             "$sandbox_log" >&2
         printf 'The session runs without them.\n' >&2
@@ -1100,6 +1126,9 @@ the environment as committed state only, and report "the per-run services
 failed to start" instead of debugging the missing sockets.
 NOSVC
     fi
+fi
+if [[ "${require_services:-false}" == true ]]; then
+    printf 'ok\n' > "$run_dir/services-startup"
 fi
 
 # The handoff document is the prompt, and every harness reads it on stdin —

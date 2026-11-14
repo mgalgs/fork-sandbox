@@ -114,6 +114,8 @@ hook. An agent-mail thread can carry these values for its seats; see
   provisioning off for the run.
 - **Failure is a warning, not a wedge.** If `up` fails, the session still
   runs; the prompt gets a correction telling it the services are absent.
+  Pass `--require-services` on a local run to abort before the first agent
+  session when services are unavailable or `up` fails.
 - **The session is told what it has.** The generated prompt gets a "Per-run
   services are up" section naming the sockets directory, the `.env.sandbox`
   convention, and a socat relay recipe for TCP-only clients.
