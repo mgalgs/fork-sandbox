@@ -282,10 +282,8 @@ the scripts it was launched from (see "How a run works"), so the checkout can
 move — a pull, a merge, a branch switch, even a move or delete — without
 changing what any running run does.
 
-A run clones its project out of `~/src` by default; keep projects elsewhere
-and add your own root(s) to `PROJECT_ROOTS` in
-`~/.config/fork-sandbox/projects.env` (colon-separated) — see
-[docs/sandbox-quickstart.md](docs/sandbox-quickstart.md).
+A run clones whichever git repository you name, wherever it lives. (The old
+`PROJECT_ROOTS` key in `projects.env` is no longer read.)
 
 You need `bwrap`, `pasta`, `git` and `jq`. `tmux`, `socat`, `setsid`, `docker`
 and `python3` each unlock a harness or a flag, and `--check` names which.
