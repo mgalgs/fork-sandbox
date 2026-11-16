@@ -3582,8 +3582,33 @@ container is called `leg`.
 | `K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE` | `1Gi` when neither storage key is set; `0` disables | number, optional suffix (or `0`) |
 | `K8S_AGENT_LIMITS_EPHEMERAL_STORAGE` | unset (no limit) | number, optional suffix |
 | `K8S_AGENT_PRIORITY_CLASS` | unset | existing PriorityClass name (DNS-1123 subdomain) |
+| `K8S_AGENT_TOLERATIONS` | unset | comma-separated `key[=value]:effect` |
 
 `K8S_AGENT_PRIORITY_CLASS` sets `priorityClassName` on every agent Job pod and on separate per-run Claude or Codex proxy Pods. Unset omits the field. Create the PriorityClass in the cluster first; `install` only checks for it and warns if missing.
+
+`K8S_AGENT_TOLERATIONS` lets agent Job pods schedule onto tainted nodes, for
+example a node tainted so only batch work lands there:
+
+```
+K8S_AGENT_TOLERATIONS=example.com/batch-only:NoSchedule,example.com/pool=batch:NoExecute
+```
+
+Each comma-separated entry is `key:effect`, which renders `operator: Exists`,
+or `key=value:effect`, which renders `operator: Equal` with that value.
+`effect` is `NoSchedule`, `PreferNoSchedule` or `NoExecute`; `key` is a label
+key (an optional DNS-subdomain prefix and `/`, then a name of at most 63
+characters) and `value` a label value. A malformed entry, an unknown effect,
+or an empty entry (a doubled, leading or trailing comma) is refused at
+startup, naming the entry, before any cluster call. Unset or empty renders no
+`tolerations:` field at all.
+
+Tolerations go on the agent Job pod only. The per-run Claude and Codex proxy
+Pods, the shared `fork-sandbox-proxy` and the postmaster's Deployment never
+get them, even though `K8S_AGENT_PRIORITY_CLASS` reaches the per-run proxies:
+those are dependencies other pods wait on, and a stall on a flaky node under
+one of them stops every agent behind it. `--services` run as sidecar
+containers inside the agent Job pod, so they share its node, and its
+tolerations, by construction.
 
 CPU and memory keys are independent: an unset key renders no field. Kubernetes
 defaults an unset request to its limit when a limit is set, before consulting

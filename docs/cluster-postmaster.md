@@ -95,6 +95,12 @@ Do these in order.
    Pods. The PriorityClass must already exist; `install` checks and warns
    if it cannot find it, but does not create it.
 
+   `K8S_AGENT_TOLERATIONS` adds tolerations to the agent Job pods the
+   postmaster wakes, and to nothing else: not the per-run proxy Pods, the
+   shared proxy, or the postmaster's own Deployment. See "The agent's
+   container resources" in [docs/kubernetes-runs.md](kubernetes-runs.md)
+   for the syntax.
+
    The rest of `k8s.env` (`K8S_CONTEXT`, `K8S_NAMESPACE`, and the rest) is
    read the same way a laptop run reads it, since the whole file is copied
    into the pod as its config. If the config dir also has `fleet.yaml` and

@@ -956,6 +956,20 @@
 #   K8S_AGENT_PRIORITY_CLASS=
 #                         optional existing PriorityClass for agent Jobs
 #                         and per-run proxy Pods; DNS-1123 subdomain.
+#   K8S_AGENT_TOLERATIONS=
+#                         optional tolerations for agent Job pods only, so
+#                         they may land on a tainted node: comma-separated
+#                         key[=value]:effect entries. key:effect renders
+#                         operator Exists, key=value:effect operator Equal;
+#                         effect is NoSchedule, PreferNoSchedule or
+#                         NoExecute; key is a label key (optional DNS
+#                         prefix and '/'), value a label value. Refused,
+#                         naming the entry, before any cluster call. Unset
+#                         renders no tolerations. Never applied to the
+#                         per-run proxy Pods, the shared proxy, the
+#                         postmaster or --services pods: they are shared
+#                         dependencies, and a stall under one stops every
+#                         agent behind it.
 #   K8S_QUOTA_WAIT_SECONDS=
 #                         how long submit waits, in total, for room in
 #                         that quota when a create is refused ("exceeded
@@ -1289,6 +1303,87 @@ k8s_valid_label_key() {
     (( ${#key} <= 63 )) && [[ "$key" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
 }
 
+# A full Kubernetes label key: an optional DNS-1123 subdomain prefix (at most
+# 253 characters) and '/', then a name segment k8s_valid_label_key accepts.
+k8s_valid_qualified_label_key() {
+    local key="$1" prefix
+    if [[ "$key" == */* ]]; then
+        prefix="${key%%/*}"
+        k8s_valid_label_key "${key#*/}" || return 1
+        (( ${#prefix} <= 253 )) &&
+            [[ "$prefix" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]
+    else
+        k8s_valid_label_key "$key"
+    fi
+}
+
+# Parses K8S_AGENT_TOLERATIONS ("key[=value]:effect,...") into
+# AGENT_TOLERATIONS_YAML: the agent Job pod spec's tolerations: block, with a
+# leading newline so it appends to the line before it (as
+# k8s_host_aliases_yaml's output does), or empty for an empty spec. key:effect
+# renders operator Exists, key=value:effect operator Equal. Every scalar is
+# double-quoted so a value like "true" or "123" stays a string. Only the agent
+# Job pod renders this block: the per-run proxy pods, the shared proxy, the
+# postmaster and --services pods are dependencies many agents share, and a
+# stall on a tainted node under one of them stops every agent behind it.
+# Returns 1, naming the bad entry, on refusal.
+k8s_parse_agent_tolerations() {
+    local spec="$1" entry rest kv key value effect
+    AGENT_TOLERATIONS_YAML=""
+    [[ -z "$spec" ]] && return 0
+    local out=$'\n      tolerations:'
+    # Split by hand, not with read -a: read drops a trailing empty field, and
+    # "a:NoSchedule," must be refused like "a:NoSchedule,,b:NoSchedule".
+    rest="$spec,"
+    while [[ -n "$rest" ]]; do
+        entry="${rest%%,*}"
+        rest="${rest#*,}"
+        if [[ -z "$entry" ]]; then
+            echo "Error: K8S_AGENT_TOLERATIONS '$spec' has an empty entry" >&2
+            echo "(a leading, trailing or doubled comma)." >&2
+            return 1
+        fi
+        if [[ "$entry" != *:* ]]; then
+            echo "Error: K8S_AGENT_TOLERATIONS entry '$entry' has no ':effect'." >&2
+            echo "Expected key[=value]:effect." >&2
+            return 1
+        fi
+        effect="${entry##*:}"
+        kv="${entry%:*}"
+        case "$effect" in
+            NoSchedule|PreferNoSchedule|NoExecute) ;;
+            *)
+                echo "Error: K8S_AGENT_TOLERATIONS entry '$entry' has effect" >&2
+                echo "'$effect'; it must be NoSchedule, PreferNoSchedule or NoExecute." >&2
+                return 1
+                ;;
+        esac
+        key="${kv%%=*}"
+        if ! k8s_valid_qualified_label_key "$key"; then
+            echo "Error: K8S_AGENT_TOLERATIONS entry '$entry' has key '$key'," >&2
+            echo "which is not a valid label key: an optional DNS-1123 subdomain" >&2
+            echo "prefix and '/', then at most 63 characters matching" >&2
+            echo '[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?.' >&2
+            return 1
+        fi
+        out+=$'\n        - key: "'"$key"'"'
+        if [[ "$kv" == *=* ]]; then
+            value="${kv#*=}"
+            if ! k8s_valid_label_value "$value"; then
+                echo "Error: K8S_AGENT_TOLERATIONS entry '$entry' has value" >&2
+                echo "'$value', which is not a valid label value: at most 63" >&2
+                echo 'characters matching [a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?.' >&2
+                return 1
+            fi
+            out+=$'\n          operator: "Equal"\n          value: "'"$value"'"'
+        else
+            out+=$'\n          operator: "Exists"'
+        fi
+        out+=$'\n          effect: "'"$effect"'"'
+    done
+    AGENT_TOLERATIONS_YAML="$out"
+}
+
 # A fresh identifier for ONE submit, unique across every run this script
 # will ever create: the fork-sandbox/run label value every per-run object
 # that submit renders carries (see cmd_submit's own run_token), recorded in
@@ -1506,6 +1601,8 @@ if [[ -z "$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE" &&
     K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE=1Gi
 fi
 K8S_AGENT_PRIORITY_CLASS="$(read_env_value "$k8s_env" K8S_AGENT_PRIORITY_CLASS || true)"
+K8S_AGENT_TOLERATIONS="$(read_env_value "$k8s_env" K8S_AGENT_TOLERATIONS || true)"
+AGENT_TOLERATIONS_YAML=""
 # The namespace LimitRange's numbers (manifests/k8s/00-namespace.yaml), for
 # the early checks on those keys; the test suite pins them to the manifest.
 K8S_LIMITRANGE_MAX_CPU=4
@@ -1808,6 +1905,7 @@ if [[ "${1-}" != check-grant ]]; then
         echo "Error: K8S_AGENT_PRIORITY_CLASS must be a DNS-1123 subdomain." >&2
         exit 1
     fi
+    k8s_parse_agent_tolerations "$K8S_AGENT_TOLERATIONS" || exit 1
 fi
 
 # None of these keys feed check-grant's extracted validators (which read
@@ -1827,7 +1925,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_AGENT_REQUESTS_CPU" "$K8S_AGENT_REQUESTS_MEMORY" \
         "$K8S_AGENT_LIMITS_CPU" "$K8S_AGENT_LIMITS_MEMORY" \
         "$K8S_AGENT_REQUESTS_EPHEMERAL_STORAGE" "$K8S_AGENT_LIMITS_EPHEMERAL_STORAGE" \
-        "$K8S_AGENT_PRIORITY_CLASS" \
+        "$K8S_AGENT_PRIORITY_CLASS" "$K8S_AGENT_TOLERATIONS" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
         "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_BASE_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
         "$K8S_POSTMASTER_DEPLOY_REPO" \
@@ -8655,7 +8753,7 @@ spec:
         fork-sandbox/branch: $safe_name
         fork-sandbox/run: $run_token${extra_labels_8}
     spec:
-      restartPolicy: Never${priority_class_line}${host_aliases_yaml}${services_grace_env}
+      restartPolicy: Never${priority_class_line}${AGENT_TOLERATIONS_YAML}${host_aliases_yaml}${services_grace_env}
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true

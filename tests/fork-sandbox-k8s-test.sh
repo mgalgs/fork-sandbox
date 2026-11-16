@@ -1400,6 +1400,96 @@ else
     ok "invalid priority class is refused"
 fi
 
+printf '\n== K8S_AGENT_TOLERATIONS: tolerations on the agent Job pod only ==\n'
+# The pod spec's tolerations: block, from its header line to the next key at
+# the pod-spec indent.
+tolerations_block_of() { awk '/^      tolerations:$/ {on=1; print; next} on && /^      [^ ]/ {exit} on'; }
+if grep -q 'tolerations:' "$submit_out"; then
+    no "unset tolerations renders no tolerations key" "$(grep 'tolerations:' "$submit_out")"
+else
+    ok "unset tolerations renders no tolerations key"
+fi
+tol_empty_render="$(agent_res_render "$(agent_res_cfg K8S_AGENT_TOLERATIONS=)")"
+# A dry-run render is deterministic for a given config, so an empty value
+# must leave the whole output exactly as an unset one does.
+if [[ "$tol_empty_render" == "$(agent_res_render "$config_dir")" ]]; then
+    ok "empty tolerations renders byte-identically to unset"
+else
+    no "empty tolerations renders byte-identically to unset" \
+        "$(diff <(agent_res_render "$config_dir") - <<< "$tol_empty_render")"
+fi
+check "empty tolerations renders no tolerations key" 0 "$(grep -c 'tolerations:' <<< "$tol_empty_render")"
+tol_exists_render="$(agent_res_render "$(agent_res_cfg K8S_AGENT_TOLERATIONS=example.com/batch-only:NoSchedule)")"
+check "an Exists toleration renders on the agent Job pod" \
+    '      tolerations:
+        - key: "example.com/batch-only"
+          operator: "Exists"
+          effect: "NoSchedule"' \
+    "$(tolerations_block_of <<< "$tol_exists_render")"
+tol_equal_render="$(agent_res_render "$(agent_res_cfg K8S_AGENT_TOLERATIONS=example.com/pool=batch:NoExecute)")"
+check "an Equal toleration renders on the agent Job pod" \
+    '      tolerations:
+        - key: "example.com/pool"
+          operator: "Equal"
+          value: "batch"
+          effect: "NoExecute"' \
+    "$(tolerations_block_of <<< "$tol_equal_render")"
+tol_multi_render="$(agent_res_render "$(agent_res_cfg \
+    K8S_AGENT_TOLERATIONS=flaky:PreferNoSchedule,example.com/pool=true:NoSchedule,example.com/batch-only:NoExecute)")"
+check "several tolerations render in order" \
+    '      tolerations:
+        - key: "flaky"
+          operator: "Exists"
+          effect: "PreferNoSchedule"
+        - key: "example.com/pool"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+        - key: "example.com/batch-only"
+          operator: "Exists"
+          effect: "NoExecute"' \
+    "$(tolerations_block_of <<< "$tol_multi_render")"
+check "tolerations render once, on the Job's pod template" 1 "$(grep -c 'tolerations:' <<< "$tol_multi_render")"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint - <<< "$tol_multi_render" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: render with tolerations"; else no "yamllint: render with tolerations" "$out"; fi
+fi
+tol_refused() {
+    # tol_refused LABEL SPEC NAMED -> submit must fail before any cluster
+    # call, and its stderr must name NAMED (the bad entry)
+    local label="$1" spec="$2" named="$3" err stub_dir
+    stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
+    printf '#!/usr/bin/env bash\necho called >> "%s/kubectl.log"\nexit 1\n' "$stub_dir" > "$stub_dir/kubectl"
+    chmod +x "$stub_dir/kubectl"
+    if err="$(PATH="$stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$(agent_res_cfg "K8S_AGENT_TOLERATIONS=$spec")" \
+        "$k8s_sh" submit --branch fs-k8s-test-tol-bad --model moonshotai/kimi-k3 \
+        "$proj_dir" "$handoff_file" 2>&1 >/dev/null)"; then
+        no "$label" "submit succeeded"
+    elif [[ "$err" != *"K8S_AGENT_TOLERATIONS"*"$named"* ]]; then
+        no "$label" "error does not name '$named': $err"
+    elif [[ -e "$stub_dir/kubectl.log" ]]; then
+        no "$label" "kubectl was called before the refusal"
+    else
+        ok "$label"
+    fi
+}
+tol_refused "a bad effect is refused, naming the entry" \
+    'ok:NoSchedule,example.com/batch-only:NoScheduleX' "'example.com/batch-only:NoScheduleX'"
+tol_refused "a missing effect is refused, naming the entry" \
+    'example.com/batch-only' "'example.com/batch-only'"
+tol_refused "an empty effect is refused, naming the entry" \
+    'example.com/batch-only:' "'example.com/batch-only:'"
+tol_refused "a bad key is refused, naming the entry" \
+    'Bad_Prefix.example/batch:NoSchedule' "'Bad_Prefix.example/batch:NoSchedule'"
+tol_refused "a key with an empty name segment is refused, naming the entry" \
+    'example.com/:NoSchedule' "'example.com/:NoSchedule'"
+tol_refused "a bad value is refused, naming the entry" \
+    'example.com/pool=-batch:NoSchedule' "'example.com/pool=-batch:NoSchedule'"
+tol_refused "an empty entry between commas is refused" \
+    'a:NoSchedule,,b:NoSchedule' "empty entry"
+tol_refused "a trailing comma is refused" \
+    'a:NoSchedule,' "empty entry"
+
 agent_res_all_out="$(agent_res_render "$(agent_res_cfg K8S_AGENT_REQUESTS_CPU=500m \
     K8S_AGENT_REQUESTS_MEMORY=1Gi K8S_AGENT_LIMITS_CPU=2 K8S_AGENT_LIMITS_MEMORY=6Gi)")"
 check "all four K8S_AGENT_* keys set render the full stanza on the agent container" \
@@ -19970,6 +20060,21 @@ else
     no "install --postmaster --dry-run exits 0 on the base fixture" "$(cat "$k8s_test_tmp"/fs-k8s-test-pm1.err)"
 fi
 check "base fixture dry-run leaves no __ placeholder" "0" "$(grep -c '__' "$pm_out1")"
+# K8S_AGENT_TOLERATIONS is for agent Job pods only: neither the shared proxy
+# nor the postmaster's own Deployment picks it up. The k8s.env is copied
+# into the postmaster pod whole, so the runs it wakes render through the
+# same submit path the agent-Job tests above pin.
+pm_cfg_tol="$(pm_cfg_without_key "$pm_cfg1" K8S_AGENT_TOLERATIONS)"
+printf 'K8S_AGENT_TOLERATIONS=example.com/batch-only:NoSchedule\n' >> "$pm_cfg_tol/k8s.env"
+pm_tol_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_tol_log")")
+pm_tol_out="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_tol_log" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_tol" \
+    "$k8s_sh" install --postmaster --dry-run 2>&1)"
+if grep -q '^kind: Deployment$' <<< "$pm_tol_out" && ! grep -q 'tolerations:' <<< "$pm_tol_out"; then
+    ok "install --postmaster renders no tolerations on the proxy or postmaster Deployments"
+else
+    no "install --postmaster renders no tolerations on the proxy or postmaster Deployments" \
+        "$(grep -n 'tolerations:\|kind:' <<< "$pm_tol_out")"
+fi
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$pm_out1" 2>&1)"
     if [[ -z "$out" ]]; then ok "yamllint: base fixture install --postmaster --dry-run"; else no "yamllint: base fixture install --postmaster --dry-run" "$out"; fi
@@ -22025,6 +22130,36 @@ PY
             "[('Job', '$priority_name', 'str'), ('Pod', '$priority_name', 'str'), ('Pod', '$priority_name', 'str')]" \
             "$priority_parsed"
     done
+    # Tolerations follow only the agent Job pod: both per-run proxy pods in
+    # the same render stay off a tainted node (each object's own spec, by
+    # kind and name, so a missed Pod or a stray Deployment shows up too).
+    tol_mixed_out="$(newdir)/tol-mixed.yaml"; tmpdirs+=("$(dirname "$tol_mixed_out")")
+    CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$(agent_res_cfg \
+        K8S_AGENT_PRIORITY_CLASS=review-seats \
+        K8S_AGENT_TOLERATIONS=example.com/batch-only:NoSchedule,example.com/pool=batch:NoExecute)" \
+        "$k8s_sh" submit --dry-run --branch fs-k8s-test-tol-mixed \
+        --harness codex --model gpt-5.6-sol --run-dir "$rd_mixed_dry" \
+        "$proj_dir" "$handoff_file" > "$tol_mixed_out" 2>/dev/null
+    tol_parsed="$(python3 - "$tol_mixed_out" <<'PY'
+import sys, yaml
+out = []
+for d in yaml.safe_load_all(open(sys.argv[1])):
+    if not d:
+        continue
+    spec = None
+    if d.get('kind') in ('Job', 'Deployment', 'StatefulSet', 'DaemonSet'):
+        spec = d['spec']['template']['spec']
+    elif d.get('kind') == 'Pod':
+        spec = d['spec']
+    if spec is not None:
+        role = 'proxy' if 'proxy' in d['metadata']['name'] else 'other'
+        out.append((d['kind'], role if d['kind'] != 'Job' else 'agent', spec.get('tolerations')))
+print(sorted(out, key=repr))
+PY
+)"
+    check "tolerations land on the agent Job pod and neither per-run proxy pod" \
+        "[('Job', 'agent', [{'key': 'example.com/batch-only', 'operator': 'Exists', 'effect': 'NoSchedule'}, {'key': 'example.com/pool', 'operator': 'Equal', 'value': 'batch', 'effect': 'NoExecute'}]), ('Pod', 'proxy', None), ('Pod', 'proxy', None)]" \
+        "$tol_parsed"
 else
     printf '  SKIP  priority class parsed-manifest checks (python3 yaml module unavailable)\n'
 fi
