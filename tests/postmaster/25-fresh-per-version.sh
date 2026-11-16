@@ -2,9 +2,11 @@
 # shellcheck extended-analysis=false  # see shellcheck-memory-budget-test.sh
 # tests/postmaster/25-fresh-per-version.sh — fork-sandbox-postmaster.sh: a
 # `review-target: follow` seat starts a fresh session when the review
-# target moves (a new version of the series under review); on the same
-# target it resumes as before. Local and k8s spawn branches, and the
-# `sets` seat.
+# target moves (a new version of the series under review), and is handed
+# its previous version's transcript as /thread/previous-transcript.jsonl;
+# on the same target it resumes as before. Local and k8s spawn branches,
+# claude and pi seats, the `sets` seat, and a missing or oversized
+# transcript.
 #
 # Usage: tests/postmaster/25-fresh-per-version.sh  (or all files at once:
 # tests/fork-sandbox-postmaster-test.sh)
@@ -96,6 +98,9 @@ once
 check "local claude: a first wake passes --session-state" \
     "$lc_store" "$(argv_after --session-state "$STUB_ARGV_LOG")"
 check "local claude: a first wake resumes nothing" 0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "local claude: a first wake stages no transcript" 1 "$([[ -e "$(staged_of "$lc_tid")" ]]; echo $?)"
+not_contains "local claude: a first wake's handoff has no previous-review section" \
+    "$(handoff_of "$lc_tid")" "$SECTION_HEAD"
 
 lc_s1=aaaa1111-0000-4000-8000-000000000001
 finish_run alice 0 "$lc_s1"
@@ -109,16 +114,32 @@ lc_next() {
 lc_next 'same target'
 check "local claude: the same target resumes the recorded session" \
     "$lc_s1" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+check "local claude: the same target stages no transcript" 1 "$([[ -e "$(staged_of "$lc_tid")" ]]; echo $?)"
+not_contains "local claude: the same target's handoff has no previous-review section" \
+    "$(handoff_of "$lc_tid")" "$SECTION_HEAD"
 
 finish_run alice 0 "$lc_s1"
 once
-new_version "$lc_tid" "$rt1_sha" 2 >/dev/null
+lc_rt2="$(new_version "$lc_tid" "$rt1_sha" 2)"
 lc_next 'version 2'
 check "local claude: a new target resumes nothing" 0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
 check "local claude: a new target still passes --session-state" \
     "$lc_store" "$(argv_after --session-state "$STUB_ARGV_LOG")"
 check "local claude: a new target records RESUMED empty" "" \
     "$(env_val "$PM_STATE_DIR/runs/$(last_rid "$lc_tid").env" RESUMED)"
+check "local claude: a new target stages the previous session's transcript as-is" \
+    '{"v":1}' "$(cat -- "$(staged_of "$lc_tid")" 2>/dev/null)"
+check "local claude: the staged transcript sits in the dir passed as --thread-dir" \
+    '{"v":1}' "$(cat -- "$(argv_after --thread-dir "$STUB_ARGV_LOG")/previous-transcript.jsonl" 2>/dev/null)"
+contains "local claude: a new target's handoff carries the previous-review section verbatim" \
+    "$(handoff_of "$lc_tid")" "$(section_of "$lc_rt2" "$rt1_sha")"
+lc_ho="$(handoff_of "$lc_tid")"
+lc_trig_line="$(grep -n '^The triggering message for this wake is: ' <<< "$lc_ho" | cut -d: -f1)"
+lc_sect_line="$(grep -n "^$SECTION_HEAD\$" <<< "$lc_ho" | cut -d: -f1)"
+check "local claude: the section follows the thread/trigger block" 1 \
+    "$(( lc_sect_line > lc_trig_line ))"
+contains "local claude: staging is reported as an event" \
+    "$(cat "$work/once.out")" "pm previous-transcript thread=${lc_tid:0:8} agent=alice staged=yes"
 
 lc_s2=aaaa1111-0000-4000-8000-000000000002
 finish_run alice 0 "$lc_s2"
@@ -127,6 +148,34 @@ once
 lc_next 'version 2 again'
 check "local claude: later wakes on the new target resume the new session" \
     "$lc_s2" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+check "local claude: and stage nothing" 1 "$([[ -e "$(staged_of "$lc_tid")" ]]; echo $?)"
+
+# The session the pointer names has no transcript in the store.
+finish_run alice 0 "$lc_s2"
+once
+rm -f -- "$lc_store/-work-project/$lc_s2.jsonl"
+lc_rt3="$(new_version "$lc_tid" "$lc_rt2" 3)"
+lc_next 'version 3'
+check "local claude: a missing transcript still wakes the seat" 1 "$(calls)"
+check "local claude: a missing transcript still starts fresh" 0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "local claude: a missing transcript stages nothing" 1 "$([[ -e "$(staged_of "$lc_tid")" ]]; echo $?)"
+not_contains "local claude: a missing transcript emits no section" "$(handoff_of "$lc_tid")" "$SECTION_HEAD"
+contains "local claude: a missing transcript is reported as an event" \
+    "$(cat "$work/once.out")" "pm previous-transcript thread=${lc_tid:0:8} agent=alice staged=no reason=missing"
+
+# Over the 32 MiB cap.
+lc_s3=aaaa1111-0000-4000-8000-000000000003
+finish_run alice 0 "$lc_s3"
+mkdir -p -- "$lc_store/-work-project"
+truncate -s $(( 32 * 1024 * 1024 + 1 )) "$lc_store/-work-project/$lc_s3.jsonl"
+once
+new_version "$lc_tid" "$lc_rt3" 4 >/dev/null
+lc_next 'version 4'
+check "local claude: an oversized transcript still wakes the seat" 1 "$(calls)"
+check "local claude: an oversized transcript stages nothing" 1 "$([[ -e "$(staged_of "$lc_tid")" ]]; echo $?)"
+not_contains "local claude: an oversized transcript emits no section" "$(handoff_of "$lc_tid")" "$SECTION_HEAD"
+contains "local claude: an oversized transcript is reported as an event" \
+    "$(cat "$work/once.out")" "pm previous-transcript thread=${lc_tid:0:8} agent=alice staged=no reason=oversized"
 
 # ============================================================
 printf '\n== fresh per version: the sets seat is unchanged ==\n'
@@ -147,6 +196,8 @@ reply_msg '@carol' "$ns_mid" 'version 2' --to '@nora' >/dev/null
 once
 check "sets seat: a new target still resumes the recorded session" \
     "$ns_s1" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+check "sets seat: and stages nothing" 1 "$([[ -e "$(staged_of "$ns_tid")" ]]; echo $?)"
+not_contains "sets seat: and emits no section" "$(handoff_of "$ns_tid")" "$SECTION_HEAD"
 
 # ============================================================
 printf '\n== fresh per version: local pi follow seat ==\n'
@@ -161,6 +212,7 @@ once
 lp_id1="$(argv_after --session-id "$STUB_ARGV_LOG")"
 check "local pi: the session id is derived from the thread, the agent and the target" \
     "$(uuid5 "$lp_tid/frank@$rt1_sha")" "$lp_id1"
+check "local pi: a first wake stages no transcript" 1 "$([[ -e "$(staged_of "$lp_tid")" ]]; echo $?)"
 finish_run frank 0 "$lp_id1"
 pi_transcript "$lp_tid" frank "$lp_id1" '{"pi":1}'
 once
@@ -169,6 +221,8 @@ reply_msg '@carol' "$lp_mid" 'same target' --to '@frank' >/dev/null
 once
 check "local pi: the same target keeps the same session id" \
     "$lp_id1" "$(argv_after --session-id "$STUB_ARGV_LOG")"
+check "local pi: the same target stages no transcript" 1 "$([[ -e "$(staged_of "$lp_tid")" ]]; echo $?)"
+not_contains "local pi: the same target emits no section" "$(handoff_of "$lp_tid")" "$SECTION_HEAD"
 finish_run frank 0 "$lp_id1"
 once
 lp_rt2="$(new_version "$lp_tid" "$rt1_sha" 2)"
@@ -180,6 +234,10 @@ check "local pi: a new target gets a different session id" 1 "$([[ "$lp_id2" != 
 check "local pi: the new id names the new target" "$(uuid5 "$lp_tid/frank@$lp_rt2")" "$lp_id2"
 check "local pi: a new target keeps the seat's store" \
     "$PM_STATE_DIR/state/$lp_tid/frank" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+check "local pi: a new target stages the previous version's session file" \
+    '{"pi":1}' "$(cat -- "$(staged_of "$lp_tid")" 2>/dev/null)"
+contains "local pi: a new target's handoff carries the section" \
+    "$(handoff_of "$lp_tid")" "$(section_of "$lp_rt2" "$rt1_sha")"
 
 # A pi seat on a thread with no review target keeps the pre-change id.
 new_root_store
@@ -264,6 +322,8 @@ once
 k8s_argv
 check "k8s claude: a first wake passes --session-state" "$kc_store" "$(argv_after --session-state "$work/k8s.argv")"
 check "k8s claude: a first wake resumes nothing" 0 "$(grep -c -- '^--resume-session$' "$work/k8s.argv")"
+check "k8s claude: a first wake stages no transcript" 1 "$([[ -e "$(staged_of "$kc_tid")" ]]; echo $?)"
+not_contains "k8s claude: a first wake emits no section" "$(handoff_of "$kc_tid")" "$SECTION_HEAD"
 check "k8s claude: the harvest recorded the session" "$kc_s1" "$(cat "$PM_STATE_DIR/sessions/$kc_tid/kai" 2>/dev/null)"
 claude_transcript "$kc_tid" kai "$kc_s1" '{"k8s":1}'
 
@@ -273,8 +333,10 @@ once
 k8s_argv
 check "k8s claude: the same target resumes the recorded session" \
     "$kc_s1" "$(argv_after --resume-session "$work/k8s.argv")"
+check "k8s claude: the same target stages no transcript" 1 "$([[ -e "$(staged_of "$kc_tid")" ]]; echo $?)"
+not_contains "k8s claude: the same target emits no section" "$(handoff_of "$kc_tid")" "$SECTION_HEAD"
 
-new_version "$kc_tid" "$rt1_sha" 2 >/dev/null
+kc_rt2="$(new_version "$kc_tid" "$rt1_sha" 2)"
 kc_s2=cccc1111-0000-4000-8000-000000000002
 k8s_summary "$kc_s2"
 reply_msg '@carol' "$kc_mid" 'version 2' --to '@kai' >/dev/null
@@ -284,6 +346,22 @@ k8s_argv
 check "k8s claude: a new target resumes nothing" 0 "$(grep -c -- '^--resume-session$' "$work/k8s.argv")"
 check "k8s claude: a new target still passes --session-state" \
     "$kc_store" "$(argv_after --session-state "$work/k8s.argv")"
+check "k8s claude: a new target stages the previous session's transcript" \
+    '{"k8s":1}' "$(cat -- "$(staged_of "$kc_tid")" 2>/dev/null)"
+check "k8s claude: the staged transcript is in the dir pushed to /thread" \
+    '{"k8s":1}' "$(cat -- "$(argv_after --thread-dir "$work/k8s.argv")/previous-transcript.jsonl" 2>/dev/null)"
+contains "k8s claude: a new target's handoff carries the section" \
+    "$(handoff_of "$kc_tid")" "$(section_of "$kc_rt2" "$rt1_sha")"
+
+# Version 3 with no transcript behind the pointer (kc_s2 never written).
+new_version "$kc_tid" "$kc_rt2" 3 >/dev/null
+reply_msg '@carol' "$kc_mid" 'version 3' --to '@kai' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+k8s_argv
+check "k8s claude: a missing transcript still wakes the seat" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s claude: a missing transcript stages nothing" 1 "$([[ -e "$(staged_of "$kc_tid")" ]]; echo $?)"
+not_contains "k8s claude: a missing transcript emits no section" "$(handoff_of "$kc_tid")" "$SECTION_HEAD"
 
 new_root_store
 kp_mid="$("$MAIL" send --from '@carol' --to '@kim' --subject 'k8s pi versions' \
@@ -307,5 +385,9 @@ once
 k8s_argv
 check "k8s pi: a new target gets the new target's session id" \
     "$(uuid5 "$kp_tid/kim@$kp_rt2")" "$(argv_after --session-id "$work/k8s.argv")"
+check "k8s pi: a new target stages the previous version's session file" \
+    '{"kpi":1}' "$(cat -- "$(staged_of "$kp_tid")" 2>/dev/null)"
+contains "k8s pi: a new target's handoff carries the section" \
+    "$(handoff_of "$kp_tid")" "$(section_of "$kp_rt2" "$rt1_sha")"
 
 finish_suite

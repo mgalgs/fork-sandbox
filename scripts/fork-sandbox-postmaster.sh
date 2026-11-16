@@ -2116,7 +2116,9 @@ print(uuid.uuid5(ns, sys.argv[2]))
 # otherwise. That is a `follow` seat whose last wake recorded a target and
 # whose target has moved since: a new version of the series under review.
 # A resumed reviewer anchors on what it read last time and misses what a
-# fresh one finds, so a new version gets a new conversation. The same target (a re-roll, a follow-up,
+# fresh one finds, so a new version gets a new conversation; the previous
+# one is staged as a file for the seat to open on purpose
+# (pm_stage_previous_transcript). The same target (a re-roll, a follow-up,
 # a retry, mail from another seat on the same version), a first wake, the
 # `sets` seat and a seat with no target all resume as before. Read before
 # this wake's own run id is appended to $SEQ/$tid.
@@ -2127,6 +2129,67 @@ pm_seat_fresh_from() {
     if [[ -n "$last" && "$last" != "$rt_sha" ]]; then
         printf '%s' "$last"
     fi
+    return 0
+}
+
+# The largest previous transcript pm_stage_previous_transcript copies. A
+# bigger one is not staged at all (never truncated): the seat would not
+# read that much of it, and a k8s wake pushes the whole thread dir.
+PM_PREVIOUS_TRANSCRIPT_MAX=$(( 32 * 1024 * 1024 ))
+
+# pm_stage_previous_transcript <harness> <tid> <agent> <old-sha> <snap-dir>:
+# on a wake that starts fresh on a new review target (pm_seat_fresh_from
+# printed <old-sha>), copies the transcript of the session the seat would
+# otherwise have resumed into the wake's thread snapshot dir as
+# previous-transcript.jsonl -- the dir both backends present at /thread.
+# Copied as-is: no summary, no rendering. claude: the session the
+# sessions/ pointer names, found as <id>.jsonl one directory down in the
+# seat's store (where claude keeps ~/.claude/projects/<slug>/<id>.jsonl).
+# pi: the previous version's derived id, found as <timestamp>_<id>.jsonl
+# at the top of the seat's store (pi's own file name), the newest if more
+# than one; failing that, the pre-target "<tid>/<agent>" id a seat woken
+# before per-target ids existed used. Succeeds only when it staged a file;
+# otherwise stages nothing and says why in one `previous-transcript`
+# event. Never fails the wake.
+pm_stage_previous_transcript() {
+    local harness="$1" tid="$2" agent="$3" old_sha="$4" snap_dir="$5"
+    local store="$PM_SESSION_STATE/$tid/$agent" src="" sid size reason=""
+    fs_harness_session_caps "$harness"
+    if [[ "$FS_HARNESS_ID_MODE" == given ]]; then
+        local f
+        for sid in "$(pm_pi_session_id "$tid" "$agent" "$old_sha")" \
+                   "$(pm_pi_session_id "$tid" "$agent")"; do
+            f="$(find "$store" -maxdepth 1 -type f -name "*_$sid.jsonl" 2>/dev/null \
+                | LC_ALL=C sort | tail -n1)"
+            [[ -z "$f" ]] || { src="$f"; break; }
+        done
+    else
+        sid="$(pm_trim "$(cat -- "$PM_SESSIONS/$tid/$agent" 2>/dev/null || true)")"
+        if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
+            src="$(find "$store" -mindepth 2 -maxdepth 2 -type f -name "$sid.jsonl" 2>/dev/null \
+                | head -n1)"
+        fi
+    fi
+    if [[ -z "$src" ]]; then
+        reason=missing
+    else
+        size="$(stat -c %s -- "$src" 2>/dev/null || echo -1)"
+        if (( size < 0 )); then
+            reason=missing
+        elif (( size > PM_PREVIOUS_TRANSCRIPT_MAX )); then
+            reason=oversized
+        elif ! cp -- "$src" "$snap_dir/previous-transcript.jsonl.part" 2>/dev/null \
+            || ! chmod 444 -- "$snap_dir/previous-transcript.jsonl.part" 2>/dev/null \
+            || ! mv -- "$snap_dir/previous-transcript.jsonl.part" "$snap_dir/previous-transcript.jsonl" 2>/dev/null; then
+            rm -f -- "$snap_dir/previous-transcript.jsonl.part"
+            reason=copy
+        fi
+    fi
+    if [[ -n "$reason" ]]; then
+        pm_event "previous-transcript thread=${tid:0:8} agent=$agent staged=no reason=$reason"
+        return 1
+    fi
+    pm_event "previous-transcript thread=${tid:0:8} agent=$agent staged=yes"
     return 0
 }
 
@@ -3791,9 +3854,13 @@ pm_cover_handoff_section() {
 # persona split into body + protocol renders exactly as the undivided one
 # did. A named file gone missing since `fleet check` fails the handoff
 # rather than wake the seat without its protocol.
+# ${10} and ${11}, when ${10} is set, are the previous and current review
+# target shas of a fresh session whose previous transcript was staged at
+# /thread/previous-transcript.jsonl (pm_stage_previous_transcript): the
+# handoff then says so, after the thread block, in fixed wording.
 pm_write_handoff() {
     local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" \
-          trigger_only="$7" is_retry="${8:-}" protocol="${9:-}"
+          trigger_only="$7" is_retry="${8:-}" protocol="${9:-}" prev_sha="${10:-}" new_sha="${11:-}"
     local render_rc=0 kit_path kit_text via_label protocol_path=""
     kit_path="$(pm_kit_path)" || {
         echo "Error: postmaster: fleet kit missing (checked loudly at deliver" >&2
@@ -3874,6 +3941,15 @@ pm_write_handoff() {
         fi
         printf '\n'
         printf 'The triggering message for this wake is: %s\n\n' "$trigger_mid"
+        if [[ -n "$prev_sha" ]]; then
+            printf '## Your previous review\n\n'
+            printf 'This is a fresh session for the new version of the series (review\n'
+            printf 'target %s). Your own transcript from the previous version\n' "$new_sha"
+            printf '(review target %s) is staged read-only at\n' "$prev_sha"
+            printf '/thread/previous-transcript.jsonl. Use it to re-check your own\n'
+            printf 'earlier points against the new head. It is not a record to agree\n'
+            printf 'with, and your verdict on this version is your own.\n\n'
+        fi
         if [[ "$is_retry" == malformed ]]; then
             local discard_line
             if [[ "$(cat -- "$DISCARDS/$tid/$agent" 2>/dev/null || true)" == "$PM_NO_REPLY_FILE_REASON" ]]; then
@@ -5692,8 +5768,33 @@ pm_spawn_wake() {
     local via
     via="$(pm_wake_via "$mid" "$agent")"
 
+    # A `follow` seat woken on a new version of the series under review
+    # starts a fresh session (pm_seat_fresh_from, applied to the spawn args
+    # by pm_session_spawn_args on either backend). Its previous session's
+    # transcript is staged beside the thread snapshot -- a file the seat
+    # opens on purpose, never text in its prompt -- and the handoff says
+    # where. Only for a harness whose session would otherwise carry over
+    # (claude, or a composed seat whose step 1 is a claude code step; pi),
+    # and only when there is a snapshot dir to stage into.
+    local prev_sha="" fresh_harness=""
+    if [[ -n "$pipelines" ]]; then
+        [[ "$pipeline_step1_action" != code || "$pipeline_step1_harness" != claude \
+           || "$is_retry" == cover ]] || fresh_harness=claude
+    else
+        fs_harness_session_caps "$harness"
+        [[ "$harness" != claude && "$FS_HARNESS_ID_MODE" != given ]] || fresh_harness="$harness"
+    fi
+    if [[ -n "$fresh_harness" && "$trigger_only" == 1 ]]; then
+        prev_sha="$(pm_seat_fresh_from "$review_target" "$tid" "$agent" "$rt_sha")"
+        if [[ -n "$prev_sha" ]] \
+            && ! pm_stage_previous_transcript "$fresh_harness" "$tid" "$agent" "$prev_sha" "$snap_dir"; then
+            prev_sha=""
+        fi
+    fi
+
     local handoff_file="$HANDOFFS/$run_id.md"
-    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$is_retry" "$protocol"; then
+    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$is_retry" "$protocol" \
+        "$prev_sha" "$rt_sha"; then
         pm_seat_flag "$tid" "$agent" "handoff render failed for $agent: $mid"
         return 0
     fi
