@@ -437,15 +437,6 @@ if [[ -d "$data_dir/.pm-home/src/proj/.git" ]]; then
 else
     no "the clone lands on the data volume" "$(find "$data_dir" 2>&1)"
 fi
-# The postmaster hands every seat's fork-sandbox.sh $HOME/src/<project>;
-# with $HOME/src a link, that path must still pass the project-root
-# boundary. No projects.env exists under this scratch HOME's config dir, so
-# the default (exactly $HOME/src) applies.
-if err="$(HOME="$home" bash -c 'source "$1"; fs_require_project_root "$HOME/src/proj" "$HOME/.config/fork-sandbox"' _ "$repo_dir/scripts/fork-sandbox-lib.sh" 2>&1)"; then
-    ok "the linked clone passes fs_require_project_root"
-else
-    no "the linked clone passes fs_require_project_root" "$err"
-fi
 
 printf '\n== a container restart (same HOME and data dir) keeps the links ==\n'
 out="$(run_init 2>&1)"

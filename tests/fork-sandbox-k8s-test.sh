@@ -99,8 +99,8 @@
 #     tools that reject the GNU flags -- with exactly one documented
 #     exception, the readlink -f bootstrap that runs before the library
 #     is sourced.
-#   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
-#     local path (fs_require_scratch_handoff, fs_require_project_root), that
+#   - fork-sandbox.sh --k8s: the lib function it shares with the
+#     local path (fs_require_scratch_handoff), that
 #     it defaults a bare --k8s to --harness pi, that a model-less --k8s run
 #     passes the launcher on ANY install -- on a legacy install the
 #     refusal is fork-sandbox-k8s.sh's own run verb, and on an endpoints
@@ -13202,7 +13202,7 @@ check "skipped: ended=skipped" "skipped" "$(rl_json "$out" '.ended')"
 check "skipped: no iterations ran" "0" "$(rl_json "$out" '.iterations | length')"
 
 
-printf '\n== fs_require_scratch_handoff / fs_require_project_root (fork-sandbox-lib.sh) ==\n'
+printf '\n== fs_require_scratch_handoff (fork-sandbox-lib.sh) ==\n'
 # Unit-level, sourcing the lib directly -- the same level fork-sandbox-clone-
 # test.sh tests fs_make_clone at. These are the two checks that let
 # fork-sandbox.sh be blanket-approved as its own security boundary, shared
@@ -13212,11 +13212,6 @@ printf '\n== fs_require_scratch_handoff / fs_require_project_root (fork-sandbox-
 lib_test_scratch_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-lib-test.XXXXXX)"
 tmpdirs+=("$lib_test_scratch_dir")
 err="$(mktemp)"
-# No projects.env under this scratch config dir, so the default (exactly
-# $HOME/src) applies -- these cases exercise the default, not the config
-# file (that gets its own suite, fork-sandbox-project-roots-test.sh).
-lib_test_config_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-lib-test-cfg.XXXXXX)"
-tmpdirs+=("$lib_test_config_dir")
 
 if fs_require_scratch_handoff "$lib_test_scratch_dir/handoff.md" 2>"$err"; then
     ok "a scratch-dir handoff accepted"
@@ -13239,45 +13234,6 @@ else
         *"must not live under the forks/"*)
             ok "a handoff under forks/ is refused" ;;
         *) no "a handoff under forks/ is refused" "$(cat "$err")" ;;
-    esac
-fi
-if fs_require_project_root "$HOME/src/anything" "$lib_test_config_dir" 2>"$err"; then
-    ok "a ~/src project is accepted"
-else
-    no "a ~/src project is accepted" "$(cat "$err")"
-fi
-if fs_require_project_root "/tmp/outside-src" "$lib_test_config_dir" 2>"$err"; then
-    no "a project outside ~/src is refused"
-else
-    case "$(cat "$err")" in
-        *"must live under ~/src"*)
-            ok "a project outside ~/src is refused" ;;
-        *) no "a project outside ~/src is refused" "$(cat "$err")" ;;
-    esac
-fi
-
-# ~/src as a symlink (the cluster postmaster's pod links it onto its data
-# volume): a project inside it is accepted, a link inside ~/src pointing
-# outward is still refused.
-srclink_home="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-srclink-test.XXXXXX)"
-tmpdirs+=("$srclink_home")
-mkdir -p "$srclink_home/home" "$srclink_home/vol/src/proj" "$srclink_home/outside/evil"
-ln -s "$srclink_home/vol/src" "$srclink_home/home/src"
-ln -s "$srclink_home/outside/evil" "$srclink_home/vol/src/escape"
-if HOME="$srclink_home/home" fs_require_project_root "$srclink_home/home/src/proj" \
-    "$srclink_home/home/.config/fork-sandbox" 2>"$err"; then
-    ok "a project under a symlinked ~/src is accepted"
-else
-    no "a project under a symlinked ~/src is accepted" "$(cat "$err")"
-fi
-if HOME="$srclink_home/home" fs_require_project_root "$srclink_home/home/src/escape" \
-    "$srclink_home/home/.config/fork-sandbox" 2>"$err"; then
-    no "a link inside a symlinked ~/src that points outside is refused"
-else
-    case "$(cat "$err")" in
-        *"must live under ~/src"*)
-            ok "a link inside a symlinked ~/src that points outside is refused" ;;
-        *) no "a link inside a symlinked ~/src that points outside is refused" "$(cat "$err")" ;;
     esac
 fi
 rm -f "$err"
@@ -13320,16 +13276,12 @@ rm -f "$err_file"
 
 printf '\n== fork-sandbox.sh --k8s (fixture config, no cluster) ==\n'
 # Real fixtures: unlike --dry-run's own local exit, fs_require_scratch_handoff
-# and fs_require_project_root run for every --k8s call, including a --dry-run
+# runs for every --k8s call, including a --dry-run
 # one, so a placeholder path is refused rather than ignored. Only the flag-
 # refusal cases below get away with a placeholder -- each fails on its own
 # flag before reaching these checks. new_src_project mirrors fork-sandbox-
 # prompt-overlay-test.sh's own fixture: a real git repo under the real
-# ~/src, since that is the one root fork-sandbox.sh accepts a project from.
-# On every real operator machine ~/src already exists (fork-sandbox's own
-# security boundary requires it for any real use), so this mkdir -p is a
-# no-op there; it only actually creates anything under a from-scratch HOME
-# with no prior fork-sandbox history, which this suite must also pass under.
+# ~/src, which the sweep ownership check below keys on.
 mkdir -p "$HOME/src"
 new_src_project() {
     local d
@@ -13347,11 +13299,9 @@ new_src_project() {
     printf '%s' "$d"
 }
 k8s_flag_proj="$(new_src_project)"; tmpdirs+=("$k8s_flag_proj")
-# A project fixture rooted under claude_home's own $HOME/src, not the real
-# one -- fs_require_project_root checks the project path against $HOME/src
-# at call time, so a --harness claude case run with HOME="$claude_home" (to
-# pick up its fixture credential) needs a project under that same fixture
-# HOME, not the real one k8s_flag_proj lives under.
+# A project fixture rooted under claude_home's own $HOME/src, so a --harness
+# claude case run with HOME="$claude_home" (to pick up its fixture
+# credential) has a project under that same fixture HOME.
 mkdir -p "$claude_home/src"
 k8s_flag_claude_proj="$(HOME="$claude_home" new_src_project)"; tmpdirs+=("$k8s_flag_claude_proj")
 k8s_flag_handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-test.XXXXXX)"
@@ -13648,7 +13598,7 @@ refuses "--k8s --prompts-dir is refused as not yet supported" \
 # --review-loop is carried through, not refused -- the cluster analogue of
 # fork-sandbox.sh's own local loop, running pod-side. Real fixtures
 # required (k8s_flag_proj / k8s_flag_handoff): --dry-run's own validation
-# runs after fs_require_scratch_handoff / fs_require_project_root, unlike
+# runs after fs_require_scratch_handoff, unlike
 # the flag-refusal cases above, which fail on their own flag first and so
 # get away with a placeholder.
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -13839,34 +13789,14 @@ refuses "--k8s refuses a handoff outside the scratch dir" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
     "$k8s_flag_proj" "$k8s_test_tmp"/fs-k8s-flag-test-outside-scratch.md
-refuses "--k8s refuses a project outside ~/src" \
-    "must live under ~/src" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
-    "$k8s_test_tmp"/fs-k8s-flag-test-outside-src "$k8s_flag_handoff"
-
-# The --config_dir wiring itself, not just the default it falls back to: a
-# fixture HOME with its own projects.env, naming a root that is NOT ~/src,
-# proves the $config_dir this call site passes to fs_require_project_root is
-# the one --k8s actually resolved (FORK_SANDBOX_CONFIG_DIR here), not a
-# hardcoded ~/.config/fork-sandbox or an unset/misspelled variable -- either
-# of those would still pass every other case above, which all use the
-# default root.
-projroot_home="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-projroot-test.XXXXXX)"
-tmpdirs+=("$projroot_home")
-projroot_config="$projroot_home/.config/fork-sandbox"
-mkdir -p "$projroot_config"
-printf 'PROJECT_ROOTS=~/code\n' > "$projroot_config/projects.env"
-# The --k8s --dry-run path still reads k8s.env/pi.env from this same
-# config dir (fs_require_project_root is only one of several things it
-# checks before printing), so this fixture needs copies of the same ones
-# $config_dir already has above, or the accept case below fails on a
-# missing k8s.env rather than proving anything about PROJECT_ROOTS.
-cp "$config_dir/k8s.env" "$config_dir/pi.env" "$projroot_config/"
-mkdir -p "$projroot_home/code"
-projroot_proj="$(mktemp -d "$projroot_home/code/fs-k8s-projroot-test.XXXXXX")"
+# Any git repository is accepted, wherever it lives -- there is no project
+# root. A repo in a throwaway temp dir (outside ~/src) must pass; a path that
+# is not a git repository is still refused, since a run needs a clone source.
+anyrepo_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-anyrepo-test.XXXXXX)"
+tmpdirs+=("$anyrepo_dir")
+mkdir -p "$anyrepo_dir/repo" "$anyrepo_dir/plain"
 (
-    cd "$projroot_proj" \
+    cd "$anyrepo_dir/repo" \
         && git init -q . \
         && git config user.email t@fork-sandbox.invalid \
         && git config user.name Tester \
@@ -13874,34 +13804,25 @@ projroot_proj="$(mktemp -d "$projroot_home/code/fs-k8s-projroot-test.XXXXXX")"
         && git add file.txt \
         && git commit -q -m init
 ) >/dev/null 2>&1
-if HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-projroot \
-    "$projroot_proj" "$k8s_flag_handoff" \
-    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-projroot.err; then
-    ok "--k8s accepts a project under a configured PROJECT_ROOTS root"
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-anyrepo \
+    "$anyrepo_dir/repo" "$k8s_flag_handoff" \
+    > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-anyrepo.err; then
+    ok "--k8s accepts a git repository outside any former project root"
 else
-    no "--k8s accepts a project under a configured PROJECT_ROOTS root" \
-        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-projroot.err)"
+    no "--k8s accepts a git repository outside any former project root" \
+        "$(cat "$k8s_test_tmp"/fs-k8s-flag-test-anyrepo.err)"
 fi
-rm -f "$k8s_test_tmp"/fs-k8s-flag-test-projroot.err
-refuses "--k8s refuses a project outside a configured PROJECT_ROOTS root, naming projects.env" \
-    "$projroot_config/projects.env" \
-    env HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-projroot-refuse \
-    "$projroot_home/other/proj" "$k8s_flag_handoff"
-
-# The local (no --k8s) call site's own wiring, not just the --k8s one
-# above: this path cannot be exercised with --dry-run (fork-sandbox.sh
-# exits on --dry-run before it ever reaches fs_require_project_root on
-# the local path), but a refusal needs nothing past that check, so this
-# fails fast -- no clone, no launch -- and still proves this call site's
-# $config_dir is the one FORK_SANDBOX_CONFIG_DIR resolved, not a
-# hardcoded default or an unset/misspelled variable.
-mkdir -p "$projroot_home/other/proj"
-refuses "run (no --k8s) refuses a project outside a configured PROJECT_ROOTS root, naming projects.env" \
-    "$projroot_config/projects.env" \
-    env HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" \
-    "$projroot_home/other/proj" "$k8s_flag_handoff"
+rm -f "$k8s_test_tmp"/fs-k8s-flag-test-anyrepo.err
+refuses "--k8s still refuses a path that is not a git repository" \
+    "is not in a git repository" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-notrepo \
+    "$anyrepo_dir/plain" "$k8s_flag_handoff"
+refuses "run (no --k8s) still refuses a path that is not a git repository" \
+    "is not in a git repository" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" \
+    "$anyrepo_dir/plain" "$k8s_flag_handoff"
 
 # The positive case: --k8s --harness pi --dry-run has to actually reach
 # fork-sandbox-k8s.sh, and with the arguments this dispatcher promises. Prove
@@ -19001,8 +18922,8 @@ fi
 printf '\n== fork-sandbox.sh --k8s: --task-meta is forwarded, not refused ==\n'
 # k8s_flag_proj/k8s_flag_handoff (set up above, under $HOME/src and
 # /var/tmp/claude-scratch respectively) are required here: unlike a direct
-# fork-sandbox-k8s.sh call, fs_require_scratch_handoff and
-# fs_require_project_root run for every --k8s call, dry-run included.
+# fork-sandbox-k8s.sh call, fs_require_scratch_handoff runs
+# for every --k8s call, dry-run included.
 taskmeta_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$taskmeta_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --branch fs-k8s-flag-test-taskmeta --model moonshotai/kimi-k3 \

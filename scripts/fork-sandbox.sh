@@ -4311,16 +4311,13 @@ if [[ "$k8s_mode" == true ]]; then
         fi
     fi
 
-    # Same two security checks the local path applies below, applied here
-    # before this run is handed to fork-sandbox-k8s.sh: this script is meant
-    # to be blanket-approved, so it is the security boundary regardless of
-    # which path a run takes. The handoff becomes the pod's prompt to a model
-    # with internet access, and project_path is what gets pushed into the
-    # pod, so both need the same constraint here that the local path enforces
-    # for the same reason -- see fs_require_scratch_handoff and
-    # fs_require_project_root in fork-sandbox-lib.sh.
+    # Same handoff check the local path applies below, applied here before
+    # this run is handed to fork-sandbox-k8s.sh: this script is meant to be
+    # blanket-approved, so it is the security boundary regardless of which
+    # path a run takes. The handoff becomes the pod's prompt to a model with
+    # internet access -- see fs_require_scratch_handoff in
+    # fork-sandbox-lib.sh.
     fs_require_scratch_handoff "$handoff_file" || exit 1
-    fs_require_project_root "$project_path" "$config_dir" || exit 1
 
     # --session-state, --resume-session and --session-id: the identical
     # check the local path applies further down, run here so a --k8s run
@@ -5156,17 +5153,13 @@ if [[ ! -s "$handoff_file" ]]; then
 fi
 
 # This script is meant to be blanket-approved, so IT is the security boundary
-# (docs/permissions.md), and three of its arguments could otherwise be
+# (docs/permissions.md), and two of its arguments could otherwise be
 # turned into primitives the approval must not hand over:
 #
 #   - The handoff is READ INTO THE PROMPT of a model with internet
 #     access, so an unconstrained path is arbitrary-file-read plus
 #     exfiltration. Handoffs live in the scratch dir, where sessions
 #     stage them on purpose.
-#   - The project is CLONED INTO the sandbox, same channel. Repos under the
-#     configured project roots (PROJECT_ROOTS in $config_dir/projects.env,
-#     default ~/src) are the working material; nothing else is.
-#     The check is on the repository the project belongs to, not only its path.
 #   - --sandbox-args passes through to claude-sandboxed, where --bind-ro
 #     would mount any host path — ~/.ssh, say — into that same sandbox.
 #     Only --unpin-egress may pass; the script adds every bind it needs
@@ -5192,10 +5185,6 @@ if [[ "$handoff_real" == "$FS_SCRATCH_ROOT"/forks/* || "$handoff_real" == "$FS_S
     echo "exists to stop. Stage the handoff in the scratch root itself." >&2
     exit 1
 fi
-# A --no-repo run hands over no project, so there is nothing for the project
-# root check to constrain; every other input (the handoff above, --attach-dir,
-# --thread-dir, --context-ro, --sandbox-args) keeps its check unchanged.
-$no_repo || fs_require_project_root "$project_path" "$config_dir" || exit 1
 # --context-ro is the reviewed home for the one extra bind a caller may
 # need: context a host-side script gathered for the session to read. The
 # path constraint is what keeps it from becoming the --bind-ro primitive

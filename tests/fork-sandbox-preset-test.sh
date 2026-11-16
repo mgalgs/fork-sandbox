@@ -659,7 +659,7 @@ refuses "--harness is refused against a composed pipeline with more than one cod
 # A composed pipeline with every seat claude/pi, modeled and unsealed
 # now dispatches through the shared runner on --k8s instead of being
 # refused outright -- --dry-run's own project/handoff security
-# checks (fs_require_scratch_handoff/fs_require_project_root) run ahead
+# check (fs_require_scratch_handoff) runs ahead
 # of the dry-run listing itself for --k8s, unlike a local dry-run, so
 # this needs a real fixture rather than run()'s "unused-project
 # unused-handoff" shorthand.

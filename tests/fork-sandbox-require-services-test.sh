@@ -34,7 +34,6 @@ bin="$scratch/bin"
 project="$scratch/project"
 mkdir -p "$home" "$bin" "$project/.agents/sandbox-services"
 mkdir -p "$scratch/config"
-printf 'PROJECT_ROOTS=%s\n' "$project" > "$scratch/config/projects.env"
 git -C "$project" init -q
 git -C "$project" config user.name Tester
 git -C "$project" config user.email tester@fork-sandbox.invalid
