@@ -2103,6 +2103,26 @@ print(uuid.uuid5(ns, sys.argv[2]))
 ' "$PM_PI_SESSION_NAMESPACE" "$tid/$agent"
 }
 
+# pm_seat_fresh_from <review-target> <tid> <agent> <target-sha>: prints the
+# review-target sha of the seat's previous wake on the thread when THIS
+# wake must start a fresh session instead of resuming, and nothing
+# otherwise. That is a `follow` seat whose last wake recorded a target and
+# whose target has moved since: a new version of the series under review.
+# A resumed reviewer anchors on what it read last time and misses what a
+# fresh one finds, so a new version gets a new conversation. The same target (a re-roll, a follow-up,
+# a retry, mail from another seat on the same version), a first wake, the
+# `sets` seat and a seat with no target all resume as before. Read before
+# this wake's own run id is appended to $SEQ/$tid.
+pm_seat_fresh_from() {
+    local review_target="$1" tid="$2" agent="$3" rt_sha="$4" last
+    [[ "$review_target" == follow && -n "$rt_sha" ]] || return 0
+    last="$(pm_seat_last_target_sha "$tid" "$agent")"
+    if [[ -n "$last" && "$last" != "$rt_sha" ]]; then
+        printf '%s' "$last"
+    fi
+    return 0
+}
+
 pm_trim() {
     local s="$1"
     s="${s#"${s%%[![:space:]]*}"}"
@@ -2121,8 +2141,15 @@ pm_trim() {
 # `mapfile -t`, takes the last line as RESUMED and everything before it as
 # spawn_args, exactly the way the old inline block did before it was two
 # copies.
+#
+# $4/$5, the seat's review-target mode and this wake's target sha, make a
+# `follow` seat start fresh on a new version of the series under review
+# (pm_seat_fresh_from): claude drops --resume-session but keeps
+# --session-state, so the new session lands in the same store and is
+# discovered and recorded as before. codex and every other seat are
+# unchanged.
 pm_session_spawn_args() {
-    local harness="$1" tid="$2" agent="$3" resumed=""
+    local harness="$1" tid="$2" agent="$3" review_target="${4:-}" rt_sha="${5:-}" resumed=""
     fs_harness_session_caps "$harness"
     if [[ "$FS_HARNESS_RESUMABLE" == true ]]; then
         printf -- '--session-state\n%s\n' "$PM_SESSION_STATE/$tid/$agent"
@@ -2135,6 +2162,9 @@ pm_session_spawn_args() {
             sid="$(pm_pi_session_id "$tid" "$agent")"
             printf -- '--session-id\n%s\n' "$sid"
             resumed="$sid"
+        elif [[ "$harness" == claude \
+                && -n "$(pm_seat_fresh_from "$review_target" "$tid" "$agent" "$rt_sha")" ]]; then
+            : # a new review target: a fresh session in the same store
         else
             local sid_file="$PM_SESSIONS/$tid/$agent" sid
             if [[ -f "$sid_file" ]]; then
@@ -5732,7 +5762,8 @@ pm_spawn_wake() {
         local resumed=""
         if [[ -n "$session_harness" && "$session_harness" != codex ]]; then
             local -a session_lines=()
-            mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent")
+            mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent" \
+                "$review_target" "$rt_sha")
             local session_last=$(( ${#session_lines[@]} - 1 ))
             resumed="${session_lines[session_last]#RESUMED=}"
             spawn_args+=("${session_lines[@]:0:session_last}")
@@ -6009,7 +6040,8 @@ pm_spawn_wake() {
     local resumed=""
     if [[ -n "$session_harness" ]]; then
         local -a session_lines=()
-        mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent")
+        mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent" \
+            "$review_target" "$rt_sha")
         local session_last=$(( ${#session_lines[@]} - 1 ))
         resumed="${session_lines[session_last]#RESUMED=}"
         spawn_args+=("${session_lines[@]:0:session_last}")
