@@ -149,6 +149,90 @@ check "sets seat: a new target still resumes the recorded session" \
     "$ns_s1" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
 
 # ============================================================
+printf '\n== fresh per version: local pi follow seat ==\n'
+# ============================================================
+
+new_root_store
+lp_mid="$("$MAIL" send --from '@carol' --to '@frank' --subject 'local pi versions' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+lp_tid="$(thread_of "$lp_mid")"
+: > "$STUB_ARGV_LOG"
+once
+lp_id1="$(argv_after --session-id "$STUB_ARGV_LOG")"
+check "local pi: the session id is derived from the thread, the agent and the target" \
+    "$(uuid5 "$lp_tid/frank@$rt1_sha")" "$lp_id1"
+finish_run frank 0 "$lp_id1"
+pi_transcript "$lp_tid" frank "$lp_id1" '{"pi":1}'
+once
+reply_msg '@carol' "$lp_mid" 'same target' --to '@frank' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "local pi: the same target keeps the same session id" \
+    "$lp_id1" "$(argv_after --session-id "$STUB_ARGV_LOG")"
+finish_run frank 0 "$lp_id1"
+once
+lp_rt2="$(new_version "$lp_tid" "$rt1_sha" 2)"
+reply_msg '@carol' "$lp_mid" 'version 2' --to '@frank' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+lp_id2="$(argv_after --session-id "$STUB_ARGV_LOG")"
+check "local pi: a new target gets a different session id" 1 "$([[ "$lp_id2" != "$lp_id1" && -n "$lp_id2" ]] && echo 1 || echo 0)"
+check "local pi: the new id names the new target" "$(uuid5 "$lp_tid/frank@$lp_rt2")" "$lp_id2"
+check "local pi: a new target keeps the seat's store" \
+    "$PM_STATE_DIR/state/$lp_tid/frank" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+
+# A pi seat on a thread with no review target keeps the pre-change id.
+new_root_store
+np_mid="$(send_msg '@carol' '@frank' 'pi no target' 'hello' 8)"
+np_tid="$(thread_of "$np_mid")"
+: > "$STUB_ARGV_LOG"
+once
+check "pi no target: the id is still uuid5 over <tid>/<agent>" \
+    "$(uuid5 "$np_tid/frank")" "$(argv_after --session-id "$STUB_ARGV_LOG")"
+check "pi no target: the derivation is byte-for-byte the pre-change one" \
+    8b9742c3-ca7c-5fc4-8e71-fbf777e29ae5 \
+    "$(pm_call pm_pi_session_id 0f1e2d3c4b5a69788796a5b4c3d2e1f0 frank)"
+check "pi no target: a follow seat with an empty target sha keeps it too" \
+    "--session-id 8b9742c3-ca7c-5fc4-8e71-fbf777e29ae5" \
+    "$(pm_call pm_session_spawn_args pi 0f1e2d3c4b5a69788796a5b4c3d2e1f0 frank follow '' \
+        | grep -A1 -x -- --session-id | paste -sd' ')"
+
+# pi itself: a new --session-id in a store that already holds another
+# session opens a new, empty session; it never continues the newest one.
+# Run against an installed pi's own session code, when there is one.
+pi_bin="$(command -v pi 2>/dev/null || true)"
+pi_pkg=""
+if [[ -n "$pi_bin" ]]; then
+    pi_pkg="$(dirname -- "$(dirname -- "$(readlink -f -- "$pi_bin")")")"
+fi
+if [[ -n "$pi_pkg" && -f "$pi_pkg/dist/core/session-manager.js" ]] && command -v node >/dev/null 2>&1; then
+    new_root PI_STORE
+    cat > "$work/pi-probe.mjs" <<'EOF'
+const [, , pkg, dir] = process.argv;
+const { SessionManager } = await import(pkg + "/dist/core/session-manager.js");
+const cwd = "/tmp";
+// What pi's main.js does with --session-id.
+const open = (id) => {
+  const p = SessionManager.findById(cwd, id, dir);
+  return p ? SessionManager.open(p, dir) : SessionManager.create(cwd, dir, { id });
+};
+const a = open("11111111-1111-5111-8111-111111111111");
+a.appendMessage({ role: "user", content: "previous version", timestamp: Date.now() });
+a.appendMessage({ role: "assistant", content: [{ type: "text", text: "ok" }], timestamp: Date.now(),
+  api: "x", provider: "x", model: "x", stopReason: "stop",
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+const b = open("22222222-2222-5222-8222-222222222222");
+console.log(b.getSessionId(), b.getEntries().length, open("11111111-1111-5111-8111-111111111111").getEntries().length);
+EOF
+    check "pi: a new --session-id in a used store is a new, empty session" \
+        "22222222-2222-5222-8222-222222222222 0 2" \
+        "$(node "$work/pi-probe.mjs" "$pi_pkg" "$PI_STORE" 2>&1 | tail -n1)"
+else
+    printf '  skip  pi: no installed pi to check --session-id against\n'
+fi
+
+# ============================================================
 printf '\n== fresh per version: k8s follow seats ==\n'
 # ============================================================
 
@@ -200,5 +284,28 @@ k8s_argv
 check "k8s claude: a new target resumes nothing" 0 "$(grep -c -- '^--resume-session$' "$work/k8s.argv")"
 check "k8s claude: a new target still passes --session-state" \
     "$kc_store" "$(argv_after --session-state "$work/k8s.argv")"
+
+new_root_store
+kp_mid="$("$MAIL" send --from '@carol' --to '@kim' --subject 'k8s pi versions' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+kp_tid="$(thread_of "$kp_mid")"
+: > "$STUB_ARGV_LOG"
+once
+k8s_argv
+kp_id1="$(argv_after --session-id "$work/k8s.argv")"
+check "k8s pi: the session id names the target" "$(uuid5 "$kp_tid/kim@$rt1_sha")" "$kp_id1"
+pi_transcript "$kp_tid" kim "$kp_id1" '{"kpi":1}'
+reply_msg '@carol' "$kp_mid" 'same target' --to '@kim' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+k8s_argv
+check "k8s pi: the same target keeps the same session id" "$kp_id1" "$(argv_after --session-id "$work/k8s.argv")"
+kp_rt2="$(new_version "$kp_tid" "$rt1_sha" 2)"
+reply_msg '@carol' "$kp_mid" 'version 2' --to '@kim' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+k8s_argv
+check "k8s pi: a new target gets the new target's session id" \
+    "$(uuid5 "$kp_tid/kim@$kp_rt2")" "$(argv_after --session-id "$work/k8s.argv")"
 
 finish_suite

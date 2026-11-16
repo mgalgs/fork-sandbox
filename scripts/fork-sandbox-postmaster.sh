@@ -2094,13 +2094,20 @@ pm_new_uuid() {
 # over on a new, empty session.
 PM_PI_SESSION_NAMESPACE='c9f5c6b0-6b1a-4b3e-9c2a-2e9f6b1c9a1e'
 
+# pm_pi_session_id <tid> <agent> [<target-sha>]: with a target sha (a
+# `review-target: follow` seat on a thread that has one), the name is
+# "<tid>/<agent>@<sha>", so each version of the series under review gets a
+# session of its own (see pm_seat_fresh_from). Without one it is
+# "<tid>/<agent>", byte for byte what every pi seat has always used.
 pm_pi_session_id() {
-    local tid="$1" agent="$2"
+    local tid="$1" agent="$2" sha="${3:-}" name
+    name="$tid/$agent"
+    [[ -z "$sha" ]] || name+="@$sha"
     python3 -c '
 import sys, uuid
 ns = uuid.UUID(sys.argv[1])
 print(uuid.uuid5(ns, sys.argv[2]))
-' "$PM_PI_SESSION_NAMESPACE" "$tid/$agent"
+' "$PM_PI_SESSION_NAMESPACE" "$name"
 }
 
 # pm_seat_fresh_from <review-target> <tid> <agent> <target-sha>: prints the
@@ -2146,8 +2153,10 @@ pm_trim() {
 # `follow` seat start fresh on a new version of the series under review
 # (pm_seat_fresh_from): claude drops --resume-session but keeps
 # --session-state, so the new session lands in the same store and is
-# discovered and recorded as before. codex and every other seat are
-# unchanged.
+# discovered and recorded as before; pi's derived id includes the target
+# sha, so a new target is a new id -- pi opens the session whose header
+# carries exactly the given id and creates it otherwise, never continuing
+# another one in the store. codex and every other seat are unchanged.
 pm_session_spawn_args() {
     local harness="$1" tid="$2" agent="$3" review_target="${4:-}" rt_sha="${5:-}" resumed=""
     fs_harness_session_caps "$harness"
@@ -2158,8 +2167,9 @@ pm_session_spawn_args() {
             # wake, so it is available -- and passed -- from the first wake
             # of this seat onward. sessions/ is never touched for this
             # harness.
-            local sid
-            sid="$(pm_pi_session_id "$tid" "$agent")"
+            local sid id_sha=""
+            [[ "$review_target" != follow ]] || id_sha="$rt_sha"
+            sid="$(pm_pi_session_id "$tid" "$agent" "$id_sha")"
             printf -- '--session-id\n%s\n' "$sid"
             resumed="$sid"
         elif [[ "$harness" == claude \
