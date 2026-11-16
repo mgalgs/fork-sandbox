@@ -747,6 +747,17 @@ that on the host. "Cannot reach Forgejo or GitHub" above means "cannot
 authenticate to them". It is never a reason to skip the sandbox for a repo
 you can stage.
 
+## Tasks with no repo
+
+When the session only reads what you stage (camera frames to judge, a log to
+triage) and there is nothing to commit, pass `--no-repo` and give the
+handoff alone: `fork-sandbox.sh --no-repo --attach-dir <dir> --wait <handoff>`.
+No anchor repo is needed. The session gets an empty work dir that is discarded
+with the run, no branch comes back, and the answer travels in the reply, which
+`fork-sandbox-status.sh --result` prints. It cannot be combined with `--branch`,
+`--checkout`, review or maintain loops, `--preset`, `--pipeline`, `--k8s` or
+`--resume`.
+
 ## Why the clone
 
 The session does **not** run in the user's checkout. `fork-sandbox.sh` makes a

@@ -85,6 +85,13 @@ dangerous primitives, and each is constrained:
 - **Sandbox arguments** are not passed through. The script adds every bind the
   run needs; a caller cannot ask it to mount `~/.ssh`.
 
+A `--no-repo` run hands over no project, so the project constraint has nothing
+to apply to and is skipped. The remaining constraints carry the argument
+alone: the handoff must live under the scratch root, `--attach-dir` and
+`--thread-dir` keep their scratch-root validation, and no sandbox arguments
+pass through, so no host path reaches the sandbox that a normal run could not
+already have handed over.
+
 ## lane-mail and lane-mail-watch
 
 Two more scripts are safe to blanket-approve, though the argument for

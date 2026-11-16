@@ -3,6 +3,7 @@
 # fork-sandbox.sh — Run one unattended headless agent session in a sandboxed clone
 #
 # Usage: fork-sandbox.sh [options] <project-path> <handoff-file>
+#        fork-sandbox.sh [options] --no-repo <handoff-file>
 #        fork-sandbox.sh configure [--remove] [--all] [--dry-run]
 #
 # `configure` discovers per-machine config already present on this host --
@@ -25,6 +26,27 @@
 # daemon's own cgroups, which neither OOMPolicy=continue nor MemoryMax
 # reaches.
 #
+# --no-repo:             run with no project at all, for a task that only
+#                        reads attached files (frames to inspect, a log to
+#                        triage) and has nothing to commit. The positional
+#                        arguments are the handoff alone; a project path as
+#                        well is a usage error. The session gets a fresh,
+#                        empty git work dir at <run dir>/work in place of the
+#                        clone. Nothing is fetched back: there is no branch,
+#                        the summary says so, and whatever the session wrote
+#                        there is discarded with the run dir. The run is
+#                        still logged, with origin_repo null and no_repo true.
+#                        The project-root check is skipped because no project
+#                        is handed over; every other input keeps its check
+#                        (the handoff and --attach-dir / --thread-dir stay
+#                        under the scratch root, --sandbox-args stays
+#                        refused). Refused, before anything is created:
+#                        --branch, --checkout, --review-only, --review-loop,
+#                        --maintainer-loop, --preset, --pipeline, --k8s,
+#                        --review-base, --clone-dir, --cover-only,
+#                        --finalize-script, and --resume. --harness, --model,
+#                        --network sealed, --attach-dir, --task-meta, --wait
+#                        and --refresh-at work as usual.
 # --branch <name>:       branch the session commits on. Defaults to a
 #                        timestamped name.
 # --checkout <ref>:      start the branch at <ref> instead of the repo's HEAD.
