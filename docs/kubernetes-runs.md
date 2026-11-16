@@ -3727,8 +3727,12 @@ is released the moment the push returns. The push also runs with
 Each slot is a lock file, `slot-0` up to `slot-N-1`, under
 `/var/tmp/claude-scratch/forks/.k8s-push-slots/` (in a postmaster pod, that is
 its data volume), held with `flock` on a file descriptor the submit keeps
-open. A submit that is killed releases its slot when the kernel closes that
-descriptor, so there is nothing stale to clean up. Where `flock` is missing or
+open and its push inherits. A submit that is killed mid-push keeps its slot
+until the push it started has really ended (the push's git, pack-objects and
+kubectl hold the same descriptor), so the cap still bounds the pushes in
+flight; such an orphaned push ends at the latest when its pod gives up on
+inputs after `INPUTS_TIMEOUT`. The slot frees when the kernel closes the last
+copy of that descriptor, so there is nothing stale to clean up. Where `flock` is missing or
 the filesystem cannot take the lock, `submit` warns and pushes without the cap
 rather than failing.
 

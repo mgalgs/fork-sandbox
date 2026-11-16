@@ -9558,13 +9558,16 @@ EOF
     # The push is the one step gated by K8S_PUSH_CONCURRENCY (see
     # k8s_push_slot_take); the slot is released the moment git returns.
     # -c pack.threads=1: a single-threaded pack-objects peaks lower, and
-    # the CPU is better spent elsewhere. The push itself runs with the
-    # slot's fd closed, so a git or kubectl that outlives a killed
-    # launcher never keeps the slot held.
+    # the CPU is better spent elsewhere. The push inherits the slot's fd on
+    # purpose: if this launcher is killed mid-push, the git, pack-objects
+    # and kubectl it leaves behind keep the slot held until the last of
+    # them exits, so the cap still bounds the pack-objects really running.
+    # That orphan is bounded: its pod gives up on inputs after
+    # INPUTS_TIMEOUT and exits, which ends the exec and so the push. The
+    # push subshell is the only child started while the slot is held.
     local push_rc=0
     k8s_push_slot_take || exit 1
     (
-        [[ -z "$K8S_PUSH_SLOT_FD" ]] || exec {K8S_PUSH_SLOT_FD}>&-
         cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null -c pack.threads=1 push --quiet \
             "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i -c agent $pod_name -- git-receive-pack /work/repo.git" \
             "$push_src:refs/heads/$branch" "${extra_refspecs[@]}") || push_rc=$?
@@ -12484,8 +12487,10 @@ cmd_collect() {
 # flight with it. So at most K8S_PUSH_CONCURRENCY such pushes run at once:
 # one lock file per slot (slot-0 .. slot-N-1) in a directory every submit on
 # this host shares, each held with flock(2) on an fd this process keeps open.
-# A launcher killed mid-push releases its slot when the kernel closes that
-# fd -- no pid files and no stale-lock cleanup.
+# The push inherits that fd, so a launcher killed mid-push releases its slot
+# when the kernel closes the fd in the last process holding it -- the
+# orphaned push itself, once it ends -- with no pid files and no stale-lock
+# cleanup.
 #
 # The directory sits under the scratch root every submit already uses for
 # its run dirs, which inside a postmaster pod is its data volume: shared by

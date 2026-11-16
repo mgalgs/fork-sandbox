@@ -379,7 +379,9 @@
 #   - K8S_PUSH_CONCURRENCY: the push-slot gate's own functions, driven
 #     against a private slot directory, never let more than the cap of
 #     concurrent stub pushes in at once; a slot whose holder was SIGKILLed
-#     is free for the next push with no cleanup; a wait that runs out
+#     is free for the next push with no cleanup; a submit SIGKILLed
+#     mid-push keeps its slot while the push it started lives, and frees
+#     it once that push exits, with no cleanup; a wait that runs out
 #     fails naming K8S_PUSH_SLOT_WAIT and K8S_PUSH_CONCURRENCY, and a wait
 #     that ends logs the seconds waited; an unusable slot directory warns
 #     and pushes ungated; malformed values of either key are refused before
@@ -27837,6 +27839,63 @@ fi
 # The slot was released when the push returned: free again right away.
 pc_err="$(pushcap_sh 1 1 "$pushcap_dir8" 'k8s_push_slot_take; echo took' 2>&1)" || true
 check "submit released its push slot once the push returned" "took" "$pc_err"
+
+# 9. A submit SIGKILLed mid-push keeps its slot until the push it started
+# has really ended: the orphaned push inherits the slot's fd, so with a cap
+# of 1 a second take waits while it lives, and gets the slot once it exits,
+# with no cleanup step. The push stub records the launcher's pid (the
+# outermost fork-sandbox-k8s.sh above it) and then becomes `sleep` in
+# place, standing in for a git/pack-objects that outlives its launcher.
+pushcap_git9="$(newdir)"; tmpdirs+=("$pushcap_git9")
+cat > "$pushcap_git9/git" <<STUB
+#!/usr/bin/env bash
+case " \$* " in
+    *" push "*)
+        p=\$PPID launcher=""
+        while [[ "\$p" =~ ^[0-9]+\$ ]] && (( p > 1 )) \\
+            && [[ "\$(ps -o args= -p "\$p" 2>/dev/null)" == *fork-sandbox-k8s.sh* ]]; do
+            launcher=\$p
+            p=\$(ps -o ppid= -p "\$p" 2>/dev/null | tr -d ' ')
+        done
+        printf '%s %s\n' "\$launcher" "\$\$" > "$pushcap_tmp/pushing9.tmp"
+        mv "$pushcap_tmp/pushing9.tmp" "$pushcap_tmp/pushing9"
+        exec sleep 300 ;;
+esac
+exec "$runstub_dir/git" "\$@"
+STUB
+chmod +x "$pushcap_git9/git"
+pushcap_dir9="$pushcap_tmp/slots9"
+config_dir="$pushcap_cfg" FS_K8S_PUSH_SLOT_DIR="$pushcap_dir9" RESUME_EXTRA_PATH="$pushcap_git9" \
+    runstub_verb "$pushcap_tmp/kubectl9.log" "$pushcap_tmp/submit9.out" submit \
+    --branch fs-k8s-test-pushcap-killed --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" 2>/dev/null &
+pc_submit=$!
+pc_n=0
+while [[ ! -e "$pushcap_tmp/pushing9" ]] && (( pc_n++ < 300 )); do sleep 0.1; done
+read -r pc_launcher pc_pusher < "$pushcap_tmp/pushing9" 2>/dev/null || true
+if [[ -z "${pc_launcher:-}" || -z "${pc_pusher:-}" ]]; then
+    no "a submit SIGKILLed mid-push keeps its slot while the orphaned push lives" \
+        "the push stub never ran: $(cat "$pushcap_tmp/submit9.out")"
+    no "the orphaned push's slot frees once the push exits, with no cleanup step"
+else
+    kill -KILL "$pc_launcher" 2>/dev/null
+    wait "$pc_submit" 2>/dev/null
+    pc_rc=0
+    pc_err="$(pushcap_sh 1 1 "$pushcap_dir9" 'k8s_push_slot_take; echo took' 2>&1)" || pc_rc=$?
+    if (( pc_rc != 0 )) && [[ "$pc_err" != *took* ]] && kill -0 "$pc_pusher" 2>/dev/null \
+        && ! kill -0 "$pc_launcher" 2>/dev/null; then
+        ok "a submit SIGKILLed mid-push keeps its slot while the orphaned push lives"
+    else
+        no "a submit SIGKILLed mid-push keeps its slot while the orphaned push lives" "rc=$pc_rc: $pc_err"
+    fi
+    kill -KILL "$pc_pusher" 2>/dev/null
+    pc_rc=0
+    pc_err="$(pushcap_sh 1 10 "$pushcap_dir9" 'k8s_push_slot_take; echo took' 2>&1)" || pc_rc=$?
+    if (( pc_rc == 0 )) && [[ "$(tail -1 <<< "$pc_err")" == took ]]; then
+        ok "the orphaned push's slot frees once the push exits, with no cleanup step"
+    else
+        no "the orphaned push's slot frees once the push exits, with no cleanup step" "rc=$pc_rc: $pc_err"
+    fi
+fi
 
 
 printf '\n== k8s claude seats: a full Claude model id is refused, an alias gets 1M ==\n'
