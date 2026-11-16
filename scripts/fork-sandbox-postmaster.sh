@@ -1867,15 +1867,48 @@ pm_persona_body() {
 # from the launcher) or after 3 consecutive failed harvests of a RESUMED
 # wake for the same pair -- the wedge bound: a genuinely broken session
 # must not wedge a seat forever. See pm_harvest_run's FAILS bookkeeping.
+#
+# $4 is the review-target sha of the wake that produced <sid> (empty when
+# it had none), kept beside the pointer (pm_session_target) so a `follow`
+# seat resumes a session only on the version it was started on -- see
+# pm_seat_fresh_from. $5 is the id that wake resumed (empty when none):
+# a wake that resumed nothing and reports the very id the pointer already
+# holds did not create that session -- the launcher's discovery fell back
+# to the newest transcript in the store, the previous version's, because
+# the wake died before writing its own -- so the pointer and its target
+# are left as they were rather than relabelled with this wake's target.
 pm_session_record() {
-    local tid="$1" agent="$2" sid="$3"
+    local tid="$1" agent="$2" sid="$3" target="${4:-}" resumed="${5:-}" cur
+    cur="$(pm_trim "$(cat -- "$PM_SESSIONS/$tid/$agent" 2>/dev/null || true)")"
+    if [[ -z "$resumed" && -n "$cur" && "$sid" == "$cur" ]]; then
+        pm_event "session thread=${tid:0:8} agent=$agent kept=$sid reason=not-created-by-wake"
+        return 0
+    fi
     mkdir -p -- "$PM_SESSIONS/$tid"
     printf '%s\n' "$sid" > "$PM_SESSIONS/$tid/$agent"
+    if [[ -n "$target" ]]; then
+        mkdir -p -- "$PM_SESSIONS/$tid/.targets"
+        printf '%s\n' "$target" > "$PM_SESSIONS/$tid/.targets/$agent"
+    else
+        rm -f -- "$PM_SESSIONS/$tid/.targets/$agent"
+    fi
 }
 
 pm_session_clear() {
     local tid="$1" agent="$2"
-    rm -f -- "$PM_SESSIONS/$tid/$agent"
+    rm -f -- "$PM_SESSIONS/$tid/$agent" "$PM_SESSIONS/$tid/.targets/$agent"
+}
+
+# pm_session_target <tid> <agent>: prints the review-target sha the
+# recorded session was started on, when there is a recorded session and
+# its target is known; nothing otherwise (no session, a wake with no
+# target, or a pointer written before targets were recorded). Kept under
+# a dot-directory so fleet teardown's <tid>/<agent> scan never takes it
+# for a seat.
+pm_session_target() {
+    local tid="$1" agent="$2"
+    [[ -f "$PM_SESSIONS/$tid/$agent" ]] || return 0
+    pm_trim "$(cat -- "$PM_SESSIONS/$tid/.targets/$agent" 2>/dev/null || true)"
 }
 
 # The wedge bound's consecutive-failure counter for a (thread, agent) pair,
@@ -2122,11 +2155,30 @@ print(uuid.uuid5(ns, sys.argv[2]))
 # a retry, mail from another seat on the same version), a first wake, the
 # `sets` seat and a seat with no target all resume as before. Read before
 # this wake's own run id is appended to $SEQ/$tid.
+#
+# A recorded session's own target (pm_session_target, claude) is what
+# decides when there is one, not the last wake's: a first wake on a new
+# target that died before its session existed has already recorded the
+# new target as the last wake's, while the pointer still names the
+# previous version's session -- the retry must start fresh again, not
+# resume that. A pointer recorded before session targets were (or a pi
+# seat, which records no pointer) falls back to the last wake's target;
+# a legacy pointer is labelled with that target the first time it fires,
+# so a failed first wake leaves the same trail behind it.
 pm_seat_fresh_from() {
     local review_target="$1" tid="$2" agent="$3" rt_sha="$4" last
     [[ "$review_target" == follow && -n "$rt_sha" ]] || return 0
+    last="$(pm_session_target "$tid" "$agent")"
+    if [[ -n "$last" ]]; then
+        [[ "$last" == "$rt_sha" ]] || printf '%s' "$last"
+        return 0
+    fi
     last="$(pm_seat_last_target_sha "$tid" "$agent")"
     if [[ -n "$last" && "$last" != "$rt_sha" ]]; then
+        if [[ -f "$PM_SESSIONS/$tid/$agent" ]]; then
+            mkdir -p -- "$PM_SESSIONS/$tid/.targets" \
+                && printf '%s\n' "$last" > "$PM_SESSIONS/$tid/.targets/$agent" || true
+        fi
         printf '%s' "$last"
     fi
     return 0
@@ -2173,7 +2225,7 @@ pm_stage_previous_transcript() {
     if [[ -z "$src" ]]; then
         reason=missing
     else
-        size="$(stat -c %s -- "$src" 2>/dev/null || echo -1)"
+        size="$("$FS_STAT" -c %s -- "$src" 2>/dev/null || echo -1)"
         if (( size < 0 )); then
             reason=missing
         elif (( size > PM_PREVIOUS_TRANSCRIPT_MAX )); then
@@ -7743,7 +7795,7 @@ pm_harvest_run() {
                 local sid
                 sid="$(pm_trim "$(jq -r '.session_id // empty' \
                     "$run_dir/summary.json" 2>/dev/null || true)")"
-                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid"
+                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field"
             fi
             was_failure=1
             dead_review=1
@@ -7783,7 +7835,7 @@ pm_harvest_run() {
                 local sid
                 sid="$(pm_trim "$(jq -r '.session_id // empty' \
                     "$run_dir/summary.json" 2>/dev/null || true)")"
-                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid"
+                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field"
             fi
             was_failure=1
         else
@@ -7812,7 +7864,7 @@ pm_harvest_run() {
                 sid="$(pm_trim "$(jq -r '.session_id // empty' \
                     "$run_dir/summary.json" 2>/dev/null || true)")"
                 if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
-                    pm_session_record "$tid" "$agent" "$sid"
+                    pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field"
                 elif [[ -z "$sid" ]]; then
                     pm_session_clear "$tid" "$agent"
                 fi

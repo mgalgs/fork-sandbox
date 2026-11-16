@@ -3020,7 +3020,20 @@ thread recorded is set and differs from this wake's
 in the same store and is recorded as usual, and pi gets a `--session-id`
 derived from `<thread>/<agent>@<target-sha>`, a new id in the same
 store. Later wakes on the same target (follow-ups, retries, other
-seats' mail) resume that new session. A first wake, the `sets` seat, a
+seats' mail) resume that new session.
+
+For claude, the target a session was started on is recorded beside its
+`sessions/<thread>/<agent>` pointer, in `sessions/<thread>/.targets/<agent>`,
+and that label decides, not the last wake's target: a first wake on a
+new target that dies before its own session exists has already made the
+new target the last wake's, while the pointer still names the previous
+version's session. Its harvest also refuses to record the id the
+pointer already held from a wake that resumed nothing (the launcher's
+discovery falling back to the store's newest transcript, the previous
+version's), so the retry starts fresh and stages the previous transcript
+again rather than resuming it. A pointer recorded before these labels
+existed falls back to the last wake's target and is labelled with it
+the first time that fires. A first wake, the `sets` seat, a
 seat with no review target and codex are unaffected. The decision is
 made in `pm_session_spawn_args`, shared by the local and k8s spawn
 branches and by composed seats whose step 1 is a claude code step.

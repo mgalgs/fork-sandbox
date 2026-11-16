@@ -1090,6 +1090,8 @@ teardown_seat() {
     local st="$PM_SESSION_STATE/$tid/$agent"
     [[ -e "$ws" ]] && { rm -rf -- "$ws"; removed+=("workspace"); }
     [[ -e "$sess" ]] && { rm -f -- "$sess"; removed+=("session record"); }
+    # The record's review-target label (the postmaster's pm_session_target).
+    rm -f -- "$PM_SESSIONS/$tid/.targets/$agent"
     [[ -e "$st" ]] && { rm -rf -- "$st"; removed+=("session state"); }
     if (( ${#removed[@]} )); then
         local joined; joined="$(IFS=', '; echo "${removed[*]}")"
