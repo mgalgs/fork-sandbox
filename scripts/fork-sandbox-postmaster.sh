@@ -1433,6 +1433,17 @@
 #                                   handoff, gets no mount, and the thread
 #                                   is flagged. Never reaped, the same as
 #                                   handoffs/ and runs/ above
+#   wake-threads/<run-id>/previous-transcript.jsonl  on a follow seat's
+#                                   first wake on a new review target
+#                                   (claude, pi), a verbatim copy of the
+#                                   session it would otherwise have
+#                                   resumed, read at
+#                                   /thread/previous-transcript.jsonl and
+#                                   named in the handoff's "Your previous
+#                                   review" section; skipped (an event says
+#                                   why) when missing, over 32MiB, or when
+#                                   wake-threads/ is not owner-only. That
+#                                   dir is kept 0700 because of it
 #   wake-threads/<run-id>.message-ids  the Message-ID of every message in
 #                                   that snapshot, one per line, listed just
 #                                   before it was rendered and written only
@@ -1460,8 +1471,18 @@
 #   sessions/<thread-id>/<agent>   the session id the LAST wake of that
 #                                   pair ended on, read out of the run's
 #                                   summary.json at harvest. Present ->
-#                                   the next wake resumes it; absent ->
-#                                   the next wake is fresh. Cleared when a
+#                                   the next wake resumes it, except a
+#                                   claude `review-target: follow` seat's
+#                                   wake on a review target other than
+#                                   the one that session was started on
+#                                   (.targets/ below), which starts
+#                                   fresh; absent -> the next wake is
+#                                   fresh. Not written by a wake that
+#                                   resumed nothing and reports a session
+#                                   that predates it (the pointer's own,
+#                                   or the run record's PRIOR_SESSION:
+#                                   discovery fell back to an older
+#                                   transcript). Cleared when a
 #                                   wake fails outright, or ends cleanly
 #                                   with a null/absent session_id, so a
 #                                   broken or missing session can never
@@ -1471,6 +1492,13 @@
 #                                   own id fresh every spawn
 #                                   (pm_pi_session_id) and never has an
 #                                   entry here at all
+#   sessions/<thread-id>/.targets/<agent>  the review-target sha the
+#                                   session in sessions/<thread-id>/<agent>
+#                                   was started on, written and removed
+#                                   with that pointer (pm_session_target);
+#                                   absent for a wake with no target. A
+#                                   follow seat resumes that session only
+#                                   on this target (pm_seat_fresh_from)
 #   workspaces/<thread-id>/<agent>/ the persistent clone for that (thread,
 #                                   agent) seat, bound into every wake of
 #                                   it (every harness, not just claude)
@@ -1503,7 +1531,13 @@
 #     resume by id (discovered from the prior wake's summary.json, see
 #     sessions/ above); pi resumes by a deterministically-derived id
 #     (pm_pi_session_id) that its own CLI creates on first use -- both
-#     read as "resumed" from this script's point of view. A sealed pi seat
+#     read as "resumed" from this script's point of view. A
+#     `review-target: follow` seat does not resume across versions of the
+#     series under review: claude drops --resume-session on a new target,
+#     and pi derives its id from <tid>/<agent>@<target-sha> (a seat with
+#     no target keeps the plain <tid>/<agent>). A LOCAL codex follow seat
+#     is the exception: it still resumes across versions (a k8s codex
+#     seat starts every wake fresh anyway). A sealed pi seat
 #     (network "sealed") is wired the same as any other resumable harness:
 #     it dispatches through agent-sandboxed, whose own
 #     --session-dir/--session-id bind the durable store into the sandbox
@@ -1872,15 +1906,21 @@ pm_persona_body() {
 # it had none), kept beside the pointer (pm_session_target) so a `follow`
 # seat resumes a session only on the version it was started on -- see
 # pm_seat_fresh_from. $5 is the id that wake resumed (empty when none):
-# a wake that resumed nothing and reports the very id the pointer already
-# holds did not create that session -- the launcher's discovery fell back
-# to the newest transcript in the store, the previous version's, because
-# the wake died before writing its own -- so the pointer and its target
-# are left as they were rather than relabelled with this wake's target.
+# a wake that resumed nothing and reports a session that predates it --
+# the very id the pointer already holds, or $6, the newest transcript in
+# the store when the wake was spawned (PRIOR_SESSION, pm_session_prior) --
+# did not create that session: the launcher's discovery fell back to the
+# newest transcript in the store, the previous version's, because the
+# wake died before writing its own. The pointer and its target are left
+# as they were (absent, when it had been cleared) rather than relabelled
+# with this wake's target. $6 is what covers a pointer cleared before the
+# wake (the wedge bound, a clean exit with no session id), which the
+# pointer comparison alone cannot see.
 pm_session_record() {
-    local tid="$1" agent="$2" sid="$3" target="${4:-}" resumed="${5:-}" cur
+    local tid="$1" agent="$2" sid="$3" target="${4:-}" resumed="${5:-}" prior="${6:-}" cur
     cur="$(pm_trim "$(cat -- "$PM_SESSIONS/$tid/$agent" 2>/dev/null || true)")"
-    if [[ -z "$resumed" && -n "$cur" && "$sid" == "$cur" ]]; then
+    if [[ -z "$resumed" ]] \
+        && { [[ -n "$cur" && "$sid" == "$cur" ]] || [[ -n "$prior" && "$sid" == "$prior" ]]; }; then
         pm_event "session thread=${tid:0:8} agent=$agent kept=$sid reason=not-created-by-wake"
         return 0
     fi
@@ -1892,6 +1932,19 @@ pm_session_record() {
     else
         rm -f -- "$PM_SESSIONS/$tid/.targets/$agent"
     fi
+}
+
+# pm_session_prior <harness> <tid> <agent>: the id the launcher's
+# discovery would report for the seat's store right now (the newest
+# transcript in it, fs_session_discover_id), for a discover-mode harness;
+# nothing for any other. Taken at spawn for a wake that resumes nothing
+# and recorded as PRIOR_SESSION, so its harvest can tell a session the
+# wake created from one that was already there (pm_session_record).
+pm_session_prior() {
+    local harness="$1" tid="$2" agent="$3"
+    fs_harness_session_caps "$harness"
+    [[ "$FS_HARNESS_RESUMABLE" == true && "$FS_HARNESS_ID_MODE" == discover ]] || return 0
+    fs_session_discover_id "$harness" "$PM_SESSION_STATE/$tid/$agent" "" 2>/dev/null || true
 }
 
 pm_session_clear() {
@@ -2200,7 +2253,10 @@ PM_PREVIOUS_TRANSCRIPT_MAX=$(( 32 * 1024 * 1024 ))
 # pi: the previous version's derived id, found as <timestamp>_<id>.jsonl
 # at the top of the seat's store (pi's own file name), the newest if more
 # than one; failing that, the pre-target "<tid>/<agent>" id a seat woken
-# before per-target ids existed used. Succeeds only when it staged a file;
+# before per-target ids existed used. Staged only beneath an owner-only
+# (0700) parent of <snap-dir> -- wake-threads/, see pm_spawn_wake -- since
+# the store keeps every transcript private; otherwise reason=unprotected.
+# Succeeds only when it staged a file;
 # otherwise stages nothing and says why in one `previous-transcript`
 # event. Never fails the wake.
 pm_stage_previous_transcript() {
@@ -2222,7 +2278,12 @@ pm_stage_previous_transcript() {
                 | head -n1)"
         fi
     fi
-    if [[ -z "$src" ]]; then
+    if [[ "$("$FS_STAT" -c %a -- "${snap_dir%/*}" 2>/dev/null)" != 700 ]]; then
+        # The transcript is private in the store; never copy it anywhere
+        # another local account could read it (pm_spawn_wake makes
+        # wake-threads/ owner-only).
+        reason=unprotected
+    elif [[ -z "$src" ]]; then
         reason=missing
     else
         size="$("$FS_STAT" -c %s -- "$src" 2>/dev/null || echo -1)"
@@ -2271,7 +2332,11 @@ pm_trim() {
 # discovered and recorded as before; pi's derived id includes the target
 # sha, so a new target is a new id -- pi opens the session whose header
 # carries exactly the given id and creates it otherwise, never continuing
-# another one in the store. codex and every other seat are unchanged.
+# another one in the store. codex and every other seat are unchanged --
+# and that is a stated limitation for codex, not a no-op: a k8s codex seat
+# never reaches here and starts every wake fresh, but a LOCAL codex seat
+# is a discover-mode resumable harness and still resumes its recorded
+# session across versions, `follow` or not, with nothing staged.
 pm_session_spawn_args() {
     local harness="$1" tid="$2" agent="$3" review_target="${4:-}" rt_sha="${5:-}" resumed=""
     fs_harness_session_caps "$harness"
@@ -5776,6 +5841,12 @@ pm_spawn_wake() {
     [[ "$is_retry" != cover ]] || pending_init="$PM_COVER_PENDING"
     local trigger_only=""
     local snap_dir="$MAIL_ROOT/.postmaster/wake-threads/$run_id"
+    # wake-threads/ is owner-only: a snapshot may hold a seat's previous
+    # transcript (pm_stage_previous_transcript), which the seat's store
+    # keeps private, and the mail root is made under the ambient umask.
+    # The mount is the run-id dir itself, so the seat reads it the same.
+    # Re-applied every wake, which also closes a dir made before this.
+    { mkdir -p -- "${snap_dir%/*}" && chmod 700 -- "${snap_dir%/*}"; } 2>/dev/null || true
     # The snapshot's message ids are listed BEFORE it is rendered: messages
     # are only ever added, so every id listed is in the render, and the list
     # is what proves later that the run was shown a message (see
@@ -5922,7 +5993,7 @@ pm_spawn_wake() {
         # --session-state there), so it starts each wake fresh rather than
         # have every wake refused. A composed seat whose step 1 is not a
         # claude code step starts fresh for the same reason.
-        local resumed=""
+        local resumed="" prior_session=""
         if [[ -n "$session_harness" && "$session_harness" != codex ]]; then
             local -a session_lines=()
             mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent" \
@@ -5930,6 +6001,7 @@ pm_spawn_wake() {
             local session_last=$(( ${#session_lines[@]} - 1 ))
             resumed="${session_lines[session_last]#RESUMED=}"
             spawn_args+=("${session_lines[@]:0:session_last}")
+            [[ -n "$resumed" ]] || prior_session="$(pm_session_prior "$session_harness" "$tid" "$agent")"
         fi
 
         # Lineage: pick up where the same agent's own most recent run on
@@ -6085,6 +6157,7 @@ pm_spawn_wake() {
             printf 'NETWORK=%s\n' "$network"
             printf 'BRANCH=%s\n' "$branch"
             printf 'RESUMED=%s\n' "$resumed"
+            printf 'PRIOR_SESSION=%s\n' "$prior_session"
             printf 'PENDING_MSGS=%s\n' "$pending_init"
             printf 'VIA=%s\n' "$via"
             printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -6200,7 +6273,7 @@ pm_spawn_wake() {
     # resumable harness now: agent-sandboxed has its own
     # --session-dir/--session-id, which bind the durable store into the
     # sandbox and point pi at it there.
-    local resumed=""
+    local resumed="" prior_session=""
     if [[ -n "$session_harness" ]]; then
         local -a session_lines=()
         mapfile -t session_lines < <(pm_session_spawn_args "$session_harness" "$tid" "$agent" \
@@ -6208,6 +6281,7 @@ pm_spawn_wake() {
         local session_last=$(( ${#session_lines[@]} - 1 ))
         resumed="${session_lines[session_last]#RESUMED=}"
         spawn_args+=("${session_lines[@]:0:session_last}")
+        [[ -n "$resumed" ]] || prior_session="$(pm_session_prior "$session_harness" "$tid" "$agent")"
     fi
 
     local launch_out rc run_dir
@@ -6239,6 +6313,7 @@ pm_spawn_wake() {
         printf 'NETWORK=%s\n' "$network"
         printf 'BRANCH=%s\n' "$branch"
         printf 'RESUMED=%s\n' "$resumed"
+        printf 'PRIOR_SESSION=%s\n' "$prior_session"
         printf 'PENDING_MSGS=%s\n' "$pending_init"
         printf 'VIA=%s\n' "$via"
         printf 'SPAWNED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -7617,7 +7692,7 @@ pm_regate_timer_pass() {
 pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
-    local agent tid trigger run_dir harness model network resumed_field
+    local agent tid trigger run_dir harness model network resumed_field prior_session
     local backend branch
     local review_target review_target_branch review_target_sha review_target_version
     agent="$(fs_pm_env_get "$f" AGENT)"
@@ -7630,6 +7705,7 @@ pm_harvest_run() {
     branch="$(fs_pm_env_get "$f" BRANCH)"
     network="$(fs_pm_env_get "$f" NETWORK)"
     resumed_field="$(fs_pm_env_get "$f" RESUMED)"
+    prior_session="$(fs_pm_env_get "$f" PRIOR_SESSION)"
     review_target="$(fs_pm_env_get "$f" REVIEW_TARGET)"
     review_target_branch="$(fs_pm_env_get "$f" REVIEW_TARGET_BRANCH)"
     review_target_sha="$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)"
@@ -7795,7 +7871,7 @@ pm_harvest_run() {
                 local sid
                 sid="$(pm_trim "$(jq -r '.session_id // empty' \
                     "$run_dir/summary.json" 2>/dev/null || true)")"
-                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field"
+                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field" "$prior_session"
             fi
             was_failure=1
             dead_review=1
@@ -7835,7 +7911,7 @@ pm_harvest_run() {
                 local sid
                 sid="$(pm_trim "$(jq -r '.session_id // empty' \
                     "$run_dir/summary.json" 2>/dev/null || true)")"
-                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field"
+                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field" "$prior_session"
             fi
             was_failure=1
         else
@@ -7864,7 +7940,7 @@ pm_harvest_run() {
                 sid="$(pm_trim "$(jq -r '.session_id // empty' \
                     "$run_dir/summary.json" 2>/dev/null || true)")"
                 if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
-                    pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field"
+                    pm_session_record "$tid" "$agent" "$sid" "$review_target_sha" "$resumed_field" "$prior_session"
                 elif [[ -z "$sid" ]]; then
                     pm_session_clear "$tid" "$agent"
                 fi

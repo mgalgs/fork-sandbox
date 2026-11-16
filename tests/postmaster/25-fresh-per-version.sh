@@ -21,6 +21,10 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 sed -i 's/^  alice: {}$/  alice:\n    review-target: follow/' "$FORK_SANDBOX_FLEET_FILE"
 sed -i 's/^    model: vendor\/model$/    model: vendor\/model\n    review-target: follow/' "$FORK_SANDBOX_FLEET_FILE"
 sed -i 's/^    endpoint: kim-endpoint$/    endpoint: kim-endpoint\n    review-target: follow/' "$FORK_SANDBOX_FLEET_FILE"
+# paf is a composed (`pipelines:`) follow seat whose step 1 is a claude
+# code step.
+sed -i 's/^agents:$/agents:\n  paf:\n    pipelines: {default: copus1-ropus1}\n    review-target: follow/' "$FORK_SANDBOX_FLEET_FILE"
+printf 'Paf is a composed follow seat.\n' > "$FORK_SANDBOX_PERSONAS_DIR/paf.md"
 # One sets seat per fleet: nora takes it over from ken (unused here).
 sed -i '/^  ken:$/,/^  kai:$/{/review-target: sets/d}' "$FORK_SANDBOX_FLEET_FILE"
 sed -i 's/^agents:$/agents:\n  nora:\n    review-target: sets/' "$FORK_SANDBOX_FLEET_FILE"
@@ -140,6 +144,11 @@ check "local claude: the section follows the thread/trigger block" 1 \
     "$(( lc_sect_line > lc_trig_line ))"
 contains "local claude: staging is reported as an event" \
     "$(cat "$work/once.out")" "pm previous-transcript thread=${lc_tid:0:8} agent=alice staged=yes"
+# The copy is as private as the store it came from: wake-threads/, the
+# only way to it, is owner-only whatever the umask.
+check "local claude: wake-threads/ is owner-only" 700 "$(stat -c %a -- "$PM_STATE_DIR/wake-threads")"
+check "local claude: the staged copy is still readable to the seat (same user)" 1 \
+    "$([[ -r "$(staged_of "$lc_tid")" ]] && echo 1 || echo 0)"
 
 lc_s2=aaaa1111-0000-4000-8000-000000000002
 finish_run alice 0 "$lc_s2"
@@ -182,6 +191,7 @@ contains "local claude: an oversized transcript is reported as an event" \
 # `gstat`, a present transcript must still be staged.
 bsd_bin="$work/bsd-stat-bin"
 mkdir -p -- "$bsd_bin" "$work/bsd-stat/sessions/t1" "$work/bsd-stat/state/t1/alice/-p" "$work/bsd-stat/snap"
+chmod 700 -- "$work/bsd-stat"
 printf '#!/bin/sh\nexec %s "$@"\n' "$(command -v stat)" > "$bsd_bin/gstat"
 printf '#!/bin/sh\necho "stat: illegal option -- c" >&2\nexit 1\n' > "$bsd_bin/stat"
 chmod +x -- "$bsd_bin/gstat" "$bsd_bin/stat"
@@ -194,6 +204,19 @@ check "local claude: staging sizes the transcript with GNU stat when bare stat i
         pm_event() { :; }
         pm_stage_previous_transcript claude t1 alice "$rt1_sha" "$work/bsd-stat/snap" \
             && cat -- "$work/bsd-stat/snap/previous-transcript.jsonl" )"
+
+# Never staged beneath a parent other accounts can traverse.
+mkdir -p -- "$work/open-parent/snap"
+chmod 755 -- "$work/open-parent"
+# shellcheck disable=SC1090,SC2030,SC2031,SC2034
+check "local claude: a snapshot under a world-traversable parent stages nothing" \
+    "1 reason=unprotected no" "$( source "$postmaster"
+        PM_SESSIONS="$work/bsd-stat/sessions" PM_SESSION_STATE="$work/bsd-stat/state"
+        pm_event() { printf '%s\n' "$*" > "$work/open-parent.event"; }
+        op_rc=0
+        pm_stage_previous_transcript claude t1 alice "$rt1_sha" "$work/open-parent/snap" || op_rc=$?
+        printf '%s %s %s' "$op_rc" "$(grep -o 'reason=[a-z]*' "$work/open-parent.event")" \
+            "$([[ -e "$work/open-parent/snap/previous-transcript.jsonl" ]] && echo yes || echo no)" )"
 
 # A first wake on a new target that dies before its own session exists:
 # the launcher's discovery falls back to the previous version's transcript
@@ -260,6 +283,92 @@ check "local claude legacy pointer: and labels the old session with the last wak
     "$lf_rt2" "$(cat "$PM_STATE_DIR/sessions/$lf_tid/.targets/alice" 2>/dev/null)"
 contains "local claude legacy pointer: the section names that target" \
     "$(handoff_of "$lf_tid")" "$(section_of "$lf_rt3" "$lf_rt2")"
+
+# The same failed fresh wake when the pointer had already been cleared (a
+# clean exit with no session id; the wedge bound clears it too): discovery
+# still reports the previous version's id, which predates the wake (the
+# run record's PRIOR_SESSION), so it is not recorded under the new target.
+new_root_store
+lx_mid="$("$MAIL" send --from '@carol' --to '@alice' --subject 'local claude cleared pointer' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+lx_tid="$(thread_of "$lx_mid")"
+once
+lx_s1=aaaa4444-0000-4000-8000-000000000001
+finish_run alice 0 "$lx_s1"
+claude_transcript "$lx_tid" alice "$lx_s1" '{"lx":1}'
+once
+reply_msg '@carol' "$lx_mid" 'v1 again' --to '@alice' >/dev/null
+once
+finish_run alice 0
+once
+check "local claude cleared pointer: a clean exit with no session clears the pointer" 1 \
+    "$([[ -e "$PM_STATE_DIR/sessions/$lx_tid/alice" ]]; echo $?)"
+new_version "$lx_tid" "$rt1_sha" 2 >/dev/null
+reply_msg '@carol' "$lx_mid" 'version 2' --to '@alice' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "local claude cleared pointer: the v2 wake resumes nothing" 0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "local claude cleared pointer: its record names the store's pre-wake newest session" \
+    "$lx_s1" "$(env_val "$PM_STATE_DIR/runs/$(last_rid "$lx_tid").env" PRIOR_SESSION)"
+finish_run alice 2 "$lx_s1"
+: > "$STUB_ARGV_LOG"
+once
+check "local claude cleared pointer: the failed wake records no pointer" 1 \
+    "$([[ -e "$PM_STATE_DIR/sessions/$lx_tid/alice" ]]; echo $?)"
+contains "local claude cleared pointer: the kept state is reported as an event" \
+    "$(cat "$work/once.out")" "pm session thread=${lx_tid:0:8} agent=alice kept=$lx_s1 reason=not-created-by-wake"
+if (( $(calls) == 0 )); then
+    reply_msg '@carol' "$lx_mid" 'version 2 retry' --to '@alice' >/dev/null
+    once
+fi
+check "local claude cleared pointer: the next v2 wake runs" 1 "$(calls)"
+check "local claude cleared pointer: the next v2 wake does not resume the v1 session" \
+    0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+lx_s2=aaaa4444-0000-4000-8000-000000000002
+claude_transcript "$lx_tid" alice "$lx_s2" '{"lx":2}'
+finish_run alice 0 "$lx_s2"
+once
+check "local claude cleared pointer: a session the wake did create is recorded" \
+    "$lx_s2" "$(cat "$PM_STATE_DIR/sessions/$lx_tid/alice" 2>/dev/null)"
+check "local claude cleared pointer: a resuming wake records no PRIOR_SESSION" "" \
+    "$( reply_msg '@carol' "$lx_mid" 'version 2 again' --to '@alice' >/dev/null; once
+        env_val "$PM_STATE_DIR/runs/$(last_rid "$lx_tid").env" PRIOR_SESSION )"
+
+# ============================================================
+printf '\n== fresh per version: a composed follow seat ==\n'
+# ============================================================
+
+new_root_store
+cf_mid="$("$MAIL" send --from '@carol' --to '@paf' --subject 'composed versions' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+cf_tid="$(thread_of "$cf_mid")"
+: > "$STUB_ARGV_LOG"
+once
+check "composed: a first wake passes --session-state" \
+    "$PM_STATE_DIR/state/$cf_tid/paf" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+check "composed: a first wake stages no transcript" 1 "$([[ -e "$(staged_of "$cf_tid")" ]]; echo $?)"
+cf_s1=dddd1111-0000-4000-8000-000000000001
+finish_run paf 0 "$cf_s1"
+claude_transcript "$cf_tid" paf "$cf_s1" '{"cf":1}'
+once
+reply_msg '@carol' "$cf_mid" 'same target' --to '@paf' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "composed: the same target resumes the recorded session" \
+    "$cf_s1" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+check "composed: the same target stages no transcript" 1 "$([[ -e "$(staged_of "$cf_tid")" ]]; echo $?)"
+not_contains "composed: the same target emits no section" "$(handoff_of "$cf_tid")" "$SECTION_HEAD"
+finish_run paf 0 "$cf_s1"
+once
+cf_rt2="$(new_version "$cf_tid" "$rt1_sha" 2)"
+reply_msg '@carol' "$cf_mid" 'version 2' --to '@paf' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "composed: a new target resumes nothing" 0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "composed: a new target stages the previous session's transcript" \
+    '{"cf":1}' "$(cat -- "$(staged_of "$cf_tid")" 2>/dev/null)"
+contains "composed: a new target's handoff carries the section" \
+    "$(handoff_of "$cf_tid")" "$(section_of "$cf_rt2" "$rt1_sha")"
 
 # ============================================================
 printf '\n== fresh per version: the sets seat is unchanged ==\n'

@@ -3012,8 +3012,9 @@ through pi directly.
 
 ### A new version is a fresh session
 
-A `review-target: follow` seat does not resume across versions of the
-series it reviews. When the review-target sha its last wake on the
+A `review-target: follow` seat on claude or pi does not resume across
+versions of the series it reviews (a local codex seat still does; see
+below). When the review-target sha its last wake on the
 thread recorded is set and differs from this wake's
 (`pm_seat_fresh_from`), the wake starts a fresh session: claude gets
 `--session-state` but no `--resume-session`, so the new session lands
@@ -3027,14 +3028,19 @@ For claude, the target a session was started on is recorded beside its
 and that label decides, not the last wake's target: a first wake on a
 new target that dies before its own session exists has already made the
 new target the last wake's, while the pointer still names the previous
-version's session. Its harvest also refuses to record the id the
-pointer already held from a wake that resumed nothing (the launcher's
-discovery falling back to the store's newest transcript, the previous
-version's), so the retry starts fresh and stages the previous transcript
+version's session. Its harvest also refuses to record, from a wake that resumed nothing,
+an id that predates the wake -- the one the pointer already held, or
+the store's newest transcript when the wake was spawned (the run
+record's `PRIOR_SESSION`, which covers a pointer cleared before the
+wake) -- since that is the launcher's discovery falling back to the
+previous version's transcript, so the retry starts fresh and stages the previous transcript
 again rather than resuming it. A pointer recorded before these labels
 existed falls back to the last wake's target and is labelled with it
 the first time that fires. A first wake, the `sets` seat, a
-seat with no review target and codex are unaffected. The decision is
+seat with no review target and codex are unaffected. For codex that is
+a limitation, not a no-op: a k8s codex seat starts every wake fresh
+anyway, but a local codex `follow` seat still resumes its recorded
+session across versions, with no transcript staged. The decision is
 made in `pm_session_spawn_args`, shared by the local and k8s spawn
 branches and by composed seats whose step 1 is a claude code step.
 
@@ -3056,7 +3062,10 @@ short "Your previous review" section after the thread block naming both
 shas and the path; the transcript is never pasted into the prompt. A
 transcript that cannot be found, or is over 32 MiB, is not staged: the
 section is left out, a `previous-transcript ... staged=no
-reason=missing|oversized|copy` event is logged, and the wake runs.
+reason=missing|oversized|copy|unprotected` event is logged, and the
+wake runs. The copy is as private as the store it came from: the
+postmaster keeps `wake-threads/` owner-only (0700), re-applied on every
+wake, and stages nothing (`reason=unprotected`) if it is not.
 
 A pi follow seat's first wake after this behavior shipped starts fresh
 even on an unchanged target, since its id format changed; nothing is

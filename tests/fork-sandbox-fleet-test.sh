@@ -1794,6 +1794,9 @@ PM_STATE="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 # alice/th1: a full seat -- workspace, session record, session state.
 mkdir -p -- "$PM_STATE/workspaces/th1/alice" "$PM_STATE/state/th1/alice" "$PM_STATE/sessions/th1"
 echo sid-alice > "$PM_STATE/sessions/th1/alice"
+mkdir -p -- "$PM_STATE/sessions/th1/.targets"
+echo 0123456789abcdef0123456789abcdef01234567 > "$PM_STATE/sessions/th1/.targets/alice"
+echo 0123456789abcdef0123456789abcdef01234567 > "$PM_STATE/sessions/th1/.targets/zed"
 
 td_out="$("$fleet" teardown alice --thread th1)"; td_rc=$?
 check "teardown: no-live-run seat exits 0" "0" "$td_rc"
@@ -1803,6 +1806,8 @@ contains "teardown: reports session state removed" "$td_out" "session state"
 path_state "teardown: workspace actually removed" gone "$PM_STATE/workspaces/th1/alice"
 path_state "teardown: session record actually removed" gone "$PM_STATE/sessions/th1/alice"
 path_state "teardown: session state actually removed" gone "$PM_STATE/state/th1/alice"
+path_state "teardown: the session's review-target label removed" gone "$PM_STATE/sessions/th1/.targets/alice"
+path_state "teardown: another seat's review-target label untouched" present "$PM_STATE/sessions/th1/.targets/zed"
 
 td_out2="$("$fleet" teardown alice --thread th1)"; td_rc2=$?
 check "teardown: nothing-to-remove exits 0" "0" "$td_rc2"
