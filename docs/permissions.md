@@ -70,27 +70,36 @@ to sit under the run-dir prefix and to contain a `run.env`; a symlinked inbox is
 refused, so the write cannot be redirected. The authority it grants is not new
 either — the session that launched the run already authored the entire handoff.
 
-**`fork-sandbox.sh` — constrained launch.** This one starts a sandboxed agent,
-so it is the one that needs the argument. Three of its inputs would otherwise be
-dangerous primitives, and each is constrained:
+**`fork-sandbox.sh` — constrained launch, not a data boundary.** This one
+starts a sandboxed agent, so it needs the most careful argument, and the
+argument has a limit worth stating plainly.
 
-- The **handoff** is read into the prompt of a model with network access, so an
-  unconstrained path would be arbitrary-file-read plus exfiltration. Handoffs
-  must live under the scratch root, where sessions stage them deliberately.
-- The **project** is cloned into the sandbox — the same channel. It must be a
-  repository under one of the configured project roots (`PROJECT_ROOTS` in
-  `~/.config/fork-sandbox/projects.env`, defaulting to `~/src`). Editing that
-  file widens what an approved call can hand to a sandbox, so treat it with
-  the same care as the allowlist itself.
-- **Sandbox arguments** are not passed through. The script adds every bind the
-  run needs; a caller cannot ask it to mount `~/.ssh`.
+What the approval does not hand over:
 
-A `--no-repo` run hands over no project, so the project constraint has nothing
-to apply to and is skipped. The remaining constraints carry the argument
-alone: the handoff must live under the scratch root, `--attach-dir` and
-`--thread-dir` keep their scratch-root validation, and no sandbox arguments
-pass through, so no host path reaches the sandbox that a normal run could not
-already have handed over.
+- **Host writes and host privilege.** The agent runs in the sandbox, against
+  a throwaway clone. It has no SSH keys, no tunnels or VPNs, and no
+  credentials beyond the model access it was given. Its work comes back only
+  as a branch fetched into the origin repo.
+- **A one-step file read.** The launcher cannot be pointed straight at a
+  secret. The handoff must live under the scratch root. `--attach-dir`,
+  `--thread-dir` and `--context-ro` take directories under the scratch root
+  only. `--sandbox-args` takes only `--unpin-egress`, so a caller cannot ask
+  for a bind of `~/.ssh`.
+
+What it does hand over: **a networked run can see whatever the caller puts
+in front of it.** The project can be any git repository the caller names.
+Anything a session can write into the scratch root, it can attach. A
+confused or prompt-injected agent that can read a file and write to the
+scratch root can therefore get that file into a run with internet access.
+The scratch-root rules make that a deliberate two-step act rather than a
+stray argument, but they do not prevent it.
+
+The control that does prevent it is the network. A `--network sealed` run
+has no network at all (see the sandbox backend's header), so nothing it
+reads can leave except through its own reply. Use sealed runs for work
+near secrets, and judge the blanket approval of networked runs as what it
+is: a decision to trust the agents that call it with the data they can
+already read.
 
 ## lane-mail and lane-mail-watch
 
