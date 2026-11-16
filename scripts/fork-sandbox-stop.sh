@@ -218,8 +218,17 @@ return_base_sha="$(fs_read_env_value "$run_env" return_base_sha || true)"
 upstream="$(fs_read_env_value "$run_env" upstream || true)"
 upstream_reason="$(fs_read_env_value "$run_env" upstream_reason || true)"
 session="$(fs_read_env_value "$run_env" session || true)"
-[[ -n "$branch" && -n "$origin_repo" && -n "$clone_dir" && -n "$base_sha" ]] \
+# A --no-repo run has no branch and no origin repo by design (run.env says
+# no_repo=true): nothing is fetched back, so every git path below is skipped.
+no_repo=0
+[[ "$(fs_read_env_value "$run_env" no_repo || true)" != "true" ]] || no_repo=1
+if (( no_repo )); then
+    branch="" origin_repo=""
+    [[ -n "$clone_dir" ]] || die "'$run_dir' has an incomplete run.env (missing clone_dir)"
+else
+    [[ -n "$branch" && -n "$origin_repo" && -n "$clone_dir" && -n "$base_sha" ]] \
     || die "'$run_dir' has an incomplete run.env (missing branch/origin_repo/clone_dir/base_sha)"
+fi
 
 exit_code_file="$run_dir/exit-code"
 pid_file="$run_dir/pid"
@@ -323,6 +332,7 @@ resolve_tidy_safe_sha() {
     tidy_safe_note=""
     tidy_safe_ref=""
     tidy_safe_already_published=0
+    (( ! no_repo )) || return 0
     local tidy_json="$run_dir/tidy.json" ended="" head_approved="" head_after=""
     local approved_ref="refs/fork-sandbox/tidy/$run_id/approved"
     local candidate_ref="refs/fork-sandbox/tidy/$run_id/candidate"
@@ -384,6 +394,9 @@ tidy_safe_used=0
 fetch_branch_back() {
     fetched=0
     tidy_safe_used=0
+    # Nothing to fetch for a --no-repo run: fetched stays 0, so no caller
+    # reconciles a branch that does not exist.
+    (( ! no_repo )) || return 0
     resolve_tidy_safe_sha
     if (( tidy_safe_already_published )); then
         # Nothing to do: this run's own publish already landed, and the
@@ -645,6 +658,11 @@ complete_run_host_side() {
         >/dev/null 2>&1 \
         || printf 'fork-sandbox-stop: run-log append failed\n' >&2
 
+    if (( no_repo )); then
+        printf 'end_reason: %s; no branch (--no-repo run, nothing fetched back).\n' "$reason"
+        return 0
+    fi
+
     if (( fetch_failed )); then
         printf 'end_reason: %s; branch %s NOT fetched back -- see the fetch failure above.\n' \
             "$reason" "$branch"
@@ -772,6 +790,11 @@ if (( teardown_done )); then
             # confirmed-clean stop leaves the origin repo the way the
             # runner's own teardown left it, not the way a bare re-fetch
             # would.
+            if (( no_repo )); then
+                printf 'stopped gracefully (exit %s) after %ss; no branch (--no-repo run, nothing fetched back).\n' \
+                    "$rc" "$waited"
+                exit 0
+            fi
             reconcile_branch_after_fetch
             printf 'stopped gracefully (exit %s) after %ss; branch %s, %s new commit(s)%s.\n' \
                 "$rc" "$waited" "$branch" "$reconcile_n_commits" \

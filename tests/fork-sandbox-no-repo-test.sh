@@ -181,6 +181,36 @@ else
 fi
 [[ -z "$run_dir3" ]] || rm -rf "$run_dir3"
 
+printf '\n== stop, the commit guard, the prompt, the run-log fallback ==\n'
+out="$(launch "$work/argv-misc" --no-repo "$handoff")"
+rd="$(sed -n 's/^  run dir:  //p' <<<"$out" | head -1)"
+stop_out="$(cd "$work" && timeout 30 "$repo_dir/scripts/fork-sandbox-stop.sh" "$rd" 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$stop_out" == *"nothing to stop"* ]]; then
+    ok "fork-sandbox-stop accepts a finished --no-repo run"
+else
+    no "fork-sandbox-stop accepts a finished --no-repo run" "rc=$rc $stop_out"
+fi
+if grep -q '^CLONE_DIR=$' "$rd/inbox/.stop-guard-config" 2>/dev/null || [[ ! -e "$rd/inbox/.stop-guard-config" ]]; then
+    ok "the commit guard is skipped (empty CLONE_DIR or no guard)"
+else
+    no "the commit guard is skipped" "$(cat "$rd/inbox/.stop-guard-config" 2>&1)"
+fi
+if [[ -f "$rd/handoff.md" ]] && ! grep -q 'throwaway clone of the repository\|Only committed work leaves\|Whoever integrates' "$rd/handoff.md" \
+   && grep -q 'no repository' "$rd/handoff.md"; then
+    ok "the session prompt does not talk about clones, branches or commits"
+else
+    no "the session prompt does not talk about clones, branches or commits" "$(grep -n 'clone\|commit' "$rd/handoff.md" 2>&1 | head -5)"
+fi
+rm -f "$rd/summary.json"
+rm -f "$logf"
+fb="$(HOME="$home" FORK_SANDBOX_RUN_SOURCE=test python3 "$repo_dir/scripts/sandbox-run-log.py" record --run-dir "$rd" 2>&1 || true)"
+if jq -e 'select(.summary_missing == true and .no_repo == true and .origin_repo == null)' "$logf" >/dev/null 2>&1; then
+    ok "the run-log fallback (no summary.json) still records no_repo"
+else
+    no "the run-log fallback still records no_repo" "$fb $(cat "$logf" 2>&1)"
+fi
+rm -rf "$rd"
+
 printf '\n== without --no-repo nothing changes ==\n'
 rm -f "$logf"
 out="$(launch "$work/argv-plain" "$project" "$handoff")"; rc=$?

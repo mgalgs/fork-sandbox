@@ -6889,6 +6889,8 @@ elif $no_repo; then
         exit 1
     fi
     clone_dir="$no_repo_work"
+    # shellcheck disable=SC2034  # read by fs_emit_prompt_preamble in the lib
+    FS_PREAMBLE_NO_REPO=true
     checkout_sha="$base_sha"
     return_base_sha="$base_sha"
 elif [[ -z "$clone_dir_flag" ]]; then
@@ -7459,7 +7461,13 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
     install -m 755 "$stop_guard_hook_src" "$stop_guard_hook"
     # Staged in the inbox: the run dir is never bound into the sandbox.
     stop_guard_config="$inbox_dir/.stop-guard-config"
-    printf 'CLONE_DIR=%s\n' "$clone_dir" > "$stop_guard_config"
+    # An empty CLONE_DIR skips the check: a no-repo run's work dir is never
+    # fetched back, so there is nothing to demand a commit for.
+    if $no_repo; then
+        printf 'CLONE_DIR=\n' > "$stop_guard_config"
+    else
+        printf 'CLONE_DIR=%s\n' "$clone_dir" > "$stop_guard_config"
+    fi
     fs_reject_unsafe_chars "$stop_guard_hook" "$stop_guard_config"
 
     # jq builds it so the path is escaped properly rather than interpolated

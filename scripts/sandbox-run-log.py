@@ -747,6 +747,9 @@ def cmd_record(args):
                   "claude_credentials_via"):
             if env.get(k):
                 rec[k] = env[k]
+        if env.get("no_repo") == "true":
+            rec["no_repo"] = True
+            rec["origin_repo"] = None
         if env.get("agent_kit"):
             rec["agent_kit"] = env["agent_kit"].split()
         try:

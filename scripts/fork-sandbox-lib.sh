@@ -3526,6 +3526,10 @@ fs_emit_test_record_section() {
 # $8  plan_file  non-empty to reserve plan.md in the outbox section; ""
 #                (the default, and always so on --k8s) leaves it out.
 #
+# FS_PREAMBLE_NO_REPO=true marks a --no-repo run: the work dir is an empty
+# scratch directory, nothing is fetched back, and the preamble and headless
+# paragraph say so instead of talking about clones, branches and commits.
+#
 # FS_PREAMBLE_CLONE_REUSED=true (a variable rather than an argument, so the
 # launcher sets it once for every leg's preamble) marks a reused persistent
 # --clone-dir. fs_reuse_clone re-fetches origin's default refspec, which
@@ -3537,10 +3541,13 @@ fs_emit_prompt_preamble() {
     local inbox_write="${6:-}"
     local outbox_max_bytes="${7:-$FS_OUTBOX_MAX_BYTES}"
     local plan_file="${8:-}"
+    local work_noun="clone of the repository"
+    [[ "${FS_PREAMBLE_NO_REPO:-}" != "true" ]] \
+        || work_noun="empty scratch directory (this run has no repository)"
     cat <<EOF
 # Your working directory
 
-You are in a sandboxed, throwaway clone of the repository. Its absolute path
+You are in a sandboxed, throwaway $work_noun. Its absolute path
 is:
 
     $clone_dir
@@ -3558,7 +3565,8 @@ EOF
     # bare repo and gets no such mapping, so say nothing there either. The "no
     # network" clause is likewise true only for a sealed run.
     if [[ "$inbox_write" != "pod" && "$network" != "gated" \
-        && "${FS_PREAMBLE_CLONE_REUSED:-}" != "true" ]]; then
+        && "${FS_PREAMBLE_CLONE_REUSED:-}" != "true" \
+        && "${FS_PREAMBLE_NO_REPO:-}" != "true" ]]; then
         cat <<EOF
 
 In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
@@ -4177,6 +4185,19 @@ fails, and nothing is posted, if HEAD moves or the clone's tree has any
 change when your turn ends. The one thing to change is the reply, the
 \`mail-*.md\` file in the artifact outbox, \`$cover_outbox\`. After your
 turn, the finalize step runs on the branch with the reply you leave.
+EOF
+        return 0
+    fi
+    if [[ "${FS_PREAMBLE_NO_REPO:-}" == "true" ]]; then
+        cat <<'EOF'
+This session is headless: when your turn ends, the run ends, and nothing
+wakes you later to deliver a background command's result. Run tests and
+builds in the foreground, or wait for every background command you started
+to finish (or kill it); either way, finish before you end your turn.
+
+This run has no repository: nothing is fetched back from the work directory,
+and anything committed there is discarded with the run. Put your answer in
+your final reply, or in the artifact outbox if one is described above.
 EOF
         return 0
     fi
