@@ -72,6 +72,9 @@ case "$harness" in
         case "$claude_model" in
             opus|sonnet|fable) claude_model+="[1m]" ;;
         esac
+        # One line naming the model the CLI actually gets, so the window
+        # this leg runs with can be confirmed from its log alone.
+        echo "fork-sandbox-k8s-leg: claude model: $claude_model (--model $model)" >&2
         # A fresh per-leg state directory, the same mechanism
         # claude_hook_leg gives each continuation locally -- a composed
         # pipeline's legs share this pod's one /tmp, so without a fresh

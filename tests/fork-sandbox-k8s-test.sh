@@ -14711,6 +14711,16 @@ else
         "got: '$claude_1m_got' want: '$claude_1m_want' block: ${claude_1m_block:-<none>}"
 fi
 
+# The entrypoint logs the model the CLI actually gets, after the [1m]
+# mapping, on the line right after that mapping: run the block through it.
+claude_1m_log_block="$(awk '/^    claude_model="\$MODEL"$/ {on=1} on {print} on && /^    esac$/ {getline; print; getline; print; getline; print; exit}' "$entrypoint_sh")"
+claude_1m_log="$(MODEL=opus bash -c "$claude_1m_log_block" 2>&1)"
+if [[ "$claude_1m_log" == "fork-sandbox-k8s-entrypoint: claude model: opus[1m] (MODEL=opus)" ]]; then
+    ok "entrypoint logs the effective claude model (opus[1m] for opus)"
+else
+    no "entrypoint logs the effective claude model (opus[1m] for opus)" "got: '$claude_1m_log'"
+fi
+
 printf '\n== entrypoint: claude coding leg keeps its conversation (R3a section 4) ==\n'
 # RESUME_FAIL_RE must match claude-sandboxed's own copy literally -- the
 # entrypoint splits it across three assignments to stay under the
@@ -23409,6 +23419,13 @@ CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" \
     leg_run "$leg_sh" --harness claude --model claude-haiku-4-5 --clone "$leg_clone" --
 check "leg wrapper (claude): a non-alias model id is not rewritten" \
     "yes" "$(grep -qF -- '--model claude-haiku-4-5 ' "$leg_record" && echo yes || echo no)"
+
+# The leg logs the model the CLI actually gets, after the [1m] mapping, so
+# a composed leg's window can be confirmed from its log alone.
+leg_model_err="$(CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-claude-proxy.invalid" \
+    leg_run "$leg_sh" --harness claude --model opus --clone "$leg_clone" -- 2>&1 >/dev/null)"
+check "leg wrapper (claude): logs the effective model (opus[1m] for opus)" \
+    "fork-sandbox-k8s-leg: claude model: opus[1m] (--model opus)" "$leg_model_err"
 
 # claude leg with --resume: a resume that finds no transcript reruns
 # fresh, with the same prompt and without --resume; any other failure,

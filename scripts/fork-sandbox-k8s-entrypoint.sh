@@ -1589,6 +1589,9 @@ else
     case "$claude_model" in
         opus|sonnet|fable) claude_model+="[1m]" ;;
     esac
+    # One line naming the model the CLI actually gets, so the window it
+    # runs with can be confirmed from this log alone.
+    echo "fork-sandbox-k8s-entrypoint: claude model: $claude_model (MODEL=$MODEL)" >&2
     claude_argv=(claude --dangerously-skip-permissions --print --verbose
         --output-format stream-json --model "$claude_model"
         --settings "$work_dir/inbox-settings.json" --include-hook-events)
