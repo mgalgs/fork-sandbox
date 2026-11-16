@@ -294,6 +294,7 @@ SUMMARY_FIELDS = [
     "usage_source",
     "branch",
     "origin_repo",
+    "no_repo",
     "base_sha",
     "agent_kit",
     "exit_code",

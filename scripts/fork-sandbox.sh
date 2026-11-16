@@ -1871,6 +1871,13 @@ if [[ -n "$fs_resume_base" && -z "$fs_resume_state_dir" ]]; then
     exit 1
 fi
 if [[ -n "$fs_resume_state_dir" ]]; then
+    for fs_resume_arg in "${fs_resume_fwd[@]}"; do
+        if [[ "$fs_resume_arg" == --no-repo ]]; then
+            echo "Error: --no-repo cannot be combined with --resume: a --no-repo" >&2
+            echo "run has no branch to resume." >&2
+            exit 1
+        fi
+    done
     # shellcheck source-path=SCRIPTDIR
     # shellcheck source=fork-sandbox-resume-lib.sh
     # shellcheck disable=SC1091
@@ -2003,6 +2010,8 @@ finalize_floor=""
 cover_only_base=""
 kit_skill_flags=()
 k8s_mode=false
+# --no-repo: the run has no project. See the header.
+no_repo=false
 # Set true only inside the --k8s dispatch block, for a composed (non-
 # legacy-shaped) preset -- declared here, unconditionally, so every
 # later read of it (under this script's own set -u) is defined on a
@@ -2250,6 +2259,10 @@ while [[ "${1:-}" == -* ]]; do
             k8s_mode=true
             shift
             ;;
+        --no-repo)
+            no_repo=true
+            shift
+            ;;
         --timeout)
             k8s_timeout="${2:?--timeout requires a number of seconds}"
             shift 2
@@ -2407,8 +2420,43 @@ if [[ -n "$context_secret" && -n "$context_ro" ]]; then
     exit 1
 fi
 
+if $no_repo; then
+    # --no-repo hands over no project, so the one positional is the handoff.
+    # Everything that presupposes a repo or commits is refused here, by name,
+    # before anything is created. The handoff, --attach-dir and --thread-dir
+    # checks further down are untouched: only the project-root check is
+    # skipped, because nothing is handed over.
+    no_repo_conflict=""
+    if [[ "$k8s_mode" == true ]]; then no_repo_conflict="--k8s"
+    elif [[ -n "$branch" ]]; then no_repo_conflict="--branch"
+    elif [[ -n "$checkout_ref" ]]; then no_repo_conflict="--checkout"
+    elif [[ "$review_only" == true ]]; then no_repo_conflict="--review-only"
+    elif [[ -n "$review_loop_arg" ]]; then no_repo_conflict="--review-loop"
+    elif [[ -n "$maintainer_loop_arg" ]]; then no_repo_conflict="--maintainer-loop"
+    elif [[ -n "$preset_name" ]]; then no_repo_conflict="--preset"
+    elif [[ -n "$pipeline_spec" ]]; then no_repo_conflict="--pipeline"
+    elif [[ -n "$review_base_ref" ]]; then no_repo_conflict="--review-base"
+    elif [[ -n "$clone_dir_flag" ]]; then no_repo_conflict="--clone-dir"
+    elif [[ -n "$cover_only_base" ]]; then no_repo_conflict="--cover-only"
+    elif [[ -n "$finalize_script_file" ]]; then no_repo_conflict="--finalize-script"
+    elif $allow_existing_branch; then no_repo_conflict="--allow-existing-branch"
+    fi
+    if [[ -n "$no_repo_conflict" ]]; then
+        echo "Error: --no-repo cannot be combined with $no_repo_conflict: it" >&2
+        echo "presupposes a repository or commits, and a --no-repo run has neither." >&2
+        exit 1
+    fi
+    if (( $# != 1 )); then
+        echo "Usage: fork-sandbox.sh [options] --no-repo <handoff-file>" >&2
+        echo "(--no-repo takes the handoff alone; a project path is a usage error.)" >&2
+        exit 1
+    fi
+    project_path=""
+    handoff_file="$1"
+else
 project_path="${1:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
 handoff_file="${2:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
+fi
 
 # --preset: agents and a pipeline in a machine-local file, compiled onto the
 # same variables the flags above set, BEFORE any validation below runs. A
@@ -4944,6 +4992,7 @@ if run_scope_flag="$(fs_read_env_value "$limits_env" RUN_SCOPE)" \
 fi
 
 if [[ "$dry_run" == true ]]; then
+    ! $no_repo || printf 'no_repo=true\n'
     if [[ -n "$pipeline_spec" ]]; then
         printf 'pipeline=%s\n' "$pipeline_spec"
     elif [[ -n "$preset_name" ]]; then
@@ -5069,7 +5118,7 @@ if [[ "$dry_run" == true ]]; then
     exit 0
 fi
 
-if [[ ! -d "$project_path" ]]; then
+if ! $no_repo && [[ ! -d "$project_path" ]]; then
     echo "Error: project path '$project_path' is not a directory" >&2
     exit 1
 fi
@@ -5120,7 +5169,10 @@ if [[ "$handoff_real" == "$FS_SCRATCH_ROOT"/forks/* || "$handoff_real" == "$FS_S
     echo "exists to stop. Stage the handoff in the scratch root itself." >&2
     exit 1
 fi
-fs_require_project_root "$project_path" "$config_dir" || exit 1
+# A --no-repo run hands over no project, so there is nothing for the project
+# root check to constrain; every other input (the handoff above, --attach-dir,
+# --thread-dir, --context-ro, --sandbox-args) keeps its check unchanged.
+$no_repo || fs_require_project_root "$project_path" "$config_dir" || exit 1
 # --context-ro is the reviewed home for the one extra bind a caller may
 # need: context a host-side script gathered for the session to read. The
 # path constraint is what keeps it from becoming the --bind-ro primitive
@@ -6294,15 +6346,22 @@ if [[ "$review_only" == true && -z "$task_meta" ]]; then
     task_meta='{"kind":"review"}'
 fi
 
+if $no_repo; then
+    # No project: no origin repo, no branch, nothing to fetch back. The
+    # work dir is created further down; its starting commit is base_sha.
+    origin_repo=""
+    branch=""
+else
 origin_repo="$(fs_repo_toplevel "$project_path")"
 branch="${branch:-sandbox-$(date +%Y%m%d-%H%M%S)}"
+fi
 
 fs_reject_unsafe_chars "$origin_repo" "$branch"
 # --allow-existing-branch skips this: fast-forward-only is enforced at
 # fetch-back time instead (the runner's own non-force refspec), which is
 # the property a continuation actually needs -- the branch being already
 # there is the point, not a collision. See that flag's own comment, above.
-$allow_existing_branch || fs_check_branch_free "$origin_repo" "$branch"
+$allow_existing_branch || $no_repo || fs_check_branch_free "$origin_repo" "$branch"
 
 # The clone starts at the origin repo's HEAD, so that is what the session's
 # commits are measured against later. --checkout moves that start point, and
@@ -6327,6 +6386,8 @@ if [[ -n "$checkout_ref" ]]; then
     # path must measure changes from the commit the clone actually checked
     # out. In particular, an unchanged review-only clone must be removable
     # even when the reviewed range has pre-existing commits.
+elif $no_repo; then
+    : # base_sha is set when the empty work dir is created
 elif ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
     echo "Error: '$origin_repo' has no commits yet, so there is nothing to" >&2
     echo "clone. Make a first commit and try again." >&2
@@ -6340,14 +6401,14 @@ fi
 # when the branch comes back, since HEAD can move while the run is in
 # flight. --review-only resolved its own above, in review_only_origin_repo;
 # skip so this does not clobber it.
-if [[ "$review_only" != true ]]; then
+if [[ "$review_only" != true ]] && ! $no_repo; then
     upstream_errf="$(mktemp)"
     upstream="$(fs_resolve_upstream "$origin_repo" "$checkout_ref" 2>"$upstream_errf")"
     upstream_reason="$(cat "$upstream_errf")"
     rm -f "$upstream_errf"
 fi
 
-fs_warn_if_dirty "$project_path" "$origin_repo"
+$no_repo || fs_warn_if_dirty "$project_path" "$origin_repo"
 
 # run.sh's body is fork-sandbox-runner.sh's exact bytes, `cat`-ed in below
 # rather than copied, so a local run and a --k8s pod run share one walker.
@@ -6784,6 +6845,30 @@ if [[ "$k8s_runner_mode" == true ]]; then
     # the real /work no test may write to.
     pod_work_dir="${FORK_SANDBOX_K8S_WORK_DIR:-/work}"
     clone_dir="$pod_work_dir/clone"
+elif $no_repo; then
+    # An empty, writable git repo stands in for the clone, so the consumers
+    # that expect clone_dir/.git (session state, the stop guard, status) work
+    # unchanged. One empty commit gives base_sha something to name. Nothing
+    # is ever fetched back from it; it lives and dies with the run dir.
+    # Built under its own name, not clone_dir: the host-side git below runs
+    # before any sandbox has touched the directory, so it is safe, and the
+    # pin in tests/fork-sandbox-uncommitted-test.sh (no host git against
+    # "$clone_dir") stays meaningful for every later line.
+    no_repo_work="$run_dir/work"
+    mkdir -p "$no_repo_work"
+    if ! git init --quiet "$no_repo_work" \
+        || ! git -C "$no_repo_work" -c user.name=fork-sandbox \
+            -c user.email=fork-sandbox@localhost -c commit.gpgsign=false \
+            -c core.hooksPath=/dev/null \
+            commit --quiet --allow-empty -m "fork-sandbox: empty work dir" \
+        || ! base_sha="$(git -C "$no_repo_work" rev-parse HEAD)"; then
+        echo "Error: could not create the empty work dir '$no_repo_work'." >&2
+        rm -rf "$run_dir"
+        exit 1
+    fi
+    clone_dir="$no_repo_work"
+    checkout_sha="$base_sha"
+    return_base_sha="$base_sha"
 elif [[ -z "$clone_dir_flag" ]]; then
     # Name the parent 'clone', not 'repo'. A directory called 'repo' sitting
     # one level above the checkout reads like the repository root, and a
@@ -6933,8 +7018,9 @@ if [[ -n "$cover_only_base" ]]; then
     base_sha="$cover_only_base"
     return_base_sha="$cover_only_base"
 fi
-if [[ "$k8s_runner_mode" == true ]]; then
-    # None of this host-side machinery applies to a pod: there are no
+if [[ "$k8s_runner_mode" == true ]] || $no_repo; then
+    # (A --no-repo run takes this arm too: no origin repo to read any of it
+    # from.) None of this host-side machinery applies to a pod: there are no
     # alternates to collect (the pod never shares an object store with a
     # host clone), no node toolchain to provision (the image already
     # carries whatever the pod needs), and no per-run services (the
@@ -9225,6 +9311,7 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     printf 'version=1\n'
     printf 'run_dir=%s\n' "$run_dir"
     printf 'origin_repo=%s\n' "$origin_repo"
+    ! $no_repo || printf 'no_repo=true\n'
     printf 'clone_dir=%s\n' "$clone_dir"
     # The run's machine-readable record of where the inbox is, for a reader
     # that has the run.env and should not have to know the layout. The two
@@ -9409,6 +9496,9 @@ fs_emit_run_sh_preamble() {
     # simply be handed down from the launcher.
     printf 'clone_lock_path=%q\n' "${clone_dir_flag:+$clone_dir/.git/fork-sandbox-lock}"
     printf 'origin_repo=%q\n' "$origin_repo"
+    # Emitted only for --no-repo, so every other run.sh is byte-for-byte what
+    # it was; the runner reads it as ${no_repo:-0}.
+    ! $no_repo || printf 'no_repo=1\n'
     # The two seams a --k8s pod run flips: a composed run routed through
     # this same function with k8s_runner_mode=true sets both to the pod
     # shape (fetch_back=0: the pod's run.sh has no origin repo of its own
@@ -10062,7 +10152,7 @@ if ! $foreground; then
     # adds a window to the caller's session. It also works outside tmux: with
     # no server running, tmux starts one.
     if ! tmux new-session -d -s "$session_name" -n "$session_name" \
-        -c "$origin_repo" "${pane_argv[@]}"; then
+        -c "${origin_repo:-$run_dir}" "${pane_argv[@]}"; then
         echo "Error: tmux could not start a session. Run it here with" >&2
         echo "--foreground, or start the generated runner yourself:" >&2
         echo "$run_dir/run.sh" >&2
@@ -10099,13 +10189,18 @@ if [[ -n "$checkout_ref" ]]; then
     checkout_line="$(printf '\n  start:    %s (%.12s)' "$checkout_ref" "$checkout_sha")"
 fi
 
+if $no_repo; then
+    branch_line="(none -- --no-repo run, nothing is fetched back)"
+else
+    branch_line="$branch  ->  $origin_repo$checkout_line"
+fi
 harness_line="$harness"
 [[ -z "$model" ]] || harness_line="$harness  ($model)"
 
 cat <<EOF
 fork-sandbox: launched in $where
   harness:  $harness_line
-  branch:   $branch  ->  $origin_repo$checkout_line
+  branch:   $branch_line
   clone:    $clone_dir
   run dir:  $run_dir
   log:      $run_dir/events.jsonl
@@ -10148,10 +10243,15 @@ EOF
     fi
 fi
 
+if $no_repo; then
+    fetch_note="When it exits, nothing is fetched back: a --no-repo run has no branch."
+else
+    fetch_note="When it exits, branch
+'$branch' is fetched into $origin_repo on its own."
+fi
 cat <<EOF
 
-The session is headless and needs no keypress. When it exits, branch
-'$branch' is fetched into $origin_repo on its own.
+The session is headless and needs no keypress. $fetch_note
 It sees committed state only, has no global ~/.claude, no ssh keys and no
 tailnet, and it cannot push.
 EOF

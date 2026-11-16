@@ -33,7 +33,11 @@ run_id="$(basename -- "$run_dir")"
 # fetched or not), so there is no ref in it to be stale in the first
 # place, and asking would just run git against a path this process cannot
 # reach.
-if (( fetch_back )); then
+# A --no-repo run (no_repo=1 in the preamble; absent otherwise) has no origin
+# repo: nothing is fetched back and no branch exists.
+no_repo="${no_repo:-0}"
+
+if (( fetch_back && ! no_repo )); then
     tidy_stale_refs=()
     for tidy_stale_ref in "refs/fork-sandbox/tidy/$run_id/approved" "refs/fork-sandbox/tidy/$run_id/candidate"; do
         if (cd "$origin_repo" && git rev-parse --verify -q "$tidy_stale_ref") >/dev/null 2>&1; then
@@ -834,9 +838,15 @@ fs_addenda_dirs() {
 
 printf '== fork-sandbox ==\n'
 printf 'harness: %s\n' "$harness"
-printf 'branch:  %s\n' "$branch"
-printf 'origin:  %s\n' "$origin_repo"
-printf 'clone:   %s\n' "$clone_dir"
+if (( no_repo )); then
+    printf 'branch:  (none -- no project)\n'
+    printf 'origin:  (none -- no project)\n'
+    printf 'work:    %s\n' "$clone_dir"
+else
+    printf 'branch:  %s\n' "$branch"
+    printf 'origin:  %s\n' "$origin_repo"
+    printf 'clone:   %s\n' "$clone_dir"
+fi
 printf 'log:     %s\n' "$events"
 printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.\n\n'
 
@@ -3829,6 +3839,8 @@ if [[ "${stop_requested:-0}" == 1 ]]; then
     tidy_detail="stop requested"
 elif [[ "$mode" == "review-only" ]]; then
     tidy_detail="read-only run"
+elif (( no_repo )); then
+    tidy_detail="a --no-repo run has no branch"
 elif (( ! fetch_back )); then
     # A --k8s pod run: the tidy-history leg's verification and publish are
     # host-side only (fs_tidy_verify/fs_tidy_publish run against
@@ -4124,7 +4136,13 @@ if [[ "${#fs_alternates[@]}" -gt 0 ]]; then
         uncommitted_bind_flags+=(--bind-ro "$uncommitted_alt")
     done
 fi
-if [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
+if (( ${no_repo:-0} )); then
+    # No project and no branch: whatever the session left in its work dir is
+    # not uncommitted work to warn about.
+    : > "$run_dir/git-status.txt"
+    : > "$run_dir/git-status.log"
+    uncommitted_status_rc=0
+elif [[ -n "${FORK_SANDBOX_LEG_HANDOFF_DIR:-}" ]]; then
     # Composed (--run-dir) pod: relayed to the LEG container over the same
     # request/response protocol every other leg uses (fs_run_leg_split),
     # never run directly in this (agent) container. The clone is
@@ -4251,7 +4269,7 @@ fetched=0
 # tidy gate above) still has them defined under `set -u`.
 tidy_kept_ref=""
 tidy_kept_sha=""
-if (( fetch_back )); then
+if (( fetch_back && ! no_repo )); then
     if [[ "$tidy_restore" == 1 ]]; then
         # The tidy leg was discarded: the clone was reset best-effort above, but
         # the origin branch comes from the approved-head holding ref, never from
@@ -4308,6 +4326,8 @@ fi
 stats_ready=0
 (( fetched )) && stats_ready=1
 (( fetch_back )) || stats_ready=1
+# A --no-repo run has no branch to count commits on.
+(( ! no_repo )) || stats_ready=0
 
 n_commits=0
 removed=0
@@ -4343,7 +4363,7 @@ fi
 # has its own "kept at this holding ref" reporting (fs_tidy_publish is
 # create-only by design) and stays "fetched: false, exit 0". Only overridden
 # when rc is still 0: a run that already failed keeps its own failure.
-if (( fetch_back )) && (( ! fetched )) && [[ -z "$tidy_kept_ref" ]] && (( rc == 0 )); then
+if (( fetch_back )) && (( ! no_repo )) && (( ! fetched )) && [[ -z "$tidy_kept_ref" ]] && (( rc == 0 )); then
     rc=1
     # exit-code was already written above, before this fetch ever ran (see
     # that write's own comment) -- overwritten here too, so a reader of the
@@ -4677,10 +4697,17 @@ loop_findings() {
     # longest label in the block, and the block reads as two aligned
     # columns only if the whole block shares its width.
     printf '== fork-sandbox summary ==\n'
+    if (( no_repo )); then
+        printf 'branch:    (none -- no project)\n'
+        printf 'mode:      %s\n' "$mode"
+        printf 'origin:    (none -- no project)\n'
+        printf 'work dir:  %s\n' "$clone_dir"
+    else
     printf 'branch:    %s\n' "$branch"
     printf 'mode:      %s\n' "$mode"
     printf 'origin:    %s\n' "$origin_repo"
     printf 'clone:     %s\n' "$clone_dir"
+    fi
     printf 'exit:      %s\n' "$rc"
     if [[ -n "$run_error" ]]; then
         printf 'error:     %s\n' "$run_error"
@@ -4770,7 +4797,10 @@ loop_findings() {
     if [[ -d "$run_dir/pi-session" ]]; then
         printf 'session:   %s\n' "$run_dir/pi-session"
     fi
-    if (( ! fetched )); then
+    if (( no_repo )); then
+        printf 'fetched:   nothing. This was a --no-repo run: it has no branch,\n'
+        printf '           and its work dir is discarded with the run dir.\n'
+    elif (( ! fetched )); then
         if [[ -n "$tidy_kept_ref" ]]; then
             # The clone is NOT a safe fallback here -- for a discard
             # it may hold the rejected rewrite, not this run's approved
@@ -4806,7 +4836,9 @@ loop_findings() {
         (cd "$branch_repo" && git diff --stat "$return_base_sha" "$branch") \
             | tr -d '\000-\010\013-\037\177'
     fi
-    if (( fetched )) && [[ "$n_commits" != "0" ]]; then
+    if (( no_repo )); then
+        :
+    elif (( fetched )) && [[ "$n_commits" != "0" ]]; then
         printf '\nReview the branch before you build it. It is agent-written code,\n'
         printf 'and a Makefile or package.json script in it runs on the host.\n'
     else
@@ -4996,6 +5028,7 @@ jq -n \
     --arg model "$record_model" \
     --arg branch "$branch" \
     --arg origin_repo "$origin_repo" \
+    --argjson no_repo "$( (( no_repo )) && echo true || echo false )" \
     --arg clone_dir "$clone_dir" \
     --arg run_dir "$run_dir" \
     --arg base_sha "$base_sha" \
@@ -5098,6 +5131,9 @@ jq -n \
     # above. fork-sandbox-status.sh treats presence as the signal that this
     # run ended other than on its own.
     + (if $end_reason == "" then {} else {end_reason: $end_reason} end)
+    # A --no-repo run has no project: origin_repo is null, not a fake path,
+    # and the flag is present only then (absent on every other run).
+    + (if $no_repo then {no_repo: true, origin_repo: null} else {} end)
     # Present only on a multi-step read-only run, one record per leg.
     + (if ($ro_steps | length) == 0 then {} else {steps: $ro_steps} end)
     # Absent, not null, on a pipeline with no maintain step anywhere -- the
