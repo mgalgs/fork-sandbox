@@ -9567,8 +9567,7 @@ EOF
         [[ -z "$K8S_PUSH_SLOT_FD" ]] || exec {K8S_PUSH_SLOT_FD}>&-
         cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null -c pack.threads=1 push --quiet \
             "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i -c agent $pod_name -- git-receive-pack /work/repo.git" \
-            "$push_src:refs/heads/$branch" "${extra_refspecs[@]}"
-    ) || push_rc=$?
+            "$push_src:refs/heads/$branch" "${extra_refspecs[@]}") || push_rc=$?
     k8s_push_slot_release
     if (( push_rc != 0 )); then
         echo "Error: the repository push to pod $pod_name failed (git exit $push_rc)." >&2
