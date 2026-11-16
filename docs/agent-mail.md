@@ -1852,6 +1852,9 @@ in the project repo and was left out of a k8s wake; see "Prior heads in a
 seat's clone"),
 `grant-ignored` (thread — a k8s seat woke on a `--no-grant` thread that
 has a grant file; the file was not forwarded),
+`previous-transcript` (thread, agent, staged=yes|no, reason=missing|oversized|copy
+when no — a follow seat's fresh session on a new review target; see "A
+new version is a fresh session"),
 `upstream-state` (thread, state=closed|open, msg=<8 hex> — the thread's
 upstream state changed), `upstream-state-ignored` (thread,
 reason=fleet-sender|malformed — see "Upstream closed" above),
@@ -2864,7 +2867,7 @@ own thread scans never see it:
 | `upstream-head/<thread-id>.env` | the thread's last upstream-moved announcement: `BRANCH`, `SHA`, `MSGID`, `SET_AT` — see "Upstream moved" |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |
-| `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
+| `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff, with `previous-transcript.jsonl` beside it on a follow seat's first wake on a new review target (see "A new version is a fresh session"); a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `seat-notes/<thread-id>/<agent>` | one `<UTC time>\t<keyword>[\t<run id>]` line per failure of an `on-failure: note` seat on that thread (the run id only when the failure belongs to a run); listed by `status` under "seat notes:", served as `seat_notes` by `status --thread --json`, and removed when operator mail (or `unflag`) clears the thread |
@@ -2935,7 +2938,10 @@ It works through three `fork-sandbox.sh` flags:
   session if it does not already exist, so passing the same id on every
   wake makes resume implicit — there is nothing to discover. The
   postmaster derives it deterministically from the (thread, agent) pair
-  (`pm_pi_session_id`) rather than reading one back from `sessions/`.
+  (`pm_pi_session_id`) rather than reading one back from `sessions/`;
+  for a `review-target: follow` seat on a thread with a review target,
+  from the target sha as well (see "A new version is a fresh session"
+  below).
 
 `summary.json` gains `session_state` and `session_id` on such a run. For a
 "discover" harness the session id is the newest transcript's stem
@@ -3003,6 +3009,45 @@ Resume works on claude, codex and pi seats alike, sealed or not — a
 sealed pi seat resumes through agent-sandboxed's own
 `--session-dir`/`--session-id` wiring the same way a non-sealed one does
 through pi directly.
+
+### A new version is a fresh session
+
+A `review-target: follow` seat does not resume across versions of the
+series it reviews. When the review-target sha its last wake on the
+thread recorded is set and differs from this wake's
+(`pm_seat_fresh_from`), the wake starts a fresh session: claude gets
+`--session-state` but no `--resume-session`, so the new session lands
+in the same store and is recorded as usual, and pi gets a `--session-id`
+derived from `<thread>/<agent>@<target-sha>`, a new id in the same
+store. Later wakes on the same target (follow-ups, retries, other
+seats' mail) resume that new session. A first wake, the `sets` seat, a
+seat with no review target and codex are unaffected. The decision is
+made in `pm_session_spawn_args`, shared by the local and k8s spawn
+branches and by composed seats whose step 1 is a claude code step.
+
+The reason is measured, not stylistic: a resumed reviewer anchors on
+its earlier reading. In a blind-judged replay of one series version a
+fresh core reviewer raised a defect that later escaped review 4 times
+in 5; a resumed one, 0 times in 5, at roughly three times the cost per
+wake.
+
+The previous version is still there on purpose. The thread is at
+`/thread/thread.txt` as on every wake, and the seat's own transcript
+from the previous version is copied as-is, unrendered, to
+`/thread/previous-transcript.jsonl` (the wake's
+`wake-threads/<run-id>/` snapshot dir, bound locally and pushed to a
+k8s pod alike). For claude that is the session `sessions/` named before
+the wake; for pi, the previous version's derived id's session file.
+When a transcript was staged, and only then, the handoff carries a
+short "Your previous review" section after the thread block naming both
+shas and the path; the transcript is never pasted into the prompt. A
+transcript that cannot be found, or is over 32 MiB, is not staged: the
+section is left out, a `previous-transcript ... staged=no
+reason=missing|oversized|copy` event is logged, and the wake runs.
+
+A pi follow seat's first wake after this behavior shipped starts fresh
+even on an unchanged target, since its id format changed; nothing is
+migrated.
 
 ## Rendering a thread
 
