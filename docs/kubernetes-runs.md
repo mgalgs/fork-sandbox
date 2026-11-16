@@ -2511,6 +2511,14 @@ fix seat's. An id that already ends in `[1m]` is accepted, and so are
 `haiku`, non-Anthropic ids served through a claude seat, and every other
 harness. A local run is unaffected.
 
+For the same reason a claude seat's `claude-args` must not set the model.
+They reach the pod after the seat's own `--model`, so a `--model VALUE` or
+`--model=VALUE` there would win and skip both the refusal and the `[1m]`
+alias. `submit` refuses any claude seat of a composed run whose claude-args
+carry either spelling, naming the seat; put the model in the agent's
+`model:` field instead. Other claude-args (`--effort high`, say) are
+unaffected.
+
 ### 1b. proxy, per-run, for claude — **Status: built.**
 
 `--harness claude` does not fit mode 1 above: OpenRouter's key is a

@@ -2181,6 +2181,38 @@ contains "cluster: a preset claude agent with a full Claude id is flagged" "$cl_
 contains "cluster: ... and the preset error names fable" "$cl_out" "use 'fable' instead"
 lacks "cluster: the preset's alias agent is not flagged" "$cl_out" "agent 'coder'"
 
+# A claude preset agent whose claude-args set the model would override its
+# seat's model on the cluster, and submit refuses it, so check --cluster
+# flags it too, in either spelling; other claude-args pass.
+cat > "$cl_dir/presets/claude-args-model.yaml" <<'YAML'
+agents:
+  coder: {harness: claude, model: opus, claude-args: --effort high}
+  reviewer: {harness: claude, model: opus, claude-args: --effort high --model claude-opus-5-5}
+  checker: {harness: claude, model: sonnet, claude-args: --model=sonnet}
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    agent: reviewer
+    repeat: 1
+  - action: review
+    agent: checker
+    repeat: 1
+YAML
+cat > "$cl_dir/fleet.yaml" <<'EOF'
+agents:
+  alpha: {harness: pi, preset: claude-args-model}
+EOF
+cl_run --cluster 1
+check "cluster: a preset whose claude-args set the model is refused" "1" "$cl_rc"
+contains "cluster: a --model VALUE in a preset agent's claude-args is flagged" "$cl_out" \
+    "agents.alpha.preset: preset 'claude-args-model' agent 'reviewer': its claude-args set the model ('--model claude-opus-5-5')"
+contains "cluster: a --model=VALUE in a preset agent's claude-args is flagged" "$cl_out" \
+    "agent 'checker': its claude-args set the model ('--model=sonnet')"
+lacks "cluster: claude-args without a model flag are not flagged" "$cl_out" "agent 'coder'"
+cl_run "" ""
+check "cluster: the same claude-args preset passes plain check" "0" "$cl_rc"
+
 # A pipelines seat is checked row by row, like a preset per row: the spec
 # names its harnesses, and the seat's own (empty) harness line never runs.
 cl_fleet <<'EOF'

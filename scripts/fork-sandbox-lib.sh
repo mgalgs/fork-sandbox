@@ -224,6 +224,23 @@ fs_claude_k8s_refusal() {
         "$1" "$2" "$3"
 }
 
+# Prints the model flag ("--model VALUE" or "--model=VALUE") that the claude
+# CLI argv words "$@" carry, and returns 0; returns 1 when they carry none.
+# A k8s claude seat's extra claude args must not set the model: the last
+# --model wins, so one there would override the seat's own model and skip
+# both the full-id refusal and the pod's [1m] aliasing (see
+# fs_claude_k8s_alias_for). The model belongs in the seat's model: field.
+fs_claude_args_model_flag() {
+    while (( $# )); do
+        case "$1" in
+            --model) printf -- '--model %s\n' "${2-}"; return 0 ;;
+            --model=*) printf '%s\n' "$1"; return 0 ;;
+        esac
+        shift
+    done
+    return 1
+}
+
 # Reads one NAME=VALUE line from an env file, first match wins. This is the
 # same first-match, never-`source`d contract fork-sandbox-k8s.sh's own
 # read_env_value applies to k8s.env and pi.env -- kept as a second, identical

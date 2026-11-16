@@ -6798,6 +6798,43 @@ k8s_set_run_owner_refs() {
     fi
 }
 
+# Prints "SEAT<TAB>FLAG" for each claude seat of the composed run dir $1
+# whose extra claude args set the model (FLAG as fs_claude_args_model_flag
+# prints it), SEAT named as the full-id refusal names it ("step 2 (review)",
+# "step 2 (review) fix seat"). Those args reach the pod only through
+# run.sh's s<K>[fix|resume|cont|tidy]_sandbox_cmd arrays, as the words after
+# fork-sandbox-k8s-leg.sh's own `--`, so that is what is read: the argv the
+# leg will really run. run.sh is never sourced or eval'd here; each array
+# line is split with `read -a` without -r, which undoes the backslash
+# escapes of the launcher's printf %q (the only quoting it emits for the
+# values fs_reject_unsafe_chars lets through).
+k8s_run_dir_claude_model_flags() {
+    local dir="$1" line k fix seat action flag i dash leg_harness
+    local -a words
+    local -A seen=()
+    [[ -f "$dir/run.sh" ]] || return 0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^s([0-9]+)(fix)?(resume|cont|tidy)?_sandbox_cmd=\((.*)\)$ ]] || continue
+        k="${BASH_REMATCH[1]}" fix="${BASH_REMATCH[2]}"
+        # shellcheck disable=SC2162  # no -r on purpose; see the comment above
+        read -a words <<< "${BASH_REMATCH[4]}"
+        [[ "${words[0]-}" == */fork-sandbox-k8s-leg.sh ]] || continue
+        dash="" leg_harness=""
+        for (( i = 1; i < ${#words[@]}; i++ )); do
+            if [[ "${words[$i]}" == -- ]]; then dash=$i; break; fi
+            [[ "${words[$i]}" == --harness ]] && leg_harness="${words[$((i + 1))]-}"
+        done
+        [[ "$leg_harness" == claude && -n "$dash" ]] || continue
+        flag="$(fs_claude_args_model_flag "${words[@]:dash+1}")" || continue
+        action="$(jq -r --argjson i "$(( k - 1 ))" '.steps[$i].action // "step"' \
+            "$dir/pipeline.json" 2>/dev/null)" || action=step
+        seat="step $k ($action)${fix:+ fix seat}"
+        [[ -z "${seen[$seat]-}" ]] || continue
+        seen[$seat]=1
+        printf '%s\t%s\n' "$seat" "$flag"
+    done < "$dir/run.sh"
+}
+
 # Seconds a Job may run past its run's TIMEOUT before the cluster stops it
 # (activeDeadlineSeconds = TIMEOUT + this); see cmd_submit.
 K8S_JOB_DEADLINE_GRACE=600
@@ -6941,6 +6978,19 @@ cmd_submit() {
               (if $s.fix != null and $s.fix.harness == "claude" and ($s.fix.model | type) == "string"
                then ["step \($n) (\($s.action)) fix seat", $s.fix.model] else empty end)
             | @tsv' "$run_dir_flag/pipeline.json")
+    fi
+    # A claude seat's extra claude args (a composed agent's claude-args;
+    # the run-level --claude-args never reaches a k8s run) come after the
+    # leg's own --model, so a model flag there wins and would sidestep both
+    # the refusal above and the pod's [1m] aliasing. Refused too, either
+    # spelling: the model belongs in the seat's model: field.
+    local claude_seat_flag
+    if [[ -n "$run_dir_flag" ]]; then
+        while IFS=$'\t' read -r claude_seat_name claude_seat_flag; do
+            [[ -n "$claude_seat_name" ]] || continue
+            echo "Error: $claude_seat_name: its claude-args set the model ('$claude_seat_flag'), which would override the seat's model on the cluster; give the model in the agent's model: field instead." >&2
+            claude_seat_bad=1
+        done < <(k8s_run_dir_claude_model_flags "$run_dir_flag")
     fi
     if (( claude_seat_bad )); then
         echo "A k8s claude seat always runs with the 1M window; nothing was created." >&2

@@ -155,7 +155,9 @@
 #                  full Claude id (claude-opus-*, claude-sonnet-*,
 #                  claude-fable-*, not ending in [1m]) is refused too,
 #                  naming the alias to use: on the cluster it would get a
-#                  200k window, and submit refuses it.
+#                  200k window, and submit refuses it. So is a claude
+#                  preset agent whose claude-args set the model (--model
+#                  VALUE or --model=VALUE), which submit refuses too.
 #                  Handler seats stay legal. Without --cluster, `check`
 #                  behaves exactly as it always has.
 #   resolve <name> Print exactly twenty-three lines for one agent: harness,
@@ -573,6 +575,17 @@ check_cluster_preset() {
         if [[ "$preset_field" == model ]]; then
             cluster_claude_model_ok "agents.$name.$key: preset '$preset' agent '$preset_agent'" \
                 "${preset_harness[$preset_agent]-}" "$preset_value" || rc=1
+            continue
+        fi
+        if [[ "$preset_field" == claude_args ]]; then
+            # Word-split, as the launcher splits a seat's claude-args.
+            local -a preset_cargs=()
+            local preset_flag
+            read -r -a preset_cargs <<< "$preset_value"
+            if preset_flag="$(fs_claude_args_model_flag "${preset_cargs[@]}")"; then
+                echo "Error: agents.$name.$key: preset '$preset' agent '$preset_agent': its claude-args set the model ('$preset_flag'), which would override the seat's model on the cluster, and submit refuses it; give the model in the agent's model: field instead." >&2
+                rc=1
+            fi
             continue
         fi
         [[ "$preset_field" == harness ]] || continue

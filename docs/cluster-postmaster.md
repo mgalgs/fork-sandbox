@@ -95,7 +95,9 @@ Do these in order.
    by alias (`opus`, `sonnet`, `fable`, `haiku`), not by a full Claude id
    such as `claude-opus-5-5`: in a pod only the alias gets the 1M context
    window, so `submit` refuses a full id and `fleet check --cluster` flags
-   one, naming the alias to use.
+   one, naming the alias to use. Likewise a claude preset agent's `claude-args` must not
+   carry `--model`: it would override the agent's `model:` in the pod, so
+   `submit` refuses it and `fleet check --cluster` flags it.
 
    `K8S_AGENT_PRIORITY_CLASS` applies to agent Jobs and their per-run proxy
    Pods. The PriorityClass must already exist; `install` checks and warns

@@ -27979,5 +27979,117 @@ cm_accepted "a composed run whose claude seats use opus, opus[1m], claude-opus-5
       {"action":"review","harness":"claude","model":"Qwen/Qwen3-8B","repeat":1},
       {"action":"review","harness":"pi","model":"claude-opus-5-5","repeat":1}]')"
 
+
+printf '\n== k8s claude seats: a model flag in a seat'"'"'s claude-args is refused ==\n'
+# A composed agent's claude-args ride after the leg wrapper's own --model,
+# so a --model there wins and would bypass the refusal above. submit reads
+# each claude leg's real argv from run.sh and refuses one, either spelling,
+# naming the seat, before any kubectl call.
+# cm_leg_line NAME HARNESS MODEL EXTRA... -> one run.sh array line, quoted
+# the way the launcher quotes it (printf %q per element).
+cm_leg_line() {
+    local name="$1" harness="$2" model="$3"; shift 3
+    printf '%s_sandbox_cmd=(' "$name"
+    printf '%q ' "/work/run/scripts/fork-sandbox-k8s-leg.sh" --harness "$harness" \
+        --model "$model" --clone /work/clone -- "$@"
+    printf ')\n'
+}
+# cm_args_rundir STEPS-JSON LINE... -> cm_rundir plus those run.sh lines.
+cm_args_rundir() {
+    local d steps="$1"; shift
+    d="$(cm_rundir "$steps")"
+    printf '%s\n' "$@" >> "$d/run.sh"
+    printf '%s' "$d"
+}
+# cm_args_refused LABEL NEEDLE SUBMIT-ARGS... -> submit fails naming NEEDLE
+# and the model: field, with no kubectl call at all.
+cm_args_refused() {
+    local label="$1" needle="$2" rc=0 log out; shift 2
+    cm_n=$(( cm_n + 1 )); log="$cm_tmp/kubectl-$cm_n.log"; out="$cm_tmp/out-$cm_n.txt"
+    : > "$log"
+    HOME="$claude_home" runstub_verb "$log" "$out" submit \
+        --branch "fs-k8s-test-claude-model-$cm_n" "$@" "$proj_dir" "$handoff_file" || rc=$?
+    if (( rc == 0 )); then
+        no "$label" "submit succeeded: $(cat "$out")"
+    elif ! grep -qF -- "$needle" "$out" || ! grep -qF "model: field" "$out" \
+        || ! grep -qF 'nothing was created' "$out"; then
+        no "$label" "error does not name '$needle' and the model: field: $(cat "$out")"
+    elif [[ -s "$log" ]]; then
+        no "$label" "kubectl was called before the refusal: $(cat "$log")"
+    else
+        ok "$label"
+    fi
+}
+cm_steps_code='[{"action":"code","harness":"claude","model":"opus","repeat":1}]'
+cm_steps_fix='[{"action":"code","harness":"pi","model":"moonshotai/kimi-k3","repeat":1},
+  {"action":"review","harness":"pi","model":"moonshotai/kimi-k3","repeat":1,
+   "fix":{"harness":"claude","model":"opus","repeat":1}}]'
+cm_args_refused "a claude code seat whose claude-args carry --model VALUE is refused" \
+    "step 1 (code): its claude-args set the model ('--model claude-opus-5-5')" \
+    --harness claude --model opus --run-dir "$(cm_args_rundir "$cm_steps_code" \
+    "$(cm_leg_line s1 claude opus --settings /work/run/inbox/.settings.json --model claude-opus-5-5)")"
+cm_args_refused "a claude code seat whose claude-args carry --model=VALUE is refused" \
+    "step 1 (code): its claude-args set the model ('--model=claude-opus-5-5')" \
+    --harness claude --model opus --run-dir "$(cm_args_rundir "$cm_steps_code" \
+    "$(cm_leg_line s1 claude opus --effort high --model=claude-opus-5-5)")"
+cm_args_refused "a claude fix seat whose claude-args carry a model flag is refused" \
+    "step 2 (review) fix seat: its claude-args set the model ('--model sonnet')" \
+    --harness pi --model moonshotai/kimi-k3 --run-dir "$(cm_args_rundir "$cm_steps_fix" \
+    "$(cm_leg_line s1 pi moonshotai/kimi-k3 --session-dir /work/clone/.git/pi-session)" \
+    "$(cm_leg_line s2 pi moonshotai/kimi-k3 --session-dir /work/clone/.git/pi-session)" \
+    "$(cm_leg_line s2fix claude opus --model sonnet)")"
+cm_accepted "a claude seat whose claude-args carry only other flags (--effort high) is accepted" \
+    --harness claude --model opus --run-dir "$(cm_args_rundir "$cm_steps_code" \
+    "$(cm_leg_line s1 claude opus --settings /work/run/inbox/.settings.json --effort high)")"
+cm_accepted "a pi seat's own --model in its pi-args is left alone" \
+    --harness pi --model moonshotai/kimi-k3 --run-dir "$(cm_args_rundir \
+    '[{"action":"code","harness":"pi","model":"moonshotai/kimi-k3","repeat":1}]' \
+    "$(cm_leg_line s1 pi moonshotai/kimi-k3 --model other/model)")"
+
+# The same refusal against a run dir the real launcher staged from a preset
+# whose second review step's claude agent carries `claude-args: --model
+# claude-opus-5-5`, so the parse is proven against run.sh as the launcher
+# really writes it. (The first code and first review step's agent args take
+# the fixed-seat routes the launcher already refuses on --k8s; a later
+# step's do not.)
+cat > "$walk_presets_dir/walk-cargs.yaml" <<'YAML'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  rev:
+    harness: pi
+    model: rd-walk-pi-model
+  checker:
+    harness: claude
+    model: opus
+    claude-args: --effort high --model claude-opus-5-5
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: rev
+  - action: review
+    repeat: 1
+    agent: checker
+YAML
+cm_stage_out="$cm_tmp/stage-cargs.txt"
+cm_stage_work="$(newdir)"; tmpdirs+=("$cm_stage_work")
+HOME="$walk_home" FORK_SANDBOX_CONFIG_DIR="$walk_config_dir" \
+    FORK_SANDBOX_PRESETS_DIR="$walk_presets_dir" FORK_SANDBOX_K8S_WORK_DIR="$cm_stage_work" \
+    "$walk_scripts/fork-sandbox.sh" --preset walk-cargs --k8s --branch "fs-k8s-test-cargs-$$" \
+    "$walk_proj" "$walk_handoff" > "$cm_stage_out" 2>&1 || true
+cm_staged="$(grep -o -- '--run-dir [^ ]*' "$cm_stage_out" | head -1 | awk '{print $2}')"
+if [[ -n "$cm_staged" && -f "$cm_staged/run.sh" ]]; then
+    tmpdirs+=("$cm_staged")
+    cm_args_refused "a launcher-staged claude seat whose preset claude-args carry --model is refused" \
+        "step 3 (review): its claude-args set the model ('--model claude-opus-5-5')" \
+        --harness claude --model opus --run-dir "$cm_staged"
+else
+    no "a launcher-staged claude seat whose preset claude-args carry --model is refused" \
+        "the launcher staged no run dir: $(cat "$cm_stage_out")"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
