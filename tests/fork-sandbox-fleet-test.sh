@@ -2136,6 +2136,51 @@ EOF
 cl_run --cluster
 lacks "cluster: a pi-only preset adds no preset error" "$cl_out" "agents.alpha.preset"
 
+# A claude seat whose model is a full Claude id would get a 200k window on
+# the cluster, and submit refuses it, so check --cluster flags it first,
+# naming the alias; an alias, an id ending in [1m], haiku, a non-Anthropic id
+# and a non-claude seat pass. Plain check is unchanged.
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: claude, model: claude-opus-5-5, backend: k8s}
+  beta: {harness: claude, model: opus, backend: k8s}
+  gamma: {harness: claude, model: "claude-sonnet-5-5[1m]", backend: k8s}
+  delta: {harness: claude, model: haiku, backend: k8s}
+  eps: {harness: claude, model: Qwen/Qwen3-8B, backend: k8s}
+  zeta: {harness: pi, model: claude-fable-5-2, backend: k8s}
+EOF
+for cl_p in gamma delta eps zeta; do
+    printf 'Standing instructions.\n' > "$cl_dir/personas/$cl_p.md"
+done
+cl_run --cluster 1
+check "cluster: a claude seat with a full Claude id is refused" "1" "$cl_rc"
+contains "cluster: the full-id error names the seat" "$cl_out" \
+    "agents.alpha.model: harness claude: model 'claude-opus-5-5' is a full Claude model id"
+contains "cluster: the full-id error names the alias to use" "$cl_out" "use 'opus' instead"
+check "cluster: only that seat is flagged" "1" "$(grep -c 'full Claude model id' <<< "$cl_out")"
+cl_run "" ""
+check "cluster: the same full-id fleet passes plain check" "0" "$cl_rc"
+cat > "$cl_dir/presets/claude-full-id.yaml" <<'YAML'
+agents:
+  coder: {harness: claude, model: sonnet}
+  reviewer: {harness: claude, model: claude-fable-5-2}
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    agent: reviewer
+    repeat: 2
+YAML
+cat > "$cl_dir/fleet.yaml" <<'EOF'
+agents:
+  alpha: {harness: pi, preset: claude-full-id}
+EOF
+cl_run --cluster 1
+contains "cluster: a preset claude agent with a full Claude id is flagged" "$cl_out" \
+    "agents.alpha.preset: preset 'claude-full-id' agent 'reviewer': harness claude: model 'claude-fable-5-2' is a full Claude model id"
+contains "cluster: ... and the preset error names fable" "$cl_out" "use 'fable' instead"
+lacks "cluster: the preset's alias agent is not flagged" "$cl_out" "agent 'coder'"
+
 # A pipelines seat is checked row by row, like a preset per row: the spec
 # names its harnesses, and the seat's own (empty) harness line never runs.
 cl_fleet <<'EOF'

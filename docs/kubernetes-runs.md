@@ -2499,6 +2499,18 @@ it, not the dispatcher.
 --effort` forwards it with `--k8s` and passes it to the local claude CLI
 otherwise. The postmaster sets it from a claude seat's `thinking`.
 
+**A claude seat always gets the 1M context window.** Behind the seat proxy
+the claude CLI grants a model its 1M window only through its own `[1m]`
+alias, so the pod runs `opus`, `sonnet` and `fable` as `opus[1m]` and so on,
+and its log says which model it ran (`claude model: opus[1m]`). A full
+Anthropic id there (`claude-opus-5-5`, say) would silently run at 200k, so
+`submit` refuses one for any claude seat, before anything is created, and
+names the alias to use instead. That covers `--model` with `--harness claude`
+and every claude seat of a composed (`--run-dir`) run: each step's and each
+fix seat's. An id that already ends in `[1m]` is accepted, and so are
+`haiku`, non-Anthropic ids served through a claude seat, and every other
+harness. A local run is unaffected.
+
 ### 1b. proxy, per-run, for claude — **Status: built.**
 
 `--harness claude` does not fit mode 1 above: OpenRouter's key is a

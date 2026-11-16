@@ -2223,10 +2223,10 @@ cat > "$claude_jobfail_home/.claude/.credentials.json" <<JSON
 JSON
 claude_jobfail_name_out="$(newdir)/claude-jobfail-name.yaml"; tmpdirs+=("$(dirname "$claude_jobfail_name_out")")
 HOME="$claude_jobfail_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-claude-jobfail --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-claude-jobfail --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_jobfail_name_out"
 priority_claude_out="$(HOME="$claude_jobfail_home" FORK_SANDBOX_CONFIG_DIR="$(agent_res_cfg K8S_AGENT_PRIORITY_CLASS=review-seats)" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-priority-claude --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-priority-claude --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" 2>/dev/null)"
 check "priority class follows agent to separate Claude proxy pod" 2 \
     "$(grep -c 'priorityClassName: "review-seats"' <<< "$priority_claude_out")"
@@ -2250,7 +2250,7 @@ STUB
 chmod +x "$claude_jobfail_stub_dir/kubectl"
 PATH="$claude_jobfail_stub_dir:$PATH" K8S_STUB_LOG="$claude_jobfail_log" HOME="$claude_jobfail_home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
-    --branch fs-k8s-test-claude-jobfail --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-claude-jobfail --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-claude-jobfail.out 2>&1
 claude_jobfail_rc=$?
 if (( claude_jobfail_rc != 0 )) && grep -q 'job-name=' "$claude_jobfail_log"; then
@@ -2488,7 +2488,7 @@ JSON
 # $1 = case name, $2 = harness, $3 = config dir; knobs come from the environment.
 # Sets quota_rc, quota_log, quota_out, quota_clock (the clock's final value).
 quota_submit() {
-    local name="$1" harness="$2" cfg="$3" model=claude-sonnet-5
+    local name="$1" harness="$2" cfg="$3" model=sonnet
     [[ "$harness" == pi ]] && model=moonshotai/kimi-k3
     quota_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$quota_log")")
     quota_out="$(dirname "$quota_log")/out"
@@ -3170,13 +3170,13 @@ cat > "$claude_gate_home/.claude/.credentials.json" <<JSON
 JSON
 claude_gate_out="$(newdir)/claude-gate.yaml"; tmpdirs+=("$(dirname "$claude_gate_out")")
 if HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+    --branch fs-k8s-test-branch --model opus --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_gate_out" 2>/dev/null; then
     ok "submit --dry-run --harness claude on an endpoints install exits 0"
 else
     no "submit --dry-run --harness claude on an endpoints install exits 0" \
         "$(HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
-            --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+            --branch fs-k8s-test-branch --model opus --harness claude \
             "$proj_dir" "$handoff_file" 2>&1)"
 fi
 if [[ "$(grep -cF -- '- name: MODEL_DISCOVERY' "$claude_gate_out")" == 0 ]]; then
@@ -3187,14 +3187,14 @@ else
 fi
 claude_gate_loop_out="$(newdir)/claude-gate-loop.yaml"; tmpdirs+=("$(dirname "$claude_gate_loop_out")")
 if HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+    --branch fs-k8s-test-branch --model opus --harness claude \
     --review-loop 1 --review-model qwen3-8b \
     "$proj_dir" "$handoff_file" > "$claude_gate_loop_out" 2>/dev/null; then
     ok "submit --dry-run --harness claude --review-loop on an endpoints install exits 0"
 else
     no "submit --dry-run --harness claude --review-loop on an endpoints install exits 0" \
         "$(HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
-            --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+            --branch fs-k8s-test-branch --model opus --harness claude \
             --review-loop 1 --review-model qwen3-8b \
             "$proj_dir" "$handoff_file" 2>&1)"
 fi
@@ -5312,7 +5312,7 @@ fi
 refuses "--harness takes only pi or claude" \
     "--harness takes 'pi' or 'claude'" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness bogus \
+    --branch fs-k8s-test-branch --model sonnet --harness bogus \
     "$proj_dir" "$handoff_file"
 
 # A fixture HOME carrying a Claude credential, so --harness claude never
@@ -5329,7 +5329,7 @@ JSON
 
 claude_submit_out="$(newdir)/claude-submit.yaml"; tmpdirs+=("$(dirname "$claude_submit_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-submit.err; then
     ok "submit --dry-run --harness claude exits 0"
 else
@@ -5388,7 +5388,7 @@ fi
 # leaving a reused branch's newer run alone" further down.
 claude_submit_out2="$(newdir)/claude-submit2.yaml"; tmpdirs+=("$(dirname "$claude_submit_out2")")
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_submit_out2" 2>/dev/null || true
 claude_run_token2="$(grep -o 'fork-sandbox/run: .*' "$claude_submit_out2" | sort -u)"
 if [[ -n "$claude_run_tokens" && -n "$claude_run_token2" && "$claude_run_tokens" == "$claude_run_token2" ]]; then
@@ -5667,7 +5667,7 @@ printf '\n== fork-sandbox-k8s.sh submit --dry-run: --refresh-at / --refresh-max 
 # cap 6), exactly like a local one: Job env, three ConfigMap keys, run.env.
 refresh_dry() {
     HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-        --branch fs-k8s-test-branch --model claude-sonnet-5 "$@" \
+        --branch fs-k8s-test-branch --model sonnet "$@" \
         "$proj_dir" "$handoff_file" 2>&1
 }
 refresh_env_val() {
@@ -5751,7 +5751,7 @@ check "--refresh-at 150000: REFRESH_CEILING_TOKENS still 800000 (window-based)" 
 big_brief_handoff="$(newdir)/big-handoff.md"; tmpdirs+=("$(dirname "$big_brief_handoff")")
 head -c 200 /dev/zero | tr '\0' 'x' > "$big_brief_handoff"
 big_brief_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" \
-    submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude --refresh-at 100 "$proj_dir" "$big_brief_handoff" 2>&1)"
 if grep -qF -- 'this brief is 200 bytes' <<< "$big_brief_out"; then
     ok "submit warns at launch for a large brief"
@@ -5764,7 +5764,7 @@ else
     no "submit's large-brief warning names the threshold" "not found in: $big_brief_out"
 fi
 small_brief_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" \
-    submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude --refresh-at 100 "$proj_dir" "$handoff_file" 2>&1)"
 # A plain 'this brief is' substring match would also hit
 # fs_refresh_warn_brief's own printf FORMAT STRING, embedded verbatim as
@@ -5782,12 +5782,12 @@ fi
 refuses "pi + --refresh-at is refused with the local message" \
     "Error: --refresh-at only works with --harness claude" \
     env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness pi --refresh-at 0.5 \
+    --branch fs-k8s-test-branch --model sonnet --harness pi --refresh-at 0.5 \
     "$proj_dir" "$handoff_file"
 refuses "a bad --refresh-max is refused" \
     "--refresh-max" \
     env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --refresh-max nope \
+    --branch fs-k8s-test-branch --model sonnet --harness claude --refresh-max nope \
     "$proj_dir" "$handoff_file"
 if grep -qF -- '- name: REFRESH_THRESHOLD_TOKENS' "$submit_out"; then
     no "a pi run (default harness) renders no refresh env" "found in $submit_out"
@@ -5796,7 +5796,7 @@ else
 fi
 # run delegates: the same flags reach submit through cmd_run.
 run_refresh_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     --refresh-at 150000 --refresh-max 3 "$proj_dir" "$handoff_file" 2>&1)"
 check "run --dry-run forwards --refresh-at" "150000" \
     "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$run_refresh_out")"
@@ -5823,7 +5823,7 @@ printf 'CLAUDE_CREDENTIALS=%s\n' "$claude_override_cred" > "$claude_override_con
 
 claude_override_out="$(newdir)/claude-override-submit.yaml"; tmpdirs+=("$(dirname "$claude_override_out")")
 if HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_override_config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_override_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-override.err; then
     ok "submit --dry-run --harness claude with CLAUDE_CREDENTIALS exits 0 despite an empty HOME"
 else
@@ -5852,7 +5852,7 @@ cat > "$claude_override_cred" <<JSON
 JSON
 claude_noscope_out="$(newdir)/claude-noscope-submit.yaml"; tmpdirs+=("$(dirname "$claude_noscope_out")")
 HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_override_config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_noscope_out" 2>/dev/null || true
 noscope_cred="$(sed -n '/claude-credentials.json: |/,/inbox-hook.sh: |/p' "$claude_noscope_out")"
 if grep -qF '"user:inference"' <<< "$noscope_cred"; then
@@ -5875,7 +5875,7 @@ refuses "a missing CLAUDE_CREDENTIALS path fails naming that path" \
     "$claude_missing_cred" \
     env HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_missing_config_dir" \
     "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file"
 
 # An expired override credential must report the OVERRIDE path in its error
@@ -5892,7 +5892,7 @@ cat > "$claude_expired_cred" <<JSON
 JSON
 printf 'CLAUDE_CREDENTIALS=%s\n' "$claude_expired_cred" > "$claude_expired_config_dir/claude.env"
 claude_expired_out="$(HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_expired_config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" 2>&1)"
 claude_expired_rc=$?
 if (( claude_expired_rc != 0 )) && [[ "$claude_expired_out" == *"the access token in $claude_expired_cred has expired"* ]]; then
@@ -5929,7 +5929,7 @@ for claude_unsafe_case in \
 JSON
     claude_unsafe_out="$(HOME="$claude_unsafe_home" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-        --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+        --branch fs-k8s-test-branch --model sonnet --harness claude \
         "$proj_dir" "$handoff_file" 2>&1)"
     claude_unsafe_rc=$?
     claude_unsafe_raw_token="$(printf '%s' "$claude_unsafe_json_token" | sed 's/\\"/"/g; s/\\\\/\\/g')"
@@ -6000,7 +6000,7 @@ balance_hook_dir_flagwins="$(balance_fake_hook flagwins "touch $balance_flag_mar
     printf 'CLAUDE_HEADROOM_HOOK=flagwins\n'
 } > "$balance_config_dir/claude.env"
 if PATH="$balance_hook_dir_flagwins:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude --claude-credentials "$claude_override_cred" \
     "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-balance-flagwins.out 2>&1; then
     ok "--claude-credentials on submit beats a configured pool: exits 0"
@@ -6050,7 +6050,7 @@ printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$balance_pool_a" > "$balance_config_dir/cl
 refuses "submit: a pool without a hook is refused loudly" \
     "without" \
     env FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude "$proj_dir" "$handoff_file"
 
 # Exit 2 (the hook's own "no routable candidate" answer) is a hard error
@@ -6063,7 +6063,7 @@ balance_hook_dir_noroute="$(balance_fake_hook noroute2 'exit 2')"
 refuses "submit: exit 2 (no routable candidate) is a hard error naming the flag override" \
     "no routable credential" \
     env PATH="$balance_hook_dir_noroute:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude "$proj_dir" "$handoff_file"
 
 # The balancer's choice naming a missing file is a hard error, the same
@@ -6081,12 +6081,12 @@ balance_hook_dir_missing="$(balance_fake_hook missing2 'printf "%s\n" "$2"')"
 refuses "submit: the balancer choosing a missing file is refused" \
     "the credential balancer chose" \
     env PATH="$balance_hook_dir_missing:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude "$proj_dir" "$handoff_file"
 refuses "submit: the balancer-chose-missing-file error names the pool entry" \
     "$balance_pool_missing" \
     env PATH="$balance_hook_dir_missing:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude "$proj_dir" "$handoff_file"
 
 # The new --claude-credentials flag itself: a missing path is refused naming
@@ -6096,17 +6096,17 @@ balance_missing_cred="$(newdir)/does-not-exist-credentials.json"; tmpdirs+=("$(d
 refuses "submit --claude-credentials naming a missing file is refused" \
     "$balance_missing_cred" \
     env FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude --claude-credentials "$balance_missing_cred" "$proj_dir" "$handoff_file"
 refuses "run --claude-credentials naming a missing file is refused (forwarded to submit)" \
     "$balance_missing_cred" \
     env FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" run --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" run --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude --claude-credentials "$balance_missing_cred" "$proj_dir" "$handoff_file"
 
 # The existing valid flag credential still works end to end via --dry-run.
 if PATH="$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
-    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model sonnet \
     --harness claude --claude-credentials "$claude_override_cred" \
     "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-balance-flagok.out 2>&1; then
     ok "submit --claude-credentials naming an existing file exits 0"
@@ -6163,7 +6163,7 @@ chmod +x "$submit_stub_dir/kubectl"
 label_stub_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$label_stub_log")")
 PATH="$submit_stub_dir:$PATH" K8S_STUB_LOG="$label_stub_log" HOME="$claude_home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
-    --branch fs-k8s-test-label-failure --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-label-failure --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" >"$k8s_test_tmp"/fs-k8s-test-label.out 2>&1
 label_rc=$?
 if (( label_rc == 0 )); then
@@ -6252,7 +6252,7 @@ printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude (long branch 
 long_branch="claude-harness-review-fix-round-2-with-extra-words-appended-to-push-well-past-any-reasonable-cap"
 long_submit_out="$(newdir)/claude-long-submit.yaml"; tmpdirs+=("$(dirname "$long_submit_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch "$long_branch" --model claude-sonnet-5 --harness claude \
+    --branch "$long_branch" --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" > "$long_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-long-submit.err; then
     ok "submit --dry-run --harness claude (long branch) exits 0"
 else
@@ -6310,7 +6310,7 @@ rm -f "$k8s_test_tmp"/fs-k8s-test-pi-rm-submit.err
 
 claude_rm_submit_out="$(newdir)/claude-rm-submit.yaml"; tmpdirs+=("$(dirname "$claude_rm_submit_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --review-model opus \
+    --branch fs-k8s-test-branch --model sonnet --harness claude --review-model opus \
     "$proj_dir" "$handoff_file" > "$claude_rm_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-rm-submit.err; then
     ok "submit --dry-run --harness claude --review-model exits 0"
 else
@@ -6579,7 +6579,7 @@ rm -f "$k8s_test_tmp"/fs-k8s-test-pialg-unsafe.out
 refuses "submit --pi-args with --harness claude is refused" \
     "passes flags to pi, which a claude run" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     --pi-args "--thinking low" \
     "$proj_dir" "$handoff_file"
 
@@ -6611,7 +6611,7 @@ printf '\n== fork-sandbox-k8s.sh submit/run --effort ==\n'
 effort_submit_out="$(newdir)/effort-submit.yaml"; tmpdirs+=("$(dirname "$effort_submit_out")")
 effort_run_out="$(newdir)/effort-run.yaml"; tmpdirs+=("$(dirname "$effort_run_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --effort xhigh \
+    --branch fs-k8s-test-branch --model sonnet --harness claude --effort xhigh \
     "$proj_dir" "$handoff_file" > "$effort_submit_out" 2>"$k8s_test_tmp"/fs-k8s-test-effort.err; then
     ok "submit --dry-run --harness claude --effort exits 0"
 else
@@ -6622,7 +6622,7 @@ check "the rendered Job carries CLAUDE_EFFORT" 'value: "xhigh"' \
 check "a claude submit without --effort renders no CLAUDE_EFFORT" 0 \
     "$(grep -c 'name: CLAUDE_EFFORT' "$claude_rm_submit_out")"
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --effort xhigh \
+    --branch fs-k8s-test-branch --model sonnet --harness claude --effort xhigh \
     "$proj_dir" "$handoff_file" > "$effort_run_out" 2>/dev/null
 check "run --effort forwards it to submit unchanged" "" "$(diff "$effort_run_out" "$effort_submit_out" 2>&1 | head -n 5)"
 refuses "submit --effort with a pi harness is refused" \
@@ -6633,7 +6633,7 @@ refuses "submit --effort with a pi harness is refused" \
 refuses "submit --effort with an unknown level is refused" \
     "--effort must be one of: low medium high xhigh max" \
     env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --effort 'high"' \
+    --branch fs-k8s-test-branch --model sonnet --harness claude --effort 'high"' \
     "$proj_dir" "$handoff_file"
 check "the entrypoint adds --effort to the claude coding leg from CLAUDE_EFFORT" 1 \
     "$(grep -cxF '    [[ -n "$CLAUDE_EFFORT" ]] && claude_argv+=(--effort "$CLAUDE_EFFORT")' "$entrypoint_sh")"
@@ -6649,7 +6649,7 @@ JSON
 refuses "an expired Claude credential is refused" \
     "has expired" \
     env HOME="$claude_home_expired" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file"
 
 claude_home_soon="$(newdir)"; tmpdirs+=("$claude_home_soon")
@@ -6659,7 +6659,7 @@ cat > "$claude_home_soon/.claude/.credentials.json" <<JSON
 {"claudeAiOauth": {"accessToken": "tok", "expiresAt": $claude_soon_ms}}
 JSON
 soon_out="$(HOME="$claude_home_soon" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" 2>&1 1>/dev/null)"
 if [[ "$soon_out" == *"expires in"*"the pod's session dies then"* ]]; then
     ok "a credential expiring within an hour warns but still renders"
@@ -6676,7 +6676,7 @@ JSON
 refuses "a credential expiring within 5 minutes is refused (the pod cannot refresh it)" \
     "the pod's session would die almost at once" \
     env HOME="$claude_home_floor" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     "$proj_dir" "$handoff_file"
 
 printf '\n== fork-sandbox-k8s.sh submit: fs_claude_refresh_if_needed ==\n'
@@ -6723,7 +6723,7 @@ touch "$refresh_contract_dir1/9.9.9-test-stub.ok"
 PATH="$refresh_stub_dir:$PATH" HOME="$refresh_home1" \
     STUB_CALL_LOG="$refresh_calllog1" FS_CLAUDE_TOKEN_CONTRACT_DIR="$refresh_contract_dir1" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-refresh-soon --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-refresh-soon --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-refresh1.err
 if grep -qF 'mcp list' "$refresh_calllog1" 2>/dev/null; then
     ok "submit refreshes the host credential when less than 120m remain"
@@ -6753,7 +6753,7 @@ touch "$refresh_contract_dir2/9.9.9-test-stub.ok"
 PATH="$refresh_stub_dir:$PATH" HOME="$refresh_home2" \
     STUB_CALL_LOG="$refresh_calllog2" FS_CLAUDE_TOKEN_CONTRACT_DIR="$refresh_contract_dir2" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-refresh-far --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-refresh-far --model sonnet --harness claude \
     "$proj_dir" "$handoff_file" >/dev/null 2>"$k8s_test_tmp"/fs-k8s-test-refresh2.err
 if grep -qF 'mcp list' "$refresh_calllog2" 2>/dev/null; then
     no "submit never refreshes when 120m or more remain" \
@@ -6843,7 +6843,7 @@ fi
 refuses "submit --harness claude --review-loop without --review-model is refused" \
     "--review-model is required with --harness claude" \
     env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-rl-branch --model claude-sonnet-5 --harness claude --review-loop 2 \
+    --branch fs-k8s-test-rl-branch --model sonnet --harness claude --review-loop 2 \
     "$proj_dir" "$handoff_file"
 
 if command -v yamllint >/dev/null 2>&1; then
@@ -8275,12 +8275,12 @@ rd_timeout_claude_fixture="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test
 tmpdirs+=("$rd_timeout_claude_fixture")
 printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_timeout_claude_fixture/run.sh"
 chmod +x "$rd_timeout_claude_fixture/run.sh"
-printf '{"steps":[{"action":"code","harness":"claude","model":"claude-sonnet-5","repeat":1},{"action":"review","harness":"claude","model":"claude-sonnet-5","repeat":1}]}' \
+printf '{"steps":[{"action":"code","harness":"claude","model":"sonnet","repeat":1},{"action":"review","harness":"claude","model":"sonnet","repeat":1}]}' \
     > "$rd_timeout_claude_fixture/pipeline.json"
 rd_timeout_claude_log="$(newdir)/kubectl.log"; rd_timeout_claude_out="$(newdir)/out.txt"
 tmpdirs+=("$(dirname "$rd_timeout_claude_log")" "$(dirname "$rd_timeout_claude_out")")
 HOME="$rd_timeout_claude_home" runstub_run "$rd_timeout_claude_log" "$rd_timeout_claude_out" \
-    --branch fs-k8s-test-rd-timeout-claude --harness claude --model claude-sonnet-5 \
+    --branch fs-k8s-test-rd-timeout-claude --harness claude --model sonnet \
     --run-dir "$rd_timeout_claude_fixture" "$proj_dir" "$handoff_file" || true
 check "a composed claude run with no --timeout also budgets refresh continuations (7+8=15) times 3600s" \
     "TIMEOUT=54000" "$(grep '^TIMEOUT=' "$rd_timeout_claude_fixture/run.env")"
@@ -8291,12 +8291,12 @@ rd_timeout_norefresh_fixture="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-t
 tmpdirs+=("$rd_timeout_norefresh_fixture")
 printf '#!/usr/bin/env bash\nexit 0\n' > "$rd_timeout_norefresh_fixture/run.sh"
 chmod +x "$rd_timeout_norefresh_fixture/run.sh"
-printf '{"steps":[{"action":"code","harness":"claude","model":"claude-sonnet-5","repeat":1},{"action":"review","harness":"claude","model":"claude-sonnet-5","repeat":1}]}' \
+printf '{"steps":[{"action":"code","harness":"claude","model":"sonnet","repeat":1},{"action":"review","harness":"claude","model":"sonnet","repeat":1}]}' \
     > "$rd_timeout_norefresh_fixture/pipeline.json"
 rd_timeout_norefresh_log="$(newdir)/kubectl.log"; rd_timeout_norefresh_out="$(newdir)/out.txt"
 tmpdirs+=("$(dirname "$rd_timeout_norefresh_log")" "$(dirname "$rd_timeout_norefresh_out")")
 HOME="$rd_timeout_claude_home" runstub_run "$rd_timeout_norefresh_log" "$rd_timeout_norefresh_out" \
-    --branch fs-k8s-test-rd-timeout-norefresh --harness claude --model claude-sonnet-5 \
+    --branch fs-k8s-test-rd-timeout-norefresh --harness claude --model sonnet \
     --refresh-at 0 --run-dir "$rd_timeout_norefresh_fixture" "$proj_dir" "$handoff_file" || true
 check "--refresh-at 0 drops the continuation budget from the composed default (1+2=3) times 3600s" \
     "TIMEOUT=10800" "$(grep '^TIMEOUT=' "$rd_timeout_norefresh_fixture/run.env")"
@@ -9363,7 +9363,7 @@ tmpdirs+=("$(dirname "$runstub_log_own_claude")" "$(dirname "$runstub_out_own_cl
 # happens to render -- see "the fork-sandbox/owner label is omitted when
 # neither K8S_RUN_OWNER nor $USER yields a value" elsewhere in this file.
 if USER='' HOME="$runstub_own_claude_home" runstub_run "$runstub_log_own_claude" "$runstub_out_own_claude" \
-    --branch "$runstub_own_claude_branch" --harness claude --model claude-sonnet-5 \
+    --branch "$runstub_own_claude_branch" --harness claude --model sonnet \
     --outbox-dir "$(newdir)/outbox-own-claude" \
     "$proj_dir" "$handoff_file"; then
     # k8s_safe_name, not a hand-built string: this branch name combined
@@ -13358,7 +13358,7 @@ refuses "--k8s --agent-resources given twice reaches fork-sandbox-k8s.sh's refus
     --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-agent-res \
     --agent-resources cpu=2 --agent-resources cpu=1 "$k8s_flag_proj" "$k8s_flag_handoff"
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --model claude-sonnet-5 \
+    --harness claude --model sonnet \
     --branch fs-k8s-flag-test-claude-harness \
     "$k8s_flag_claude_proj" "$k8s_flag_handoff" \
     > /dev/null 2>"$k8s_test_tmp"/fs-k8s-flag-test-claude-harness.err; then
@@ -13643,7 +13643,7 @@ refuses "--k8s --harness pi --review-model without --review-loop is refused" \
 refuses "--k8s --harness claude --review-model without --review-loop is refused (coherence checked before harness rules)" \
     "only applies to review legs and requires" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --model claude-sonnet-5 --review-model opus \
+    --harness claude --model sonnet --review-model opus \
     unused-project unused-handoff
 refuses "--k8s --harness pi --review-harness pi --review-model without --review-loop hits the coherence message first" \
     "only applies to review legs and requires" \
@@ -13680,22 +13680,22 @@ refuses "--k8s --harness pi --review-harness is refused (the pod's review loop i
 refuses "--k8s --harness claude --review-loop without --review-harness pi is refused" \
     "needs" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --model claude-sonnet-5 --review-loop 2 \
+    --harness claude --model sonnet --review-loop 2 \
     unused-project unused-handoff
 refuses "--k8s --harness claude --review-harness claude is refused as pi-only, regardless of --review-loop" \
     "pi-only" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --model claude-sonnet-5 --review-harness claude \
+    --harness claude --model sonnet --review-harness claude \
     unused-project unused-handoff
 refuses "--k8s --harness claude --review-loop --review-harness claude is refused as pi-only" \
     "pi-only" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --model claude-sonnet-5 --review-loop 2 --review-harness claude \
+    --harness claude --model sonnet --review-loop 2 --review-harness claude \
     unused-project unused-handoff
 
 claude_review_out="$(newdir)/claude-review.yaml"; tmpdirs+=("$(dirname "$claude_review_out")")
 if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --model claude-sonnet-5 --review-loop 2 \
+    --harness claude --model sonnet --review-loop 2 \
     --review-harness pi --review-model moonshotai/kimi-k3 \
     --branch fs-k8s-flag-test-claude-review \
     "$k8s_flag_claude_proj" "$k8s_flag_handoff" \
@@ -16212,7 +16212,7 @@ check "--label renders fork-sandbox.io/<key> on all 3 render sites" 3 \
 # label set.
 claude_label_out="$(newdir)/claude-label.yaml"; tmpdirs+=("$(dirname "$claude_label_out")")
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     --label extra=example-value \
     "$proj_dir" "$handoff_file" > "$claude_label_out" 2>"$k8s_test_tmp"/fs-k8s-test-claude-label.err
 check "--label renders on the claude-proxy objects too (7 render sites total)" 7 \
@@ -16342,7 +16342,7 @@ check "fork-sandbox/branch is unchanged with owner+labels set" 3 \
 combined_dir="$(mk_label_config 'K8S_RUN_OWNER=example-team')"
 combined_out="$(newdir)/combined.yaml"; tmpdirs+=("$(dirname "$combined_out")")
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$combined_dir" "$k8s_sh" submit --dry-run \
-    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --branch fs-k8s-test-branch --model sonnet --harness claude \
     --label extra=example-value \
     "$proj_dir" "$handoff_file" > "$combined_out" 2>"$k8s_test_tmp"/fs-k8s-test-combined.err
 selector_block="$(grep -A4 -E 'selector:|matchLabels:' "$combined_out" || true)"
@@ -18526,7 +18526,7 @@ balance_happy_out="$(PATH="$balance_happy_hook_dir:$runstub_dir:$PATH" \
     K8S_STUB_LOG="$balance_happy_kubectl_log" \
     K8S_STUB_BASE_SHA="$rundir_head_sha" \
     FORK_SANDBOX_CONFIG_DIR="$balance_happy_config_dir" \
-    "$k8s_sh" submit --branch fs-k8s-test-balance-happy --model claude-sonnet-5 \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-happy --model sonnet \
     --harness claude "$proj_dir" "$handoff_file" 2>&1)"
 balance_happy_rc=$?
 balance_happy_rd="$(sed -n 's/^  run dir:  *//p' <<<"$balance_happy_out" | head -1)"
@@ -18584,7 +18584,7 @@ secretapply_out="$(HOME="$claude_home" PATH="$runstub_dir:$PATH" \
     K8S_STUB_LOG="$secretapply_log" K8S_STUB_SECRET_APPLY_CAPTURE="$secretapply_capture" \
     K8S_STUB_BASE_SHA="$rundir_head_sha" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" \
-    "$k8s_sh" submit --branch fs-k8s-test-secret-serverside --model claude-sonnet-5 \
+    "$k8s_sh" submit --branch fs-k8s-test-secret-serverside --model sonnet \
     --harness claude "$proj_dir" "$handoff_file" 2>&1)"
 secretapply_rc=$?
 secretapply_rd="$(sed -n 's/^  run dir:  *//p' <<<"$secretapply_out" | head -1)"
@@ -18650,7 +18650,7 @@ balance_via_out="$(FORK_SANDBOX_CONFIG_DIR="$balance_via_config_dir" \
     FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1 \
     PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$balance_via_kubectl_log" \
     K8S_STUB_BASE_SHA="$rundir_head_sha" \
-    "$k8s_sh" submit --branch fs-k8s-test-balance-via --model claude-sonnet-5 \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-via --model sonnet \
     --harness claude --claude-credentials "$balance_pool_a" \
     "$proj_dir" "$handoff_file" 2>&1)"
 balance_via_rc=$?
@@ -18677,7 +18677,7 @@ balance_via_out2="$(env -u FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA -u FORK_SANDBOX_C
     FORK_SANDBOX_CONFIG_DIR="$balance_via_config_dir" \
     PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$balance_via_kubectl_log2" \
     K8S_STUB_BASE_SHA="$rundir_head_sha" \
-    "$k8s_sh" submit --branch fs-k8s-test-balance-via2 --model claude-sonnet-5 \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-via2 --model sonnet \
     --harness claude --claude-credentials "$balance_pool_a" \
     "$proj_dir" "$handoff_file" 2>&1)"
 balance_via_rc2=$?
@@ -18720,7 +18720,7 @@ balance_resolved_out="$(HOME="$balance_resolved_home" FORK_SANDBOX_CLAUDE_CREDEN
     FORK_SANDBOX_CONFIG_DIR="$balance_via_config_dir" \
     PATH="$balance_resolved_hook_dir:$runstub_dir:$PATH" K8S_STUB_LOG="$balance_resolved_kubectl_log" \
     K8S_STUB_BASE_SHA="$rundir_head_sha" \
-    "$k8s_sh" submit --branch fs-k8s-test-balance-resolved --model claude-sonnet-5 \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-resolved --model sonnet \
     --harness claude "$proj_dir" "$handoff_file" 2>&1)"
 balance_resolved_rc=$?
 balance_resolved_rd="$(sed -n 's/^  run dir:  *//p' <<<"$balance_resolved_out" | head -1)"
@@ -18995,7 +18995,7 @@ check "--k8s --pi-args renders byte-for-byte the same as a direct run --dry-run"
 refuses "--k8s --harness claude --pi-args is still refused (by cmd_submit's harness cross-check, forwarded through)" \
     "passes flags to pi, which a claude run" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --branch fs-k8s-flag-test-piargs-bad --model claude-sonnet-5 \
+    --harness claude --branch fs-k8s-flag-test-piargs-bad --model sonnet \
     --pi-args '--thinking high' \
     "$k8s_flag_proj" "$k8s_flag_handoff"
 
@@ -19003,10 +19003,10 @@ printf '\n== fork-sandbox.sh --effort ==\n'
 effort_dispatch_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$effort_dispatch_out")")
 effort_direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$effort_direct_out")")
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --branch fs-k8s-flag-test-effort --model claude-sonnet-5 --effort max \
+    --harness claude --branch fs-k8s-flag-test-effort --model sonnet --effort max \
     "$k8s_flag_claude_proj" "$k8s_flag_handoff" > "$effort_dispatch_out" 2>"$effort_dispatch_out.err"
 HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
-    --branch fs-k8s-flag-test-effort --model claude-sonnet-5 --harness claude --effort max \
+    --branch fs-k8s-flag-test-effort --model sonnet --harness claude --effort max \
     "$k8s_flag_claude_proj" "$k8s_flag_handoff" > "$effort_direct_out" 2>/dev/null
 check "--k8s --effort renders a CLAUDE_EFFORT env" 1 \
     "$(grep -c 'name: CLAUDE_EFFORT' "$effort_dispatch_out")$(grep -i error "$effort_dispatch_out.err")"
@@ -27820,6 +27820,88 @@ fi
 # The slot was released when the push returned: free again right away.
 pc_err="$(pushcap_sh 1 1 "$pushcap_dir8" 'k8s_push_slot_take; echo took' 2>&1)" || true
 check "submit released its push slot once the push returned" "took" "$pc_err"
+
+
+printf '\n== k8s claude seats: a full Claude model id is refused, an alias gets 1M ==\n'
+# Behind the seat proxy only the CLI's [1m] aliases get the 1M window, so a
+# full Anthropic id on any claude seat is refused at submit, before any
+# kubectl call, naming the alias to use. Driven against the stubbed kubectl,
+# whose log must stay free of every create/apply (and of any call at all).
+cm_tmp="$(newdir)"; tmpdirs+=("$cm_tmp")
+cm_n=0
+# cm_rundir STEPS-JSON -> a composed run dir whose pipeline.json has STEPS.
+cm_rundir() {
+    local d
+    d="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-claude-model.XXXXXX)"
+    tmpdirs+=("$d")
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$d/run.sh"; chmod +x "$d/run.sh"
+    printf '{"steps":%s}\n' "$1" > "$d/pipeline.json"
+    printf '%s' "$d"
+}
+# cm_refused LABEL ALIAS NEEDLE SUBMIT-ARGS... -> submit must fail naming
+# ALIAS (and NEEDLE, the seat), with no kubectl call at all.
+cm_refused() {
+    local label="$1" alias="$2" needle="$3" rc=0 log out; shift 3
+    cm_n=$(( cm_n + 1 )); log="$cm_tmp/kubectl-$cm_n.log"; out="$cm_tmp/out-$cm_n.txt"
+    : > "$log"
+    HOME="$claude_home" runstub_verb "$log" "$out" submit \
+        --branch "fs-k8s-test-claude-model-$cm_n" "$@" "$proj_dir" "$handoff_file" || rc=$?
+    if (( rc == 0 )); then
+        no "$label" "submit succeeded: $(cat "$out")"
+    elif ! grep -qF -- "use '$alias' instead" "$out" || ! grep -qF -- "$needle" "$out" \
+        || ! grep -qF '200k' "$out"; then
+        no "$label" "error does not name '$alias' and '$needle' and the 200k window: $(cat "$out")"
+    elif grep -qE ' (create|apply) ' "$log" || [[ -s "$log" ]]; then
+        no "$label" "kubectl was called before the refusal: $(cat "$log")"
+    else
+        ok "$label"
+    fi
+}
+# cm_accepted LABEL SUBMIT-ARGS... -> submit --dry-run must succeed.
+cm_accepted() {
+    local label="$1" rc=0 out; shift
+    cm_n=$(( cm_n + 1 )); out="$cm_tmp/out-$cm_n.txt"
+    HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch "fs-k8s-test-claude-model-$cm_n" "$@" "$proj_dir" "$handoff_file" \
+        > "$out" 2>&1 || rc=$?
+    if (( rc == 0 )); then ok "$label"; else no "$label" "rc=$rc: $(tail -5 "$out")"; fi
+}
+
+cm_refused "--harness claude --model claude-opus-5-5 is refused, naming opus" opus \
+    "--model: model 'claude-opus-5-5'" --harness claude --model claude-opus-5-5
+cm_refused "--harness claude --model claude-sonnet-5-5 is refused, naming sonnet" sonnet \
+    "'claude-sonnet-5-5'" --harness claude --model claude-sonnet-5-5
+cm_refused "--harness claude --model claude-fable-5-2 is refused, naming fable" fable \
+    "'claude-fable-5-2'" --harness claude --model claude-fable-5-2
+cm_refused "a composed run's claude code seat with a full id is refused" opus \
+    "step 1 (code): model 'claude-opus-5-5'" --harness claude --model sonnet --run-dir "$(cm_rundir \
+    '[{"action":"code","harness":"claude","model":"claude-opus-5-5","repeat":1}]')"
+cm_refused "a composed run's claude review seat with a full id is refused" opus \
+    "step 2 (review): model 'claude-opus-5-5'" --harness claude --model sonnet --run-dir "$(cm_rundir \
+    '[{"action":"code","harness":"claude","model":"sonnet","repeat":1},
+      {"action":"review","harness":"claude","model":"claude-opus-5-5","repeat":1}]')"
+cm_refused "a composed run's claude maintain seat with a full id is refused" opus \
+    "step 2 (maintain): model 'claude-opus-5-5'" --harness claude --model sonnet --run-dir "$(cm_rundir \
+    '[{"action":"code","harness":"claude","model":"sonnet","repeat":1},
+      {"action":"maintain","harness":"claude","model":"claude-opus-5-5","repeat":1}]')"
+cm_refused "a composed run's claude fix seat with a full id is refused" opus \
+    "step 2 (review) fix seat: model 'claude-opus-5-5'" --harness pi --model moonshotai/kimi-k3 --run-dir "$(cm_rundir \
+    '[{"action":"code","harness":"pi","model":"moonshotai/kimi-k3","repeat":1},
+      {"action":"review","harness":"pi","model":"moonshotai/kimi-k3","repeat":1,
+       "fix":{"harness":"claude","model":"claude-opus-5-5","repeat":1}}]')"
+
+for cm_model in opus 'opus[1m]' 'claude-opus-5-5[1m]' haiku Qwen/Qwen3-8B; do
+    cm_accepted "--harness claude --model $cm_model is accepted" --harness claude --model "$cm_model"
+done
+cm_accepted "a full Claude id on a pi seat is left alone" --harness pi --model claude-opus-5-5
+cm_accepted "a composed run whose claude seats use opus, opus[1m], claude-opus-5-5[1m], haiku and a non-Anthropic id is accepted" \
+    --harness claude --model opus --run-dir "$(cm_rundir \
+    '[{"action":"code","harness":"claude","model":"opus","repeat":1},
+      {"action":"review","harness":"claude","model":"opus[1m]","repeat":1,
+       "fix":{"harness":"claude","model":"claude-opus-5-5[1m]","repeat":1}},
+      {"action":"maintain","harness":"claude","model":"haiku","repeat":1},
+      {"action":"review","harness":"claude","model":"Qwen/Qwen3-8B","repeat":1},
+      {"action":"review","harness":"pi","model":"claude-opus-5-5","repeat":1}]')"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

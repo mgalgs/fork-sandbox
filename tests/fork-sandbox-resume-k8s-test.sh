@@ -272,7 +272,7 @@ proj_head="$(git -C "$proj_dir" rev-parse HEAD)"
 deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
 export K8S_STUB_SESSION_DIR="$session_fixture_1" K8S_STUB_BASE_SHA="$proj_head"
 rd1="$(K8S_STUB_DELETE_SLEEP=3 run_fs --resume "$state_dir" --k8s --harness claude \
-    --model claude-sonnet-5 "$proj_dir" "$note1")"
+    --model sonnet "$proj_dir" "$note1")"
 rc1=$?
 check "submit 1: exits 0" "0" "$rc1"
 if [[ -n "$rd1" && -d "$rd1" ]]; then
@@ -330,7 +330,7 @@ check "submit 1: summary.json's session_id is the fixture's discovered id" \
 # ---------------------------------------------------------------------------
 printf '\n== --resume --k8s: a repeat submit of the SAME note is idempotent ==\n'
 # ---------------------------------------------------------------------------
-rd1b="$(run_fs --resume "$state_dir" --k8s --harness claude --model claude-sonnet-5 "$proj_dir" "$note1")"
+rd1b="$(run_fs --resume "$state_dir" --k8s --harness claude --model sonnet "$proj_dir" "$note1")"
 check "repeat submit: prints the same run dir" "$rd1" "$rd1b"
 
 # ---------------------------------------------------------------------------
@@ -340,7 +340,7 @@ branch1_tip="$(git -C "$proj_dir" rev-parse "$branch1")"
 printf 'second agent reply\n' > "$outbox_fixture/reply.md"
 printf 'second run event\n' > "$evidence_fixture/events.jsonl"
 export K8S_STUB_SESSION_DIR="$session_fixture_2" K8S_STUB_BASE_SHA="$branch1_tip"
-rd2="$(run_fs --resume "$state_dir" --base "$branch1" --k8s --harness claude --model claude-sonnet-5 \
+rd2="$(run_fs --resume "$state_dir" --base "$branch1" --k8s --harness claude --model sonnet \
     "$proj_dir" "$note2")"
 rc2=$?
 check "submit 2 (--base): exits 0" "0" "$rc2"
@@ -373,7 +373,7 @@ deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
 rd_failed="$(K8S_STUB_DELETE_SLEEP=3 K8S_STUB_RUN_COMPLETE_VALUE=1 \
     K8S_STUB_BASE_SHA="$failed_base" \
     run_fs --resume "$state_dir" --k8s --harness claude \
-    --model claude-sonnet-5 "$proj_dir" "$note_failed")"
+    --model sonnet "$proj_dir" "$note_failed")"
 if wait_for_summary "$rd_failed"; then
     ok "failed agent: collect wrote summary.json"
 else
@@ -461,7 +461,7 @@ rm -f -- "$outbox_fixture/reply.md"
 branch2_tip="$(git -C "$proj_dir" rev-parse "$branch2")"
 export K8S_STUB_SESSION_DIR="$session_fixture_2" K8S_STUB_BASE_SHA="$branch2_tip"
 rd3="$(K8S_STUB_JOB_APPLY_SLEEP=3 run_fs --resume "$state_dir" --base "$branch2" --k8s \
-    --harness claude --model claude-sonnet-5 "$proj_dir" "$note3")"
+    --harness claude --model sonnet "$proj_dir" "$note3")"
 rc3=$?
 check "submit 3: exits 0" "0" "$rc3"
 
@@ -505,7 +505,7 @@ note4="$notes_dir/note4.md"; printf 'fourth note\n' > "$note4"
 branch3_tip="$(git -C "$proj_dir" rev-parse "$branch2")"
 export K8S_STUB_BASE_SHA="$branch3_tip"
 rd4="$(K8S_STUB_APPLY_RC=1 run_fs --resume "$state_dir" --base "$branch2" --k8s \
-    --harness claude --model claude-sonnet-5 "$proj_dir" "$note4")"
+    --harness claude --model sonnet "$proj_dir" "$note4")"
 for _ in $(seq 1 100); do
     [[ "$("$status_sh" --json "$rd4" 2>/dev/null | jq -r '.state' 2>/dev/null)" == failed ]] && break
     sleep 0.2
@@ -537,7 +537,7 @@ shared_state="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-shared-state.XXXX
 shared_root="$(mktmp_dir /var/tmp/claude-scratch/fs-resumek8s-shared.XXXXXX)"
 printf 'first shared reply\n' > "$outbox_fixture/reply.md"
 printf 'first shared event\n' > "$evidence_fixture/events.jsonl"
-shared_rd1="$(run_fs --resume "$shared_state" --k8s --harness claude --model claude-sonnet-5 \
+shared_rd1="$(run_fs --resume "$shared_state" --k8s --harness claude --model sonnet \
     --outbox-dir "$shared_root/outbox" "$proj_dir" "$note1")"
 wait_for_summary "$shared_rd1" || no "shared outbox: first run completed"
 check "shared outbox: first reply extracted" "first shared reply" \
@@ -547,7 +547,7 @@ shared_tip="$(git -C "$proj_dir" rev-parse "$shared_branch")"
 printf 'second shared reply\n' > "$outbox_fixture/reply.md"
 printf 'second shared event\n' > "$evidence_fixture/events.jsonl"
 shared_rd2="$(K8S_STUB_BASE_SHA="$shared_tip" run_fs --resume "$shared_state" --base "$shared_branch" \
-    --k8s --harness claude --model claude-sonnet-5 --outbox-dir "$shared_root/outbox" "$proj_dir" "$note2")"
+    --k8s --harness claude --model sonnet --outbox-dir "$shared_root/outbox" "$proj_dir" "$note2")"
 wait_for_summary "$shared_rd2" || no "shared outbox: second run completed"
 if [[ -s "$shared_rd2/outbox/reply.md" ]] \
     && [[ "$(cat "$shared_rd2/outbox/reply.md")" != 'first shared reply' ]]; then
@@ -572,7 +572,7 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"The answer is 42."
 deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
 reply_rd="$(K8S_STUB_BASE_SHA="$proj_head" K8S_STUB_FETCH_REF_OVERRIDE=0 \
     K8S_STUB_OUTBOX_DIR_OVERRIDE="$empty_outbox" run_fs --resume "$reply_state" \
-    --k8s --harness claude --model claude-sonnet-5 "$proj_dir" "$reply_note")"
+    --k8s --harness claude --model sonnet "$proj_dir" "$reply_note")"
 wait_for_summary "$reply_rd" || no "reply-only note completed"
 if wait_for_teardown "$deletes_before" "$reply_rd" \
     && [[ "$(cat "$reply_rd/exit-code" 2>/dev/null)" == 0 ]] \
@@ -588,7 +588,7 @@ empty_base_tip="$(git -C "$proj_dir" rev-parse "$branch1")"
 deletes_before="$(grep -c ' delete job ' "$K8S_STUB_LOG" || true)"
 empty_rd="$(K8S_STUB_BASE_SHA="$empty_base_tip" K8S_STUB_FETCH_REF_OVERRIDE=0 \
     K8S_STUB_OUTBOX_DIR_OVERRIDE="$empty_outbox" run_fs --resume "$reply_state" \
-    --base "$branch1" --k8s --harness claude --model claude-sonnet-5 \
+    --base "$branch1" --k8s --harness claude --model sonnet \
     "$proj_dir" "$empty_note")"
 wait_for_summary "$empty_rd" || no "empty note completed"
 for _ in $(seq 1 100); do

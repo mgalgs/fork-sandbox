@@ -91,6 +91,12 @@ Do these in order.
    then the existing enabled default. `fleet check --cluster` requires a
    YAML boolean.
 
+   A claude seat (or a claude agent of a seat's preset) must name its model
+   by alias (`opus`, `sonnet`, `fable`, `haiku`), not by a full Claude id
+   such as `claude-opus-5-5`: in a pod only the alias gets the 1M context
+   window, so `submit` refuses a full id and `fleet check --cluster` flags
+   one, naming the alias to use.
+
    `K8S_AGENT_PRIORITY_CLASS` applies to agent Jobs and their per-run proxy
    Pods. The PriorityClass must already exist; `install` checks and warns
    if it cannot find it, but does not create it.

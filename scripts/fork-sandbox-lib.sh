@@ -198,6 +198,32 @@ fs_reject_unsafe_chars() {
     return 0
 }
 
+# A k8s claude seat reaches the model through the seat proxy, and behind a
+# proxy the claude CLI grants a model its 1M context window only through the
+# CLI's own [1m] alias (the pod maps opus/sonnet/fable to opus[1m] and so
+# on). A full Anthropic id such as claude-opus-5-5 there silently gets a
+# 200k window instead, so the k8s path refuses one. Prints the alias to use
+# instead for such an id and returns 0; returns 1 (printing nothing) for any
+# model that is fine as it is: an alias, an id already ending in [1m], a
+# model with no [1m] alias (haiku), or a non-Anthropic id.
+fs_claude_k8s_alias_for() {
+    case "$1" in
+        *"[1m]") return 1 ;;
+        claude-opus-*) printf 'opus\n' ;;
+        claude-sonnet-*) printf 'sonnet\n' ;;
+        claude-fable-*) printf 'fable\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+# The refusal line for a k8s claude seat ($1 names it, e.g. "--model" or
+# "step 2 (review)") whose model $2 fs_claude_k8s_alias_for refuses, with
+# that alias $3. One line, so a caller can prefix it.
+fs_claude_k8s_refusal() {
+    printf "%s: model '%s' is a full Claude model id, which gets a 200k context window behind the k8s seat proxy; use '%s' instead, which gets the 1M window there.\n" \
+        "$1" "$2" "$3"
+}
+
 # Reads one NAME=VALUE line from an env file, first match wins. This is the
 # same first-match, never-`source`d contract fork-sandbox-k8s.sh's own
 # read_env_value applies to k8s.env and pi.env -- kept as a second, identical

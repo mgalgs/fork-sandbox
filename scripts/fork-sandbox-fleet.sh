@@ -151,6 +151,11 @@
 #                  compared by its part before any `/` (a preset may
 #                  write `codex/<model>`); presets are read with
 #                  fork-sandbox-preset-parse.py, never a second parser.
+#                  A claude seat or claude preset agent whose model is a
+#                  full Claude id (claude-opus-*, claude-sonnet-*,
+#                  claude-fable-*, not ending in [1m]) is refused too,
+#                  naming the alias to use: on the cluster it would get a
+#                  200k window, and submit refuses it.
 #                  Handler seats stay legal. Without --cluster, `check`
 #                  behaves exactly as it always has.
 #   resolve <name> Print exactly twenty-three lines for one agent: harness,
@@ -496,6 +501,17 @@ cluster_harness_refusal() {
     esac
 }
 
+# A cluster seat on harness $2 ("claude", or anything else to pass) with
+# model $3 must not be a full Claude model id: the cluster refuses one at
+# submit (see fs_claude_k8s_alias_for). $1 names it in the error.
+cluster_claude_model_ok() {
+    local alias
+    [[ "$2" == claude ]] || return 0
+    alias="$(fs_claude_k8s_alias_for "$3")" || return 0
+    echo "Error: $1: $(fs_claude_k8s_refusal "harness claude" "$3" "$alias")" >&2
+    return 1
+}
+
 # The extra refusals of `check --cluster` (see the header). $1 is the fleet
 # dump, the rest are every agent name. Prints every error found, not just
 # the first.
@@ -533,6 +549,7 @@ check_cluster() {
             echo "Error: agents.$name.harness: $(cluster_harness_refusal "${eff_harness%%/*}") (resolved harness '$eff_harness')." >&2
             rc=1
         fi
+        cluster_claude_model_ok "agents.$name.model" "${eff_harness%%/*}" "${seat[1]-}" || rc=1
         [[ -n "$preset" ]] || continue
         check_cluster_preset "$name" preset "$preset" || rc=1
     done
@@ -550,9 +567,17 @@ check_cluster_preset() {
         echo "Error: agents.$name.$key: preset '$preset' could not be parsed, so a cluster postmaster cannot tell what harnesses it runs." >&2
         return 1
     fi
+    local -A preset_harness=()
     while IFS=$'\t' read -r preset_kind preset_agent preset_field preset_value; do
-        [[ "$preset_kind" == agent && "$preset_field" == harness ]] || continue
+        [[ "$preset_kind" == agent ]] || continue
+        if [[ "$preset_field" == model ]]; then
+            cluster_claude_model_ok "agents.$name.$key: preset '$preset' agent '$preset_agent'" \
+                "${preset_harness[$preset_agent]-}" "$preset_value" || rc=1
+            continue
+        fi
+        [[ "$preset_field" == harness ]] || continue
         local preset_leg="${preset_value%%/*}"
+        preset_harness[$preset_agent]="$preset_leg"
         if ! cluster_harness_ok "$preset_leg"; then
             echo "Error: agents.$name.$key: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; $(cluster_harness_refusal "$preset_leg")." >&2
             rc=1

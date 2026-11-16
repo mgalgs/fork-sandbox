@@ -6917,6 +6917,36 @@ cmd_submit() {
             | unique | .[]' "$run_dir_flag/pipeline.json" 2>/dev/null)"
     fi
 
+    # Every claude seat must get the 1M window, which behind the seat proxy
+    # only the CLI's own aliases carry (see fs_claude_k8s_alias_for): a full
+    # Anthropic id there runs silently at 200k, so it is refused here, before
+    # anything is created. Runner mode checks every claude seat pipeline.json
+    # names, each step's and each fix seat's; a legacy run's only claude leg
+    # is --model's (its review loop always runs pi).
+    local claude_seat_bad=0 claude_seat_alias claude_seat_name claude_seat_model
+    if [[ "$harness" == claude ]] && claude_seat_alias="$(fs_claude_k8s_alias_for "$model")"; then
+        echo "Error: $(fs_claude_k8s_refusal --model "$model" "$claude_seat_alias")" >&2
+        claude_seat_bad=1
+    fi
+    if [[ -n "$run_dir_flag" ]]; then
+        while IFS=$'\t' read -r claude_seat_name claude_seat_model; do
+            [[ -n "$claude_seat_name" ]] || continue
+            claude_seat_alias="$(fs_claude_k8s_alias_for "$claude_seat_model")" || continue
+            echo "Error: $(fs_claude_k8s_refusal "$claude_seat_name" "$claude_seat_model" "$claude_seat_alias")" >&2
+            claude_seat_bad=1
+        done < <(jq -r '
+            .steps | to_entries[] | (.key + 1) as $n | .value as $s
+            | (if $s.harness == "claude" and ($s.model | type) == "string"
+               then ["step \($n) (\($s.action))", $s.model] else empty end),
+              (if $s.fix != null and $s.fix.harness == "claude" and ($s.fix.model | type) == "string"
+               then ["step \($n) (\($s.action)) fix seat", $s.fix.model] else empty end)
+            | @tsv' "$run_dir_flag/pipeline.json")
+    fi
+    if (( claude_seat_bad )); then
+        echo "A k8s claude seat always runs with the 1M window; nothing was created." >&2
+        exit 1
+    fi
+
     # --task-meta never enters the pod -- it is written straight to a file
     # in the run directory, where sandbox-run-log.py's `record` (invoked by
     # cmd_collect) picks it up as the record's `task` object -- so the check
