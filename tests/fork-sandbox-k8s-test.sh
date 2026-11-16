@@ -437,8 +437,7 @@ pass=0; fail=0; tmpdirs=()
 # tells this run's dirs from a concurrent run's (k8s_test_owns_rundir).
 k8s_test_tmp="$(realpath "$(mktemp -d)")"; tmpdirs+=("$k8s_test_tmp")
 export TMPDIR="$k8s_test_tmp"
-# The fixture projects that must live under ~/src instead (the project-root
-# rule), one per line, so the sweep claims their runs too. A file, not an
+# The fixture projects created under ~/src, one per line, so the sweep claims their runs too. A file, not an
 # array: new_src_project runs in a command substitution.
 k8s_test_src_projects="$k8s_test_tmp/src-projects"
 : > "$k8s_test_src_projects"

@@ -81,10 +81,8 @@ mkdir -p "$FORK_SANDBOX_CONFIG_DIR"
 # cannot route a fixture run, nor refuse it outright when the machine's
 # live quota is tight.
 launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
-# The launcher's own security boundary requires the project to live under
-# ~/src -- which it resolves against the scratch HOME above, so fixture
-# projects must live there too (and the suite stops littering the real
-# ~/src as a side effect).
+# Fixture projects live under ~/src, resolved against the scratch HOME above,
+# so the suite does not litter the real ~/src.
 mkdir -p "$launcher_home/src"
 # --review-loop refuses to start unless the review kit's skill directories
 # exist under $HOME/.claude/skills (fork-sandbox.sh's review_skill_src

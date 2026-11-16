@@ -2456,9 +2456,8 @@ mkdir -p "$real_presets"
 # cannot route a fixture run, nor refuse it outright when the machine's
 # live quota is tight.
 launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
-# The launcher's own security boundary requires the project to live under
-# ~/src -- which it resolves against the scratch HOME above, so fixture
-# projects must live there too.
+# Fixture projects live under ~/src, resolved against the scratch HOME above,
+# so the suite does not litter the real ~/src.
 mkdir -p "$launcher_home/src"
 # --review-loop (reached here via presets with a review pipeline step, e.g.
 # composed/reviewloop/sealed-review/fixseat) refuses to start unless the

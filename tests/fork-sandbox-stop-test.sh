@@ -64,10 +64,8 @@ export FORK_SANDBOX_BY_SESSION_DIR="$fs_by_session_scratch"
 # live quota is tight. The guard near the end of this file holds the
 # archive half of this.
 launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
-# The launcher's own security boundary requires the project to live under
-# ~/src -- which it resolves against the scratch HOME above, so fixture
-# projects must live there too (and the suite stops littering the real
-# ~/src as a side effect). sandbox-run-log.py's record() opens its
+# Fixture projects live under ~/src, resolved against the scratch HOME above,
+# so the suite does not litter the real ~/src. sandbox-run-log.py's record() opens its
 # ~/.claude/sandbox-runs.jsonl in append mode and does not create the
 # parent directory itself, so on a genuinely empty HOME (no prior real
 # usage to have created it) record() fails outright -- pre-create it here

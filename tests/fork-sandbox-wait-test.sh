@@ -63,9 +63,8 @@ export FORK_SANDBOX_BY_SESSION_DIR="$fs_by_session_scratch"
 # fixture run. The guard near the end of this file holds the archive half
 # of this.
 launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
-# The launcher's own security boundary requires the project to live under
-# ~/src, resolved against the scratch HOME above -- fixture projects must
-# live there too. sandbox-run-log.py's record() opens
+# Fixture projects live under ~/src, resolved against the scratch HOME above,
+# so the suite does not litter the real ~/src. sandbox-run-log.py's record() opens
 # ~/.claude/sandbox-runs.jsonl in append mode without creating the parent
 # itself, so pre-create it rather than relying on a prior real run having
 # already done so.

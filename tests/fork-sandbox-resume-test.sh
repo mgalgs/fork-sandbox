@@ -100,8 +100,8 @@ mktmp_dir() { local d; d="$(mktemp -d "$1")"; tmpdirs+=("$d"); printf '%s' "$d";
 printf '== fork-sandbox.sh: the refusals ==\n'
 # ---------------------------------------------------------------------------
 
-# A handoff has to live in the scratch root, and a project under ~/src, or
-# the launcher refuses for those reasons instead of the ones under test.
+# A handoff has to live in the scratch root, or the launcher refuses for that
+# reason instead of the ones under test.
 refusal_handoff_dir="$(mktmp_dir "$scratch/fs-resume-ho.XXXXXX")"
 refusal_handoff="$refusal_handoff_dir/handoff.md"
 printf 'do the task\n' > "$refusal_handoff"

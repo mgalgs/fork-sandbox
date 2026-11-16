@@ -153,9 +153,8 @@ STUB
 # scratch HOME below closes the archive-leak half without changing how any
 # credential or config fixture is built or injected.
 launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
-# The launcher's own security boundary requires the project to live under
-# ~/src -- which it resolves against the scratch HOME above, so fixture
-# projects must live there too.
+# Fixture projects live under ~/src, resolved against the scratch HOME above,
+# so the suite does not litter the real ~/src.
 mkdir -p "$launcher_home/src"
 # The review-leg case below drives --review-loop, which refuses to start
 # unless the review kit's skill directories exist under $HOME/.claude/skills.
