@@ -2462,6 +2462,7 @@ if $no_repo; then
     elif [[ -n "$cover_only_base" ]]; then no_repo_conflict="--cover-only"
     elif [[ -n "$finalize_script_file" ]]; then no_repo_conflict="--finalize-script"
     elif $allow_existing_branch; then no_repo_conflict="--allow-existing-branch"
+    elif $require_services; then no_repo_conflict="--require-services"
     fi
     if [[ -n "$no_repo_conflict" ]]; then
         echo "Error: --no-repo cannot be combined with $no_repo_conflict: it" >&2

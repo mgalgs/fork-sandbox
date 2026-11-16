@@ -144,6 +144,7 @@ refuse "--pipeline is refused" "--pipeline" --no-repo --pipeline csonnet "$hando
 refuse "--k8s is refused" "--k8s" --no-repo --k8s "$handoff"
 refuse "--clone-dir is refused" "--clone-dir" --no-repo --clone-dir /var/tmp/claude-scratch/x "$handoff"
 refuse "--finalize-script is refused" "--finalize-script" --no-repo --finalize-script "$handoff" "$handoff"
+refuse "--require-services is refused" "--require-services" --no-repo --require-services "$handoff"
 rm -f "$work/argv-refuse"
 # --resume is intercepted ahead of the option loop.
 before="$(run_dirs)"
