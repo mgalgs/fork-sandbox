@@ -668,6 +668,13 @@ default. The postmaster pod carries the same `k8s.env`, so the keys apply to
 the seats it launches once `install --postmaster` has been re-run; see "The
 agent's container resources" in [kubernetes-runs.md](kubernetes-runs.md).
 
+Each wake's submit pushes the project's full history into its seat pod, and
+that push runs inside the postmaster container. At most
+`K8S_PUSH_CONCURRENCY` (default `2`) such pushes run at once; the rest wait up
+to `K8S_PUSH_SLOT_WAIT` seconds (default `240`) for a slot, so a burst of
+wakes cannot add up to the container's memory limit. See "Concurrent
+repository pushes" in [kubernetes-runs.md](kubernetes-runs.md).
+
 The postmaster container itself defaults to a `250m` / `512Mi` request and
 a `1` / `1Gi` limit. A postmaster pinned at its cpu limit is CFS-throttled,
 and every seat wake waits on it; raise it with `K8S_POSTMASTER_LIMITS_CPU`

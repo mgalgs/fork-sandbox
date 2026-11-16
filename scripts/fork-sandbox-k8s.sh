@@ -979,6 +979,21 @@
 #                         budget of its own: time spent quota-blocked does
 #                         not count against the pod-ready budget. Other
 #                         create errors stay fatal.
+#   K8S_PUSH_CONCURRENCY=
+#                         how many full repository pushes into agent pods
+#                         may run at once from this host (or postmaster
+#                         pod). Optional; defaults to 2; a positive
+#                         integer (refused otherwise). Each push's
+#                         pack-objects can take hundreds of MiB on a large
+#                         repo, so a burst of submits is capped here rather
+#                         than left to add up. Only the repository push is
+#                         gated: Job creation, the pod-ready wait and the
+#                         small context/thread/attachment pushes are not.
+#   K8S_PUSH_SLOT_WAIT=   how long one submit waits for a free push slot
+#                         before failing, naming both keys. Optional;
+#                         defaults to 240; a positive integer under 300,
+#                         the pod's INPUTS_TIMEOUT, which is already
+#                         running while submit waits.
 #   GIT_USER_NAME=, GIT_USER_EMAIL=
 #                         identity the pod's commits land under. Optional;
 #                         default to a fixed fork-sandbox identity.
@@ -1568,6 +1583,17 @@ K8S_SERVICE_MAX_STARTUP_SECONDS="${K8S_SERVICE_MAX_STARTUP_SECONDS:-600}"
 # pod-ready budget -- see k8s_quota_wait_step.
 K8S_QUOTA_WAIT_SECONDS="$(read_env_value "$k8s_env" K8S_QUOTA_WAIT_SECONDS || true)"
 K8S_QUOTA_WAIT_SECONDS="${K8S_QUOTA_WAIT_SECONDS:-900}"
+# How many full repository pushes into pods may run at once from this host,
+# and how long one submit waits for a free slot -- see k8s_push_slot_take.
+K8S_PUSH_CONCURRENCY="$(read_env_value "$k8s_env" K8S_PUSH_CONCURRENCY || true)"
+K8S_PUSH_CONCURRENCY="${K8S_PUSH_CONCURRENCY:-2}"
+K8S_PUSH_SLOT_WAIT="$(read_env_value "$k8s_env" K8S_PUSH_SLOT_WAIT || true)"
+K8S_PUSH_SLOT_WAIT="${K8S_PUSH_SLOT_WAIT:-240}"
+# The pod entrypoint's INPUTS_TIMEOUT default (fork-sandbox-k8s-entrypoint.sh),
+# counted from container start: a slot wait that reaches it can only end in a
+# pod that has already given up on its inputs, so K8S_PUSH_SLOT_WAIT must stay
+# under it.
+K8S_POD_INPUTS_TIMEOUT=300
 # The namespace ResourceQuota's five limits, substituted into
 # manifests/k8s/00-namespace.yaml by cmd_install, which also validates them
 # (only install renders the quota, so no other verb fails over a bad one).
@@ -1895,6 +1921,17 @@ fi
 if [[ "${1-}" != check-grant && ! "$K8S_QUOTA_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: K8S_QUOTA_WAIT_SECONDS must be a positive integer, got" >&2
     echo "'$K8S_QUOTA_WAIT_SECONDS'." >&2
+    exit 1
+fi
+if [[ "${1-}" != check-grant && ! "$K8S_PUSH_CONCURRENCY" =~ ^[1-9][0-9]{0,2}$ ]]; then
+    echo "Error: K8S_PUSH_CONCURRENCY must be a positive integer (at most 999)," >&2
+    echo "got '$K8S_PUSH_CONCURRENCY'." >&2
+    exit 1
+fi
+if [[ "${1-}" != check-grant ]] && { [[ ! "$K8S_PUSH_SLOT_WAIT" =~ ^[1-9][0-9]{0,5}$ ]] \
+    || (( K8S_PUSH_SLOT_WAIT >= K8S_POD_INPUTS_TIMEOUT )); }; then
+    echo "Error: K8S_PUSH_SLOT_WAIT must be a positive integer of seconds under" >&2
+    echo "the pod's ${K8S_POD_INPUTS_TIMEOUT}s INPUTS_TIMEOUT, got '$K8S_PUSH_SLOT_WAIT'." >&2
     exit 1
 fi
 if [[ "${1-}" != check-grant ]]; then
@@ -9488,10 +9525,21 @@ EOF
     for er_i in "${!extra_ref_names[@]}"; do
         extra_refspecs+=("${extra_ref_shas[$er_i]}:refs/heads/${extra_ref_names[$er_i]}")
     done
+    # The push is the one step gated by K8S_PUSH_CONCURRENCY (see
+    # k8s_push_slot_take); the slot is released the moment git returns.
+    # -c pack.threads=1: a single-threaded pack-objects peaks lower, and
+    # the CPU is better spent elsewhere. The push itself runs with the
+    # slot's fd closed, so a git or kubectl that outlives a killed
+    # launcher never keeps the slot held.
     local push_rc=0
-    (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null push --quiet \
-        "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i -c agent $pod_name -- git-receive-pack /work/repo.git" \
-        "$push_src:refs/heads/$branch" "${extra_refspecs[@]}") || push_rc=$?
+    k8s_push_slot_take || exit 1
+    (
+        [[ -z "$K8S_PUSH_SLOT_FD" ]] || exec {K8S_PUSH_SLOT_FD}>&-
+        cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null -c pack.threads=1 push --quiet \
+            "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i -c agent $pod_name -- git-receive-pack /work/repo.git" \
+            "$push_src:refs/heads/$branch" "${extra_refspecs[@]}"
+    ) || push_rc=$?
+    k8s_push_slot_release
     if (( push_rc != 0 )); then
         echo "Error: the repository push to pod $pod_name failed (git exit $push_rc)." >&2
         echo "fork-sandbox-k8s: the pod's agent container log, for the reason:" >&2
@@ -12398,6 +12446,108 @@ cmd_collect() {
         [[ -n "$run_dir" ]] && rm -f -- "$run_dir/.reap-pending"
     fi
     trap - ERR
+}
+
+# The repository push into a pod's /work/repo.git runs git pack-objects on
+# this host, which on a large repo peaks at hundreds of MiB. A burst of
+# submits (every wake a postmaster pod starts is a child process of it) would
+# otherwise add those up until something is OOM-killed, taking every wake in
+# flight with it. So at most K8S_PUSH_CONCURRENCY such pushes run at once:
+# one lock file per slot (slot-0 .. slot-N-1) in a directory every submit on
+# this host shares, each held with flock(2) on an fd this process keeps open.
+# A launcher killed mid-push releases its slot when the kernel closes that
+# fd -- no pid files and no stale-lock cleanup.
+#
+# The directory sits under the scratch root every submit already uses for
+# its run dirs, which inside a postmaster pod is its data volume: shared by
+# all of that pod's wakes and writable there. FS_K8S_PUSH_SLOT_DIR
+# overrides it (the test suite uses this).
+K8S_PUSH_SLOT_FD=""
+k8s_push_slot_dir() {
+    printf '%s\n' "${FS_K8S_PUSH_SLOT_DIR:-/var/tmp/claude-scratch/forks/.k8s-push-slots}"
+}
+
+# Takes a free push slot, polling every slot until one frees up or
+# K8S_PUSH_SLOT_WAIT seconds pass. Returns 0 holding one (its fd in
+# K8S_PUSH_SLOT_FD), or 0 holding none, with a warning, when this host
+# cannot take the locks at all (no flock(1), an unwritable directory, a
+# filesystem without flock): the push then runs ungated, as the driver lock
+# above degrades, because an uncapped push is better than a failed wake.
+# Returns 1, with an error naming both keys, when the wait runs out.
+k8s_push_slot_take() {
+    local dir cap="$K8S_PUSH_CONCURRENCY" max_wait="$K8S_PUSH_SLOT_WAIT"
+    local i fd rc start now waited=false
+    local -a fds=()
+    K8S_PUSH_SLOT_FD=""
+    dir="$(k8s_push_slot_dir)"
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "fork-sandbox-k8s: warning: flock is not installed; pushing without" \
+            "the K8S_PUSH_CONCURRENCY cap." >&2
+        return 0
+    fi
+    if ! mkdir -p -- "$dir" 2>/dev/null; then
+        echo "fork-sandbox-k8s: warning: cannot create $dir; pushing without" \
+            "the K8S_PUSH_CONCURRENCY cap." >&2
+        return 0
+    fi
+    for (( i = 0; i < cap; i++ )); do
+        if ! { exec {fd}>>"$dir/slot-$i"; } 2>/dev/null; then
+            for fd in "${fds[@]}"; do exec {fd}>&-; done
+            echo "fork-sandbox-k8s: warning: cannot open $dir/slot-$i; pushing" \
+                "without the K8S_PUSH_CONCURRENCY cap." >&2
+            return 0
+        fi
+        fds+=("$fd")
+    done
+    start="$(date +%s)"
+    while true; do
+        for i in "${!fds[@]}"; do
+            # -E 3: flock(1) exits 1 on some plain errors too, so give
+            # "held by someone else" a code of its own.
+            rc=0
+            flock -E 3 -n -x "${fds[$i]}" 2>/dev/null || rc=$?
+            if (( rc == 0 )); then
+                K8S_PUSH_SLOT_FD="${fds[$i]}"
+                for fd in "${fds[@]}"; do
+                    [[ "$fd" == "$K8S_PUSH_SLOT_FD" ]] || exec {fd}>&-
+                done
+                if [[ "$waited" == true ]]; then
+                    echo "fork-sandbox-k8s: got repository push slot $i after" \
+                        "$(( $(date +%s) - start ))s." >&2
+                fi
+                return 0
+            fi
+            if (( rc != 3 )); then
+                for fd in "${fds[@]}"; do exec {fd}>&-; done
+                echo "fork-sandbox-k8s: warning: cannot flock $dir/slot-$i (flock" \
+                    "exit $rc); pushing without the K8S_PUSH_CONCURRENCY cap." >&2
+                return 0
+            fi
+        done
+        now="$(date +%s)"
+        if [[ "$waited" == false ]]; then
+            echo "fork-sandbox-k8s: all $cap repository push slots are busy" \
+                "(K8S_PUSH_CONCURRENCY=$cap); waiting up to ${max_wait}s for one." >&2
+            waited=true
+        fi
+        if (( now - start >= max_wait )); then
+            for fd in "${fds[@]}"; do exec {fd}>&-; done
+            echo "Error: no repository push slot came free within ${max_wait}s" >&2
+            echo "(K8S_PUSH_SLOT_WAIT): all $cap slots (K8S_PUSH_CONCURRENCY) stayed busy." >&2
+            echo "Raise either key in k8s.env, or submit fewer runs at once." >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+# Releases the slot k8s_push_slot_take took, if any. Safe to call twice.
+k8s_push_slot_release() {
+    local fd="$K8S_PUSH_SLOT_FD"
+    [[ -n "$fd" ]] || return 0
+    K8S_PUSH_SLOT_FD=""
+    flock -u "$fd" 2>/dev/null || true
+    exec {fd}>&-
 }
 
 # DIR/.driver.lock, held exclusively by whichever process drives a run

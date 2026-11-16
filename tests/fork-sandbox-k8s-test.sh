@@ -376,6 +376,16 @@
 #     field and the key; a malformed key value is refused naming k8s.env,
 #     not the spec; and `validate-services` applies the same resolution
 #     and prints which rule it used.
+#   - K8S_PUSH_CONCURRENCY: the push-slot gate's own functions, driven
+#     against a private slot directory, never let more than the cap of
+#     concurrent stub pushes in at once; a slot whose holder was SIGKILLed
+#     is free for the next push with no cleanup; a wait that runs out
+#     fails naming K8S_PUSH_SLOT_WAIT and K8S_PUSH_CONCURRENCY, and a wait
+#     that ends logs the seconds waited; an unusable slot directory warns
+#     and pushes ungated; malformed values of either key are refused before
+#     any kubectl call; and a real submit (stubbed kubectl and git) fails
+#     without pushing while every slot is held, and otherwise pushes with
+#     -c pack.threads=1 and releases its slot.
 #   - `peek <run-dir>`, driven against the same kind of stubbed kubectl the
 #     rest of this file uses, its own exec call re-run for real (through the
 #     stub) against a fixture directory standing in for the pod's own
@@ -7892,7 +7902,9 @@ status_sh="$repo_dir/scripts/fork-sandbox-status.sh"
 cat > "$runstub_dir/git" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
-    *" push "*) exit 0 ;;
+    *" push "*)
+        [[ -z "${K8S_STUB_GIT_LOG:-}" ]] || printf '%s\n' "$*" >> "$K8S_STUB_GIT_LOG"
+        exit 0 ;;
     *" fetch "*)
         # Emulate the real fetch's refspec refs/heads/X:refs/heads/X,
         # which creates the local branch at the pod's tip even when the
@@ -12906,7 +12918,7 @@ fi
 # remote-tracking ref (githooks(5): reference-transaction "is invoked by any
 # Git command that performs reference updates"). Scoped the same way as
 # protocol.ext.allow=always, and checked the same way here.
-if grep -qE 'git -c protocol\.ext\.allow=always -c core\.hooksPath=/dev/null push' "$k8s_sh"; then
+if grep -qE 'git -c protocol\.ext\.allow=always -c core\.hooksPath=/dev/null (-c [^ ]+ )*push' "$k8s_sh"; then
     ok "submit's git push scopes core.hooksPath=/dev/null"
 else
     no "submit's git push scopes core.hooksPath=/dev/null" "not found in $k8s_sh"
@@ -27615,6 +27627,199 @@ if grep -q -- ' get pod -l job-name=.*--request-timeout=10s' "$peek_log4" \
 else
     no "peek: both the pod lookup and the exec carry the same request-timeout bound" "$(cat "$peek_log4")"
 fi
+
+
+printf '\n== K8S_PUSH_CONCURRENCY: repository pushes into pods are capped per host ==\n'
+# The slot gate's own functions, extracted from the script and driven
+# directly against a private slot directory: the real implementation, with
+# a stub "push" in place of git. Every property below is decided by flock
+# state, never by how the timing happens to fall.
+pushcap_fns="$(sed -n '/^K8S_PUSH_SLOT_FD=""$/,/^}$/p; /^k8s_push_slot_take() {$/,/^}$/p; /^k8s_push_slot_release() {$/,/^}$/p' "$k8s_sh")"
+# pushcap_sh CAP WAIT DIR SCRIPT -> runs SCRIPT after the gate's functions.
+pushcap_sh() {
+    K8S_PUSH_CONCURRENCY="$1" K8S_PUSH_SLOT_WAIT="$2" FS_K8S_PUSH_SLOT_DIR="$3" \
+        bash -c "set -euo pipefail
+$pushcap_fns
+$4"
+}
+pushcap_tmp="$(newdir)"; tmpdirs+=("$pushcap_tmp")
+
+# 1. Six concurrent gated pushes under a cap of 2. The stub push counts the
+# pushes inside the gate (under its own lock) and records the count each
+# one saw on entry; the highest count recorded must never exceed the cap.
+pushcap_dir1="$pushcap_tmp/slots1"
+printf '0\n' > "$pushcap_tmp/inflight"
+: > "$pushcap_tmp/seen"
+pushcap_worker='k8s_push_slot_take
+( flock 8; n=$(( $(cat "$PC_TMP/inflight") + 1 )); printf "%s\n" "$n" > "$PC_TMP/inflight"; printf "%s\n" "$n" >> "$PC_TMP/seen" ) 8>>"$PC_TMP/count.lock"
+sleep 0.4
+( flock 8; n=$(( $(cat "$PC_TMP/inflight") - 1 )); printf "%s\n" "$n" > "$PC_TMP/inflight" ) 8>>"$PC_TMP/count.lock"
+k8s_push_slot_release'
+pushcap_pids=()
+for _ in 1 2 3 4 5 6; do
+    PC_TMP="$pushcap_tmp" pushcap_sh 2 60 "$pushcap_dir1" "$pushcap_worker" \
+        2>>"$pushcap_tmp/workers.err" &
+    pushcap_pids+=("$!")
+done
+pushcap_rcs=""
+for pc_pid in "${pushcap_pids[@]}"; do
+    pc_rc=0; wait "$pc_pid" || pc_rc=$?; pushcap_rcs+="$pc_rc"
+done
+pushcap_max="$(sort -n "$pushcap_tmp/seen" | tail -1)"
+check "six gated pushes under a cap of 2 all complete" "000000 6" \
+    "$pushcap_rcs $(grep -c . "$pushcap_tmp/seen")"
+if [[ -n "$pushcap_max" ]] && (( pushcap_max >= 1 && pushcap_max <= 2 )); then
+    ok "six gated pushes under a cap of 2 never overlap more than 2 at once"
+else
+    no "six gated pushes under a cap of 2 never overlap more than 2 at once" \
+        "max in flight '$pushcap_max'; $(cat "$pushcap_tmp/workers.err")"
+fi
+check "the gate made exactly the 2 slot files the cap names" "slot-0 slot-1" \
+    "$(cd "$pushcap_dir1" 2>/dev/null && echo slot-*)"
+
+# 2. A slot whose holder is SIGKILLed is free for the next push, with no
+# cleanup step in between. The holder takes the only slot (cap 1) and then
+# becomes `sleep` in place, so the killed pid is the one holding the fd.
+pushcap_dir2="$pushcap_tmp/slots2"
+pushcap_holder() { # DIR READY-FILE -> pid of a process holding the one slot
+    # Its output goes nowhere: this runs inside $(...), which would
+    # otherwise wait for the holder to close that pipe.
+    pushcap_sh 1 60 "$1" "k8s_push_slot_take; : > '$2'; exec sleep 300" >/dev/null 2>&1 &
+    local pid=$! n=0
+    while [[ ! -e "$2" ]] && (( n++ < 100 )); do sleep 0.1; done
+    printf '%s\n' "$pid"
+}
+pc_holder="$(pushcap_holder "$pushcap_dir2" "$pushcap_tmp/held2")"
+# 3. While it is held: the bounded wait runs out, names both keys, and says
+# it is waiting (the slot count and the cap) before it does.
+pc_rc=0
+pc_err="$(pushcap_sh 1 1 "$pushcap_dir2" 'k8s_push_slot_take; echo took' 2>&1)" || pc_rc=$?
+if (( pc_rc != 0 )) && [[ "$pc_err" != *took* ]] \
+    && [[ "$pc_err" == *K8S_PUSH_SLOT_WAIT* && "$pc_err" == *K8S_PUSH_CONCURRENCY* ]] \
+    && [[ "$pc_err" == *"all 1 repository push slots are busy (K8S_PUSH_CONCURRENCY=1)"* ]]; then
+    ok "a slot wait that runs out fails, naming K8S_PUSH_SLOT_WAIT and K8S_PUSH_CONCURRENCY"
+else
+    no "a slot wait that runs out fails, naming K8S_PUSH_SLOT_WAIT and K8S_PUSH_CONCURRENCY" \
+        "rc=$pc_rc: $pc_err"
+fi
+kill -KILL "$pc_holder" 2>/dev/null; wait "$pc_holder" 2>/dev/null
+pc_rc=0
+pc_err="$(pushcap_sh 1 1 "$pushcap_dir2" 'k8s_push_slot_take; echo took' 2>&1)" || pc_rc=$?
+if (( pc_rc == 0 )) && [[ "$pc_err" == took ]]; then
+    ok "a slot held by a SIGKILLed push is free for the next one, no cleanup, no wait logged"
+else
+    no "a slot held by a SIGKILLed push is free for the next one, no cleanup, no wait logged" \
+        "rc=$pc_rc: $pc_err"
+fi
+
+# 4. A push that has to wait logs the wait once, then the seconds it waited
+# once the slot comes free.
+pushcap_dir4="$pushcap_tmp/slots4"
+pc_holder="$(pushcap_holder "$pushcap_dir4" "$pushcap_tmp/held4")"
+pushcap_sh 1 30 "$pushcap_dir4" 'k8s_push_slot_take; echo took' \
+    > "$pushcap_tmp/waiter.out" 2>&1 &
+pc_waiter=$!
+sleep 1.5
+kill -KILL "$pc_holder" 2>/dev/null; wait "$pc_holder" 2>/dev/null
+pc_rc=0; wait "$pc_waiter" || pc_rc=$?
+pc_err="$(cat "$pushcap_tmp/waiter.out")"
+if (( pc_rc == 0 )) && [[ "$(grep -c 'repository push slots are busy' <<< "$pc_err")" == 1 ]] \
+    && grep -qE '^fork-sandbox-k8s: got repository push slot 0 after [0-9]+s\.$' <<< "$pc_err" \
+    && [[ "$(tail -1 <<< "$pc_err")" == took ]]; then
+    ok "a push that waits logs the wait once, then the seconds waited"
+else
+    no "a push that waits logs the wait once, then the seconds waited" "rc=$pc_rc: $pc_err"
+fi
+
+# 5. A release frees the slot at once, for the next push in this process
+# and in another.
+pc_err="$(pushcap_sh 1 1 "$pushcap_tmp/slots5" 'k8s_push_slot_take; k8s_push_slot_release
+k8s_push_slot_release
+k8s_push_slot_take; echo again' 2>&1)" || true
+check "a released slot is free again at once (and a second release is harmless)" "again" "$pc_err"
+
+# 6. A slot directory that cannot be made warns and pushes ungated, never
+# failing the wake.
+: > "$pushcap_tmp/not-a-dir"
+pc_rc=0
+pc_err="$(pushcap_sh 2 1 "$pushcap_tmp/not-a-dir/slots" \
+    'k8s_push_slot_take; echo "took fd=${K8S_PUSH_SLOT_FD:-none}"' 2>&1)" || pc_rc=$?
+if (( pc_rc == 0 )) && [[ "$pc_err" == *"warning: cannot create"*"K8S_PUSH_CONCURRENCY cap"* ]] \
+    && [[ "$(tail -1 <<< "$pc_err")" == "took fd=none" ]]; then
+    ok "an unusable slot directory warns and pushes without the cap"
+else
+    no "an unusable slot directory warns and pushes without the cap" "rc=$pc_rc: $pc_err"
+fi
+
+# 7. The keys' validation, before any cluster call.
+pushcap_refused() { # LABEL KEY=VAL NEEDLE
+    local label="$1" kv="$2" needle="$3" err stub_dir
+    stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
+    printf '#!/usr/bin/env bash\necho called >> "%s/kubectl.log"\nexit 1\n' "$stub_dir" > "$stub_dir/kubectl"
+    chmod +x "$stub_dir/kubectl"
+    if err="$(PATH="$stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$(agent_res_cfg "$kv")" \
+        "$k8s_sh" submit --branch fs-k8s-test-pushcap-bad --model moonshotai/kimi-k3 \
+        "$proj_dir" "$handoff_file" 2>&1 >/dev/null)"; then
+        no "$label" "submit succeeded"
+    elif [[ "$err" != *"$needle"* ]]; then
+        no "$label" "error does not say '$needle': $err"
+    elif [[ -e "$stub_dir/kubectl.log" ]]; then
+        no "$label" "kubectl was called before the refusal"
+    else
+        ok "$label"
+    fi
+}
+pushcap_refused "K8S_PUSH_CONCURRENCY=0 is refused" K8S_PUSH_CONCURRENCY=0 \
+    "K8S_PUSH_CONCURRENCY must be a positive integer"
+pushcap_refused "a negative K8S_PUSH_CONCURRENCY is refused" K8S_PUSH_CONCURRENCY=-1 \
+    "K8S_PUSH_CONCURRENCY must be a positive integer"
+pushcap_refused "a non-integer K8S_PUSH_CONCURRENCY is refused" K8S_PUSH_CONCURRENCY=two \
+    "K8S_PUSH_CONCURRENCY must be a positive integer"
+pushcap_refused "a fractional K8S_PUSH_CONCURRENCY is refused" K8S_PUSH_CONCURRENCY=1.5 \
+    "K8S_PUSH_CONCURRENCY must be a positive integer"
+pushcap_refused "K8S_PUSH_SLOT_WAIT=0 is refused" K8S_PUSH_SLOT_WAIT=0 \
+    "K8S_PUSH_SLOT_WAIT must be a positive integer"
+pushcap_refused "a K8S_PUSH_SLOT_WAIT at the pod's INPUTS_TIMEOUT is refused" K8S_PUSH_SLOT_WAIT=300 \
+    "under"$'\n'"the pod's 300s INPUTS_TIMEOUT"
+if agent_res_render "$(agent_res_cfg K8S_PUSH_CONCURRENCY=3 K8S_PUSH_SLOT_WAIT=120)" >/dev/null; then
+    ok "a valid K8S_PUSH_CONCURRENCY and K8S_PUSH_SLOT_WAIT are accepted"
+else
+    no "a valid K8S_PUSH_CONCURRENCY and K8S_PUSH_SLOT_WAIT are accepted"
+fi
+
+# 8. The real submit goes through the gate: with the one slot held, submit
+# fails naming both keys and never pushes; with it free, the push it runs
+# carries -c pack.threads=1.
+pushcap_cfg="$(agent_res_cfg K8S_PUSH_CONCURRENCY=1 K8S_PUSH_SLOT_WAIT=1)"
+pushcap_dir8="$pushcap_tmp/slots8"
+pc_holder="$(pushcap_holder "$pushcap_dir8" "$pushcap_tmp/held8")"
+pc_rc=0
+config_dir="$pushcap_cfg" FS_K8S_PUSH_SLOT_DIR="$pushcap_dir8" K8S_STUB_GIT_LOG="$pushcap_tmp/git8a.log" \
+    runstub_verb "$pushcap_tmp/kubectl8a.log" "$pushcap_tmp/submit8a.out" submit \
+    --branch fs-k8s-test-pushcap-held --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" || pc_rc=$?
+if (( pc_rc != 0 )) && grep -q 'K8S_PUSH_SLOT_WAIT' "$pushcap_tmp/submit8a.out" \
+    && grep -q 'K8S_PUSH_CONCURRENCY' "$pushcap_tmp/submit8a.out" \
+    && ! grep -q ' push ' "$pushcap_tmp/git8a.log" 2>/dev/null; then
+    ok "submit with every push slot held fails naming both keys, and never pushes"
+else
+    no "submit with every push slot held fails naming both keys, and never pushes" \
+        "rc=$pc_rc: $(cat "$pushcap_tmp/submit8a.out") git: $(cat "$pushcap_tmp/git8a.log" 2>/dev/null)"
+fi
+kill -KILL "$pc_holder" 2>/dev/null; wait "$pc_holder" 2>/dev/null
+pc_rc=0
+config_dir="$pushcap_cfg" FS_K8S_PUSH_SLOT_DIR="$pushcap_dir8" K8S_STUB_GIT_LOG="$pushcap_tmp/git8b.log" \
+    runstub_verb "$pushcap_tmp/kubectl8b.log" "$pushcap_tmp/submit8b.out" submit \
+    --branch fs-k8s-test-pushcap-free --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" || pc_rc=$?
+pc_push="$(grep ' push ' "$pushcap_tmp/git8b.log" 2>/dev/null)"
+if (( pc_rc == 0 )) && [[ "$pc_push" == *"-c pack.threads=1 push "*"git-receive-pack /work/repo.git"* ]]; then
+    ok "submit's repository push carries -c pack.threads=1"
+else
+    no "submit's repository push carries -c pack.threads=1" \
+        "rc=$pc_rc push='$pc_push': $(cat "$pushcap_tmp/submit8b.out")"
+fi
+# The slot was released when the push returned: free again right away.
+pc_err="$(pushcap_sh 1 1 "$pushcap_dir8" 'k8s_push_slot_take; echo took' 2>&1)" || true
+check "submit released its push slot once the push returned" "took" "$pc_err"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

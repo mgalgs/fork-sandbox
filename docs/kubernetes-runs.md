@@ -3699,6 +3699,34 @@ loudly: the Job-side wait just never sees the refusal and the run falls back to
 the pod-ready timeout. Re-run `install` (and `install --postmaster`) to pick the
 grants up on an existing namespace.
 
+## Concurrent repository pushes
+
+Every `submit` pushes the project's full history into its pod's
+`/work/repo.git`, and the `git pack-objects` that push runs on the submitting
+host can peak at hundreds of MiB on a large repository. A burst of submits
+from one host (a postmaster pod starting several wakes at once is the usual
+case) would add those up, so at most `K8S_PUSH_CONCURRENCY` repository pushes
+run at once per host (a positive integer; default `2`; anything else is
+refused naming the key). Only that push is gated: Job creation, the pod-ready
+wait and the small context, thread and attachment pushes are not, and the slot
+is released the moment the push returns. The push also runs with
+`-c pack.threads=1`, which peaks lower.
+
+Each slot is a lock file, `slot-0` up to `slot-N-1`, under
+`/var/tmp/claude-scratch/forks/.k8s-push-slots/` (in a postmaster pod, that is
+its data volume), held with `flock` on a file descriptor the submit keeps
+open. A submit that is killed releases its slot when the kernel closes that
+descriptor, so there is nothing stale to clean up. Where `flock` is missing or
+the filesystem cannot take the lock, `submit` warns and pushes without the cap
+rather than failing.
+
+A submit that finds every slot busy prints one line saying so (the number of
+slots, the cap) and one more with the seconds it waited once it gets a slot.
+It waits at most `K8S_PUSH_SLOT_WAIT` seconds (default `240`; a positive
+integer under `300`, because the pod's own 300-second `INPUTS_TIMEOUT` is
+already running while submit waits). When that runs out, `submit` fails with
+an error naming both keys and the usual failure cleanup runs.
+
 ## Limits
 
 Stated rather than solved, in the same spirit `docs/sandbox-backend.md` states
