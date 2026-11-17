@@ -2627,8 +2627,15 @@ also schedules a bounded, deferred retry of the same trigger — see
 
 A malformed reply file — bad address, unparseable stanza, or a `mail`
 call that itself fails — is skipped and flags the thread with the
-filename and the reason. It never costs the run's other, well-formed
-replies. The run is then marked harvested exactly once.
+filename and the reason, ending with the run that wrote it:
+`malformed reply file <name>: <why> (run <id>)` (keyword
+`malformed-reply`). It never costs the run's other, well-formed
+replies. The run is then marked harvested exactly once. The seat's next
+wake that posts a reply and has no reply file of its own discarded as
+malformed clears that seat's malformed-reply flags (journal `clear` line,
+`flag-clear` event with `reason=malformed-reply`); another seat's stay. A
+reason raised before the run id was added names no run, so nothing clears
+it but the operator's `unflag`.
 
 #### Silent wakes
 
@@ -2672,7 +2679,8 @@ already has a newer message pending (that wake renders the whole thread
 anyway) or the thread's upstream state is closed, and a retry whose own
 wake discards everything again, or posts nothing, gets no further retry: it
 is flagged the ordinary way. The needs-operator flag for the malformed file
-stays raised; flags are advisory and do not stop routing.
+stays raised until a wake of that seat posts a clean reply (the retry
+itself, when it does); flags are advisory and do not stop routing.
 
 The retry goes through the crash-retry machinery (`retries/`, the retry
 pass, the follow-up wake) but is due on the very next pass and spends none

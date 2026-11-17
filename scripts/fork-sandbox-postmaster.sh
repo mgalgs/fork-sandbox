@@ -111,12 +111,14 @@
 #                the flag's would be `other`: k8s-timeout,
 #                k8s-failure-streak, snapshot-failed, and wake-exit for a
 #                headroom refusal (see SEAT NOTES below)
-#   flag-clear   thread, agent, reason=wake-exit|no-summary|silent-wake|no-grant,
-#                run=<failed run id> (all but no-grant),
-#                by=<recovering run id>, flagged=yes|no -- a wake of the
-#                same seat on the same thread exited 0 and cleared the
-#                wake-exit or no-summary flag reason that seat's failed
-#                wake raised (or replied, clearing its silent-wake reason;
+#   flag-clear   thread, agent, reason=wake-exit|no-summary|silent-wake|
+#                malformed-reply|no-grant, run=<failed run id> (all but
+#                no-grant), by=<recovering run id>, flagged=yes|no -- a
+#                wake of the same seat on the same thread exited 0 and
+#                cleared the wake-exit or no-summary flag reason that
+#                seat's failed wake raised (or replied, clearing its
+#                silent-wake reason; or posted a reply with no reply file
+#                malformed, clearing its malformed-reply reasons;
 #                or a grant released it, clearing its no-grant reason,
 #                by=grant when the release spawned no run). flagged says
 #                whether the thread is still flagged for something else.
@@ -1180,8 +1182,9 @@
 # each pass by pm_regate_timer_pass with no run.
 # A malformed reply file (bad address, unparseable stanza, or a
 # `mail.sh` call that itself fails) is skipped and flags the thread with
-# the filename and the reason -- it never costs the run's other,
-# well-formed replies. The run is then marked harvested exactly once.
+# the filename, the reason and the run (`(run <id>)`) -- it never costs the
+# run's other, well-formed replies. That seat's next wake that posts a reply
+# with no reply file malformed clears the flag (pm_wake_exit_clear). The run is then marked harvested exactly once.
 # Posted replies are new unrouted messages; the next scan routes them --
 # that loop is the whole conversation.
 #
@@ -3358,37 +3361,65 @@ pm_wake_exit_mark_cleared() {
 # wake-exit, a silent-wake reply, a no-grant release) rewrote the flag
 # file to that still-open no-summary reason. Journals written then still
 # hold such lines.
+#
+# The malformed-reply flag (key malformed-reply, prefix $PM_MALFORMED_PREFIX)
+# is by seat in the same way: its reason names the reply file and the run
+# (`(run <id>)`, the last such token -- see pm_harvest_discard), never the
+# agent, so its seat too is read from $RUNS/<run>.env. A reason raised
+# before the run id was added names no run and is never matched here; the
+# operator's `unflag` answers it.
 PM_NO_SUMMARY_PREFIX="wake never produced summary.json: "
+PM_MALFORMED_PREFIX="malformed reply file "
+# The run id a journal reason names: the word after the no-summary prefix;
+# for a malformed-reply reason the LAST `(run <id>)`, since the text before
+# it may quote what the seat wrote; else the first `(run <id>)`; else "".
+# Needs awk variables nspref and mfpref.
+# shellcheck disable=SC2016  # awk source, not shell
+PM_RUNID_AWK='
+    function runid(s,   r, t, i) {
+        if (index(s, nspref) == 1) { r = substr(s, length(nspref) + 1); sub(/ .*/, "", r); return r }
+        if (index(s, mfpref) == 1) {
+            r = ""; t = s
+            while ((i = match(t, /\(run [^)]+\)/)) > 0) {
+                r = substr(t, RSTART + 5, RLENGTH - 6); t = substr(t, RSTART + RLENGTH)
+            }
+            return r
+        }
+        if (match(s, /\(run [^)]+\)/)) return substr(s, RSTART + 5, RLENGTH - 6)
+        return ""
+    }'
 pm_wake_exit_clear() {
     local tid="$1" agent="$2" rid="$3" key="${4:-wake-exit}"
     local pref="${5:-wake for $2 exited }"
     local jf="$NEEDS_OPERATOR_JOURNAL/$tid"
     [[ -f "$jf" ]] || return 0
-    # The journal's no-summary runs: this agent's (when clearing them), and
-    # those whose seat has since recovered.
-    local ns_run ns_agent ns_mine=" " ns_stale=" " by_seat=0
-    [[ "$key" == no-summary ]] && by_seat=1
-    while IFS= read -r ns_run; do
-        [[ "$ns_run" =~ $PM_WAKE_EXIT_ID_RE && -f "$RUNS/$ns_run.env" ]] || continue
-        fs_pm_env_read ns_agent "$RUNS/$ns_run.env" AGENT
-        (( by_seat )) && [[ "$ns_agent" == "$agent" ]] && ns_mine+="$ns_run "
-        pm_seat_recovered_after "$tid" "$ns_agent" "$ns_run" >/dev/null && ns_stale+="$ns_run "
-    done < <(awk -F'\t' -v p="$PM_NO_SUMMARY_PREFIX" '
-        $2 == "flag" && $3 == "no-summary" && index($4, p) == 1 {
-            r = substr($4, length(p) + 1); sub(/ .*/, "", r); if (!(r in s)) { s[r] = 1; print r }
+    # The journal's by-seat runs: this agent's (when clearing a by-seat
+    # keyword), and the no-summary ones whose seat has since recovered.
+    local bs_kw bs_run bs_agent mine=" " stale=" " by_seat=0
+    case "$key" in no-summary|malformed-reply) by_seat=1 ;; esac
+    while IFS=$'\t' read -r bs_kw bs_run; do
+        [[ "$bs_run" =~ $PM_WAKE_EXIT_ID_RE && -f "$RUNS/$bs_run.env" ]] || continue
+        fs_pm_env_read bs_agent "$RUNS/$bs_run.env" AGENT
+        (( by_seat )) && [[ "$bs_kw" == "$key" && "$bs_agent" == "$agent" ]] && mine+="$bs_run "
+        [[ "$bs_kw" == no-summary ]] && pm_seat_recovered_after "$tid" "$bs_agent" "$bs_run" >/dev/null \
+            && stale+="$bs_run "
+    done < <(awk -F'\t' -v key="$key" -v byseat="$by_seat" \
+            -v nspref="$PM_NO_SUMMARY_PREFIX" -v mfpref="$PM_MALFORMED_PREFIX" "$PM_RUNID_AWK"'
+        $2 == "flag" && ($3 == "no-summary" || (byseat && $3 == key)) {
+            reason = $0; sub(/^[^\t]*\t[^\t]*\t[^\t]*\t/, "", reason)
+            r = runid(reason)
+            if (r != "" && !(($3, r) in s)) { s[$3, r] = 1; print $3 "\t" r }
         }' "$jf" 2>/dev/null)
+    local cur=""
+    [[ -f "$NEEDS_OPERATOR/$tid" ]] && cur="$(cat -- "$NEEDS_OPERATOR/$tid" 2>/dev/null || true)"
     local scan
-    scan="$(awk -F'\t' -v key="$key" -v pref="$pref" -v nspref="$PM_NO_SUMMARY_PREFIX" \
-            -v byseat="$by_seat" -v mine="$ns_mine" -v stale="$ns_stale" '
-        function runid(s,   r) {
-            if (index(s, nspref) == 1) { r = substr(s, length(nspref) + 1); sub(/ .*/, "", r); return r }
-            if (match(s, /\(run [^)]+\)/)) return substr(s, RSTART + 5, RLENGTH - 6)
-            return ""
+    scan="$(PM_CUR="$cur" awk -F'\t' -v key="$key" -v pref="$pref" -v nspref="$PM_NO_SUMMARY_PREFIX" \
+            -v mfpref="$PM_MALFORMED_PREFIX" -v byseat="$by_seat" -v mine="$mine" -v stale="$stale" \
+            "$PM_RUNID_AWK"'
+        function mine_reason(s) {
+            return index(s, pref) == 1 && (!byseat || index(mine, " " runid(s) " ") > 0)
         }
-        function ours(i) {
-            return kw[i] == key && index(rs[i], pref) == 1 \
-                && (!byseat || index(mine, " " runid(rs[i]) " ") > 0)
-        }
+        function ours(i) { return kw[i] == key && mine_reason(rs[i]) }
         function answered(i) {
             return kw[i] == "no-summary" && index(stale, " " runid(rs[i]) " ") > 0
         }
@@ -3418,31 +3449,24 @@ pm_wake_exit_clear() {
                 print "keep\t" kw[i] "\t" rs[i]
                 break
             }
+            if (mine_reason(ENVIRON["PM_CUR"])) print "cur\t-\t-"
         }' "$jf" 2>/dev/null)" || return 0
-    local kind a b keep_reason="" have_keep=0
+    local kind a b keep_reason="" have_keep=0 cur_ours=0
     local -a open_runs=() open_reasons=()
     while IFS=$'\t' read -r kind a b; do
         case "$kind" in
             open) open_runs+=("$a"); open_reasons+=("$b") ;;
             keep) have_keep=1; keep_reason="$b" ;;
+            cur) cur_ours=1 ;;
         esac
     done <<< "$scan"
     (( ${#open_runs[@]} )) || return 0
 
-    local cur="" i
-    [[ -f "$NEEDS_OPERATOR/$tid" ]] && cur="$(cat -- "$NEEDS_OPERATOR/$tid" 2>/dev/null || true)"
+    local i
     for i in "${!open_runs[@]}"; do
         pm_wake_exit_mark_cleared "$tid" "$agent" "${open_runs[$i]}" "$rid"
         pm_flag_journal_append "$tid" clear "$key" "${open_reasons[$i]} cleared by run $rid"
     done
-    local cur_ours=0 cur_run
-    if [[ "$cur" == "$pref"* ]]; then
-        cur_ours=1
-        if (( by_seat )); then
-            cur_run="${cur#"$pref"}"; cur_run="${cur_run%% *}"
-            [[ "$ns_mine" == *" $cur_run "* ]] || cur_ours=0
-        fi
-    fi
     if (( cur_ours )); then
         if (( have_keep )); then
             printf '%s\n' "$keep_reason" > "$NEEDS_OPERATOR/$tid"
@@ -4967,7 +4991,7 @@ pm_exec_wake() {
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
         reply_files=$(( reply_files + 1 ))
-        if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" "" "" "" "" "" "" "" "" ""; then
+        if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" "" "" "" "" "" "" "" "" "" "$run_id"; then
             replies=$(( replies + 1 ))
         fi
     done
@@ -6985,11 +7009,19 @@ pm_flag_quote_line() {
 
 # Flags a reply file the postmaster is discarding and remembers the reason
 # for the harvest's own use (an `on-silence: retry` seat is shown it in its
-# retry handoff). Whitespace runs are flattened so one reason is one line.
+# retry handoff). Newlines, CRs and tabs become spaces so one reason is one
+# line, in the flag and journal as well as here. $5 is the wake's run id: a
+# malformed-reply reason ends with `(run <id>)`, which is how
+# pm_wake_exit_clear tells whose flag a later clean reply answers (the
+# seat is read from that run's record). It goes last, after any quoted
+# reply or mail-command text, and the clear reads the LAST such token, so
+# text a seat wrote cannot redirect it.
 pm_harvest_discard() {
-    local tid="$1" agent="$2" reason="$3" keyword="${4:-}"
-    PM_HARVEST_DISCARDS+=("${reason//[$'\n\r\t']/ }")
-    pm_seat_flag "$tid" "$agent" "$reason" "$keyword"
+    local tid="$1" agent="$2" reason="$3" keyword="${4:-}" run="${5:-}"
+    reason="${reason//[$'\n\r\t']/ }"
+    [[ -n "$run" && "$reason" == "$PM_MALFORMED_PREFIX"* ]] && reason+=" (run $run)"
+    PM_HARVEST_DISCARDS+=("$reason")
+    pm_seat_flag "$tid" "$agent" "$reason" "$keyword" "" "$run"
 }
 
 pm_harvest_one_file() {
@@ -6997,6 +7029,7 @@ pm_harvest_one_file() {
     local harness="${6:-}" model="${7:-}" network="${8:-}" project="${9:-}"
     local review_target_key="${10:-}" wake_branch="${11:-}"
     local spawn_rt_branch="${12:-}" spawn_rt_sha="${13:-}" spawn_rt_version="${14:-}"
+    local run="${15:-}"
     local body_file parsed
     body_file="$(mktemp "$MAIL_ROOT/.postmaster.body.XXXXXX")"
     local bad_line_file bad_line=""
@@ -7010,7 +7043,7 @@ pm_harvest_one_file() {
         local reason
         reason="malformed reply file $(basename -- "$mf"): unparseable header stanza"
         [[ -n "$bad_line" ]] && reason+=": $(pm_flag_quote_line "$bad_line")"
-        pm_harvest_discard "$tid" "$agent" "$reason"
+        pm_harvest_discard "$tid" "$agent" "$reason" "" "$run"
         return 1
     fi
     unset PM_PARSE_BAD_LINE_FILE
@@ -7029,7 +7062,7 @@ pm_harvest_one_file() {
     # malformed as any other reply this store refuses to post).
     if [[ -n "$version" && "$review_target_key" != sets ]]; then
         rm -f -- "$body_file"
-        pm_harvest_discard "$tid" "$agent" "malformed reply file $(basename -- "$mf"): Version: header from a seat without review-target: sets"
+        pm_harvest_discard "$tid" "$agent" "malformed reply file $(basename -- "$mf"): Version: header from a seat without review-target: sets" "" "$run"
         return 1
     fi
 
@@ -7081,7 +7114,7 @@ pm_harvest_one_file() {
             done
             local reason
             reason="malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject (missing: $missing_joined)"
-            pm_harvest_discard "$tid" "$agent" "$reason"
+            pm_harvest_discard "$tid" "$agent" "$reason" "" "$run"
             return 1
         fi
         cmd=("$MAIL" send --from "@$agent" --to "$to" --subject "$subject" --body "$body_file" --hops "$decremented")
@@ -7170,7 +7203,7 @@ pm_harvest_one_file() {
         # "handler "-prefixed patterns, so $err_out (the mail command's own
         # stderr) can't supply a false second literal the way it can at the
         # pm_exec_wake call site above (see pm_flag_keyword's own comment).
-        pm_harvest_discard "$tid" "$agent" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply"
+        pm_harvest_discard "$tid" "$agent" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply" "$run"
         return 1
     fi
 
@@ -8003,7 +8036,7 @@ pm_harvest_run() {
         (( ! finalize_refused && ! cover_held && ! dead_review )) || continue
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network" \
                 "$project" "$review_target" "$branch" \
-                "$review_target_branch" "$review_target_sha" "$review_target_version"; then
+                "$review_target_branch" "$review_target_sha" "$review_target_version" "$rid"; then
             replies=$(( replies + 1 ))
         fi
     done
@@ -8034,6 +8067,17 @@ pm_harvest_run() {
             fi
             pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=released held=${cover_held_rid:--}"
         fi
+    fi
+    # A wake that posted a reply and had no reply file discarded as
+    # malformed answers this seat's earlier malformed-reply flags on the
+    # thread (by run, see pm_wake_exit_clear); one still malformed now
+    # answers nothing.
+    local malformed_now=0 discard
+    for discard in "${PM_HARVEST_DISCARDS[@]}"; do
+        [[ "$discard" == "$PM_MALFORMED_PREFIX"* ]] && malformed_now=1
+    done
+    if (( replies > 0 && ! malformed_now )); then
+        pm_wake_exit_clear "$tid" "$agent" "$rid" malformed-reply "$PM_MALFORMED_PREFIX" || true
     fi
     # SILENT WAKE in the header. A malformed reply file has flagged already,
     # so only an outbox with no reply file at all counts as silence (and
