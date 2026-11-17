@@ -3,8 +3,9 @@
 # tests/postmaster/26-malformed-clear.sh — fork-sandbox-postmaster.sh: a
 # seat's malformed-reply flag carries the run that raised it, and that
 # seat's next wake that posts a reply with nothing malformed clears it, as
-# a clean exit clears a wake-exit flag. Another seat's flag, a wake that is
-# still partly malformed, and a legacy reason with no run id stay.
+# a clean exit clears a wake-exit flag -- a handler seat's included. Another
+# seat's flag, a wake that is still partly malformed, a legacy reason with
+# no run id, and the raising run's wake-exit record stay.
 #
 # Usage: tests/postmaster/26-malformed-clear.sh  (or all files at once:
 # tests/fork-sandbox-postmaster-test.sh)
@@ -17,7 +18,24 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 for mc_seat in mia max; do
     printf 'Malformed-clear fixture seat.\n' > "$FORK_SANDBOX_PERSONAS_DIR/$mc_seat.md"
 done
-sed -i 's/^agents:$/agents:\n  mia:\n    on-silence: retry\n  max:\n    on-silence: retry/' "$FORK_SANDBOX_FLEET_FILE"
+new_root MC_HANDLERS_DIR
+export FORK_SANDBOX_HANDLERS_DIR="$MC_HANDLERS_DIR"
+MC_FLIP="$work/mc-flip"
+export MC_FLIP
+# A handler seat whose first wake writes a malformed reply and every later
+# one a good one.
+cat > "$MC_HANDLERS_DIR/flip-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ -e "$MC_FLIP" ]]; then
+    printf 'Subject: verdict\n\nlooks fine\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+else
+    : > "$MC_FLIP"
+    printf 'handler junk\n\nbody\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+fi
+STUB
+chmod +x "$MC_HANDLERS_DIR/flip-handler"
+sed -i 's/^agents:$/agents:\n  mia:\n    on-silence: retry\n  max:\n    on-silence: retry\n  flip:\n    handler: exec\n    command: flip-handler/' "$FORK_SANDBOX_FLEET_FILE"
 "$FLEET" check >/dev/null 2>&1 || { echo "FATAL: malformed-clear fixture fleet fails check" >&2; exit 1; }
 
 mc_store() {
@@ -40,10 +58,11 @@ mc_out() {
     mkdir -p -- "$rd/outbox"
     printf '%b' "$3" > "$rd/outbox/$2"
 }
+# mc_end <agent> [exit-code]
 mc_end() {
     local rd
     rd="$(env_val "$(live_env_for_agent "$1")" RUN_DIR)"
-    printf '0\n' > "$rd/exit-code"
+    printf '%s\n' "${2:-0}" > "$rd/exit-code"
     printf '{}\n' > "$rd/summary.json"
 }
 mc_flag() { cat "$PM_STATE_DIR/needs-operator/$mc_tid" 2>/dev/null || true; }
@@ -147,5 +166,57 @@ check "five: the reply posted" "pm harvest thread=$mc_short agent=mia replies=1"
     "$(grep -o "pm harvest thread=$mc_short agent=mia replies=[0-9]*" "$work/once.out")"
 check "five: the legacy flag stands" "$mc_legacy" "$(mc_flag)"
 check "five: no clear line" 0 "$(mc_jcount malformed-reply)"
+
+printf '\n== a recovering run that itself failed leaves the wake-exit record open ==\n'
+mc_thread '@mia' six
+once
+mc_r1="$(mc_rid mia)"
+mc_out mia mail-1.md 'six junk\n\nbody\n'; mc_end mia 1
+once
+mc_we="$PM_STATE_DIR/wake-exits/$mc_tid/mia"
+check "six: the failed malformed run has a wake-exit record" 1 \
+    "$([[ -f "$mc_we/$mc_r1.json" ]] && echo 1 || echo 0)"
+[[ -n "$(live_env_for_agent mia)" ]] || reply_msg '@alice' "$mc_mid" 'try again' --to '@mia' >/dev/null
+once
+mc_r2="$(mc_rid mia)"
+mc_out mia mail-1.md "$mc_good"; mc_end mia 1
+once
+contains "six: the failed run's good reply clears the malformed-reply flag" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=$mc_short agent=mia reason=malformed-reply run=$mc_r1 by=$mc_r2"
+check "six: but does not mark the first run's wake-exit record cleared" 0 \
+    "$([[ -e "$mc_we/$mc_r1.cleared" ]] && echo 1 || echo 0)"
+check "six: and the first run's wake-exit flag has no clear line" 0 "$(mc_jcount wake-exit)"
+contains "six: so the flag falls back to an open wake-exit reason" "$(mc_flag)" "wake for mia exited 1"
+
+printf '\n== quoted text with an unclosed "(run " does not hide the run id ==\n'
+mc_thread '@mia' seven
+once
+mc_r1="$(mc_rid mia)"
+mc_out mia mail-1.md 'retry (run 2 of 3\n\nbody\n'; mc_end mia
+once
+check "seven: the reason quotes the unclosed text, then the run" \
+    "malformed reply file mail-1.md: unparseable header stanza: retry (run 2 of 3 (run $mc_r1)" "$(mc_flag)"
+once
+mc_r2="$(mc_rid mia)"
+mc_out mia mail-1.md "$mc_good"; mc_end mia
+once
+check "seven: the clean retry clears it" "" "$(mc_flag)"
+contains "seven: with a flag-clear event naming the right run" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=$mc_short agent=mia reason=malformed-reply run=$mc_r1 by=$mc_r2 flagged=no"
+
+printf '\n== a handler seat whose next wake posts a clean reply is cleared too ==\n'
+rm -f -- "$MC_FLIP"
+mc_thread '@flip' eight
+once
+contains "eight: the handler's malformed reply flags with its run id" "$(mc_flag)" \
+    "malformed reply file mail-1.md: unparseable header stanza: handler junk (run "
+reply_msg '@alice' "$mc_mid" 'try again' --to '@flip' >/dev/null
+once
+check "eight: the handler's clean reply posted" "pm harvest thread=$mc_short agent=flip replies=1" \
+    "$(grep -o "pm harvest thread=$mc_short agent=flip replies=[0-9]*" "$work/once.out")"
+check "eight: and cleared its flag" "" "$(mc_flag)"
+check "eight: one malformed-reply clear line" 1 "$(mc_jcount malformed-reply)"
+contains "eight: with a flag-clear event" "$(cat "$work/once.out")" \
+    "pm flag-clear thread=$mc_short agent=flip reason=malformed-reply run="
 
 finish_suite

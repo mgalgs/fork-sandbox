@@ -1184,7 +1184,8 @@
 # `mail.sh` call that itself fails) is skipped and flags the thread with
 # the filename, the reason and the run (`(run <id>)`) -- it never costs the
 # run's other, well-formed replies. That seat's next wake that posts a reply
-# with no reply file malformed clears the flag (pm_wake_exit_clear). The run is then marked harvested exactly once.
+# with no reply file malformed -- a handler seat's too -- clears the flag
+# (pm_malformed_clear). The run is then marked harvested exactly once.
 # Posted replies are new unrouted messages; the next scan routes them --
 # that loop is the whole conversation.
 #
@@ -3364,26 +3365,26 @@ pm_wake_exit_mark_cleared() {
 #
 # The malformed-reply flag (key malformed-reply, prefix $PM_MALFORMED_PREFIX)
 # is by seat in the same way: its reason names the reply file and the run
-# (`(run <id>)`, the last such token -- see pm_harvest_discard), never the
+# (`(run <id>)`, the token that ends it -- see pm_harvest_discard), never the
 # agent, so its seat too is read from $RUNS/<run>.env. A reason raised
 # before the run id was added names no run and is never matched here; the
 # operator's `unflag` answers it.
 PM_NO_SUMMARY_PREFIX="wake never produced summary.json: "
 PM_MALFORMED_PREFIX="malformed reply file "
 # The run id a journal reason names: the word after the no-summary prefix;
-# for a malformed-reply reason the LAST `(run <id>)`, since the text before
-# it may quote what the seat wrote; else the first `(run <id>)`; else "".
+# for a malformed-reply reason only the `(run <id>)` that ends it (before a
+# clear line's " cleared by run <id>"), since the text before it may quote
+# what the seat wrote, an unclosed "(run " included; else the first
+# `(run <id>)`; else "".
 # Needs awk variables nspref and mfpref.
 # shellcheck disable=SC2016  # awk source, not shell
 PM_RUNID_AWK='
-    function runid(s,   r, t, i) {
+    function runid(s,   r, t) {
         if (index(s, nspref) == 1) { r = substr(s, length(nspref) + 1); sub(/ .*/, "", r); return r }
         if (index(s, mfpref) == 1) {
-            r = ""; t = s
-            while ((i = match(t, /\(run [^)]+\)/)) > 0) {
-                r = substr(t, RSTART + 5, RLENGTH - 6); t = substr(t, RSTART + RLENGTH)
-            }
-            return r
+            t = s; sub(/ cleared by run [^ ]*$/, "", t)
+            if (match(t, /\(run [^() ]+\)$/)) return substr(t, RSTART + 5, RLENGTH - 6)
+            return ""
         }
         if (match(s, /\(run [^)]+\)/)) return substr(s, RSTART + 5, RLENGTH - 6)
         return ""
@@ -3464,7 +3465,12 @@ pm_wake_exit_clear() {
 
     local i
     for i in "${!open_runs[@]}"; do
-        pm_wake_exit_mark_cleared "$tid" "$agent" "${open_runs[$i]}" "$rid"
+        # A malformed-reply clear answers the reply, not the exit: the run
+        # it names may also have a wake-exit record, and a recovering run
+        # that itself failed must not mark that record cleared (status and
+        # pm_k8s_failure_streak read the mark).
+        [[ "$key" == malformed-reply ]] \
+            || pm_wake_exit_mark_cleared "$tid" "$agent" "${open_runs[$i]}" "$rid"
         pm_flag_journal_append "$tid" clear "$key" "${open_reasons[$i]} cleared by run $rid"
     done
     if (( cur_ours )); then
@@ -4988,6 +4994,7 @@ pm_exec_wake() {
     fi
     local mf replies=0 reply_files=0
     PM_HARVEST_POSTED=()
+    PM_HARVEST_DISCARDS=()
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
         reply_files=$(( reply_files + 1 ))
@@ -5022,6 +5029,7 @@ pm_exec_wake() {
 
     pm_mark_harvested "$run_id"
     fs_pm_index_settle "$ig"
+    pm_malformed_clear "$tid" "$agent" "$run_id" "$replies"
 
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
@@ -7014,7 +7022,7 @@ pm_flag_quote_line() {
 # malformed-reply reason ends with `(run <id>)`, which is how
 # pm_wake_exit_clear tells whose flag a later clean reply answers (the
 # seat is read from that run's record). It goes last, after any quoted
-# reply or mail-command text, and the clear reads the LAST such token, so
+# reply or mail-command text, and the clear reads only the token that ends it, so
 # text a seat wrote cannot redirect it.
 pm_harvest_discard() {
     local tid="$1" agent="$2" reason="$3" keyword="${4:-}" run="${5:-}"
@@ -7022,6 +7030,21 @@ pm_harvest_discard() {
     [[ -n "$run" && "$reason" == "$PM_MALFORMED_PREFIX"* ]] && reason+=" (run $run)"
     PM_HARVEST_DISCARDS+=("$reason")
     pm_seat_flag "$tid" "$agent" "$reason" "$keyword" "" "$run"
+}
+
+# A wake of seat $2 on thread $1 (run $3) that posted $4 > 0 replies and
+# had no reply file discarded as malformed (PM_HARVEST_DISCARDS, reset by
+# the caller before its harvest) answers that seat's earlier malformed-reply
+# flags on the thread (by run, see pm_wake_exit_clear); one still malformed
+# now answers nothing. Both wake paths call it: pm_harvest_run and
+# pm_exec_wake.
+pm_malformed_clear() {
+    local tid="$1" agent="$2" rid="$3" replies="$4" discard
+    (( replies > 0 )) || return 0
+    for discard in "${PM_HARVEST_DISCARDS[@]}"; do
+        [[ "$discard" == "$PM_MALFORMED_PREFIX"* ]] && return 0
+    done
+    pm_wake_exit_clear "$tid" "$agent" "$rid" malformed-reply "$PM_MALFORMED_PREFIX" || true
 }
 
 pm_harvest_one_file() {
@@ -8068,17 +8091,7 @@ pm_harvest_run() {
             pm_event "finalize thread=${tid:0:8} agent=$agent run=$rid outcome=released held=${cover_held_rid:--}"
         fi
     fi
-    # A wake that posted a reply and had no reply file discarded as
-    # malformed answers this seat's earlier malformed-reply flags on the
-    # thread (by run, see pm_wake_exit_clear); one still malformed now
-    # answers nothing.
-    local malformed_now=0 discard
-    for discard in "${PM_HARVEST_DISCARDS[@]}"; do
-        [[ "$discard" == "$PM_MALFORMED_PREFIX"* ]] && malformed_now=1
-    done
-    if (( replies > 0 && ! malformed_now )); then
-        pm_wake_exit_clear "$tid" "$agent" "$rid" malformed-reply "$PM_MALFORMED_PREFIX" || true
-    fi
+    pm_malformed_clear "$tid" "$agent" "$rid" "$replies"
     # SILENT WAKE in the header. A malformed reply file has flagged already,
     # so only an outbox with no reply file at all counts as silence (and
     # not a cover retry's: its hold's flag says it posted nothing).

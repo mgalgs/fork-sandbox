@@ -2633,7 +2633,10 @@ filename and the reason, ending with the run that wrote it:
 replies. The run is then marked harvested exactly once. The seat's next
 wake that posts a reply and has no reply file of its own discarded as
 malformed clears that seat's malformed-reply flags (journal `clear` line,
-`flag-clear` event with `reason=malformed-reply`); another seat's stay. A
+`flag-clear` event with `reason=malformed-reply`), a handler seat's
+included, whatever that wake's exit code; it answers only the reply, so a
+wake-exit record of the run that raised it stays as it was. Another
+seat's flags stay. A
 reason raised before the run id was added names no run, so nothing clears
 it but the operator's `unflag`.
 
