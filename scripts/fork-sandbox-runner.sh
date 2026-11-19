@@ -5058,6 +5058,8 @@ jq -n \
     --arg session_id "$session_id_json" \
     --arg claude_credentials_source "$claude_credentials_source" \
     --arg claude_credentials_via "$claude_credentials_via" \
+    --arg account_profile "${account_profile:-}" \
+    --arg account_profile_via "${account_profile_via:-}" \
     --arg end_reason "${end_reason:-}" \
     --arg agent_kit "$agent_kit" \
     --argjson leg_retries "${total_leg_retries:-0}" \
@@ -5126,6 +5128,13 @@ jq -n \
     + (if $claude_credentials_via == "" then {} else {
         claude_credentials_source: $claude_credentials_source,
         claude_credentials_via: $claude_credentials_via,
+    } end)
+    # The account profile (docs/account-profiles.md) and how it was chosen:
+    # present on every run whose run.sh carries it, account_profile null
+    # when via is "none". A name, never token material.
+    + (if $account_profile_via == "" then {} else {
+        account_profile: (if $account_profile == "" then null else $account_profile end),
+        account_profile_via: $account_profile_via,
     } end)
     # Absent, not null, on every normal run -- same convention as the pair
     # above. fork-sandbox-status.sh treats presence as the signal that this

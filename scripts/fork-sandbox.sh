@@ -9504,6 +9504,11 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
         printf 'claude_credentials_source=%s\n' "${claude_credentials_resolved:-default}"
         printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
     fi
+    # The account profile this run was billed under and how it was chosen
+    # (flag | session | default | none -- docs/account-profiles.md), always
+    # printed so "none" is visible. A name, never token material.
+    printf 'account_profile=%s\n' "$account_profile"
+    printf 'account_profile_via=%s\n' "$account_profile_via"
 } > "$run_dir/run.env"
 
 # Generate the runner instead of building a shell command string. Every value
@@ -9870,6 +9875,8 @@ fs_emit_run_sh_preamble() {
         printf 'claude_credentials_source=%q\n' ""
         printf 'claude_credentials_via=%q\n' ""
     fi
+    printf 'account_profile=%q\n' "$account_profile"
+    printf 'account_profile_via=%q\n' "$account_profile_via"
     printf 'mode=%q\n' "$mode"
     printf 'review_prompt=%q\n' "$review_prompt"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"

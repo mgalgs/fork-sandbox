@@ -961,6 +961,9 @@ what is mounted, what is not, and a numbered list of the gaps.
 - [docs/credential-balancing.md](docs/credential-balancing.md) — picking a
   Claude credential from an operator-configured pool instead of always
   defaulting to the same account.
+- [docs/account-profiles.md](docs/account-profiles.md) — routing a run's
+  Claude and codex logins by who launched it, when one machine serves more
+  than one billing owner.
 - [docs/sandbox-backend-container.md](docs/sandbox-backend-container.md) — the
   container backend: mechanism, threat model, and limits.
 

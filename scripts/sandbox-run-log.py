@@ -76,7 +76,17 @@ Claude credential attribution (claude_credentials_source, claude_credentials_via
   plus headroom hook -- see docs/credential-balancing.md), or `default`
   (today's default chain, no override). Never the token itself -- paths
   only. Group on it directly: `stats --by claude_credentials_via` answers
-  how often a run rode the balancer versus a pin versus the default.
+  how often a run rode the balancer versus a pin versus the default. With
+  account profiles (docs/account-profiles.md) `profile` also appears: the
+  profile's single credential, or its first after a crashed hook.
+
+Account profile (account_profile, account_profile_via):
+  Which account profile the run was billed under, and how it was chosen:
+  `flag` (the profile holding --claude-credentials), `session` (the profile
+  holding the launching Claude Code session's own login), `default`
+  (DEFAULT_PROFILE), or `none` (no profiles.env, or a run that used no
+  profile login; account_profile is then null or absent). A name, never
+  token material. `stats --by account_profile` splits a fleet by owner.
 
 Recommended --task-meta fields (documented here, enforced nowhere):
   kind                implement | fix | refactor | test | docs |
@@ -314,6 +324,8 @@ SUMMARY_FIELDS = [
     "duration_seconds",
     "claude_credentials_source",
     "claude_credentials_via",
+    "account_profile",
+    "account_profile_via",
     "end_reason",
     "leg_retries",
     "uncommitted_files",
@@ -744,7 +756,8 @@ def cmd_record(args):
         for k in ("harness", "harness_version", "network", "model", "image",
                   "image_source", "branch",
                   "origin_repo", "base_sha", "claude_credentials_source",
-                  "claude_credentials_via"):
+                  "claude_credentials_via", "account_profile",
+                  "account_profile_via"):
             if env.get(k):
                 rec[k] = env[k]
         if env.get("no_repo") == "true":

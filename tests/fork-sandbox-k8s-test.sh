@@ -18578,6 +18578,8 @@ if (( balance_happy_rc == 0 )) && [[ -n "$balance_happy_rd" && -d "$balance_happ
     check "balance happy path: run.env records the hook's choice as the source" \
         "claude_credentials_source=$balance_pool_b" \
         "$(grep '^claude_credentials_source=' "$balance_happy_rd/run.env")"
+    check "no profiles.env: run.env records account_profile_via=none" \
+        "account_profile_via=none" "$(grep '^account_profile_via=' "$balance_happy_rd/run.env")"
 else
     no "balance happy path: submit exits 0 and produces a run dir" \
         "rc=$balance_happy_rc out=$balance_happy_out"

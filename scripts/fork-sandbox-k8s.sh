@@ -12049,6 +12049,7 @@ cmd_collect() {
     if [[ -n "$run_dir" ]]; then
         local run_log_harness run_log_model run_log_commits=""
         local run_log_claude_source="" run_log_claude_via=""
+        local run_log_profile="" run_log_profile_via=""
         local run_log_image="" run_log_image_source=""
         local run_log_exit_code run_log_started_at run_log_ended_at run_log_duration_block
         run_log_harness="$(read_env_value "$run_dir/run.env" harness || true)"
@@ -12057,6 +12058,8 @@ cmd_collect() {
         run_log_image_source="$(read_env_value "$run_dir/run.env" image_source || true)"
         run_log_claude_source="$(read_env_value "$run_dir/run.env" claude_credentials_source || true)"
         run_log_claude_via="$(read_env_value "$run_dir/run.env" claude_credentials_via || true)"
+        run_log_profile="$(read_env_value "$run_dir/run.env" account_profile || true)"
+        run_log_profile_via="$(read_env_value "$run_dir/run.env" account_profile_via || true)"
         # Legacy single-seat pods write events.jsonl, not summary.json.
         # Read the captured stream with the same formatter as a local
         # Claude run. Each continuation/review/fix stream is a separate
@@ -12312,6 +12315,8 @@ cmd_collect() {
             --argjson duration_block "$run_log_duration_block" \
             --arg claude_credentials_source "$run_log_claude_source" \
             --arg claude_credentials_via "$run_log_claude_via" \
+            --arg account_profile "$run_log_profile" \
+            --arg account_profile_via "$run_log_profile_via" \
             --arg session_state "$pull_session_state" \
             --arg session_id "$run_log_session_id" \
             --argjson refresh_block "$run_log_refresh_block" \
@@ -12337,6 +12342,10 @@ cmd_collect() {
             + (if $claude_credentials_via == "" then {} else {
                 claude_credentials_source: $claude_credentials_source,
                 claude_credentials_via: $claude_credentials_via,
+            } end)
+            + (if $account_profile_via == "" then {} else {
+                account_profile: (if $account_profile == "" then null else $account_profile end),
+                account_profile_via: $account_profile_via,
             } end)
             + (if $session_state == "" then {} else {
                 session_state: $session_state,

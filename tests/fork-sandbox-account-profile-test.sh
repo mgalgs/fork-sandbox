@@ -588,5 +588,65 @@ else
     no "in a pod: the launch produced a run directory (profiles.env ignored)" "$LAUNCH_OUT"
 fi
 
+printf '\n== recording: run.env, summary.json and the run-log row ==\n'
+runs_log="$launcher_home/.claude/sandbox-runs.jsonl"
+# This checkout's own sandbox-run-log.py appends the row (the runner may use
+# an installed copy), under the scratch HOME; the last row for a run wins.
+last_row() {
+    HOME="$launcher_home" FORK_SANDBOX_RUN_SOURCE=test \
+        "$repo_dir/scripts/sandbox-run-log.py" record --run-dir "$1" >/dev/null 2>&1
+    jq -c --arg rd "$(basename "$1")" \
+        'select(.run_id == $rd or (.run_dir // "" | endswith($rd)))' "$runs_log" 2>/dev/null | tail -1
+}
+cfg="$(newdir)"; std_fixture "$cfg"
+printf 'DEFAULT_PROFILE=alpha\n' >> "$cfg/profiles.env"
+hook_bin="$(fake_hook pick 'printf "%s\n" "$2"')"
+launch "$cfg" "$proj" PATH="$hook_bin:$real_stub:$PATH" -- --harness claude
+if [[ -n "$LAUNCH_RD" ]]; then
+    run_env="$(cat "$LAUNCH_RD/run.env")"
+    contains "run.env records account_profile" "account_profile=alpha" "$run_env"
+    contains "run.env records account_profile_via=default" "account_profile_via=default" "$run_env"
+    contains "run.env still records the credential path" "claude_credentials_source=$a2" "$run_env"
+    contains "run.env records claude_credentials_via=balance" "claude_credentials_via=balance" "$run_env"
+    equals "summary.json records account_profile" alpha "$(jq -r .account_profile "$LAUNCH_RD/summary.json")"
+    equals "summary.json records account_profile_via" default "$(jq -r .account_profile_via "$LAUNCH_RD/summary.json")"
+    row="$(last_row "$LAUNCH_RD")"
+    equals "the run-log row records account_profile and its via" "alpha/default" \
+        "$(jq -r '"\(.account_profile)/\(.account_profile_via)"' <<< "$row")"
+    lacks "no token material is recorded" "fixture" "$run_env$(cat "$LAUNCH_RD/summary.json")$row"
+else
+    no "recording: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
+sess="$(newdir)"
+cp "$b1" "$sess/.credentials.json"
+cfg_s="$(newdir)"
+printf 'PROFILE_beta_CLAUDE_POOL=%s\n' "$sess/.credentials.json" > "$cfg_s/profiles.env"
+launch "$cfg_s" "$proj" CLAUDECODE=1 CLAUDE_CONFIG_DIR="$sess" -- --harness claude
+if [[ -n "$LAUNCH_RD" ]]; then
+    contains "session tier: run.env records via=session" "account_profile_via=session" "$(cat "$LAUNCH_RD/run.env")"
+    contains "single-entry pool: claude_credentials_via=profile" "claude_credentials_via=profile" "$(cat "$LAUNCH_RD/run.env")"
+else
+    no "session recording: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
+launch "$cfg_s" "$proj" -- --harness claude --claude-credentials "$sess/.credentials.json"
+if [[ -n "$LAUNCH_RD" ]]; then
+    contains "flag tier: run.env records via=flag" "account_profile_via=flag" "$(cat "$LAUNCH_RD/run.env")"
+else
+    no "flag recording: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
+launch "$(newdir)" "$proj" -- --harness claude
+if [[ -n "$LAUNCH_RD" ]]; then
+    contains "no profiles.env: run.env records via=none" "account_profile_via=none" "$(cat "$LAUNCH_RD/run.env")"
+    equals "no profiles.env: summary.json account_profile is null" "null/none" \
+        "$(jq -r '"\(.account_profile)/\(.account_profile_via)"' "$LAUNCH_RD/summary.json")"
+    row="$(last_row "$LAUNCH_RD")"
+    equals "no profiles.env: the run-log row records via=none" none "$(jq -r .account_profile_via <<< "$row")"
+else
+    no "none recording: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

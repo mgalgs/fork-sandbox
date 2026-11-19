@@ -9,6 +9,13 @@ the policy. Which account is healthy is answered entirely by the hook,
 installed outside this repo, so no real quota tool or account name is ever
 named here (see the repo's own `CLAUDE.md`).
 
+One machine serving more than one billing owner wants **account profiles**
+instead — named bundles of a Claude pool and a codex login, chosen by who
+launched the run; see [account-profiles.md](account-profiles.md). With a
+`profiles.env`, the pool keys below move into it (setting them in
+`claude.env` too is refused); `CLAUDE_HEADROOM_HOOK` stays here and
+balances any multi-entry profile pool under the same contract.
+
 ## Config (`~/.config/fork-sandbox/claude.env`)
 
 | Key | Meaning |
@@ -133,7 +140,13 @@ recorded — `run.env`, `summary.json`, and the JSONL row
 
 - `claude_credentials_source` — the resolved path, or the literal `default`.
 - `claude_credentials_via` — `flag` | `claude-env` | `balance` | `default`,
-  naming which of the four precedence tiers actually decided it.
+  naming which of the four precedence tiers actually decided it. Under
+  account profiles it is `flag`, `balance`, or `profile` (the profile's
+  single credential, or its first after a crashed hook).
+
+Every run also records `account_profile` and `account_profile_via`
+(`flag` | `session` | `default` | `none`) — see
+[account-profiles.md](account-profiles.md#recording).
 
 Token material is never recorded — paths only. See
 `scripts/sandbox-run-log.py`'s own header for how to group stats on these
