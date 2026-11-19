@@ -2869,10 +2869,7 @@ fs_balance_claude_credential() {
     done
 
     local hook_bin
-    hook_bin="$(command -v "fork-sandbox-headroom-$hook_name" 2>/dev/null || true)"
-    if [[ -z "$hook_bin" && -x "$script_dir/fork-sandbox-headroom-$hook_name" ]]; then
-        hook_bin="$script_dir/fork-sandbox-headroom-$hook_name"
-    fi
+    hook_bin="$(_fs_headroom_hook_bin "$hook_name" "$script_dir")"
     if [[ -z "$hook_bin" ]]; then
         echo "Error: cannot find fork-sandbox-headroom-$hook_name, which" >&2
         echo "CLAUDE_HEADROOM_HOOK names. Looked on PATH and beside" >&2
@@ -2881,9 +2878,49 @@ fs_balance_claude_credential() {
         return 1
     fi
 
-    local hook_out hook_rc
+    local ask_rc=0 choice=""
+    _fs_headroom_ask choice "$hook_bin" "${pool[@]}" || ask_rc=$?
+    if (( ask_rc == 0 )); then
+        printf '%s\n' "$choice"
+    elif (( ask_rc == 3 )); then
+        echo "Warning: $hook_bin exited $_FS_HEADROOM_RC. Falling back to today's" >&2
+        echo "default credential chain for this launch -- fix the hook" >&2
+        echo "when you get a chance." >&2
+        return 0
+    fi
+    return "$ask_rc"
+}
+
+# Resolves a headroom plugin name to its executable: PATH first, then
+# beside the calling script (the rule resolve_platform() uses for k8s
+# platform plugins). Prints the path, or nothing when there is none.
+_fs_headroom_hook_bin() {
+    local hook_name="$1" script_dir="$2" hook_bin
+    hook_bin="$(command -v "fork-sandbox-headroom-$hook_name" 2>/dev/null || true)"
+    if [[ -z "$hook_bin" && -x "$script_dir/fork-sandbox-headroom-$hook_name" ]]; then
+        hook_bin="$script_dir/fork-sandbox-headroom-$hook_name"
+    fi
+    printf '%s' "$hook_bin"
+}
+
+# Asks a resolved headroom hook to pick one of the candidates and enforces
+# its contract (docs/credential-balancing.md, "The hook contract"). Shared
+# by the machine-wide pool above and an account profile's pool below.
+# Usage: _fs_headroom_ask <outvar> <hook_bin> <candidate>...
+# Returns 0 with the choice in <outvar>; 1 (error on stderr) on a broken
+# exit-0 contract or an exit-2 "no routable candidate"; 3, printing
+# nothing, when the hook itself failed -- each caller words its own
+# fallback, with the hook's exit code left in _FS_HEADROOM_RC. Sets its
+# results by name rather than on stdout so a caller never needs a
+# subshell that would lose _FS_HEADROOM_RC.
+_FS_HEADROOM_RC=0
+_fs_headroom_ask() {
+    local _fs_ask_out="$1" hook_bin="$2"; shift 2
+    local -a pool=("$@")
+    local hook_out hook_rc entry
     hook_out="$("$hook_bin" "${pool[@]}")"
     hook_rc=$?
+    _FS_HEADROOM_RC="$hook_rc"
     if (( hook_rc == 0 )); then
         if [[ -z "$hook_out" ]]; then
             echo "Error: $hook_bin printed nothing on stdout. Its contract" >&2
@@ -2908,7 +2945,7 @@ fs_balance_claude_credential() {
             echo "exactly one of them." >&2
             return 1
         fi
-        printf '%s\n' "$hook_out"
+        printf -v "$_fs_ask_out" '%s' "$hook_out"
         return 0
     elif (( hook_rc == 2 )); then
         echo "Error: headroom: no candidate -- $hook_bin found no routable credential (its" >&2
@@ -2916,12 +2953,447 @@ fs_balance_claude_credential() {
         echo "looked unhealthy. Pin one by hand with --claude-credentials" >&2
         echo "to override, or fix the accounts and retry." >&2
         return 1
+    fi
+    return 3
+}
+
+# --- Account profiles -------------------------------------------------------
+#
+# Named bundles of the logins a run may use, so one machine can serve
+# several billing owners without a run launched for one of them silently
+# riding another's Claude pool or codex login. See
+# docs/account-profiles.md for the config, the resolution order and the
+# repo guard rules; this is the one implementation of all three.
+#
+# The config is $config_dir/profiles.env, read line by line (never
+# sourced), one KEY=VALUE per line, blank lines and #-comments skipped:
+#
+#   PROFILE_<name>_CLAUDE_POOL=/abs/a.json[:/abs/b.json...]   (required)
+#   PROFILE_<name>_CODEX_HOME=/abs/dir                        (optional)
+#   DEFAULT_PROFILE=<name>                                    (optional)
+#   REPO_RULE=<glob> <name>                                   (repeatable)
+#
+# <name> is lowercase alphanumerics and hyphens -- no underscore, so the
+# key splits unambiguously. Everything is validated hard by
+# fs_profiles_load before any of it is used; a file that does not exist
+# means "no profiles", and every caller then behaves exactly as it did
+# before profiles existed.
+FS_PROFILES_FILE_NAME="profiles.env"
+
+_fs_profile_exists() {
+    local want="$1" n
+    for n in "${FS_PROFILE_NAMES[@]}"; do [[ "$n" == "$want" ]] && return 0; done
+    return 1
+}
+
+# fs_profiles_load <config_dir>
+#
+# Returns 0 with FS_PROFILES_ACTIVE=0 when there is no profiles.env.
+# Otherwise validates it and sets FS_PROFILES_ACTIVE=1 and:
+#   FS_PROFILE_NAMES        names, in order of first appearance
+#   FS_PROFILE_POOL[name]   the colon-separated Claude pool
+#   FS_PROFILE_CODEX[name]  the codex home, or empty
+#   FS_PROFILE_OF[canon]    profile owning a canonicalized pool path
+#   FS_PROFILE_DEFAULT      DEFAULT_PROFILE, or empty
+#   FS_PROFILE_RULE_GLOBS / FS_PROFILE_RULE_NAMES   REPO_RULE lines, in order
+#   FS_PROFILE_HOOK         CLAUDE_HEADROOM_HOOK from claude.env, or empty
+# Inside a pod (_fs_profiles_in_pod) the file is never read: always inactive.
+# Returns 1 with the error on stderr on any config error.
+fs_profiles_load() {
+    local config_dir="$1"
+    local file="$config_dir/$FS_PROFILES_FILE_NAME"
+    local claude_env="$config_dir/claude.env"
+    FS_PROFILES_ACTIVE=0
+    FS_PROFILE_NAMES=()
+    declare -gA FS_PROFILE_POOL=() FS_PROFILE_CODEX=() FS_PROFILE_OF=()
+    FS_PROFILE_DEFAULT=""
+    FS_PROFILE_RULE_GLOBS=()
+    FS_PROFILE_RULE_NAMES=()
+    FS_PROFILE_HOOK=""
+    _fs_profiles_in_pod && return 0
+    [[ -e "$file" ]] || return 0
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        echo "Error: $file exists but is not a readable file." >&2
+        return 1
+    fi
+
+    local key
+    for key in CLAUDE_CREDENTIALS CLAUDE_CREDENTIAL_POOL; do
+        if [[ -n "$(fs_read_env_value "$claude_env" "$key" || true)" ]]; then
+            echo "Error: claude.env sets $key, and $file defines account" >&2
+            echo "profiles. Two sources for one credential -- move it into a" >&2
+            echo "profile's PROFILE_<name>_CLAUDE_POOL and remove it from" >&2
+            echo "claude.env." >&2
+            return 1
+        fi
+    done
+
+    local line lineno=0 value name field default_seen=false
+    local -A seen_key=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$(( lineno + 1 ))
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        if [[ "$line" != *=* ]]; then
+            echo "Error: $file line $lineno is not KEY=VALUE: $line" >&2
+            return 1
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ "$key" == REPO_RULE ]]; then
+            local glob target
+            if [[ ! "$value" =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]]; then
+                echo "Error: $file line $lineno: REPO_RULE takes '<glob> <profile>'," >&2
+                echo "e.g. REPO_RULE=example.com/acme/* alpha; got: $value" >&2
+                return 1
+            fi
+            glob="${BASH_REMATCH[1]}"
+            target="${BASH_REMATCH[2]}"
+            FS_PROFILE_RULE_GLOBS+=("$glob")
+            FS_PROFILE_RULE_NAMES+=("$target")
+            continue
+        fi
+        if [[ -n "${seen_key[$key]:-}" ]]; then
+            echo "Error: $file sets $key twice (lines ${seen_key[$key]} and $lineno)." >&2
+            return 1
+        fi
+        seen_key[$key]="$lineno"
+        if [[ "$key" == DEFAULT_PROFILE ]]; then
+            FS_PROFILE_DEFAULT="$value"
+            default_seen=true
+            continue
+        fi
+        if [[ "$key" =~ ^PROFILE_(.+)_(CLAUDE_POOL|CODEX_HOME)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            field="${BASH_REMATCH[2]}"
+        else
+            echo "Error: $file line $lineno: unknown key '$key'. Known keys:" >&2
+            echo "PROFILE_<name>_CLAUDE_POOL, PROFILE_<name>_CODEX_HOME," >&2
+            echo "DEFAULT_PROFILE, REPO_RULE." >&2
+            return 1
+        fi
+        if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "Error: $file line $lineno: profile name '$name' must be lowercase" >&2
+            echo "alphanumerics and hyphens, starting with an alphanumeric." >&2
+            return 1
+        fi
+        local known=false n
+        for n in "${FS_PROFILE_NAMES[@]}"; do
+            [[ "$n" == "$name" ]] && known=true && break
+        done
+        $known || FS_PROFILE_NAMES+=("$name")
+        if [[ "$field" == CLAUDE_POOL ]]; then
+            FS_PROFILE_POOL[$name]="$value"
+        else
+            if [[ "$value" != /* ]]; then
+                echo "Error: $file line $lineno: $key='$value' is not an absolute path." >&2
+                return 1
+            fi
+            fs_reject_unsafe_chars "$value" || return 1
+            FS_PROFILE_CODEX[$name]="$value"
+        fi
+    done < "$file"
+
+    if (( ${#FS_PROFILE_NAMES[@]} == 0 )); then
+        echo "Error: $file defines no profile. Add a" >&2
+        echo "PROFILE_<name>_CLAUDE_POOL line, or remove the file." >&2
+        return 1
+    fi
+
+    local needs_hook=false entry canon
+    local -a pool
+    for name in "${FS_PROFILE_NAMES[@]}"; do
+        value="${FS_PROFILE_POOL[$name]:-}"
+        if [[ -z "$value" ]]; then
+            echo "Error: profile '$name' in $file has no PROFILE_${name}_CLAUDE_POOL." >&2
+            echo "Every profile names at least one Claude credential file." >&2
+            return 1
+        fi
+        if [[ "$value" == :* || "$value" == *: || "$value" == *::* ]]; then
+            echo "Error: PROFILE_${name}_CLAUDE_POOL has an empty entry (check for" >&2
+            echo "a leading, trailing or doubled ':')." >&2
+            return 1
+        fi
+        IFS=':' read -r -a pool <<< "$value"
+        (( ${#pool[@]} > 1 )) && needs_hook=true
+        for entry in "${pool[@]}"; do
+            if [[ "$entry" != /* ]]; then
+                echo "Error: PROFILE_${name}_CLAUDE_POOL entry '$entry' is not an" >&2
+                echo "absolute path." >&2
+                return 1
+            fi
+            if [[ "$entry" =~ [[:space:]] ]]; then
+                echo "Error: PROFILE_${name}_CLAUDE_POOL entry '$entry' contains" >&2
+                echo "whitespace, which is not supported in a colon-separated" >&2
+                echo "list entry." >&2
+                return 1
+            fi
+            fs_reject_unsafe_chars "$entry" || return 1
+            canon="$("$FS_REALPATH" -m "$entry")"
+            if [[ -n "${FS_PROFILE_OF[$canon]:-}" ]]; then
+                echo "Error: credential '$entry' is in profile '${FS_PROFILE_OF[$canon]}'" >&2
+                echo "and in profile '$name' in $file. A credential belongs to" >&2
+                echo "exactly one profile, so which one a run is billed to is" >&2
+                echo "never ambiguous." >&2
+                return 1
+            fi
+            FS_PROFILE_OF[$canon]="$name"
+        done
+    done
+
+    if $default_seen && ! _fs_profile_exists "$FS_PROFILE_DEFAULT"; then
+        echo "Error: DEFAULT_PROFILE='$FS_PROFILE_DEFAULT' in $file names no" >&2
+        echo "defined profile (defined: ${FS_PROFILE_NAMES[*]})." >&2
+        return 1
+    fi
+    local i
+    for i in "${!FS_PROFILE_RULE_NAMES[@]}"; do
+        if ! _fs_profile_exists "${FS_PROFILE_RULE_NAMES[$i]}"; then
+            echo "Error: REPO_RULE=${FS_PROFILE_RULE_GLOBS[$i]} ${FS_PROFILE_RULE_NAMES[$i]}" >&2
+            echo "in $file names no defined profile (defined: ${FS_PROFILE_NAMES[*]})." >&2
+            return 1
+        fi
+    done
+
+    FS_PROFILE_HOOK="$(fs_read_env_value "$claude_env" CLAUDE_HEADROOM_HOOK || true)"
+    if [[ -n "$FS_PROFILE_HOOK" && ! "$FS_PROFILE_HOOK" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        echo "Error: CLAUDE_HEADROOM_HOOK='$FS_PROFILE_HOOK' is not a plugin" >&2
+        echo "name. It becomes fork-sandbox-headroom-$FS_PROFILE_HOOK, so it" >&2
+        echo "must be lowercase alphanumerics and hyphens, starting with" >&2
+        echo "an alphanumeric." >&2
+        return 1
+    fi
+    if $needs_hook && [[ -z "$FS_PROFILE_HOOK" ]]; then
+        echo "Error: a profile in $file has a Claude pool of more than one" >&2
+        echo "credential, but claude.env sets no CLAUDE_HEADROOM_HOOK to pick" >&2
+        echo "between them. Set the hook, or give each profile one credential." >&2
+        return 1
+    fi
+
+    FS_PROFILES_ACTIVE=1
+    return 0
+}
+
+# True when this process runs inside a Kubernetes pod (kubelet sets
+# KUBERNETES_SERVICE_HOST in every container). Profiles are a host-side,
+# launch-time fact: a pod -- the cluster postmaster, a pod-side claude
+# seat -- keeps exactly the credential chain it had before profiles
+# existed, with no profile lookup and no session detection at all.
+_fs_profiles_in_pod() {
+    [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]]
+}
+
+# True when launched from inside a Claude Code session: Claude Code exports
+# CLAUDECODE=1 to every tool process it starts, and CLAUDE_CODE_SESSION_ID
+# alongside it (the launcher's per-session index already keys on the
+# latter). Either one counts.
+fs_in_claude_session() {
+    [[ "${CLAUDECODE:-}" == 1 || -n "${CLAUDE_CODE_SESSION_ID:-}" ]]
+}
+
+# The credential file a Claude Code session itself authenticates from.
+fs_session_claude_credential() {
+    printf '%s/.credentials.json' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+}
+
+# Normalizes a git remote URL to host/owner/repo so an ssh and an https
+# remote for one repo compare equal: scheme, user@, :port and a trailing
+# .git or / are dropped, the scp-style host:path colon becomes a slash, and
+# the host is lowercased. A local path (or file:// URL) comes back as the
+# path itself.
+fs_normalize_remote_url() {
+    local url="$1" host rest
+    url="${url%/}"
+    url="${url%.git}"
+    url="${url%/}"
+    if [[ "$url" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
+        if [[ "$url" == file://* ]]; then
+            printf '%s\n' "${url#file://}"
+            return 0
+        fi
+        url="${url#*://}"
+        host="${url%%/*}"
+        rest="${url#*/}"
+        [[ "$rest" == "$url" ]] && rest=""
+        host="${host##*@}"
+        host="${host%%:*}"
+    elif [[ "$url" =~ ^([^/:]+):(.*)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+        host="${host##*@}"
     else
-        echo "Warning: $hook_bin exited $hook_rc. Falling back to today's" >&2
-        echo "default credential chain for this launch -- fix the hook" >&2
-        echo "when you get a chance." >&2
+        printf '%s\n' "$url"
         return 0
     fi
+    rest="${rest#/}"
+    printf '%s/%s\n' "${host,,}" "$rest"
+}
+
+# fs_resolve_account_profile <config_dir> <script_dir> <flag_credential>
+#                            <needs_claude> <needs_codex> <project_path>
+#
+# The one place a run's account profile is chosen. Sets:
+#   FS_PROFILE              the profile name, or empty
+#   FS_PROFILE_VIA          flag | session | default | none
+#   FS_PROFILE_CLAUDE_CRED  the Claude credential (absolute, existing), or empty
+#   FS_PROFILE_CLAUDE_VIA   flag | balance | profile | default
+#   FS_PROFILE_CODEX_HOME   the profile's codex home, or empty
+#
+# FS_PROFILE_VIA=none -- no profiles.env, a pod (see _fs_profiles_in_pod),
+# or a run whose legs use neither a Claude nor a codex login and that pins
+# no credential -- means the caller runs its pre-profile chain unchanged.
+#
+# Resolution order (docs/account-profiles.md): an explicit
+# --claude-credentials picks the profile containing it; else a Claude Code
+# session picks the profile containing that session's own credential file;
+# else DEFAULT_PROFILE. Each tier refuses rather than guesses. Within the
+# profile, the flag's path is used as given; otherwise the pool is balanced
+# by CLAUDE_HEADROOM_HOOK (one entry needs no hook). A hook that crashes
+# falls back to the profile's first entry -- never outside the profile.
+# Then the repo guard rules (fs_profile_repo_guard) and, for a run with a
+# codex leg, the profile's codex home are checked.
+#
+# Returns 1 with the error on stderr on any refusal; the caller exits.
+# shellcheck disable=SC2034  # FS_PROFILE_* are this function's outputs
+fs_resolve_account_profile() {
+    local config_dir="$1" script_dir="$2" flag_cred="$3"
+    local needs_claude="$4" needs_codex="$5" project_path="$6"
+    FS_PROFILE=""
+    FS_PROFILE_VIA="none"
+    FS_PROFILE_CLAUDE_CRED=""
+    FS_PROFILE_CLAUDE_VIA="default"
+    FS_PROFILE_CODEX_HOME=""
+    fs_profiles_load "$config_dir" || return 1
+    (( FS_PROFILES_ACTIVE )) || return 0
+    [[ -n "$flag_cred" || "$needs_claude" == true || "$needs_codex" == true ]] \
+        || return 0
+
+    local file="$config_dir/$FS_PROFILES_FILE_NAME" canon
+    if [[ -n "$flag_cred" ]]; then
+        fs_reject_unsafe_chars "$flag_cred" || return 1
+        canon="$("$FS_REALPATH" -m "$flag_cred")"
+        FS_PROFILE="${FS_PROFILE_OF[$canon]:-}"
+        if [[ -z "$FS_PROFILE" ]]; then
+            echo "Error: --claude-credentials names '$canon', which is in no" >&2
+            echo "account profile in $file. Add it to the profile it bills to," >&2
+            echo "or pin a credential that is already in one." >&2
+            return 1
+        fi
+        FS_PROFILE_VIA="flag"
+    elif fs_in_claude_session; then
+        local session_cred
+        session_cred="$(fs_session_claude_credential)"
+        canon="$("$FS_REALPATH" -m "$session_cred")"
+        FS_PROFILE="${FS_PROFILE_OF[$canon]:-}"
+        if [[ -z "$FS_PROFILE" ]]; then
+            echo "Error: this launch comes from a Claude Code session whose own" >&2
+            echo "credential, '$canon', is in no account profile in" >&2
+            echo "$file. Add that login to the profile it bills to, or pin" >&2
+            echo "--claude-credentials to a credential in the profile you mean." >&2
+            return 1
+        fi
+        FS_PROFILE_VIA="session"
+    elif [[ -n "$FS_PROFILE_DEFAULT" ]]; then
+        FS_PROFILE="$FS_PROFILE_DEFAULT"
+        FS_PROFILE_VIA="default"
+    else
+        echo "Error: $file defines account profiles, but this launch has no" >&2
+        echo "way to choose one: no --claude-credentials, no Claude Code" >&2
+        echo "session, and no DEFAULT_PROFILE. Pin --claude-credentials to a" >&2
+        echo "credential in the profile you mean, or set DEFAULT_PROFILE." >&2
+        return 1
+    fi
+
+    fs_profile_repo_guard "$project_path" "$FS_PROFILE" || return 1
+
+    FS_PROFILE_CODEX_HOME="${FS_PROFILE_CODEX[$FS_PROFILE]:-}"
+    if [[ "$needs_codex" == true && -z "$FS_PROFILE_CODEX_HOME" ]]; then
+        echo "Error: this run has a codex leg, but account profile" >&2
+        echo "'$FS_PROFILE' (chosen by $FS_PROFILE_VIA) has no codex login." >&2
+        echo "Set PROFILE_${FS_PROFILE}_CODEX_HOME in $file, or run the" >&2
+        echo "codex seats under a profile that has one." >&2
+        return 1
+    fi
+
+    if [[ -n "$flag_cred" ]]; then
+        FS_PROFILE_CLAUDE_CRED="$canon"
+        FS_PROFILE_CLAUDE_VIA="flag"
+        if [[ ! -f "$canon" ]]; then
+            echo "Error: --claude-credentials names '$canon'," >&2
+            echo "which does not exist." >&2
+            return 1
+        fi
+        return 0
+    fi
+    [[ "$needs_claude" == true ]] || return 0
+
+    local -a pool
+    IFS=':' read -r -a pool <<< "${FS_PROFILE_POOL[$FS_PROFILE]}"
+    if (( ${#pool[@]} == 1 )); then
+        FS_PROFILE_CLAUDE_CRED="${pool[0]}"
+        FS_PROFILE_CLAUDE_VIA="profile"
+    else
+        local hook_bin choice="" ask_rc=0
+        hook_bin="$(_fs_headroom_hook_bin "$FS_PROFILE_HOOK" "$script_dir")"
+        if [[ -z "$hook_bin" ]]; then
+            echo "Error: cannot find fork-sandbox-headroom-$FS_PROFILE_HOOK, which" >&2
+            echo "CLAUDE_HEADROOM_HOOK names. Looked on PATH and beside" >&2
+            echo "$script_dir. Profile '$FS_PROFILE' has more than one Claude" >&2
+            echo "credential and needs it to pick one." >&2
+            return 1
+        fi
+        _fs_headroom_ask choice "$hook_bin" "${pool[@]}" || ask_rc=$?
+        if (( ask_rc == 0 )); then
+            FS_PROFILE_CLAUDE_CRED="$choice"
+            FS_PROFILE_CLAUDE_VIA="balance"
+        elif (( ask_rc == 3 )); then
+            echo "Warning: $hook_bin exited $_FS_HEADROOM_RC. Falling back to" >&2
+            echo "profile '$FS_PROFILE''s first credential for this launch --" >&2
+            echo "fix the hook when you get a chance." >&2
+            FS_PROFILE_CLAUDE_CRED="${pool[0]}"
+            FS_PROFILE_CLAUDE_VIA="profile"
+        else
+            return 1
+        fi
+    fi
+    FS_PROFILE_CLAUDE_CRED="$("$FS_REALPATH" -m "$FS_PROFILE_CLAUDE_CRED")"
+    if [[ ! -f "$FS_PROFILE_CLAUDE_CRED" ]]; then
+        echo "Error: account profile '$FS_PROFILE' chose Claude credential" >&2
+        echo "'$FS_PROFILE_CLAUDE_CRED', which does not exist. Fix" >&2
+        echo "PROFILE_${FS_PROFILE}_CLAUDE_POOL in $file, or pin" >&2
+        echo "--claude-credentials." >&2
+        return 1
+    fi
+    return 0
+}
+
+# fs_profile_repo_guard <project_path> <profile>
+#
+# REPO_RULE lines only refuse, never choose: the first rule whose glob
+# matches the origin remote (normalized by fs_normalize_remote_url) names
+# the profile that repo requires, and a run under any other profile is
+# refused. No origin, or no matching rule, is no constraint. Needs
+# fs_profiles_load to have run.
+fs_profile_repo_guard() {
+    local project_path="$1" profile="$2" url norm i glob
+    (( ${#FS_PROFILE_RULE_GLOBS[@]} )) || return 0
+    [[ -n "$project_path" ]] || return 0
+    url="$(git -C "$project_path" remote get-url origin 2>/dev/null)" || return 0
+    [[ -n "$url" ]] || return 0
+    norm="$(fs_normalize_remote_url "$url")"
+    for i in "${!FS_PROFILE_RULE_GLOBS[@]}"; do
+        glob="${FS_PROFILE_RULE_GLOBS[$i]}"
+        # shellcheck disable=SC2053  # the right side is a glob on purpose
+        if [[ "$norm" == $glob ]]; then
+            [[ "${FS_PROFILE_RULE_NAMES[$i]}" == "$profile" ]] && return 0
+            echo "Error: repo '$norm' matches REPO_RULE=$glob" >&2
+            echo "${FS_PROFILE_RULE_NAMES[$i]}, which requires account profile" >&2
+            echo "'${FS_PROFILE_RULE_NAMES[$i]}', but this run resolved profile" >&2
+            echo "'$profile'. Launch it as the required profile (pin" >&2
+            echo "--claude-credentials to one of its credentials)." >&2
+            return 1
+        fi
+    done
+    return 0
 }
 
 # The host's model and browser caches, read-only, when the host has them.
