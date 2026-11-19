@@ -280,7 +280,7 @@ runs it once at install time; the hook is what keeps that guarantee true
 after a reboot empties `/tmp`, or after anything else removes the symlink.
 
 **`context-nudge.py`** reads the session's stashed context-window reading
-(written by `statusline-stash.sh`) and, at 35%, 80% and 90% usage, injects
+(written by `statusline-stash.sh`) and, at 40%, 80% and 90% usage, injects
 a short system nudge telling the model to run `/freshly-forked` at the
 next natural break. It is rate-limited to once per session per step — a
 later climb past the same step stays silent until usage drops back under

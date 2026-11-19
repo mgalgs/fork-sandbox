@@ -159,11 +159,11 @@ write_reading() {
     printf '%s' "$payload" | CONTEXT_NUDGE_DIR="$dir" "$stash" >/dev/null
 }
 
-echo "== context-nudge.py: silent below 35% =="
+echo "== context-nudge.py: silent below 40% =="
 dir9="$(new_dir)"
-write_reading "$dir9" sid-9 20
-out9="$(hook_json sid-9 20 | CONTEXT_NUDGE_DIR="$dir9" python3 "$nudge")"
-if [[ -z "$out9" ]]; then ok "silent below 35%"; else no "silent below 35%" "got: $out9"; fi
+write_reading "$dir9" sid-9 38
+out9="$(hook_json sid-9 38 | CONTEXT_NUDGE_DIR="$dir9" python3 "$nudge")"
+if [[ -z "$out9" ]]; then ok "silent below 40%"; else no "silent below 40%" "got: $out9"; fi
 
 echo "== context-nudge.py: fires at 40% =="
 dir10="$(new_dir)"

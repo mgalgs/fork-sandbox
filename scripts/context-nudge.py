@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """UserPromptSubmit hook: nudge to /freshly-forked when the context window fills.
 
-When a session's context window crosses 35% (then 80%, 90%) usage, this injects a
+When a session's context window crosses 40% (then 80%, 90%) usage, this injects a
 short system nudge telling the model to run /freshly-forked at the next natural
 break — handing off to a clean session before quality degrades (or before
 auto-compaction mangles the transcript, where that is enabled).
@@ -22,8 +22,8 @@ customized statusLine command that does not wrap statusline-stash.sh), it
 falls back to reading the tail of the transcript for the last assistant
 message's token usage and estimating the window from the model id.
 
-The nudge is rate-limited: at most once per session per severity step (80%,
-90%), tracked in a per-session file. A large drop in usage (a /clear or
+The nudge is rate-limited: at most once per session per severity step (40%,
+80%, 90%), tracked in a per-session file. A large drop in usage (a /clear or
 /compact) re-arms it.
 
 Usage:
@@ -37,7 +37,7 @@ import sys
 
 # Severity steps (percent of the context window). The nudge fires once as each
 # step is first crossed, most-severe-applicable only.
-STEPS = [35, 80, 90]
+STEPS = [40, 80, 90]
 
 # Below this, treat the context as freshly reset (/clear, /compact) and re-arm
 # every step so a later climb nudges again.
