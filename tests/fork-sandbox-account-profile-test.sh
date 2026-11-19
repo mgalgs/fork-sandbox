@@ -512,5 +512,73 @@ launch "$cfg" "$proj_acme" -- --harness claude --claude-credentials "$a1"
 if [[ -n "$LAUNCH_RD" ]]; then ok "repo rule match: the launcher proceeds"
 else no "repo rule match: the launcher proceeds" "$LAUNCH_OUT"; fi
 
+printf '\n== the real launcher: codex legs follow the profile ==\n'
+cfg="$(newdir)"; std_fixture "$cfg"
+printf '{"tokens":{"refresh_token":"fixture"}}\n' > "$cfg/codex-alpha/auth.json"
+# A decoy machine-wide codex home: a leg that still read it would say so.
+decoy_codex="$(newdir)"
+printf '{"tokens":{}}\n' > "$decoy_codex/auth.json"
+launch "$cfg" "$proj" CODEX_HOME="$decoy_codex" -- --harness codex --claude-credentials "$a1"
+if [[ -n "$LAUNCH_RD" ]]; then
+    run_sh="$(cat "$LAUNCH_RD/run.sh")"
+    contains "a codex leg reads auth from the profile's codex home" \
+        "codex_auth_src=$cfg/codex-alpha/auth.json" "$run_sh"
+    lacks "... not from the machine-wide CODEX_HOME" "$decoy_codex" "$run_sh"
+else
+    no "codex under alpha: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
+# The model check reads the profile's model cache too.
+printf '{"models":[{"slug":"fixture-codex-model","visibility":"list"}]}\n' \
+    > "$cfg/codex-alpha/models_cache.json"
+launch "$cfg" "$proj" CODEX_HOME="$decoy_codex" -- --harness codex --model fixture-codex \
+    --claude-credentials "$a1"
+contains "a codex model resolves against the profile's model cache" \
+    "'fixture-codex' -> 'fixture-codex-model'" "$LAUNCH_OUT"
+
+launch "$cfg" "$proj" -- --harness codex --claude-credentials "$b1"
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "a codex implement leg under a no-codex profile: refused before any run dir" \
+        "has no codex login" "$LAUNCH_OUT"
+    contains "... naming the profile" "'beta'" "$LAUNCH_OUT"
+else
+    no "a codex implement leg under a no-codex profile: refused before any run dir" "$LAUNCH_OUT"
+fi
+
+launch "$cfg" "$proj" -- --harness claude --review-loop 1 --review-harness codex \
+    --claude-credentials "$b1"
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "a codex review seat under a no-codex profile: refused before any run dir" \
+        "has no codex login" "$LAUNCH_OUT"
+else
+    no "a codex review seat under a no-codex profile: refused before any run dir" "$LAUNCH_OUT"
+fi
+
+launch "$cfg" "$proj" -- --pipeline csonnet-rsol-csonnet --claude-credentials "$b1"
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "a composed pipeline's codex seat under a no-codex profile: refused" \
+        "has no codex login" "$LAUNCH_OUT"
+else
+    no "a composed pipeline's codex seat under a no-codex profile: refused" "$LAUNCH_OUT"
+fi
+
+printf '\n== the real launcher inside a pod: the in-pod pool path is unchanged ==\n'
+cfg="$(newdir)"; std_fixture "$cfg"
+printf 'DEFAULT_PROFILE=beta\n' >> "$cfg/profiles.env"
+pod_a="$(fake_cred "$cfg/pod/a.json")"
+pod_b="$(fake_cred "$cfg/pod/b.json")"
+printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\nCLAUDE_HEADROOM_HOOK=pick\n' "$pod_a" "$pod_b" > "$cfg/claude.env"
+hook_bin="$(fake_hook pick 'printf "%s\n" "$2"')"
+launch "$cfg" "$proj" PATH="$hook_bin:$real_stub:$PATH" KUBERNETES_SERVICE_HOST=192.0.2.1 \
+    CLAUDECODE=1 CLAUDE_CONFIG_DIR="$(newdir)" -- --harness claude
+if [[ -n "$LAUNCH_RD" ]]; then
+    contains "in a pod: the claude leg rides the in-pod pool's hook choice" \
+        "--claude-credentials $pod_b" "$(sandbox_line)"
+    contains "in a pod: run.env records via=balance, as before profiles" \
+        "claude_credentials_via=balance" "$(cat "$LAUNCH_RD/run.env")"
+else
+    no "in a pod: the launch produced a run directory (profiles.env ignored)" "$LAUNCH_OUT"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

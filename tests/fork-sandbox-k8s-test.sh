@@ -20943,6 +20943,19 @@ check "claude pool: headroom PATH mount" 'headroom /etc/fork-sandbox/headroom tr
     "$(pm_hooks_mounts_of postmaster | grep '^headroom ')"
 check "claude pool: cluster gate env is set" 'FORK_SANDBOX_CLUSTER_CLAUDE=1' \
     "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_CLUSTER_CLAUDE=')"
+# Account profiles are host-side and launch-time only
+# (docs/account-profiles.md, "Pods"): a profiles.env on the host must not
+# change one byte of the postmaster's in-pod pool rendering, and is never
+# shipped into the pod's config.
+pm_pool_out_noprofiles="$pm_api_out"
+printf 'PROFILE_alpha_CLAUDE_POOL=%s\nDEFAULT_PROFILE=alpha\n' \
+    "$pm_cfg_pool/accounts/alpha.json" > "$pm_cfg_pool/profiles.env"
+pm_api_install "$pm_cfg_pool"
+check "claude pool: a host profiles.env leaves the in-pod pool rendering unchanged" 1 \
+    "$([[ "$pm_api_out" == "$pm_pool_out_noprofiles" ]] && echo 1 || echo 0)"
+check "claude pool: a host profiles.env is never shipped into the pod" 0 \
+    "$(grep -c 'profiles.env\|PROFILE_alpha' <<< "$pm_api_out")"
+rm -f "$pm_cfg_pool/profiles.env"
 pm_pool_sum="$(pm_api_sum)"
 printf ' ' >> "$pm_cfg_pool/accounts/alpha.json"
 pm_api_install "$pm_cfg_pool"
@@ -21934,6 +21947,59 @@ if CODEX_HOME="$rd_codex_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
 else
     no "a composed Codex run needs no phantom top-level model"
 fi
+
+# Account profiles (docs/account-profiles.md) on this direct entry point: a
+# codex seat reads the resolved profile's codex home, not CODEX_HOME, and a
+# profile with no codex home refuses the run before anything is rendered.
+# The session tier is kept out of the way so DEFAULT_PROFILE decides.
+prof_codex_cfg="$(newdir)"; tmpdirs+=("$prof_codex_cfg")
+cp "$config_dir/k8s.env" "$prof_codex_cfg/k8s.env"
+install -m 600 /dev/null "$prof_codex_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$prof_codex_cfg/pi.env"
+prof_beta_cred="$(newdir)/beta-credentials.json"; tmpdirs+=("$(dirname "$prof_beta_cred")")
+cp "$claude_override_cred" "$prof_beta_cred"
+{
+    printf 'PROFILE_alpha_CLAUDE_POOL=%s\n' "$claude_override_cred"
+    printf 'PROFILE_alpha_CODEX_HOME=%s\n' "$rd_codex_home"
+    printf 'PROFILE_beta_CLAUDE_POOL=%s\n' "$prof_beta_cred"
+    printf 'DEFAULT_PROFILE=alpha\n'
+} > "$prof_codex_cfg/profiles.env"
+prof_decoy_codex="$(newdir)"; tmpdirs+=("$prof_decoy_codex")
+prof_codex_out="$(newdir)/prof-codex.yaml"; tmpdirs+=("$(dirname "$prof_codex_out")")
+if env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID CODEX_HOME="$prof_decoy_codex" \
+    FORK_SANDBOX_CONFIG_DIR="$prof_codex_cfg" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-prof-codex \
+    --harness codex --model gpt-5.6-sol --run-dir "$rd_codex_dry" \
+    "$proj_dir" "$handoff_file" > "$prof_codex_out" 2>&1; then
+    ok "profiles: a direct submit's codex seat reads the profile's codex home, not CODEX_HOME"
+else
+    no "profiles: a direct submit's codex seat reads the profile's codex home, not CODEX_HOME" \
+        "$(cat "$prof_codex_out")"
+fi
+if grep -q 'secretName: .*codex-token' "$prof_codex_out"; then
+    ok "profiles: ... and renders the codex proxy from it"
+else
+    no "profiles: ... and renders the codex proxy from it"
+fi
+refuses "profiles: a direct submit's codex seat under a no-codex profile is refused" \
+    "has no codex login" \
+    env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID CODEX_HOME="$rd_codex_home" \
+    FORK_SANDBOX_CONFIG_DIR="$prof_codex_cfg" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-prof-codex-beta \
+    --harness codex --model gpt-5.6-sol --run-dir "$rd_codex_dry" \
+    --claude-credentials "$prof_beta_cred" "$proj_dir" "$handoff_file"
+refuses "profiles: a direct claude submit pinning a path in no profile is refused" \
+    "which is in no" \
+    env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID FORK_SANDBOX_CONFIG_DIR="$prof_codex_cfg" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-prof-stray --model sonnet \
+    --harness claude --claude-credentials "$rd_codex_home/auth.json" \
+    "$proj_dir" "$handoff_file"
+sed -i '/^DEFAULT_PROFILE=/d' "$prof_codex_cfg/profiles.env"
+refuses "profiles: a direct claude submit with no session and no default is refused" \
+    "no DEFAULT_PROFILE" \
+    env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID FORK_SANDBOX_CONFIG_DIR="$prof_codex_cfg" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-prof-nodefault --model sonnet \
+    --harness claude "$proj_dir" "$handoff_file"
 if grep -qF "$rd_codex_token" "$rd_codex_out" \
     || grep -qF "$rd_codex_account" "$rd_codex_out" \
     || grep -qF 'fixture-refresh-never-in-pod' "$rd_codex_out"; then
