@@ -7329,6 +7329,36 @@ cmd_submit() {
     # fs_balance_claude_credential's own header comment).
     local claude_cred_json="" claude_access_token="" claude_configmap_cred=""
     local codex_key_conf="" codex_auth_path="" codex_auth_managed=0
+    # The run's account profile (docs/account-profiles.md), resolved before
+    # the codex login below is read, since a codex seat's login is the
+    # profile's codex home. fork-sandbox.sh --k8s already resolved it on
+    # its side and hands the result over (FORK_SANDBOX_ACCOUNT_PROFILE*,
+    # beside FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED, with CODEX_HOME
+    # already exported); a direct invocation resolves it here. With no
+    # profiles.env this is via "none" and every chain below is unchanged.
+    local account_profile="" account_profile_via="none"
+    FS_PROFILE_CLAUDE_CRED=""
+    FS_PROFILE_CLAUDE_VIA="default"
+    if [[ -n "${FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED:-}" ]]; then
+        account_profile="${FORK_SANDBOX_ACCOUNT_PROFILE:-}"
+        account_profile_via="${FORK_SANDBOX_ACCOUNT_PROFILE_VIA:-none}"
+        case "$account_profile_via" in
+            flag | session | default) ;;
+            *) account_profile=""; account_profile_via="none" ;;
+        esac
+    else
+        local profile_needs_claude=false profile_needs_codex=false
+        [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]] && profile_needs_claude=true
+        (( pipeline_has_codex )) && [[ -z "${FORK_SANDBOX_CODEX_AUTH_FILE:-}" ]] \
+            && profile_needs_codex=true
+        fs_resolve_account_profile "$config_dir" "$script_dir" "$claude_credentials_flag" \
+            "$profile_needs_claude" "$profile_needs_codex" "$project_path" || exit 1
+        account_profile="$FS_PROFILE"
+        account_profile_via="$FS_PROFILE_VIA"
+        if [[ -n "$FS_PROFILE_CODEX_HOME" ]]; then
+            export CODEX_HOME="$FS_PROFILE_CODEX_HOME"
+        fi
+    fi
     if (( pipeline_has_codex )) && [[ -n "${FORK_SANDBOX_CODEX_AUTH_FILE:-}" ]]; then
         # A managed file (see the header): read, never refreshed, so the
         # checks a refresh would have made good are refusals here.
@@ -7369,7 +7399,11 @@ cmd_submit() {
         fi
     fi
     local claude_credentials_override="" claude_credentials_via="default"
-    if [[ -n "$claude_credentials_flag" && "$harness" != claude \
+    if [[ "$account_profile_via" != none ]]; then
+        # fs_resolve_account_profile already refused a pinned path in no
+        # profile, or one that does not exist; nothing more to check here.
+        :
+    elif [[ -n "$claude_credentials_flag" && "$harness" != claude \
         && "$pipeline_has_claude" != 1 ]]; then
         # A typo in --claude-credentials is refused here too, even though
         # this harness will never read the file -- the same "fail loud
@@ -7401,8 +7435,10 @@ cmd_submit() {
             # source, so the ledger keeps per-account attribution instead of
             # flattening every delegated run to "flag".
             local via_env="${FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA:-flag}"
+            [[ -z "${FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED:-}" \
+                && "$account_profile_via" != none ]] && via_env="flag"
             case "$via_env" in
-                flag | claude-env | balance) claude_credentials_via="$via_env" ;;
+                flag | claude-env | balance | profile) claude_credentials_via="$via_env" ;;
                 *) claude_credentials_via="flag" ;;
             esac
         elif [[ -n "${FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED:-}" ]]; then
@@ -7414,6 +7450,11 @@ cmd_submit() {
             # for one run, which is the one thing the launcher's own forward
             # is meant to prevent.
             claude_credentials_via="default"
+        elif [[ "$account_profile_via" != none ]]; then
+            # A direct invocation with profiles configured: the profile's
+            # own pool was balanced by fs_resolve_account_profile above.
+            claude_credentials_override="$FS_PROFILE_CLAUDE_CRED"
+            claude_credentials_via="$FS_PROFILE_CLAUDE_VIA"
         else
             # Called unconditionally, not gated on claude_credentials_config
             # being empty -- fs_balance_claude_credential also validates
@@ -9166,6 +9207,11 @@ EOF
         printf 'UPSTREAM=%s\n' "$upstream"
         printf 'UPSTREAM_REASON=%s\n' "$upstream_reason"
         [[ -n "$run_dir_flag" ]] && printf 'RUNNER=1\n'
+        # Which account profile this run was billed under, and how it was
+        # chosen (docs/account-profiles.md) -- always printed, "none" when
+        # no profile applies. A name, never token material.
+        printf 'account_profile=%s\n' "$account_profile"
+        printf 'account_profile_via=%s\n' "$account_profile_via"
         if [[ "$harness" == claude || "$pipeline_has_claude" == 1 ]]; then
             printf 'claude_credentials_source=%s\n' "${claude_credentials_override:-default}"
             printf 'claude_credentials_via=%s\n' "$claude_credentials_via"

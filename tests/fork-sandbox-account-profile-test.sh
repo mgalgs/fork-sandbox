@@ -61,11 +61,12 @@ equals() {
     if [[ "$want" == "$got" ]]; then ok "$label"; else no "$label" "want '$want', got '$got'"; fi
 }
 
+# Called as $(newdir), a subshell, so it cannot register into tmpdirs:
+# every fixture dir lives under one suite root instead.
+suite_tmp="$(mktemp -d)"
+tmpdirs+=("$suite_tmp")
 newdir() {
-    local d
-    d="$(mktemp -d)"
-    tmpdirs+=("$d")
-    printf '%s' "$d"
+    mktemp -d "$suite_tmp/d.XXXXXX"
 }
 
 fake_cred() {
@@ -366,6 +367,150 @@ equals "in a pod: no profile and no session lookup, via none" "0/none" "$rc/$FS_
 out="$(KUBERNETES_SERVICE_HOST=192.0.2.1 PATH="$hook_bin:$PATH" \
     fs_balance_claude_credential "$d" "$script_dir" 2>&1)"; rc=$?
 equals "in a pod: the in-pod pool path balances exactly as before" "0/$a2" "$rc/$out"
+
+printf '\n== the real launcher: claude legs ride the resolved profile ==\n'
+launcher="$repo_dir/scripts/fork-sandbox.sh"
+export FORK_SANDBOX_RUN_SOURCE=test
+mkdir -p /var/tmp/claude-scratch
+real_stub="$(mktemp -d /var/tmp/claude-scratch/fs-account-profile-stub.XXXXXX)"
+tmpdirs+=("$real_stub")
+for stub in claude-sandboxed agent-sandboxed; do
+    printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' > "$real_stub/$stub"
+done
+cat > "$real_stub/sandbox-backend-fake-image" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--capabilities" ]]; then
+    printf 'toolchain=image\n'
+    exit 0
+fi
+exit 0
+STUB
+chmod +x "$real_stub"/*
+launcher_home="$(newdir)"
+mkdir -p "$launcher_home/src"
+FORK_SANDBOX_BY_SESSION_DIR="$(newdir)"
+export FORK_SANDBOX_BY_SESSION_DIR
+
+new_project() {
+    local d remote="${1:-}"
+    d="$(mktemp -d "$launcher_home/src/fs-account-profile-test.XXXXXX")"
+    (
+        cd "$d" && git init -q . && git config user.email t@fork-sandbox.invalid \
+            && git config user.name Tester && printf 'hello\n' > file.txt \
+            && git add file.txt && git commit -q -m init
+        [[ -z "$remote" ]] || git remote add origin "$remote"
+    ) >/dev/null 2>&1
+    printf '%s' "$d"
+}
+proj="$(new_project)"
+handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-account-profile-handoff.XXXXXX)"
+tmpdirs+=("$handoff_dir")
+handoff="$handoff_dir/handoff.md"
+printf 'do the task\n' > "$handoff"
+
+# launch <cfg> <project> [env assignments...] -- [fork-sandbox.sh args...]
+# Prints combined output; LAUNCH_RC and LAUNCH_RD are set.
+LAUNCH_RC=0
+LAUNCH_RD=""
+launch() {
+    local cfg="$1" project="$2"; shift 2
+    local -a envs=()
+    while (( $# )) && [[ "$1" != -- ]]; do envs+=("$1"); shift; done
+    shift
+    LAUNCH_OUT="$(env HOME="$launcher_home" PATH="$real_stub:$PATH" \
+        FORK_SANDBOX_CONFIG_DIR="$cfg" FORK_SANDBOX_BACKEND=fake-image "${envs[@]}" \
+        timeout 60 "$launcher" --foreground "$@" "$project" "$handoff" 2>&1)"
+    LAUNCH_RC=$?
+    LAUNCH_RD="$(printf '%s\n' "$LAUNCH_OUT" | sed -n 's/^  run dir:  *//p' | head -1)"
+    [[ -n "$LAUNCH_RD" ]] && tmpdirs+=("$LAUNCH_RD")
+    return 0
+}
+sandbox_line() { grep '^sandbox_cmd=' "$LAUNCH_RD/run.sh" 2>/dev/null; }
+
+cfg="$(newdir)"; std_fixture "$cfg"
+printf 'DEFAULT_PROFILE=alpha\n' >> "$cfg/profiles.env"
+hook_bin="$(fake_hook pick 'printf "%s\n" "$2"')"
+
+launch "$cfg" "$proj" PATH="$hook_bin:$real_stub:$PATH" -- --harness claude
+if [[ -n "$LAUNCH_RD" ]]; then
+    contains "default tier: the claude leg carries the profile pool's hook choice" \
+        "--claude-credentials $a2" "$(sandbox_line)"
+else
+    no "default tier: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
+sess="$(newdir)"
+cp "$b1" "$sess/.credentials.json"
+cfg_s="$(newdir)"
+{
+    printf 'PROFILE_alpha_CLAUDE_POOL=%s:%s\n' "$a1" "$a2"
+    printf 'PROFILE_beta_CLAUDE_POOL=%s\n' "$sess/.credentials.json"
+    printf 'DEFAULT_PROFILE=alpha\n'
+} > "$cfg_s/profiles.env"
+printf 'CLAUDE_HEADROOM_HOOK=pick\n' > "$cfg_s/claude.env"
+launch "$cfg_s" "$proj" PATH="$hook_bin:$real_stub:$PATH" CLAUDECODE=1 \
+    CLAUDE_CONFIG_DIR="$sess" -- --harness claude
+if [[ -n "$LAUNCH_RD" ]]; then
+    contains "session tier: the claude leg carries the session profile's credential" \
+        "--claude-credentials $sess/.credentials.json" "$(sandbox_line)"
+else
+    no "session tier: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
+launch "$cfg_s" "$proj" CLAUDECODE=1 CLAUDE_CONFIG_DIR="$(newdir)" -- --harness claude
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "session login in no profile: refused before any run dir" \
+        "is in no account profile" "$LAUNCH_OUT"
+else
+    no "session login in no profile: refused before any run dir" "$LAUNCH_OUT"
+fi
+
+launch "$cfg" "$proj" -- --harness claude --claude-credentials "$stray"
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "pinned path in no profile: refused before any run dir" "which is in no" "$LAUNCH_OUT"
+else
+    no "pinned path in no profile: refused before any run dir" "$LAUNCH_OUT"
+fi
+
+launch "$cfg" "$proj" -- --harness claude --claude-credentials "$b1"
+if [[ -n "$LAUNCH_RD" ]]; then
+    contains "flag tier: the pinned path is used as given" \
+        "--claude-credentials $b1" "$(sandbox_line)"
+else
+    no "flag tier: the launch produced a run directory" "$LAUNCH_OUT"
+fi
+
+cfg_nd="$(newdir)"; std_fixture "$cfg_nd"
+launch "$cfg_nd" "$proj" -- --harness claude
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "no session and no default: refused before any run dir" "no DEFAULT_PROFILE" "$LAUNCH_OUT"
+else
+    no "no session and no default: refused before any run dir" "$LAUNCH_OUT"
+fi
+
+cfg_pp="$(newdir)"; std_fixture "$cfg_pp"
+printf 'CLAUDE_CREDENTIAL_POOL=%s\nCLAUDE_HEADROOM_HOOK=pick\n' "$stray" > "$cfg_pp/claude.env"
+launch "$cfg_pp" "$proj" -- --harness claude --claude-credentials "$b1"
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "pool + profiles: refused before any run dir" \
+        "claude.env sets CLAUDE_CREDENTIAL_POOL" "$LAUNCH_OUT"
+else
+    no "pool + profiles: refused before any run dir" "$LAUNCH_OUT"
+fi
+
+proj_acme="$(new_project git@example.com:acme/widget.git)"
+cfg="$(newdir)"; std_fixture "$cfg"
+printf 'REPO_RULE=example.com/acme/* alpha\n' >> "$cfg/profiles.env"
+launch "$cfg" "$proj_acme" -- --harness claude --claude-credentials "$b1"
+if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
+    contains "repo rule mismatch: the launcher refuses before any run dir" \
+        "requires account profile" "$LAUNCH_OUT"
+else
+    no "repo rule mismatch: the launcher refuses before any run dir" "$LAUNCH_OUT"
+fi
+launch "$cfg" "$proj_acme" -- --harness claude --claude-credentials "$a1"
+if [[ -n "$LAUNCH_RD" ]]; then ok "repo rule match: the launcher proceeds"
+else no "repo rule match: the launcher proceeds" "$LAUNCH_OUT"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

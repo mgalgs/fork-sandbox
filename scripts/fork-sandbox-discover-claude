@@ -13,7 +13,10 @@
 # machine's claude.env sets CLAUDE_CREDENTIALS, or configures
 # CLAUDE_CREDENTIAL_POOL + CLAUDE_HEADROOM_HOOK -- the path a real run
 # would resolve instead (see fs_balance_claude_credential in
-# fork-sandbox-lib.sh, and docs/credential-balancing.md). There is nothing
+# fork-sandbox-lib.sh, and docs/credential-balancing.md). With account
+# profiles configured (profiles.env, docs/account-profiles.md) it reports
+# the profile a launch from this same environment would resolve, and that
+# profile's credential. There is nothing
 # for configure to install; the value of listing it at all is telling a
 # new user their `claude` harness is ready before they try a run and find
 # out the hard way. It runs that same resolution so the report matches
@@ -45,6 +48,24 @@ source "$script_dir/fork-sandbox-lib.sh"
 config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
 
 cmd_discover() {
+    local override label="Claude credential"
+    # Account profiles (docs/account-profiles.md): with a profiles.env, the
+    # credential a launch from here would use is the resolved profile's --
+    # by session, else DEFAULT_PROFILE -- so report that, through the same
+    # fs_resolve_account_profile a run calls. A refusal a run would hit
+    # (session login in no profile, no default, bad config) is "not
+    # present", with the reason already on stderr.
+    if ! fs_resolve_account_profile "$config_dir" "$script_dir" "" true false ""; then
+        return 0
+    fi
+    if [[ "$FS_PROFILE_VIA" != none ]]; then
+        if fs_read_claude_credential "$FS_PROFILE_CLAUDE_CRED" >/dev/null 2>&1; then
+            printf 'present\t-\t%s (profile %s, via %s)\t%s\tfound\n' "$label" \
+                "$FS_PROFILE" "$FS_PROFILE_VIA" \
+                "$(fs_claude_credential_source "$FS_PROFILE_CLAUDE_CRED")"
+        fi
+        return 0
+    fi
     local override
     override="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
     # Mirrors fork-sandbox.sh's own local-path precedence (minus the
@@ -62,7 +83,7 @@ cmd_discover() {
         return 0
     fi
     if fs_read_claude_credential "$override" >/dev/null 2>&1; then
-        printf 'present\t-\tClaude credential\t%s\tfound\n' \
+        printf 'present\t-\t%s\t%s\tfound\n' "$label" \
             "$(fs_claude_credential_source "$override")"
     fi
 }

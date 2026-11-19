@@ -3574,6 +3574,48 @@ resolve_model() {
     esac
 }
 
+# The run's account profile (docs/account-profiles.md), resolved once, here,
+# before any model is resolved: a codex seat's model check reads the codex
+# home's model cache, and that home is the profile's. Which legs this run
+# has decides whether a profile is needed at all -- a Claude login for a
+# claude leg, a codex login for a codex leg -- over every seat that can
+# run: a composed pipeline's steps and fix seats, or the legacy shape's
+# implement (unless phantom, see impl_seat_is_phantom below), review,
+# maintainer and fix seats. With no profiles.env this sets
+# FS_PROFILE_VIA=none and every chain below runs exactly as before.
+profile_needs_claude=false
+profile_needs_codex=false
+profile_seats=()
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    for ((profile_k = 1; profile_k <= preset_step_count; profile_k++)); do
+        profile_seats+=("${preset_agent_harness[${preset_step_agent[$profile_k]}]}")
+        profile_seats+=("${preset_step_fix_harness[$profile_k]:-}")
+    done
+else
+    [[ "$preset_read_only" == true && "$preset_ro_review" != true ]] \
+        || profile_seats+=("$harness")
+    profile_seats+=("$review_harness" "$maintainer_harness" "$fix_harness" "$mntfix_harness")
+fi
+for profile_seat in "${profile_seats[@]}"; do
+    [[ "$profile_seat" == claude ]] && profile_needs_claude=true
+    [[ "$profile_seat" == codex ]] && profile_needs_codex=true
+done
+fs_resolve_account_profile "$config_dir" "$script_dir" "$claude_credentials" \
+    "$profile_needs_claude" "$profile_needs_codex" \
+    "$($no_repo || printf '%s' "$project_path")" || exit 1
+account_profile="$FS_PROFILE"
+account_profile_via="$FS_PROFILE_VIA"
+if [[ -n "$FS_PROFILE_CODEX_HOME" ]]; then
+    export CODEX_HOME="$FS_PROFILE_CODEX_HOME"
+fi
+# fork-sandbox-k8s.sh's internal handoff, like FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA:
+# a --k8s run forwards the chosen credential as --claude-credentials, and
+# these keep the profile (and how it was chosen) from being re-resolved or
+# flattened to "flag" on the other side.
+export FORK_SANDBOX_ACCOUNT_PROFILE="$account_profile"
+export FORK_SANDBOX_ACCOUNT_PROFILE_VIA="$account_profile_via"
+unset profile_seats profile_seat profile_k
+
 resolve_model model "$model_given" "$harness" || exit 1
 
 review_model_given=false
@@ -4260,7 +4302,14 @@ if [[ "$k8s_mode" == true ]]; then
     # a composed preset, so it never carries a real step's harness) --
     # composed_has_claude_seat, computed over every real step and fix seat
     # above, is the question this branch actually needs answered there.
-    if [[ -n "$claude_credentials" ]]; then
+    #
+    # With account profiles configured, the profile resolution above
+    # already chose (and existence-checked) the credential; nothing below
+    # may pick a second one.
+    if [[ "$account_profile_via" != none ]]; then
+        claude_credentials_resolved="$FS_PROFILE_CLAUDE_CRED"
+        claude_credentials_via="$FS_PROFILE_CLAUDE_VIA"
+    elif [[ -n "$claude_credentials" ]]; then
         claude_credentials_via="flag"
     elif [[ "$k8s_runner_mode" == true && "$composed_has_claude_seat" == true ]] \
         || [[ "$k8s_runner_mode" != true && "$harness" == "claude" ]]; then
@@ -5947,7 +5996,12 @@ fi
 if [[ "$k8s_runner_mode" != true ]]; then
 claude_credentials_via="default"
 claude_credentials_resolved="$claude_credentials"
-if [[ -n "$claude_credentials" ]]; then
+if [[ "$account_profile_via" != none ]]; then
+    # Account profiles: the resolution before the model checks already
+    # chose and existence-checked the credential (docs/account-profiles.md).
+    claude_credentials_resolved="$FS_PROFILE_CLAUDE_CRED"
+    claude_credentials_via="$FS_PROFILE_CLAUDE_VIA"
+elif [[ -n "$claude_credentials" ]]; then
     claude_credentials_via="flag"
 elif $has_claude_leg; then
     # Called unconditionally, not gated on claude_credentials_config being

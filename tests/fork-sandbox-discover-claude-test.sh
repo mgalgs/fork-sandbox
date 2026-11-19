@@ -153,5 +153,24 @@ printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$cred_f" > "$cfg_f/claude.env"
 out="$(run_discover "$home_f" "$cfg_f")"
 check "pool without hook, real default present: discover still prints nothing" "" "$out"
 
+printf '\n== account profiles: reports what a launch from here would resolve ==\n'
+home_g="$(newdir)"; tmpdirs+=("$home_g")
+cfg_g="$(newdir)"; tmpdirs+=("$cfg_g")
+mkdir -p "$home_g/.claude"
+printf 'secret-token-marker-g\n' > "$home_g/.claude/.credentials.json"
+cred_g_alpha="$(fake_cred "$cfg_g" alpha.json)"
+printf 'PROFILE_alpha_CLAUDE_POOL=%s\nPROFILE_beta_CLAUDE_POOL=%s\n' \
+    "$cred_g_alpha" "$home_g/.claude/.credentials.json" > "$cfg_g/profiles.env"
+out="$(run_discover "$home_g" "$cfg_g" 2>/dev/null)"
+check "profiles, plain shell, no DEFAULT_PROFILE: reports nothing (a run would refuse)" "" "$out"
+printf 'DEFAULT_PROFILE=alpha\n' >> "$cfg_g/profiles.env"
+out="$(run_discover "$home_g" "$cfg_g")"
+check "profiles, plain shell: reports DEFAULT_PROFILE's credential, not ~/.claude's" \
+    "present	-	Claude credential (profile alpha, via default)	$cred_g_alpha	found" "$out"
+out="$(env -i PATH=/usr/bin:/bin HOME="$home_g" CLAUDECODE=1 \
+    FORK_SANDBOX_CONFIG_DIR="$cfg_g" "$discover_claude" discover)"
+check "profiles, inside a Claude Code session: reports the session's profile" \
+    "present	-	Claude credential (profile beta, via session)	$home_g/.claude/.credentials.json	found" "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
