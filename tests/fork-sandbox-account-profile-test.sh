@@ -511,6 +511,14 @@ fi
 launch "$cfg" "$proj_acme" -- --harness claude --claude-credentials "$a1"
 if [[ -n "$LAUNCH_RD" ]]; then ok "repo rule match: the launcher proceeds"
 else no "repo rule match: the launcher proceeds" "$LAUNCH_OUT"; fi
+# The --k8s dispatch resolves the profile (and so the guard) on this side,
+# before it execs into fork-sandbox-k8s.sh.
+k8s_guard_out="$(env HOME="$launcher_home" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$cfg" timeout 60 "$launcher" --dry-run --k8s \
+    --harness claude --model sonnet --claude-credentials "$b1" \
+    "$proj_acme" "$handoff" 2>&1)"
+contains "repo rule mismatch on --k8s: refused by the launcher" \
+    "requires account profile" "$k8s_guard_out"
 
 printf '\n== the real launcher: codex legs follow the profile ==\n'
 cfg="$(newdir)"; std_fixture "$cfg"

@@ -16605,6 +16605,34 @@ if [[ -z "$hits" ]]; then
 else
     no "no private-hostname shape in the repo" "$hits"
 fi
+# Account profiles (docs/account-profiles.md) made two more leak classes
+# possible: a REPO_RULE glob names a real git host and organization, and a
+# PROFILE_<name>_ key names a billing owner. Anything in the repo that
+# looks like either must use an invented name: a REPO_RULE host under
+# example.com/.org/.net or a reserved .example/.invalid/.test TLD, and a
+# profile name from the invented set below.
+profile_leak_hits="$(grep -rEoh --exclude-dir=.git --exclude='fork-sandbox-k8s-test.sh' \
+    'REPO_RULE=[^[:space:]`|]+' "$repo_dir" 2>/dev/null \
+    | grep -Ev '^REPO_RULE=(\$|<)' \
+    | grep -Ev '^REPO_RULE=([a-z0-9*-]+\.)*(example\.(com|org|net)|[a-z0-9-]+\.(example|invalid|test))(/|$)' || true)"
+profile_leak_hits+="$(grep -rEoh --exclude-dir=.git --exclude='fork-sandbox-k8s-test.sh' \
+    'PROFILE_[a-z0-9-]+_(CLAUDE_POOL|CODEX_HOME)' "$repo_dir" 2>/dev/null \
+    | grep -Ev '^PROFILE_(alpha|beta|gamma|delta)_' || true)"
+if [[ -z "$profile_leak_hits" ]]; then
+    ok "no real-looking REPO_RULE host or profile name in the repo"
+else
+    no "no real-looking REPO_RULE host or profile name in the repo" "$profile_leak_hits"
+fi
+for profile_leak_probe in 'REPO_RULE=github.com/somecorp/* alpha' 'PROFILE_somecorp_CLAUDE_POOL=/x.json'; do
+    if grep -Eo 'REPO_RULE=[^[:space:]`|]+' <<< "$profile_leak_probe" \
+        | grep -Evq '^REPO_RULE=([a-z0-9*-]+\.)*(example\.(com|org|net)|[a-z0-9-]+\.(example|invalid|test))(/|$)' \
+        || grep -Eo 'PROFILE_[a-z0-9-]+_(CLAUDE_POOL|CODEX_HOME)' <<< "$profile_leak_probe" \
+        | grep -Evq '^PROFILE_(alpha|beta|gamma|delta)_'; then
+        ok "the profile leak guard catches '$profile_leak_probe'"
+    else
+        no "the profile leak guard catches '$profile_leak_probe'"
+    fi
+done
 # A synthetic check that the new Service-DNS branch of leak_pattern is
 # live, not silently inert -- proves a real-TLD-shaped Service DNS name
 # would be caught, without writing one into the repo itself.
