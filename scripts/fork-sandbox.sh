@@ -4309,6 +4309,10 @@ if [[ "$k8s_mode" == true ]]; then
     if [[ "$account_profile_via" != none ]]; then
         claude_credentials_resolved="$FS_PROFILE_CLAUDE_CRED"
         claude_credentials_via="$FS_PROFILE_CLAUDE_VIA"
+    elif (( FS_PROFILES_ACTIVE )); then
+        # Profiles configured, no seat needing a Claude login: never fall
+        # back to the machine-wide balancer (see the local chain below).
+        :
     elif [[ -n "$claude_credentials" ]]; then
         claude_credentials_via="flag"
     elif [[ "$k8s_runner_mode" == true && "$composed_has_claude_seat" == true ]] \
@@ -6001,6 +6005,13 @@ if [[ "$account_profile_via" != none ]]; then
     # chose and existence-checked the credential (docs/account-profiles.md).
     claude_credentials_resolved="$FS_PROFILE_CLAUDE_CRED"
     claude_credentials_via="$FS_PROFILE_CLAUDE_VIA"
+elif (( FS_PROFILES_ACTIVE )); then
+    # Profiles are configured but this run's real seats need no Claude
+    # login (e.g. an all-pi composed pipeline; has_claude_leg can still be
+    # true from the phantom $harness). The machine-wide balancer must not
+    # run under profiles: claude.env carries the hook but, by design, no
+    # pool, so it would refuse a valid launch.
+    :
 elif [[ -n "$claude_credentials" ]]; then
     claude_credentials_via="flag"
 elif $has_claude_leg; then

@@ -3197,13 +3197,14 @@ fs_session_claude_credential() {
 
 # Normalizes a git remote URL to host/owner/repo so an ssh and an https
 # remote for one repo compare equal: scheme, user@, :port and a trailing
-# .git or / are dropped, the scp-style host:path colon becomes a slash, and
+# .git (any case) or / are dropped, the scp-style host:path colon becomes a slash, and
 # the host is lowercased. A local path (or file:// URL) comes back as the
 # path itself.
 fs_normalize_remote_url() {
     local url="$1" host rest
     url="${url%/}"
-    url="${url%.git}"
+    # .git in any case: hosts accept widget.GIT for widget.
+    [[ "${url,,}" == *.git ]] && url="${url:0:${#url}-4}"
     url="${url%/}"
     if [[ "$url" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
         if [[ "$url" == file://* ]]; then
@@ -3380,10 +3381,18 @@ fs_profile_repo_guard() {
     url="$(git -C "$project_path" remote get-url origin 2>/dev/null)" || return 0
     [[ -n "$url" ]] || return 0
     norm="$(fs_normalize_remote_url "$url")"
+    # Matched case-insensitively: common hosts treat owner and repo names
+    # that way, so git@example.com:Acme/Widget is the same repo as
+    # example.com/acme/widget, and a rule that only refuses must not be
+    # dodged by a clone URL's spelling.
+    local restore_nocase
+    restore_nocase="$(shopt -p nocasematch || true)"
+    shopt -s nocasematch
     for i in "${!FS_PROFILE_RULE_GLOBS[@]}"; do
         glob="${FS_PROFILE_RULE_GLOBS[$i]}"
         # shellcheck disable=SC2053  # the right side is a glob on purpose
         if [[ "$norm" == $glob ]]; then
+            eval "$restore_nocase"
             [[ "${FS_PROFILE_RULE_NAMES[$i]}" == "$profile" ]] && return 0
             echo "Error: repo '$norm' matches REPO_RULE=$glob" >&2
             echo "${FS_PROFILE_RULE_NAMES[$i]}, which requires account profile" >&2
@@ -3393,6 +3402,7 @@ fs_profile_repo_guard() {
             return 1
         fi
     done
+    eval "$restore_nocase"
     return 0
 }
 

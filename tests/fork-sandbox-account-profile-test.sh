@@ -220,6 +220,8 @@ for url in git@example.com:acme/widget.git ssh://git@example.com/acme/widget.git
 done
 equals "a local path is left as the path" "/srv/git/widget" \
     "$(fs_normalize_remote_url /srv/git/widget.git)"
+equals "a .GIT suffix in any case is dropped" "example.com/acme/widget" \
+    "$(fs_normalize_remote_url https://example.com/acme/widget.GIT)"
 
 printf '\n== resolution tiers ==\n'
 
@@ -353,6 +355,14 @@ resolve "$d" "$b1" true false "$r_nomatch"; rc=$?
 equals "no matching rule: no constraint" 0 "$rc"
 resolve "$d" "$b1" true false "$r_none"; rc=$?
 equals "no origin remote: matches nothing" 0 "$rc"
+r_case="$(mkrepo git@EXAMPLE.com:Acme/Widget.GIT)"
+contains "owner/repo case does not dodge a rule (Acme/Widget vs acme/*)" \
+    "requires account profile" "$(resolve_err "$d" "$b1" true false "$r_case")"
+PATH="$hook_bin:$PATH" resolve "$d" "$a1" true false "$r_case"; rc=$?
+equals "... and the right profile is still allowed" 0 "$rc"
+[[ "$(shopt -p nocasematch)" == "shopt -u nocasematch" ]] \
+    && ok "the guard leaves nocasematch as it found it" \
+    || no "the guard leaves nocasematch as it found it" "$(shopt -p nocasematch)"
 
 printf '\n== inside a pod, profiles are never consulted ==\n'
 d="$(newdir)"; std_fixture "$d"
@@ -569,6 +579,46 @@ if (( LAUNCH_RC != 0 )) && [[ -z "$LAUNCH_RD" ]]; then
 else
     no "a composed pipeline's codex seat under a no-codex profile: refused" "$LAUNCH_OUT"
 fi
+
+# An all-pi composed pipeline needs no Claude login; the phantom top-level
+# claude harness must not send it to the machine-wide balancer, which under
+# profiles sees CLAUDE_HEADROOM_HOOK with no pool and would refuse.
+cfg="$(newdir)"; std_fixture "$cfg"
+printf 'DEFAULT_PROFILE=alpha\n' >> "$cfg/profiles.env"
+install -m 600 /dev/null "$cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fixture\n' > "$cfg/pi.env"
+mkdir -p "$cfg/presets"
+cat > "$cfg/presets/allpi.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi
+    model: example-org/fixture-model
+  reviewer:
+    harness: pi
+    model: example-org/fixture-model
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+launch "$cfg" "$proj" -- --preset allpi
+if [[ -n "$LAUNCH_RD" ]]; then
+    ok "an all-pi composed pipeline under profiles launches"
+    contains "... recording no profile (no leg needs one)" \
+        "account_profile_via=none" "$(cat "$LAUNCH_RD/run.env")"
+else
+    no "an all-pi composed pipeline under profiles launches" "$LAUNCH_OUT"
+fi
+k8s_pi_out="$(env HOME="$launcher_home" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$cfg" timeout 60 "$launcher" --dry-run --k8s \
+    --preset allpi "$proj" "$handoff" 2>&1)"
+lacks "... and on --k8s, never reaches the machine-wide balancer" \
+    "without CLAUDE_CREDENTIAL_POOL" "$k8s_pi_out"
 
 printf '\n== the real launcher inside a pod: the in-pod pool path is unchanged ==\n'
 cfg="$(newdir)"; std_fixture "$cfg"
