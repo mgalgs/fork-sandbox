@@ -360,9 +360,11 @@ contains "owner/repo case does not dodge a rule (Acme/Widget vs acme/*)" \
     "requires account profile" "$(resolve_err "$d" "$b1" true false "$r_case")"
 PATH="$hook_bin:$PATH" resolve "$d" "$a1" true false "$r_case"; rc=$?
 equals "... and the right profile is still allowed" 0 "$rc"
-[[ "$(shopt -p nocasematch)" == "shopt -u nocasematch" ]] \
-    && ok "the guard leaves nocasematch as it found it" \
-    || no "the guard leaves nocasematch as it found it" "$(shopt -p nocasematch)"
+if [[ "$(shopt -p nocasematch)" == "shopt -u nocasematch" ]]; then
+    ok "the guard leaves nocasematch as it found it"
+else
+    no "the guard leaves nocasematch as it found it" "$(shopt -p nocasematch)"
+fi
 
 printf '\n== inside a pod, profiles are never consulted ==\n'
 d="$(newdir)"; std_fixture "$d"
