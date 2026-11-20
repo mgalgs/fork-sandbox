@@ -479,4 +479,58 @@ check "retry: a budget-exhausted trigger is refused, not spawned" 0 \
 check "retry: the budget-exhausted schedule is dropped after refusal" 0 \
     "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$bg_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
 
+# ============================================================
+printf '\n== retry: a seat whose wake failed for good is named in other seats'"'"' handoffs ==\n'
+# ============================================================
+# A seat that exhausted its retries replies to nothing until a new message
+# wakes it, so a seat waiting on its reply would wait for ever. Every other
+# seat's handoff names it -- but never the seat itself, never one with a run
+# in progress, and never one that has since recovered.
+
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+fg_heading='## Seats whose wake failed for good'
+
+fg_mid1="$(send_msg '@carol' '@alice' 'failed for good' 'first message' 8)"
+fg_tid="$(thread_of "$fg_mid1")"
+once
+finish_run alice 1; once; once
+finish_run alice 1; once; once
+finish_run alice 1; once
+contains "failed-for-good: alice's retries are exhausted" \
+    "$(cat "$PM_STATE_DIR/retries/$fg_tid/alice" 2>/dev/null)" "STATE=exhausted"
+
+fg_mid2="$(reply_msg '@carol' "$fg_mid1" 'over to bob' --to '@bob')"
+once
+fg_bob1="$(cat -- "$PM_STATE_DIR/handoffs/$(basename "$(live_env_for_agent bob)" .env).md")"
+contains "failed-for-good: another seat's handoff has the section" "$fg_bob1" "$fg_heading"
+contains "failed-for-good: the section names the seat, its trigger and its retries" \
+    "$fg_bob1" "- @alice: message $fg_mid1, after 2 retries"
+finish_run bob 0; once
+
+fg_mid3="$(reply_msg '@carol' "$fg_mid2" 'alice again' --to '@alice')"
+once
+fg_alice="$(cat -- "$PM_STATE_DIR/handoffs/$(basename "$(live_env_for_agent alice)" .env).md")"
+not_contains "failed-for-good: the failed seat's own handoff does not name it" \
+    "$fg_alice" "$fg_heading"
+
+fg_mid4="$(reply_msg '@carol' "$fg_mid3" 'bob while alice runs' --to '@bob')"
+once
+fg_bob2="$(cat -- "$PM_STATE_DIR/handoffs/$(basename "$(live_env_for_agent bob)" .env).md")"
+not_contains "failed-for-good: a seat with a run in progress is not named" \
+    "$fg_bob2" "$fg_heading"
+finish_run alice 0
+finish_run bob 0
+once
+
+reply_msg '@carol' "$fg_mid4" 'bob after alice recovered' --to '@bob' >/dev/null
+once
+fg_bob3="$(cat -- "$PM_STATE_DIR/handoffs/$(basename "$(live_env_for_agent bob)" .env).md")"
+contains "failed-for-good: alice's clean wake recovered her record" \
+    "$(cat "$PM_STATE_DIR/retries/$fg_tid/alice" 2>/dev/null)" "STATE=recovered"
+not_contains "failed-for-good: a recovered seat is not named" "$fg_bob3" "$fg_heading"
+finish_run bob 0; once
+
 finish_suite
