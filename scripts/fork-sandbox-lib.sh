@@ -4668,6 +4668,32 @@ fs_emit_headless_turn_section() {
     fs_emit_headless_turn_para "${1:-integrator}" "${2:-}" "${3:-}" "${4:-}"
 }
 
+# The memory-limit section of a prompt. $1 is the memory limit of the
+# container the agent runs in, as a Kubernetes quantity (6Gi). The caller
+# passes the limit the container actually gets: on --k8s, cmd_submit passes
+# it after --agent-resources is applied, falling back to the namespace
+# LimitRange default.
+fs_emit_memory_limit_section() {
+    local limit="$1"
+    cat <<EOF
+
+## Memory limit
+
+This container has a memory limit of $limit. It covers everything in the
+container: your own session, and every command, test run and process you
+start. A container that goes over it is killed at once, and the run ends
+with no report.
+
+So keep what you run well under that limit. Before you run something whose
+memory grows with its input (a large test fixture, a stress or size-limit
+probe, a whole test suite in parallel), size it: run it on a fraction of
+the input first, measure, and scale up only while the estimate stays well
+below the limit. When a check would need more than the limit to run at
+full size, do not run it at full size: report what you measured and the
+size you would have needed.
+EOF
+}
+
 # inner_review is "yes" when a --review-loop ran before this one and "no"
 # otherwise: the two wordings are the difference between "the diff was
 # already read line by line, read around it" and "you are the branch's only

@@ -2124,6 +2124,19 @@ fork-sandbox mail send --from @ci --to @core --subject ... --body - \
     --seat-resources core=cpu=2,memory=4Gi
 ```
 
+### The agent is told its memory limit
+
+The `handoff.md` prompt `submit` renders, and so the continuation header a
+refreshed session is re-sent, carries a `## Memory limit` section after the
+context and services sections. It names the memory limit of the container
+the agent runs in: `--agent-resources` memory when given (so a `--seat-resources`
+grant too), else `K8S_AGENT_LIMITS_MEMORY`, else the namespace `LimitRange`
+default. The limit covers the agent's own session as well as everything it
+starts, and a container that goes over it is OOM-killed with no report. The
+section asks the agent to size anything whose memory grows with its input
+on a fraction of that input first, and to report a check that would not fit
+rather than run it at full size.
+
 ### Checking a grant ahead of time: `check-grant`
 
 `fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...

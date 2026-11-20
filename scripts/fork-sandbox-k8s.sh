@@ -8577,7 +8577,7 @@ CENV
     fi
 
     # The exact prompt text the pod's ConfigMap embeds under handoff.md --
-    # preamble, then the optional context/services sections, then the
+    # preamble, then the optional context/services/memory sections, then the
     # headless-turn warning, then the operator's own handoff -- captured
     # here once so run_dir's own
     # handoff.md (below) is a faithful archive rather than a second,
@@ -8595,6 +8595,7 @@ CENV
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
    [[ -n "$context_secret" ]] && render_context_secret_section "$POD_CONTEXT_DIR" "$context_secret"
    [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
+   fs_emit_memory_limit_section "${K8S_AGENT_LIMITS_MEMORY:-$K8S_LIMITRANGE_DEFAULT_MEMORY}"
    FS_BROWSER_DEFER_TO_POD=1 fs_emit_browser_section
    fs_emit_headless_turn_section
    printf 'X'; })"

@@ -1573,9 +1573,10 @@ check "storage limit alone omits the default request" \
               ephemeral-storage: "512Mi"' \
     "$(agent_container_of <<< "$agent_storage_limit_only" | sed -n '4,$p')"
 # Everything outside the agent container's own stanza is unchanged.
+# The prompt's memory-limit line names the limit, so it differs too.
 check "the rest of the Job renders identically with the keys set" \
-    "$(grep -v -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$agent_res_all_out")" \
-    "$(agent_res_render "$config_dir")"
+    "$(grep -v -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' -e 'This container has a memory limit of' <<< "$agent_res_all_out")" \
+    "$(agent_res_render "$config_dir" | grep -v 'This container has a memory limit of')"
 
 # The built-in LimitRange constants the early check uses must be the manifest's.
 check "the early limit check's ceiling is the LimitRange max in the manifest" \
@@ -1976,6 +1977,26 @@ refuses "submit --agent-resources '' (empty) is refused" \
 refuses "submit --agent-resources given twice is refused" \
     "--agent-resources given twice" \
     ar_submit "$config_dir" --agent-resources cpu=1 --agent-resources memory=1Gi
+
+printf '\n== submit: handoff.md names the agent container'"'"'s memory limit ==\n'
+# The limit the section names is the one the Job renders: --agent-resources
+# over k8s.env over the LimitRange default.
+ml_handoff_limit() {
+    sed -n '/^  handoff.md: |$/,/^---$/p' <<< "$1" \
+        | grep -o 'This container has a memory limit of [^.]*\.' | sed 's/.* of //; s/\.$//' | paste -sd' '
+}
+check "handoff.md: no limit set names the LimitRange default" \
+    "2Gi" "$(ml_handoff_limit "$(ar_submit "$config_dir" 2>/dev/null)")"
+ml_cfg="$(agent_res_cfg K8S_AGENT_LIMITS_MEMORY=6Gi)"
+check "handoff.md: K8S_AGENT_LIMITS_MEMORY is the limit named" \
+    "6Gi" "$(ml_handoff_limit "$(ar_submit "$ml_cfg" 2>/dev/null)")"
+check "handoff.md: --agent-resources memory over k8s.env is the limit named" \
+    "3Gi" "$(ml_handoff_limit "$(ar_submit "$ml_cfg" --agent-resources memory=3Gi 2>/dev/null)")"
+check "handoff.md: --agent-resources cpu only keeps k8s.env's limit" \
+    "6Gi" "$(ml_handoff_limit "$(ar_submit "$ml_cfg" --agent-resources cpu=2 2>/dev/null)")"
+check "the memory section's fallback is the LimitRange default in the manifest" \
+    "$(awk '/default:/ {on=1} on && /memory:/ {print $2; exit}' "$repo_dir/manifests/k8s/00-namespace.yaml")" \
+    "$(sed -n 's/^K8S_LIMITRANGE_DEFAULT_MEMORY=\(.*\)$/\1/p' "$k8s_sh")"
 refuses "run --agent-resources given twice is refused" \
     "--agent-resources given twice" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
@@ -18454,6 +18475,7 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
     # the archive's blank terminal lines before this write.
     expected_rundir_handoff="$({ fs_emit_prompt_preamble /work/clone /work/inbox \
         pi gated /work/outbox pod 67108864
+        fs_emit_memory_limit_section 2Gi
         FS_BROWSER_DEFER_TO_POD=1 fs_emit_browser_section
         fs_emit_headless_turn_section
         printf '\n---\n\n'
@@ -24640,8 +24662,8 @@ check "composed pod, all four keys: the agent (walker) container has no resource
 check "composed pod, all four keys: exactly one resources stanza in the Job" \
     "1" "$(grep -c '^ *resources:' <<< "$comp_res_all_out")"
 check "composed pod: the rest of the Job renders identically with the keys set" \
-    "$comp_res_base_out" \
-    "$(grep -v -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' <<< "$comp_res_all_out")"
+    "$(grep -v 'This container has a memory limit of' <<< "$comp_res_base_out")" \
+    "$(grep -v -e '^ *limits:$' -e '^ *\(cpu\|memory\): "' -e 'This container has a memory limit of' <<< "$comp_res_all_out")"
 # The render is still valid YAML, and the stanza parses onto the leg container.
 if python3 -c 'import yaml' 2>/dev/null; then
     comp_res_parsed="$(python3 -c '
