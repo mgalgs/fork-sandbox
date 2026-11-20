@@ -4005,6 +4005,32 @@ pm_cover_handoff_section() {
 # target shas of a fresh session whose previous transcript was staged at
 # /thread/previous-transcript.jsonl (pm_stage_previous_transcript): the
 # handoff then says so, after the thread block, in fixed wording.
+# Prints one line per seat on <tid> other than <self> whose wake failed for
+# good: its crash-retry record (the read contract above
+# pm_retry_raw_write) is STATE=exhausted with REASON=failed, and no run of
+# it on the thread is live. Each line is "<agent> <trigger> <attempt>",
+# sorted by agent. Such a seat replies to nothing until a new message
+# addressed to it wakes it again, so a seat waiting on its reply waits
+# for ever; pm_write_handoff names these seats for exactly that reason.
+# A malformed-reply schedule (REASON=malformed) is not one: it is a
+# pending retry of a wake that exited cleanly.
+pm_seats_failed_for_good() {
+    local tid="$1" self="$2" f agent rstate rreason last
+    [[ -d "$RETRIES/$tid" ]] || return 0
+    for f in "$RETRIES/$tid"/*; do
+        [[ -f "$f" ]] || continue
+        agent="${f##*/}"
+        [[ "$agent" == .* || "$agent" == "$self" ]] && continue
+        rstate="$(fs_pm_env_get "$f" STATE)"
+        rreason="$(fs_pm_env_get "$f" REASON)"
+        [[ "$rstate" == exhausted && "${rreason:-failed}" == failed ]] || continue
+        last="$(pm_seat_last_run "$tid" "$agent")"
+        [[ -n "$last" && ! -e "$HARVESTED/$last" ]] && continue
+        printf '%s %s %s\n' "$agent" "$(fs_pm_env_get "$f" TRIGGER)" \
+            "$(fs_pm_env_get "$f" ATTEMPT)"
+    done | LC_ALL=C sort
+}
+
 pm_write_handoff() {
     local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" \
           trigger_only="$7" is_retry="${8:-}" protocol="${9:-}" prev_sha="${10:-}" new_sha="${11:-}"
@@ -4135,6 +4161,21 @@ pm_write_handoff() {
                 printf 'look for a message already From: @%s answering this trigger, in the\n' "$agent"
                 printf 'thread rendered above, before writing a new one.\n\n'
             fi
+        fi
+        local failed_seats
+        failed_seats="$(pm_seats_failed_for_good "$tid" "$agent")"
+        if [[ -n "$failed_seats" ]]; then
+            local f_agent f_trigger f_attempt
+            printf '## Seats whose wake failed for good\n\n'
+            printf 'Each seat below crashed or was killed on every attempt to answer\n'
+            printf 'the message named, its retries are spent, and it has no run in\n'
+            printf 'progress. It replies to nothing until a new message addressed to it\n'
+            printf 'wakes it again, so do not wait for its reply: nothing will arrive.\n\n'
+            while read -r f_agent f_trigger f_attempt; do
+                printf -- '- @%s: message %s, after %s retries\n' \
+                    "$f_agent" "${f_trigger:-unknown}" "${f_attempt:-0}"
+            done <<< "$failed_seats"
+            printf '\n'
         fi
         cat <<'INSTR'
 ## Replying

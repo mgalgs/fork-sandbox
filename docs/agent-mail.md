@@ -2740,6 +2740,17 @@ points the agent at `/thread/thread.txt` instead of "above"; the legacy
 full-thread handoff (used when a thread snapshot could not be written)
 already renders the whole thread above, so the section points there.
 
+Every wake's handoff also names the other seats on the thread whose wake
+failed for good: a "Seats whose wake failed for good" section, just before
+"Replying", with one line per seat giving the message it failed to answer
+and the retries it spent. A seat is listed while its retry record is
+`STATE=exhausted` (`REASON=failed`) and none of its runs on the thread is
+live; a later clean wake makes the record `recovered` and drops it from the
+list, and a seat is never listed in its own handoff. Such a seat replies to
+nothing until a new message addressed to it wakes it, so a seat whose
+protocol waits for another's reply can stop waiting instead of waiting for
+ever.
+
 `deliver`'s loop runs a retry pass between routing and harvesting each
 scan: a due retry (its backoff elapsed, and the seat has no run in
 flight) re-invokes the same follow-up-wake path a pending message uses,
